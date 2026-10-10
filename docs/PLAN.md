@@ -127,7 +127,7 @@ Second round: the reviewer's verification of `817ab03` and `e3556bf` accepted R0
 | 2.5 | **Harness-kill behavior.** Extend the §3 experiment to a CPU-bound query, a lock-blocked query and a large scratch rollback. | Results in `docs/notes/`. Any gap gets a mitigation (a server-side `-t`, a session setting). | S |
 | 2.6 | **Drain policy experiment.** Measure the cost of draining on the biggest StackOverflow2010 tables. Prototype a bounded drain: stop counting after a time or row budget, send an attention, and report `≥N rows`, with an explicit note that later statements in that batch didn't run. | Numbers recorded, and the owner decides the default (§6.6). | M |
 | 2.7 | **Memory.** Use the driver's streaming path (`next_row_into` with a cutting `RowWriter`, or PLP chunks) so hidden rows and cut cells aren't fully materialized. | Peak memory stays flat on a 1 GB `varchar(max)` value shown with `--max-cell 500`. | M |
-| 2.8 | **Agent session defaults** (§6.7), proposed: `SET LOCK_TIMEOUT 10000` and `SET DEADLOCK_PRIORITY LOW`, so agent queries give way to production work instead of waiting behind it. | Documented in DESIGN.md §4.3; a live test confirms the settings. | S |
+| 2.8 | **Agent session defaults** (§6.7), proposed: `SET LOCK_TIMEOUT 10000` and `SET DEADLOCK_PRIORITY LOW`, so agent queries give way to production work instead of waiting behind it. **Also consider `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` as the default for read-only runs** (owner, 2026-10-10: "worth considering"). The owner's earlier sql-query-runner skill sets it on every query, so agent reads never take shared locks or block writers. Points to settle with a live test: dirty reads can return uncommitted, duplicated or missing rows, so the docs must say so; it doesn't help against schema-modification locks, so the lock timeout is still needed; apply it only when read-only, never under `--allow-write`, where a write could be based on a dirty read; and decide whether a profile can override it. | Documented in DESIGN.md §4.3; a live test confirms the settings, including a read that would otherwise block behind an open write transaction. | S |
 
 ### Phase 3: execution core, CI and fixtures (the enabler for Phases 4 and 5)
 
@@ -150,6 +150,14 @@ Build `docs/schema-commands.md` on top of the Phase 3 `Runner`, with the review'
 
 Validate on SQL Server 2025, and keep 2016 portability cheap but untested. (L)
 
+**Also in this phase: profile descriptions and search** (owner, 2026-10-10, after comparing sqlh with the earlier sql-query-runner skill, which has both and uses them to pick a server). Finding out *which server* is the first step of many turns, and it costs context like any other discovery. It is independent of the schema commands, so it can ship ahead of them. (S)
+
+| # | Task | Acceptance |
+|---|---|---|
+| 4.1 | **`description` profile key.** Optional, one line, up to 300 characters (environment, purpose, sensitivity: "prod reporting replica, safe for ad-hoc"). Set with `sqlh profile add NAME --description "..."`; a re-run that leaves it out keeps the saved value, like other options. Optional in the file so existing profiles keep working. Human-set only, because `profile add` is the only prompt. | Parser tests (known key, over-length, repeated key, escapes); `profile add` keeps and replaces it |
+| 4.2 | **`profile list` shows it, and `profile list --search TEXT` filters.** A case-insensitive substring match over the name and the description. It never reads a password, as today. Every variable field goes through the text escaper like any metadata field (DESIGN.md §5.1), including in json. | Exact-output tests for text and json, including a hostile description; a search that matches only the description; no match gives an empty list, not an error |
+| 4.3 | **Docs.** DESIGN.md §8 gains the key, the flag and the output shape; `--help` stays under about 60 lines. | DESIGN.md §8 and `--help` match the code |
+
 ### Phase 5: connection reuse (VISION priority 3b)
 
 Decide the mechanism using the 2.1 results:
@@ -168,6 +176,13 @@ This is design work with the owner before any code:
 4. Map each category to a policy (allow, deny, require `--allow-write` or the `execute` tool).
 
 Classifier v2 implements the result. Showplan support (`SET SHOWPLAN_XML`, summarized) probably belongs here as a first-class DBA read. (L, mostly design)
+
+**Interim step, not blocked on the taxonomy: extend the EXEC allowlist** (owner, 2026-10-10: "we will need to allow `xp_readerrorlog` and `xp_instance_regread`, and maybe more if the login permissions allow"). VISION.md keeps selecting individual permitted commands separate from designing the categories, so this can ship first. Today `xp_*` is blocked wholesale (DESIGN.md §7), which rules out reading the SQL Server error log, a basic investigation. The earlier sql-query-runner skill already allows these two, so they come from real use. (S)
+- **Principle:** the allowlist says which commands are read-only. Whether a login may run one is the server's call, and database permissions stay the enforcement boundary (VISION.md). So a command belongs on the list because it only reads, not because this login happens to have the rights, and a login without the permission just gets the server's error.
+- **First additions:** `xp_readerrorlog` and its wrapper `sp_readerrorlog`, and `xp_instance_regread`. Name them exactly: a prefix match on `xp_*` would also admit `xp_cmdshell` and `xp_instance_regwrite`, which stay blocked. `xp_instance_regread` reads registry values, which can disclose information; record that in the category notes.
+- **Candidates to evaluate in the same pass:** `xp_fixeddrives`, `xp_msver`, and `sp_configure` in its listing form only (with arguments it changes settings, so it needs the argument check `sp_spaceused` gets).
+- **To verify on SQL Server 2025 Standard:** which permission each one needs for a non-sysadmin login (newer versions have finer-grained server permissions for the error log), so the blocked/allowed advice and the docs can say what to grant.
+- **Acceptance:** table-driven guard tests (allowed bare and qualified as `sys.`/`master.`; `xp_instance_regwrite` and `xp_cmdshell` still blocked; stacked statements still refused); a live read of the error log; DESIGN.md §7 updated in the same change.
 
 ### Phase 7: evidence-based evaluations (VISION priority 5)
 
@@ -203,7 +218,7 @@ Decided 2026-10-10:
 Still open:
 
 6. **The drain default after 2.6.** Exact counts as today, or a bounded drain with `≥N`?
-7. **Agent session defaults.** `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY LOW`: yes or no, and which values?
+7. **Agent session defaults.** `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY LOW`: yes or no, and which values? Also `READ UNCOMMITTED` for read-only runs (owner, 2026-10-10: worth considering as a default); the trade-offs are in 2.8.
 8. **A Git remote and CI?** That decides whether 3.3 stays a local script.
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
