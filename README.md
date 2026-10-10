@@ -52,7 +52,22 @@ Orders	2026-09-30T14:02:11.483
 
 ## Documents
 
+Shared agent instructions are in [AGENTS.md](AGENTS.md); Claude Code imports them through CLAUDE.md.
+
 - [docs/VISION.md](docs/VISION.md): what the product is for, and its priorities
 - [docs/PLAN.md](docs/PLAN.md): the current plan of attack
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
 - [code-review.md](code-review.md): the architecture review the plan responds to
+
+## Local housekeeping
+
+Builds stay in the ignored `target/` directory. Keep this cache during active development;
+use `cargo clean` when you need the disk space (the next build will be slower).
+Use ignored `scratch/` for disposable experiments and `artifacts/` for local query
+results, logs and copied binaries. Real server data and connection profiles stay local;
+committed examples and fixtures should use synthetic data.
+
+Source, tests, Cargo.lock, shared configuration, plans, reviews and useful findings
+belong in Git even during early development. Review staged changes before committing,
+and review history for private data before the first public push. Executables can be
+distributed as GitHub release assets when releases are ready.

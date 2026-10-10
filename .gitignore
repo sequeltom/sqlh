@@ -17,6 +17,11 @@ mutants.out*/
 profiles.toml
 *.toml.tmp
 
+# Disposable experiments and local query results; these may contain real server data.
+# Durable examples and test fixtures belong in docs/ or tests/, with synthetic data.
+/scratch/
+/artifacts/
+
 # Editors and IDEs
 .vscode/
 .idea/
@@ -26,6 +31,20 @@ profiles.toml
 
 # Personal Claude Code settings (shared settings in .claude/settings.json stay tracked)
 .claude/settings.local.json
+
+# Codex runtime state if CODEX_HOME is placed inside the checkout.
+# Keep AGENTS.md, .agents/skills/, and shared .codex/config.toml, rules and hooks trackable.
+.codex/auth.json
+.codex/history.jsonl
+.codex/sessions/
+.codex/archived_sessions/
+.codex/log/
+.codex/shell_snapshots/
+.codex/tmp/
+.codex/*.sqlite*
+.codex/plugins/cache/
+# An explicitly separate, repository-local Codex home is entirely machine-local.
+/.codex-home/
 
 # OS clutter
 Thumbs.db

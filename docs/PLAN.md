@@ -33,11 +33,11 @@ The review's architecture section also holds up: extract an execution core, keep
 
 ## 2. Docs re-review
 
-The vision update is coherent, and CLAUDE.md, DESIGN.md and the two plans now agree with it. What remains is mostly stale text and claims the code doesn't meet:
+The vision update is coherent, and AGENTS.md, DESIGN.md and the two plans now agree with it. What remains is mostly stale text and claims the code doesn't meet:
 
 | # | Where | Problem | Resolution |
 |---|---|---|---|
-| D1 | VISION.md, DESIGN.md §2 | "SQL Server 2025 Standard on Windows Server 2025 Standard" didn't say where `sqlh.exe` runs. | **Resolved** (§6.1): workstations only, server usually remote. VISION.md, DESIGN.md and CLAUDE.md updated. |
+| D1 | VISION.md, DESIGN.md §2 | "SQL Server 2025 Standard on Windows Server 2025 Standard" didn't say where `sqlh.exe` runs. | **Resolved** (§6.1): workstations only, server usually remote. VISION.md, DESIGN.md and AGENTS.md updated. |
 | D2 | DESIGN.md §4.3 | Says `$(var)` is substituted before splitting; the code splits first (F10) | **Decided** (§6.3): keep the code, correct the doc in Phase 1 |
 | D3 | DESIGN.md §4.3, §6 | Ctrl+Break and console close are promised but not handled (F08) | Phase 2 |
 | D4 | DESIGN.md §8 | "zeroed after use" is not true (F14) | Phase 1: correct the claim |
