@@ -91,7 +91,7 @@ These flags are sqlcmd-compatible:
 | Flag | Meaning |
 |---|---|
 | `-S server` | `host`, `host\instance`, `host,port`, with an optional `tcp:` prefix. Env: `SQLCMDSERVER`. |
-| `-d db` | Database. Env: `SQLCMDDBNAME`. |
+| `-d db` | Database. Env: `SQLCMDDBNAME`. Without it, the profile's database applies, else the login's default, which is often `master`. |
 | `-E` | Windows integrated auth. This is the default when there is no `-U`, same as sqlcmd. |
 | `-U user` | SQL login. The password comes from the profile's credential or `SQLCMDPASSWORD`. Env: `SQLCMDUSER`. |
 | `-P` | **Rejected** with exit 3 and a message pointing to profiles or `SQLCMDPASSWORD`. Command lines end up in agent transcripts and process lists. |

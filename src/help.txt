@@ -8,6 +8,7 @@ USAGE
 EXAMPLES
   sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders ORDER BY Id DESC"
   sqlh -S myserver,1433 -U reader -d AppDb -i report.sql   (password: env SQLCMDPASSWORD)
+  sqlh --profile dev -Q "SELECT TOP 0 * FROM sys.dm_exec_requests"   (columns and types only)
   sqlh -S myserver -d AppDb <<'SQL'
   SELECT name, create_date FROM sys.tables ORDER BY name;
   SQL
@@ -15,10 +16,9 @@ EXAMPLES
 CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
   -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
-  -d database     (env SQLCMDDBNAME)
+  -d database     (env SQLCMDDBNAME); default: the profile's, else the login's (often master)
   -E              Windows integrated auth (the default when there is no -U)
-  -U login        SQL login (env SQLCMDUSER); password from the profile or env SQLCMDPASSWORD.
-                  -P is refused
+  -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
   -C              trust the server certificate (self-signed dev servers)
   -Ns | -Nm | -No encryption strict | mandatory (default) | optional
   -K ReadOnly     read-only application intent      -M  multi-subnet failover
