@@ -130,6 +130,9 @@ Second round: the reviewer's verification of `817ab03` and `e3556bf` accepted R0
 | 2.7 | **Memory.** Use the driver's streaming path (`next_row_into` with a cutting `RowWriter`, or PLP chunks) so hidden rows and cut cells aren't fully materialized. | Peak memory stays flat on a 1 GB `varchar(max)` value shown with `--max-cell 500`. | M |
 | 2.8 | **Agent session defaults** (§6.7), proposed: `SET LOCK_TIMEOUT 10000` and `SET DEADLOCK_PRIORITY LOW`, so agent queries give way to production work instead of waiting behind it. **Also consider `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` as the default for read-only runs** (owner, 2026-10-10: "worth considering"). The owner's earlier sql-query-runner skill sets it on every query, so agent reads never take shared locks or block writers. Points to settle with a live test: dirty reads can return uncommitted, duplicated or missing rows, so the docs must say so; it doesn't help against schema-modification locks, so the lock timeout is still needed; apply it only when read-only, never under `--allow-write`, where a write could be based on a dirty read; and decide whether a profile can override it. | Documented in DESIGN.md §4.3; a live test confirms the settings, including a read that would otherwise block behind an open write transaction. | S |
 
+| 2.9 | **Help tips from agent trial 1** ([notes/agent-trial-1.md](notes/agent-trial-1.md)). In `--help`: how to see a table's or view's columns (`SELECT TOP 0 * FROM x`, or `sys.all_columns` for system views, since `sys.columns` and `information_schema` show none), and that without `-d` the profile's database applies (`master` if it has none). Consider giving the `test` profile a database. | `--help` stays under about 60 lines; a repeat of trial 1 needs fewer discovery calls. | S |
+| 2.10 | **Agent trial 2.** Same setup, with tasks that hit the row and value limits, a guard refusal (a cleanup request), and a long query, to see whether the agent narrows queries, reads the advice, and avoids `--allow-write`. | Findings recorded in `docs/notes/`, follow-ups planned. | S |
+
 ### Phase 3: execution core, CI and fixtures (the enabler for Phases 4 and 5)
 
 | # | Task | Acceptance | Size |
@@ -150,6 +153,8 @@ Build `docs/schema-commands.md` on top of the Phase 3 `Runner`, with the review'
 - framing that survives control characters in definitions
 
 Validate on SQL Server 2025, and keep 2016 portability cheap but untested. (L)
+
+**Evidence from agent trial 1** ([notes/agent-trial-1.md](notes/agent-trial-1.md)): five of eleven calls went to finding one system view's columns, including an invented view name. `describe` should cover system views and DMVs (`sys.dm_db_partition_stats`), not only user tables, so this costs one call.
 
 **Also in this phase: profile descriptions and search** (owner, 2026-10-10, after comparing sqlh with the earlier sql-query-runner skill, which has both and uses them to pick a server). Finding out *which server* is the first step of many turns, and it costs context like any other discovery. It is independent of the schema commands, so it can ship ahead of them. (S)
 
@@ -193,7 +198,7 @@ Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor
 
 Raised 2026-10-10. Not a VISION priority: the exe is the product, and these are wrappers that get it to agents. Nothing is decided or started; the owner deferred drafting the skill. In order:
 
-1. **Skill** (S, no code). A `SKILL.md` for Bash-driven agents. `--help` already carries the syntax, so the skill covers workflow: describe before querying, how to read the output format, the limits and exit codes, and when to reach for sqlh. It can be drafted at any time, and is more useful once Phase 4's schema commands exist.
+1. **Skill** (S, no code). A `SKILL.md` for Bash-driven agents. `--help` already carries the syntax, so the skill covers workflow: describe before querying, how to read the output format, the limits and exit codes, and when to reach for sqlh. It can be drafted at any time, and is more useful once Phase 4's schema commands exist. From agent trial 1: tell the agent to state only what the output shows (the trial's answer named tables it never queried), to pass `-d` or check `DB_NAME()` first, and to look up column names before writing a query.
 2. **Connector = local stdio MCP server** (built in Phase 5(a), not here). It is not a hosted, remote connector: credentials come from Credential Manager and SSPI on the workstation, and the workstation reaches the SQL Server, and neither survives a hosted deployment. Packaging it as a Claude Desktop extension (`.mcpb`) is a possible later step and is unresearched.
 3. **Plugin** (S, after 2). Bundles the skill, the MCP config and the exe location so installing is one step. Open: whether the plugin carries the exe or points at an installed path, which ties into the code-signing decision in Phase 7.
 

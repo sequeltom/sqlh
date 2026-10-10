@@ -51,7 +51,7 @@ tests/smoke.sql  read-only end-to-end script for a real server (manual)
 README.md        human-facing intro, build, quick start, safety note
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
-docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency)
+docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, agent trials)
 docs/schema-commands.md, docs/mcp-mode.md   designs and plans for later phases
 code-review.md   the architecture review the plan responds to
 code-review-phase1.md   the follow-up review of Phase 1 (R01–R05)
