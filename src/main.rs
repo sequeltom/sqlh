@@ -21,7 +21,7 @@ use cli::{Command, Opts};
 use config::Settings;
 use db::{Cancel, DbError, Session};
 use error::{Exit, Failure};
-use output::{BatchInfo, Format, Limits, Output, Summary};
+use output::{BatchInfo, Format, Limits, Summary};
 use script::{Batch, Source};
 
 const HELP: &str = include_str!("help.txt");
@@ -32,7 +32,7 @@ const SESSION_SETUP: &str = "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WA
     SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; \
     SET NUMERIC_ROUNDABORT OFF;";
 
-type Out = Box<dyn Output>;
+type Out = output::Stream;
 
 /// Whether stdout carries the text format, so the panic hook may append a status line.
 /// JSON and CSV can't be completed by a stray line, so they only get the stderr message.
@@ -135,7 +135,7 @@ fn run_command(opts: Opts, started: Instant) -> Exit {
 }
 
 fn stdout_output(format: Format, limits: Limits) -> Out {
-    output::create(format, Box::new(io::stdout().lock()), limits)
+    output::create(format, Box::new(io::stdout()), limits)
 }
 
 /// Text output on stdout, for commands that have no --format (`sqlh profile ...`).
@@ -214,7 +214,18 @@ fn finish(out: &mut Out, result: Result<Stats, Failure>, started: Instant) -> Ex
 /// Writes the closing lines and flushes. If that fails, the reader didn't get the complete
 /// output, so the exit code becomes 7 and stderr says what the run itself ended with.
 fn deliver(out: &mut Out, summary: &Summary, exit: Exit) -> Exit {
-    let delivered = out.finish(summary).and_then(|()| out.flush());
+    // How long the reader may stall while the rest is written (`None`: the stall limit, -t).
+    // After a cancel the console may be gone, so don't wait long; after a failure mid-run,
+    // don't wait at all.
+    let stall = match exit {
+        Exit::Undelivered => Some(Duration::ZERO),
+        Exit::Cancelled => Some(Duration::from_secs(1)),
+        _ => None,
+    };
+    let delivered = out
+        .finish(summary)
+        .and_then(|()| out.flush())
+        .and_then(|()| out.wait_delivered(stall));
     if exit == Exit::Undelivered {
         // Writing failed mid-run (`output_failure`), and sqlh stopped at that point.
         diag(format_args!(
@@ -271,9 +282,12 @@ enum Destination {
 }
 
 impl Destination {
-    fn open(target: Option<&Path>, sources: &[Source]) -> Result<(Self, Box<dyn Write>), Failure> {
+    fn open(
+        target: Option<&Path>,
+        sources: &[Source],
+    ) -> Result<(Self, Box<dyn Write + Send>), Failure> {
         let Some(target) = target else {
-            return Ok((Destination::Stdout, Box::new(io::stdout().lock())));
+            return Ok((Destination::Stdout, Box::new(io::stdout())));
         };
         let shown = target.display();
         if target.is_dir() {
@@ -543,6 +557,7 @@ async fn run_session(
     }
 
     let mut stats = Stats::default();
+    let gate = out.gate();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
     let mut number = 0;
     'batches: for batch in batches {
@@ -574,7 +589,7 @@ async fn run_session(
             })
             .map_err(output_failure)?;
             session
-                .run(batch.sql.clone(), timeout, cancel, &mut **out)
+                .run(batch.sql.clone(), timeout, cancel, &mut **out, &gate)
                 .await
                 .map_err(|e| match e {
                     DbError::Timeout(_) => Failure::new(

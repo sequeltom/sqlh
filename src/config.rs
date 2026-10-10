@@ -263,6 +263,7 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
         )));
     }
     let defaults = Limits::default();
+    let query_timeout = opts.query_timeout.or(p.query_timeout).unwrap_or(60);
     Ok(Settings {
         connect: ConnectOptions {
             server,
@@ -287,8 +288,9 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
             max_results: opts.max_results.unwrap_or(defaults.max_results),
             max_messages: defaults.max_messages,
             max_output: opts.max_output.unwrap_or(defaults.max_output),
+            stall_secs: query_timeout,
         },
-        query_timeout: opts.query_timeout.or(p.query_timeout).unwrap_or(60),
+        query_timeout,
         allow_write: opts.allow_write || policy == WritePolicy::Allow,
         profile: profile.map(|p| p.name),
     })

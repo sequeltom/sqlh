@@ -9,8 +9,10 @@
 //! The `live` tests are ignored unless asked for (see that module).
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const DEAD: &[&str] = &["-S", "127.0.0.1,1", "-l", "1"];
 
@@ -747,6 +749,58 @@ mod live {
             "{doc}"
         );
         assert_eq!(doc["ok"], true);
+    }
+
+    // F07 / PLAN.md 2.3: a reader that holds stdout open and never reads can't make sqlh
+    // hang. With much output, the batch stops waiting after -t seconds. With output that
+    // fits sqlh's queue (256 KiB) but not the pipe (64 KiB), the run finishes and the last
+    // wait for delivery gives up instead. Either way: exit 7.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_stalled_reader_cannot_hang_the_run() {
+        let (p, db) = target();
+        let sql = "SELECT TOP (200000) a.object_id, a.name FROM sys.all_objects AS a \
+                   CROSS JOIN sys.all_objects AS b";
+        for limits in [
+            &["--max-rows", "0", "--max-output", "0"][..],
+            &["--max-rows", "0", "--max-output", "200000"],
+        ] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_sqlh"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(["--profile", &p, "-d", &db, "-t", "2"])
+                .args(limits)
+                .args(["-Q", sql])
+                .spawn()
+                .expect("sqlh starts");
+            let _held_open = child.stdout.take();
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    panic!("{limits:?}: sqlh hung behind a stalled reader");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let elapsed = started.elapsed();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(status.code(), Some(7), "{limits:?}: {stderr}");
+            assert!(
+                stderr.contains("the reader stopped reading for 2 s"),
+                "{limits:?}: {stderr}"
+            );
+            assert!(elapsed < Duration::from_secs(15), "{limits:?}: {elapsed:?}");
+        }
     }
 
     // PLAN.md 2.1: --verbose says where the time to the first batch went; a build with

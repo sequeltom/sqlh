@@ -3,11 +3,14 @@
 //! was shown, cut or hidden.
 
 pub mod csv;
+pub mod delivery;
 pub mod json;
 pub mod text;
 
 use std::fmt::Write as _;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
+use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 
 use crate::db::{BatchSink, ServerMessage};
 
@@ -41,6 +44,9 @@ pub struct Limits {
     pub max_messages: usize,
     /// Bytes of output per run, across all streams; 0 = no limit (DESIGN.md §4.4).
     pub max_output: u64,
+    /// Seconds the reader may take no output before delivery fails (exit 7); 0 = wait as
+    /// long as it takes. It follows the query timeout, `-t` (DESIGN.md §6).
+    pub stall_secs: u32,
 }
 
 impl Default for Limits {
@@ -51,6 +57,7 @@ impl Default for Limits {
             max_results: 20,
             max_messages: 100,
             max_output: 1_000_000,
+            stall_secs: 60,
         }
     }
 }
@@ -118,12 +125,53 @@ pub trait Output: BatchSink {
 
 /// The output for `format`. CSV keeps stdout (or `-o`) for data only, so its metadata goes
 /// to stderr.
-pub fn create(format: Format, out: Box<dyn Write>, limits: Limits) -> Box<dyn Output> {
-    let out = BufWriter::with_capacity(64 * 1024, out);
-    match format {
-        Format::Text => Box::new(text::TextSink::new(out, limits)),
-        Format::Json => Box::new(json::JsonSink::new(out, limits)),
-        Format::Csv => Box::new(csv::CsvSink::new(out, Box::new(io::stderr()), limits)),
+pub fn create(format: Format, out: Box<dyn Write + Send>, limits: Limits) -> Stream {
+    let stall = (limits.stall_secs > 0).then(|| Duration::from_secs(limits.stall_secs.into()));
+    let meta = (format == Format::Csv).then(|| Box::new(io::stderr()) as Box<dyn Write + Send>);
+    let delivery = delivery::Delivery::start(out, meta, stall);
+    let main = delivery.writer(delivery::Dest::Main);
+    let output: Box<dyn Output> = match format {
+        Format::Text => Box::new(text::TextSink::new(main, limits)),
+        Format::Json => Box::new(json::JsonSink::new(main, limits)),
+        Format::Csv => {
+            let meta = Box::new(delivery.writer(delivery::Dest::Meta));
+            Box::new(csv::CsvSink::new(main, meta, limits))
+        }
+    };
+    Stream { output, delivery }
+}
+
+/// A run's output: the sink for its format, and the thread that delivers what it writes
+/// (`delivery`). Derefs to the sink.
+pub struct Stream {
+    output: Box<dyn Output>,
+    delivery: delivery::Delivery,
+}
+
+impl Stream {
+    /// For the batch loop, to wait while the reader is behind.
+    pub fn gate(&self) -> delivery::Gate {
+        self.delivery.gate()
+    }
+
+    /// Waits until everything the sink has flushed reached its destination; see
+    /// `Delivery::finish`.
+    pub fn wait_delivered(&mut self, stall: Option<Duration>) -> io::Result<()> {
+        self.delivery.finish(stall)
+    }
+}
+
+impl Deref for Stream {
+    type Target = dyn Output;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.output
+    }
+}
+
+impl DerefMut for Stream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.output
     }
 }
 

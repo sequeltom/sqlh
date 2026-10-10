@@ -1,0 +1,529 @@
+//! Output delivery (PLAN.md 2.3, review F07): a thread does the writing, so a reader that
+//! stops reading can't block the async runtime.
+//!
+//! - The sinks write into `ChannelWriter`s, which hand full chunks to the thread through a
+//!   queue and never block.
+//! - While the queue holds more than `QUEUE_LIMIT` bytes, the batch loop awaits
+//!   `Gate::room` instead of reading more rows, so the runtime keeps handling timers and
+//!   Ctrl+C, and memory stays bounded.
+//! - When the reader makes no progress for the stall limit (the query timeout, `-t`), the
+//!   output couldn't be delivered: exit 7.
+
+use std::collections::VecDeque;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// Bytes a `ChannelWriter` collects before handing them to the thread.
+const CHUNK: usize = 64 * 1024;
+
+/// Bytes queued for the thread before the batch loop waits for the reader.
+const QUEUE_LIMIT: usize = 256 * 1024;
+
+/// Which stream a chunk goes to: csv sends its metadata to stderr, apart from the data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dest {
+    Main,
+    Meta,
+}
+
+struct State {
+    queue: VecDeque<(Dest, Vec<u8>)>,
+    /// No more chunks will come; the thread flushes and stops once the queue is empty.
+    closed: bool,
+    /// The thread has stopped: everything was written and flushed, or a write failed.
+    done: bool,
+    /// The first write error, kept as kind and text because `io::Error` isn't `Clone`.
+    error: Option<(io::ErrorKind, String)>,
+    /// When the thread last finished a write, or started one after being idle: a reader that
+    /// has made no progress since then for the stall limit has stalled.
+    progress: Instant,
+    idle: bool,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    /// Bytes in the queue or being written, readable without the lock on every row.
+    queued: AtomicUsize,
+    /// A write has failed (`State::error` says how), checked without the lock on every write.
+    failed: AtomicBool,
+    /// Wakes the thread when a chunk arrives or the queue closes.
+    work: Condvar,
+    /// Wakes `Delivery::finish` when the thread makes progress or stops.
+    progress: Condvar,
+    /// Wakes `Gate::room` when the thread makes progress or stops.
+    room: tokio::sync::Notify,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A poisoned lock means the thread panicked; the panic hook ends the process anyway.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn error(&self) -> Option<io::Error> {
+        if !self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.lock()
+            .error
+            .as_ref()
+            .map(|(kind, text)| io::Error::new(*kind, text.clone()))
+    }
+
+    /// Records the first error; later ones add nothing.
+    fn fail(&self, state: &mut State, error: &io::Error) {
+        state.error.get_or_insert((error.kind(), error.to_string()));
+        self.failed.store(true, Ordering::Release);
+    }
+}
+
+fn stalled(limit: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "the reader stopped reading for {} s (-t)",
+            limit.as_secs().max(1)
+        ),
+    )
+}
+
+/// The writing thread and its queue. Create the writers with `writer`, then call `finish`
+/// once the sinks have flushed everything into them.
+pub struct Delivery {
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
+    /// How long the reader may make no progress before delivery fails (None: forever).
+    stall: Option<Duration>,
+}
+
+impl Delivery {
+    /// Starts the thread. `meta` is the second stream, if the format has one.
+    pub fn start(
+        main: Box<dyn Write + Send>,
+        meta: Option<Box<dyn Write + Send>>,
+        stall: Option<Duration>,
+    ) -> Delivery {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                closed: false,
+                done: false,
+                error: None,
+                progress: Instant::now(),
+                idle: true,
+            }),
+            queued: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            work: Condvar::new(),
+            progress: Condvar::new(),
+            room: tokio::sync::Notify::new(),
+        });
+        let thread_shared = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("sqlh-output".into())
+            .spawn(move || write_out(&thread_shared, main, meta))
+            .ok();
+        if thread.is_none() {
+            let mut state = shared.lock();
+            shared.fail(
+                &mut state,
+                &io::Error::other("cannot start the output thread"),
+            );
+            state.done = true;
+        }
+        Delivery {
+            shared,
+            thread,
+            stall,
+        }
+    }
+
+    pub fn writer(&self, dest: Dest) -> ChannelWriter {
+        ChannelWriter {
+            shared: Arc::clone(&self.shared),
+            dest,
+            buf: Vec::with_capacity(CHUNK),
+        }
+    }
+
+    pub fn gate(&self) -> Gate {
+        Gate {
+            shared: Arc::clone(&self.shared),
+            stall: self.stall,
+        }
+    }
+
+    /// Waits until everything queued has been written and flushed, the files closed. Fails
+    /// with the first write error, or when the reader makes no progress for `stall`
+    /// (`None`: the delivery's own limit). On a stall the thread is left blocked; the
+    /// process ends without it.
+    pub fn finish(&mut self, stall: Option<Duration>) -> io::Result<()> {
+        let stall = stall.or(self.stall);
+        let mut state = self.shared.lock();
+        state.closed = true;
+        self.shared.work.notify_one();
+        while !state.done {
+            match stall {
+                Some(limit) => {
+                    let waited = state.progress.elapsed();
+                    if waited >= limit {
+                        return Err(stalled(limit));
+                    }
+                    state = self
+                        .shared
+                        .progress
+                        .wait_timeout(state, limit - waited)
+                        .map(|(guard, _)| guard)
+                        .unwrap_or_else(|e| e.into_inner().0);
+                }
+                None => {
+                    state = self
+                        .shared
+                        .progress
+                        .wait(state)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        drop(state);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        match self.shared.error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Delivery {
+    /// Delivers what's left when nobody called `finish` (a profile command's notes before its
+    /// test), as far as the stall limit allows.
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.finish(None);
+        }
+    }
+}
+
+/// The thread: writes chunks in order until the queue closes, then flushes both streams and
+/// drops them (closing a `-o` file before it is renamed into place).
+fn write_out(
+    shared: &Shared,
+    mut main: Box<dyn Write + Send>,
+    mut meta: Option<Box<dyn Write + Send>>,
+) {
+    loop {
+        let (dest, chunk) = {
+            let mut state = shared.lock();
+            loop {
+                if let Some(item) = state.queue.pop_front() {
+                    if state.idle {
+                        state.progress = Instant::now();
+                        state.idle = false;
+                    }
+                    break item;
+                }
+                if state.closed {
+                    drop(state);
+                    let flushed = main
+                        .flush()
+                        .and_then(|()| meta.as_mut().map_or(Ok(()), |m| m.flush()));
+                    drop(main);
+                    drop(meta);
+                    let mut state = shared.lock();
+                    if let Err(e) = flushed {
+                        shared.fail(&mut state, &e);
+                    }
+                    state.done = true;
+                    shared.progress.notify_all();
+                    shared.room.notify_one();
+                    return;
+                }
+                state.idle = true;
+                state = shared.work.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let written = match (dest, meta.as_mut()) {
+            (Dest::Meta, Some(meta)) => meta.write_all(&chunk),
+            _ => main.write_all(&chunk),
+        };
+        shared.queued.fetch_sub(chunk.len(), Ordering::Relaxed);
+        let mut state = shared.lock();
+        match written {
+            Ok(()) => state.progress = Instant::now(),
+            Err(e) => {
+                shared.fail(&mut state, &e);
+                state.done = true;
+                let dropped: usize = state.queue.drain(..).map(|(_, c)| c.len()).sum();
+                shared.queued.fetch_sub(dropped, Ordering::Relaxed);
+                shared.progress.notify_all();
+                shared.room.notify_one();
+                return;
+            }
+        }
+        shared.progress.notify_all();
+        shared.room.notify_one();
+    }
+}
+
+/// A sink's end of the delivery: collects bytes and hands full chunks to the thread. It never
+/// blocks. A write fails once the thread has hit an error, such as a reader that closed the
+/// pipe, so the run sees it at once (exit 7).
+pub struct ChannelWriter {
+    shared: Arc<Shared>,
+    dest: Dest,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn send(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
+        let mut state = self.shared.lock();
+        if state.done {
+            return;
+        }
+        self.shared.queued.fetch_add(chunk.len(), Ordering::Relaxed);
+        state.queue.push_back((self.dest, chunk));
+        self.shared.work.notify_one();
+    }
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(error) = self.shared.error() {
+            return Err(error);
+        }
+        self.buf.extend_from_slice(buf);
+        if self.buf.len() >= CHUNK {
+            self.send();
+        }
+        Ok(buf.len())
+    }
+
+    /// Hands what's collected to the thread; doesn't wait for it to be written.
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(error) = self.shared.error() {
+            return Err(error);
+        }
+        self.send();
+        Ok(())
+    }
+}
+
+impl Drop for ChannelWriter {
+    fn drop(&mut self) {
+        self.send();
+    }
+}
+
+/// The batch loop's view of the queue: whether it's full, and a way to wait for room
+/// without blocking the runtime.
+#[derive(Clone)]
+pub struct Gate {
+    shared: Arc<Shared>,
+    stall: Option<Duration>,
+}
+
+impl Gate {
+    pub fn is_full(&self) -> bool {
+        self.shared.queued.load(Ordering::Relaxed) > QUEUE_LIMIT
+    }
+
+    /// Waits until the queue has room. Fails with the thread's write error, or when the
+    /// reader makes no progress for the stall limit.
+    pub async fn room(&self) -> io::Result<()> {
+        loop {
+            // Registered before checking, so a wakeup in between isn't lost.
+            let notified = self.shared.room.notified();
+            let wait = {
+                let state = self.shared.lock();
+                if let Some((kind, text)) = &state.error {
+                    return Err(io::Error::new(*kind, text.clone()));
+                }
+                if state.done || !self.is_full() {
+                    return Ok(());
+                }
+                match self.stall {
+                    Some(limit) => {
+                        let waited = state.progress.elapsed();
+                        if waited >= limit {
+                            return Err(stalled(limit));
+                        }
+                        Some(limit - waited)
+                    }
+                    None => None,
+                }
+            };
+            match wait {
+                Some(left) => {
+                    let _ = tokio::time::timeout(left, notified).await;
+                }
+                None => notified.await,
+            }
+        }
+    }
+}
+
+impl crate::db::Backpressure for Gate {
+    fn is_full(&self) -> bool {
+        Gate::is_full(self)
+    }
+
+    fn room(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + '_>> {
+        Box::pin(Gate::room(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Collects what the thread writes, shared with the test.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A reader that never reads: every write blocks until the test lets it go.
+    struct Stalled(Mutex<mpsc::Receiver<()>>);
+
+    impl Write for Stalled {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "reader went away",
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn delivers_both_streams_in_order() {
+        let (main, meta) = (Sink::default(), Sink::default());
+        let mut delivery =
+            Delivery::start(Box::new(main.clone()), Some(Box::new(meta.clone())), None);
+        let mut data = delivery.writer(Dest::Main);
+        let mut info = delivery.writer(Dest::Meta);
+        for i in 0..20_000 {
+            writeln!(data, "row {i}").unwrap();
+        }
+        writeln!(info, "-- 20000 rows").unwrap();
+        data.flush().unwrap();
+        info.flush().unwrap();
+        delivery.finish(None).unwrap();
+        let main = String::from_utf8(main.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(main.lines().count(), 20_000);
+        assert!(main.starts_with("row 0\nrow 1\n") && main.ends_with("row 19999\n"));
+        assert_eq!(*meta.0.lock().unwrap(), b"-- 20000 rows\n");
+    }
+
+    // F07: with a reader that doesn't read, writing never blocks, the gate fills, waiting
+    // for room gives up after the stall limit, and so does finishing.
+    #[test]
+    fn a_stalled_reader_never_blocks_the_writer_and_times_out() {
+        let (release, blocked) = mpsc::channel();
+        let stall = Duration::from_millis(300);
+        let mut delivery =
+            Delivery::start(Box::new(Stalled(Mutex::new(blocked))), None, Some(stall));
+        let gate = delivery.gate();
+        let mut out = delivery.writer(Dest::Main);
+        let started = Instant::now();
+        let line = [b'x'; 1000];
+        while !gate.is_full() {
+            out.write_all(&line).unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "writes didn't block"
+        );
+        let error = runtime().block_on(gate.room()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stopped reading"), "{error}");
+        out.flush().unwrap();
+        let error = delivery.finish(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(release);
+    }
+
+    // F07: once the reader catches up, waiting for room ends without an error.
+    #[test]
+    fn room_comes_back_when_the_reader_catches_up() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(
+            Box::new(Stalled(Mutex::new(blocked))),
+            None,
+            Some(Duration::from_secs(10)),
+        );
+        let gate = delivery.gate();
+        let mut out = delivery.writer(Dest::Main);
+        while !gate.is_full() {
+            out.write_all(&[b'x'; 1000]).unwrap();
+        }
+        let releaser = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                if release.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        runtime().block_on(gate.room()).unwrap();
+        assert!(!gate.is_full());
+        out.flush().unwrap();
+        delivery.finish(None).unwrap();
+        releaser.join().unwrap();
+    }
+
+    // F02 still holds: a reader that closed the pipe fails the next write and `finish`.
+    #[test]
+    fn a_write_error_reaches_the_writer_and_finish() {
+        let mut delivery = Delivery::start(Box::new(Broken), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"one\n").unwrap();
+        out.flush().unwrap();
+        assert_eq!(
+            delivery.finish(None).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            out.write_all(b"two\n").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+}

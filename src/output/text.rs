@@ -300,6 +300,7 @@ pub(super) mod tests {
             max_results: 1,
             max_messages: 1,
             max_output: 0,
+            stall_secs: 0,
         }
     }
 
@@ -485,6 +486,7 @@ pub(super) mod tests {
             max_results: 0,
             max_messages: 0,
             max_output: crate::output::OUTPUT_RESERVE + body,
+            stall_secs: 0,
         }
     }
 

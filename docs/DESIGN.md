@@ -101,7 +101,7 @@ These flags are sqlcmd-compatible:
 | `-v n=v ...` | Values for `$(n)` substitution. Environment variables also resolve, as in sqlcmd. |
 | `-x` | Turn off `$(var)` substitution. |
 | `-l sec` | Login timeout covering TCP, TLS and login. Default 15. |
-| `-t sec` | Query timeout per batch. Default 60; 0 means none. sqlcmd's default of none is wrong for agents. |
+| `-t sec` | Query timeout per batch. Default 60; 0 means none. sqlcmd's default of none is wrong for agents. It is also how long sqlh waits for a reader that stops reading its output (exit 7, §6). |
 | `-b` | Accepted. Stopping at the first failing batch is already the default. |
 | `-c term` | Batch terminator. Default `GO`. |
 | `-C` | Trust the server certificate. `--trust-server-certificate=false` turns off a profile's saved trust for one run. |
@@ -292,6 +292,7 @@ Usage errors found while parsing the arguments happen before `--format` is known
 
 **Exit 7, undeliverable output.** sqlh couldn't hand its complete output, including the final status line, to its destination. That happens when:
 - the program reading stdout closed it early (a broken pipe), for example a harness that stopped reading. This covers `--help` and `--version` too;
+- the reader kept stdout open but read nothing for `-t` seconds (a stall). A thread writes the output, so a stalled reader can't block timers or Ctrl+C: the batch waits for room in a bounded queue, then gives up;
 - in csv mode, stderr was closed: it carries the metadata and the status (§5.3);
 - writing or flushing `-o file` failed, for example a full disk or lost permissions;
 - the finished `.partial` file couldn't be renamed over `file`.
@@ -445,7 +446,7 @@ The primary product measure is time to the next useful answer across repeated ag
 - **Size:** a stripped exe under 6 MB. Measure at M0, and justify any growth over 10%.
 - **Startup:** under 10 ms from process start to the first TDS packet, on a warm cache.
 - **Connect:** measured in [notes/connect-latency.md](notes/connect-latency.md). Against SQL Server 2025 with SQL authentication, a connect takes about 195 ms on the dev LAN, and about 150 ms of it is the server hashing the password (PBKDF2), by design. sqlh and the driver add about 5 ms. Fast repeated turns therefore need connection reuse (PLAN.md Phase 5), not client tuning.
-- **Memory:** rows stream through one locked 64 KB `BufWriter` on stdout. It flushes at the end of each batch and before exit, and no result set is ever buffered.
+- **Memory:** rows stream, and no result set is ever buffered. The sinks hand 64 KB chunks to an output thread (`output/delivery.rs`), with at most 256 KB queued. Past that, the batch stops reading rows and waits for the reader, without blocking the async runtime. The queue is flushed at the end of each batch, and sqlh waits for it to drain before it exits.
 - **Runtime:** Tokio `current_thread`, with only the features we use enabled in our crate.
 - **Lazy setup:** the profile file isn't read when flags alone are enough.
 - **Console encoding:** when stdout is a console, call `SetConsoleOutputCP(CP_UTF8)`. Output is always UTF-8 without a BOM.

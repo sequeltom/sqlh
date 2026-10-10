@@ -5,7 +5,11 @@ pub mod phases;
 mod types;
 mod value;
 
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{
@@ -92,20 +96,72 @@ impl From<io::Error> for DbError {
     }
 }
 
-/// Cancels the connect or the running batch. Cancelling a handle cancels its children.
-pub struct Cancel(CancelHandle);
+/// Cancels the connect or the running batch. Cancelling a handle cancels its children; the
+/// children share one flag, so cancel only the root.
+pub struct Cancel {
+    handle: CancelHandle,
+    flag: Arc<CancelFlag>,
+}
+
+/// Lets sqlh's own waits (output backpressure) see a cancel; the driver's handle covers
+/// requests to the server.
+#[derive(Default)]
+struct CancelFlag {
+    set: AtomicBool,
+    notify: tokio::sync::Notify,
+}
 
 impl Cancel {
     pub fn new() -> Self {
-        Cancel(CancelHandle::new())
+        Cancel {
+            handle: CancelHandle::new(),
+            flag: Arc::default(),
+        }
     }
 
     pub fn child(&self) -> Self {
-        Cancel(self.0.child_handle())
+        Cancel {
+            handle: self.handle.child_handle(),
+            flag: Arc::clone(&self.flag),
+        }
     }
 
     pub fn cancel(self) {
-        self.0.cancel();
+        self.flag.set.store(true, Ordering::SeqCst);
+        self.flag.notify.notify_waiters();
+        self.handle.cancel();
+    }
+
+    /// Resolves once the root is cancelled.
+    pub async fn cancelled(&self) {
+        loop {
+            // Registered before checking, so `notify_waiters` in between isn't lost.
+            let notified = self.flag.notify.notified();
+            if self.flag.set.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Output backpressure (PLAN.md 2.3): while too much output waits for a slow reader, `run`
+/// waits here instead of reading more rows. The wait doesn't block the runtime, so timers
+/// and Ctrl+C keep working.
+pub trait Backpressure {
+    fn is_full(&self) -> bool;
+    /// Resolves when there is room again; fails when the reader has stalled for too long.
+    fn room(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+}
+
+/// Waits while the output is backed up, unless the run is cancelled first.
+async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(), DbError> {
+    if !gate.is_full() {
+        return Ok(());
+    }
+    tokio::select! {
+        room = gate.room() => room.map_err(DbError::Output),
+        () = cancel.cancelled() => Err(DbError::Cancelled),
     }
 }
 
@@ -146,7 +202,7 @@ impl Session {
         context.multi_subnet_failover = options.multi_subnet_failover;
 
         let mut client = TdsConnectionProvider::new()
-            .create_client(context, &options.server, Some(&cancel.0))
+            .create_client(context, &options.server, Some(&cancel.handle))
             .await
             .map_err(|e| connect_error(e, options))?;
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
@@ -181,16 +237,18 @@ impl Session {
         timeout_secs: u32,
         cancel: &Cancel,
         sink: &mut dyn BatchSink,
+        gate: &dyn Backpressure,
     ) -> Result<(), DbError> {
         let options = ExecuteOptions::new()
             .timeout_secs(timeout_secs)
-            .cancel(&cancel.0)
+            .cancel(&cancel.handle)
             .on_error(BatchErrorMode::Continue);
         let mut step = self.client.execute(sql, options).await;
         loop {
             self.flush_messages(sink)?;
+            wait_for_output(gate, cancel).await?;
             match step {
-                Ok(StatementResult::Rows) => self.read_rows(sink).await?,
+                Ok(StatementResult::Rows) => self.read_rows(sink, gate, cancel).await?,
                 Ok(StatementResult::NoRows {
                     rows_affected: Some(count),
                 }) => sink.rows_affected(count)?,
@@ -214,7 +272,12 @@ impl Session {
         Ok(())
     }
 
-    async fn read_rows(&mut self, sink: &mut dyn BatchSink) -> Result<(), DbError> {
+    async fn read_rows(
+        &mut self,
+        sink: &mut dyn BatchSink,
+        gate: &dyn Backpressure,
+        cancel: &Cancel,
+    ) -> Result<(), DbError> {
         let columns: Vec<Column> = self
             .client
             .get_metadata()
@@ -228,6 +291,7 @@ impl Session {
                     if sink.wants_values() {
                         let values: Vec<Value> = row.into_iter().map(value::convert).collect();
                         sink.row(&values)?;
+                        wait_for_output(gate, cancel).await?;
                     } else {
                         sink.skipped_row();
                     }

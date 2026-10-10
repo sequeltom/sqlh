@@ -10,7 +10,7 @@ publish = false
 # Preview driver: pin exactly and read the changelog before bumping. Only src/db/ may use it.
 mssql-tds = "=0.2.0"
 # mssql-tds already pulls tokio with "full"; we name only what we use.
-tokio = { version = "1", default-features = false, features = ["rt", "time", "signal", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "signal", "macros", "sync"] }
 lexopt = "0.3"
 # Feature `timing` only. Already in the tree through mssql-tds's tracing.
 log = { version = "0.4", optional = true }
