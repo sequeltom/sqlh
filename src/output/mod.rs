@@ -97,8 +97,8 @@ pub trait Output: BatchSink {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()>;
     fn end_batch(&mut self) -> io::Result<()>;
     fn note(&mut self, text: &str) -> io::Result<()>;
-    /// The read-only guard refused the input; nothing ran.
-    fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()>;
+    /// The read-only guard refused the input; nothing ran. `advice` says how to get past it.
+    fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()>;
     /// Writes the end of the output: limit notes, any error, the status. Always called last,
     /// also after a failure mid-result, and must leave well-formed output.
     fn finish(&mut self, summary: &Summary) -> io::Result<()>;
@@ -117,8 +117,11 @@ pub fn create(format: Format, out: Box<dyn Write>, limits: Limits) -> Box<dyn Ou
     }
 }
 
-pub const BLOCKED_ADVICE: &str =
-    "nothing was run. Rerun with --allow-write if the write is intended";
+/// A guard refusal as one message, for every format:
+/// `line 3: UPDATE dbo.T would write; nothing was run. <advice>`.
+pub fn blocked_message(location: &str, reason: &str, advice: &str) -> String {
+    format!("{location}: {reason}; nothing was run. {advice}")
+}
 
 /// Limits and counts shared by all formats.
 pub struct Tally {
@@ -338,6 +341,18 @@ pub fn escaped(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     push_escaped(&mut out, s, 0);
     out
+}
+
+/// Appends a column's type name for a `name:type` header entry: escaped like a name, with
+/// `:` also written as `\x3A`, so the type is always everything after the last `:`. Type
+/// names are mostly built by sqlh, but a CLR UDT's comes from the server as is.
+pub fn push_type(out: &mut String, type_name: &str) {
+    for (i, part) in type_name.split(':').enumerate() {
+        if i > 0 {
+            out.push_str("\\x3A");
+        }
+        push_escaped(out, part, 0);
+    }
 }
 
 /// Appends `s` with `\\ \t \n \r` and other control characters escaped (the text format's

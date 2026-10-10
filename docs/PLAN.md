@@ -64,7 +64,7 @@ Sizes: **S** is up to half a day, **M** is 1–2 days, **L** is longer. Each pha
 
 ### Phase 1: correctness and trustworthy outcomes (VISION priority 1)
 
-**Status (2026-10-10): built and tested.** 1.9 was checked by hand in Git Bash on the dev machine: the password stayed hidden. That Git Bash runs native programs in a real Windows console (pseudo-console mode), so echo-off works there. The refusal path for a console-less mintty is verified by code review only; this machine can't produce it.
+**Status (2026-10-10): built and tested, and so are the fixes the follow-up review asked for (below).** 1.9 was checked by hand in Git Bash on the dev machine: the password stayed hidden. That Git Bash runs native programs in a real Windows console (pseudo-console mode), so echo-off works there. The refusal path for a console-less mintty is verified by code review only.
 - The harness is `tests/cli.rs`: 13 process-level tests, 3 of them live against the scratch database `sqlh_test`. A negative control confirmed the live tests really run.
 - Every task below has its regression tests; 61 unit tests in all.
 - Also done along the way:
@@ -87,14 +87,36 @@ Start with a **CLI test harness**, because most of these fixes are process-level
 | 1.9 | **F13.** Refuse to read a password unless echo was actually turned off, and point Git Bash users to PowerShell or `winpty`. | Manual: in Git Bash, `profile add` with a dummy password neither echoes nor proceeds. | S |
 | 1.10 | **Docs truth-up** (D3–D6). Correct the claims about zeroization and Ctrl+Break, add the security-boundary sentence to `--help` and a short README, and replace the spike checklist with §7. | The doc review finds no claim that is ahead of the code. | S |
 
+#### Phase 1 follow-up ([code-review-phase1.md](../code-review-phase1.md))
+
+The follow-up review asked for changes before Phase 1 counts as complete. Each finding was reproduced, fixed and given a regression test. As a negative control, the new tests were run against `9482722`: they failed exactly where the review said, and the existing tests passed.
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| R01 (P1) | Every run shared `<path>.partial`, so a run could write into output that another run had already published, and it took over any existing `.partial` file. | Each run creates its own `<path>.<pid>-<n>.partial` (CREATE_NEW, others may only read it, marked for deletion until published), closes it, then renames it. A failed or killed run leaves nothing. An existing target that can't be written is refused before anything runs. Overlapping runs: the last complete file wins. | `files.rs` units; CLI: concurrent runs, a held destination, an existing `.partial` file |
+| R02 | `eprintln!` and the panic hook could panic on a closed stream: exit 10 or an abort instead of 7. | Every diagnostic is a best-effort write. `--help` and `--version` write fallibly (exit 7). The password prompt returns write errors, so echo is restored, and the panic hook restores it too. stderr says when a failure mid-run leaves the outcome unknown. | CLI: stdout, stderr or both closed, across text, json, csv, help, version, usage errors and the panic path |
+| R03 | The panic test failed in release builds. | Built only in debug builds, like `SQLH_DEBUG_PANIC`, and aimed at the unreachable address. | `cargo test --release --test cli` |
+| R04 | The NOEXEC refusal advised `--allow-write`, which can't help. | Each refusal carries its own advice; `--allow-write` is suggested only where it helps. Specific advice for NOEXEC, `##` tables, `sp_spaceused`, qualified procedure names (`sys.sp_who`) and typos. | guard units; CLI: all three formats |
+| R05 | CLR UDT type names reached text and csv metadata unescaped. | Type names are escaped like names, and `:` is written `\x3A`. | text and csv exact-output tests |
+
+Also from the review:
+- **Live suite:** the live tests are `#[ignore]`d, so skipping shows, and they fail when asked for without a profile. They write only to a table of their own, in a database with the `dbo.sqlh_scratch` marker (`tests/fixtures/sqlh_test.sql`), and drop it.
+- **Docs:**
+  - The README's "never interactive" names the `profile add` exception.
+  - DESIGN.md and `--help` separate completed output from best-effort fatal diagnostics.
+  - Exit 7 is documented as no reason to retry a write.
+  - The `dbo.` rule is described as a policy, with the `sys.` spelling suggested.
+- **Found while fixing:** Phase 1's rename broke `-o NUL` (exit 7). Devices and pipes are written directly again.
+- **Still open, as planned:** the response budget (2.2), stalled-reader cancellation (2.3), Windows cancellation coverage (2.4), and F12's lock and config/credential ordering and F14's wiping (3.2).
+
 ### Phase 2: fast, bounded, cancellable turns (VISION priority 2)
 
 | # | Task | Acceptance | Size |
 |---|---|---|---|
-| 2.1 | **Connect-latency investigation** (§3). Time each phase (TCP, prelogin, TLS, login, setup) behind `--verbose`, find where the roughly 150 ms goes, then fix it in our code or file it upstream. | A breakdown is recorded in `docs/notes/`. Target: under 40 ms connect on this LAN, or a documented reason why not. | M |
+| 2.1 | **Connect-latency investigation** (§3), time-boxed. Time each phase (TCP, prelogin, TLS, login, setup) behind `--verbose`, find where the roughly 150 ms goes, then fix it in our code or file it upstream. An upstream investigation must not hold up 2.2–2.4, which are release requirements (follow-up review, answer 5). | A breakdown is recorded in `docs/notes/`. Target: under 40 ms connect on this LAN, or a documented reason why not. | M |
 | 2.2 | **F06, the response budget.** Collapse consecutive `rows affected` lines into one (`-- 300 statements, 300 rows affected`). Cap `GO n` at 1,000. Cap input at 10 MB. Add a total output budget (proposed default 1 MB, `--max-output`) that keeps room for the closing lines and reports what was withheld. | The temp-table loop prints one line. A run over the budget ends with a valid status (text and JSON) and a note. | M |
 | 2.3 | **F07, separate output from the database.** A writer thread fed by a bounded channel, so the runtime keeps handling timers and cancellation while a pipe is stalled. | Test: with a stalled reader, `-t 2` still fires. | M |
-| 2.4 | **F08, cancellation everywhere.** Ctrl+Break, close, logoff and shutdown handlers. Pass the cancel handle through connect, setup, NOEXEC and rollback. Report "attention acknowledged" vs "connection dropped". Make an unreachable server end the same way every time: today the TCP connect timeout (exit 2) and the login deadline (exit 4) race. **Fail fast on a refused connection:** today sqlh retries until the login deadline, taking 14.2 s with the default `-l 15`, although one refused attempt takes about 2 s on Windows (measured 2026-10-10). | Tests for each signal and for cancelling during connect and setup. An unreachable server always gives the same exit code. A refused connection fails after one attempt. | M |
+| 2.4 | **F08, cancellation everywhere.** Ctrl+Break, close, logoff and shutdown handlers. Pass the cancel handle through connect, setup, NOEXEC and rollback. Report "attention acknowledged" vs "connection dropped". Make an unreachable server end the same way every time: today the TCP connect timeout (exit 2) and the login deadline (exit 4) race. **Fail fast on a refused connection:** today sqlh retries until the login deadline, taking 14.2 s with the default `-l 15`, although one refused attempt takes about 2 s on Windows (measured 2026-10-10). Restore console echo when Ctrl+C or a close arrives at the `profile add` password prompt. | Tests for each signal and for cancelling during connect and setup. An unreachable server always gives the same exit code. A refused connection fails after one attempt. | M |
 | 2.5 | **Harness-kill behavior.** Extend the §3 experiment to a CPU-bound query, a lock-blocked query and a large scratch rollback. | Results in `docs/notes/`. Any gap gets a mitigation (a server-side `-t`, a session setting). | S |
 | 2.6 | **Drain policy experiment.** Measure the cost of draining on the biggest StackOverflow2010 tables. Prototype a bounded drain: stop counting after a time or row budget, send an attention, and report `≥N rows`, with an explicit note that later statements in that batch didn't run. | Numbers recorded, and the owner decides the default (§6.6). | M |
 | 2.7 | **Memory.** Use the driver's streaming path (`next_row_into` with a cutting `RowWriter`, or PLP chunks) so hidden rows and cut cells aren't fully materialized. | Peak memory stays flat on a 1 GB `varchar(max)` value shown with `--max-cell 500`. | M |
@@ -105,9 +127,9 @@ Start with a **CLI test harness**, because most of these fixes are process-level
 | # | Task | Acceptance | Size |
 |---|---|---|---|
 | 3.1 | **Extract a library and a `Runner`** with `RunPolicy` (guard, wrapper, check mode), `QueryOrigin` (user SQL vs generated SQL; generated SQL skips `$(var)` and the classifier but not the wrapper) and `RunOutcome` (exit code and counts, independent of the sink). Profile commands stop importing from `main.rs`. | No behavior change: all existing tests and the smoke run pass. | L |
-| 3.2 | **Injectable stores** for config, credentials and output. Then the F12 work: a lock around profile edits, unique temp files, credential/config coordination, and surfacing deletion errors. | Failure-injection tests. | M |
+| 3.2 | **Injectable stores** for config, credentials and output. Then the F12 work: a lock around profile edits, unique temp files (`files::Partial` from the R01 fix fits), and credential/config coordination; deletion errors already surface. And F14: wipe sqlh's own password copies with `zeroize`, already in the dependency tree, and document what the driver keeps. | Failure-injection tests. | M |
 | 3.3 | **`scripts/check.ps1`**, a local release check: fmt, clippy, tests, `--locked` release build, size budget, and `dumpbin` imports. It becomes CI once there's a remote. | One command, non-zero on any failure. | S |
-| 3.4 | **Asserted live tests.** Turn `tests/smoke.sql` into golden-output tests with volatile values normalized. Add disposable fixtures (sequence, procedure, trigger, FK, filtered index) in the scratch database `sqlh_test` (§6.5). | `SQLH_TEST_PROFILE=test cargo test` checks real server behavior, including the F03 and F04 regressions. | M |
+| 3.4 | **Asserted live tests.** Turn `tests/smoke.sql` into golden-output tests with volatile values normalized. Add disposable fixtures (sequence, procedure, trigger, FK, filtered index) in the scratch database `sqlh_test` (§6.5). | `SQLH_TEST_PROFILE=test cargo test --test cli -- --ignored live` checks real server behavior, including the F03 and F04 regressions. | M |
 
 ### Phase 4: focused schema discovery (VISION priority 3a)
 
@@ -148,7 +170,7 @@ Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor
 
 - **1.1 (F04) first.** It is the only finding where the tool states something false while possibly executing writes.
 - **The test harness comes before the other fixes,** so every fix lands with a process-level regression test.
-- **2.1 (connect latency) early.** It is cheap to measure and could change Phase 5 entirely. Building pooling to hide a fixable 150 ms would be the wrong order.
+- **2.1 (connect latency) early, but time-boxed.** It is cheap to measure and could change Phase 5 entirely. Building pooling to hide a fixable 150 ms would be the wrong order. Bounded output and cancellation under a stalled reader (2.2–2.4) are release requirements, so they come before pooling or more discovery features, whatever 2.1 finds.
 - **The Runner refactor (3.1) after the correctness fixes and before schema/MCP work.** Fixing defects first keeps the refactor behavior-neutral and easy to verify; schema commands and MCP both need its policies.
 
 ## 6. Owner decisions

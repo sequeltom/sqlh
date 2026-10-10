@@ -37,11 +37,13 @@ pub fn read_password(prompt: &str) -> io::Result<String> {
             ),
         )
     })?;
-    eprint!("{prompt}");
-    io::stderr().flush()?;
+    // Fallible writes, not eprint!: a panic here would exit without restoring echo.
+    let mut stderr = io::stderr();
+    write!(stderr, "{prompt}")?;
+    stderr.flush()?;
     let mut line = String::new();
     let result = io::stdin().read_line(&mut line);
-    eprintln!();
+    let _ = writeln!(stderr);
     result?;
     let trimmed = line.trim_end_matches(['\r', '\n']).len();
     line.truncate(trimmed);
@@ -52,8 +54,36 @@ pub fn stdin_is_console() -> bool {
     io::stdin().is_terminal()
 }
 
-/// Turns console echo off for its lifetime and restores the saved mode when dropped,
-/// on every return path.
+/// The console mode saved by an `EchoOff` that is alive, for `restore_echo`.
+#[cfg(windows)]
+static SAVED_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(windows)]
+static ECHO_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Restores the console mode if a password prompt turned echo off. For the panic hook,
+/// which exits without running destructors.
+#[cfg(windows)]
+pub fn restore_echo() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+    if ECHO_OFF.swap(false, Ordering::SeqCst) {
+        // SAFETY: restores a mode saved from the same standard handle; both calls take
+        // their arguments by value.
+        unsafe {
+            SetConsoleMode(
+                GetStdHandle(STD_INPUT_HANDLE),
+                SAVED_MODE.load(Ordering::SeqCst),
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restore_echo() {}
+
+/// Turns console echo off for its lifetime and restores the saved mode when dropped, on
+/// every return path. A panic restores it through `restore_echo`; a process killed while
+/// waiting at the prompt (Ctrl+C included) can leave echo off in that console.
 struct EchoOff {
     #[cfg_attr(not(windows), allow(dead_code))]
     saved: u32,
@@ -83,6 +113,8 @@ impl EchoOff {
                 return Err(io::Error::other("echo is still on"));
             }
         }
+        SAVED_MODE.store(saved, std::sync::atomic::Ordering::SeqCst);
+        ECHO_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(EchoOff { saved })
     }
 }
@@ -91,6 +123,7 @@ impl EchoOff {
 impl Drop for EchoOff {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        ECHO_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: restores the mode saved in `new` on the same standard handle. Failure
         // can't be reported from a destructor, and the prompt has already returned.
         unsafe {

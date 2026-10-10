@@ -59,4 +59,4 @@ FORMAT
 
 EXIT CODES
   0 ok  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled
-  7 output not delivered (reader closed stdout, or -o failed)  10 internal error
+  7 output not delivered (the reader went away, or -o failed)  10 internal error

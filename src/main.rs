@@ -10,7 +10,7 @@ mod output;
 mod profile;
 mod script;
 
-use std::fs::{self, File};
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -52,21 +52,18 @@ fn main() -> ExitCode {
     let exit = match cli::parse() {
         Ok(Command::Run(opts)) => run_command(*opts, started),
         Ok(Command::Profile(command)) => profile::run(command, started),
-        Ok(Command::Help) => {
-            print!("{HELP}");
-            Exit::Ok
-        }
-        Ok(Command::Version) => {
-            println!("sqlh {}", env!("CARGO_PKG_VERSION"));
-            Exit::Ok
-        }
+        Ok(Command::Help) => print_plain(HELP),
+        Ok(Command::Version) => print_plain(&format!("sqlh {}\n", env!("CARGO_PKG_VERSION"))),
         Err(message) => fail(Failure::usage(message), Format::Text, started),
     };
     exit.into()
 }
 
-/// A panic is a bug, but it must still end with the documented exit code 10, and with a
-/// status line in text output, rather than an abort (0xC0000409) and no summary.
+/// A panic is a bug, but it must still end with the documented exit code 10 rather than an
+/// abort (0xC0000409). The rest is best effort: a stderr line, and a status line on stdout
+/// in text output. Output still buffered is lost, a JSON document stays unfinished, and
+/// `-o` output is never published. Expected failures must not rely on this: they are
+/// `Result`s, and nothing here may panic again.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let message = info.payload_as_str().unwrap_or("unknown panic");
@@ -74,7 +71,8 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!(" at {}:{}", l.file(), l.line()))
             .unwrap_or_default();
-        eprintln!("sqlh: internal error: {message}{location}");
+        console::restore_echo();
+        diag(format_args!("sqlh: internal error: {message}{location}"));
         if TEXT_ON_STDOUT.load(Ordering::Relaxed) {
             let mut line = String::new();
             output::push_escaped(&mut line, message, 0);
@@ -216,23 +214,60 @@ fn finish(out: &mut Out, result: Result<Stats, Failure>, started: Instant) -> Ex
 /// Writes the closing lines and flushes. If that fails, the reader didn't get the complete
 /// output, so the exit code becomes 7 and stderr says what the run itself ended with.
 fn deliver(out: &mut Out, summary: &Summary, exit: Exit) -> Exit {
-    match out.finish(summary).and_then(|()| out.flush()) {
+    let delivered = out.finish(summary).and_then(|()| out.flush());
+    if exit == Exit::Undelivered {
+        // Writing failed mid-run (`output_failure`), and sqlh stopped at that point.
+        diag(format_args!(
+            "sqlh: output could not be delivered ({}); sqlh stopped there, so the outcome is \
+             unknown: the batch being written may have run, and later batches did not",
+            summary.error.unwrap_or("writing output failed")
+        ));
+        return exit;
+    }
+    match delivered {
         Ok(()) => exit,
         Err(e) => {
-            eprintln!(
+            diag(format_args!(
                 "sqlh: output could not be delivered ({e}); the run itself ended with exit {}: {}",
                 exit as u8, summary.status
-            );
+            ));
             Exit::Undelivered
         }
     }
 }
 
-/// Where the output goes. `-o` writes to `<path>.partial`, which is renamed over the
-/// destination when the run ends: the destination is replaced whole, or not at all.
+/// Writes one line to stderr, best effort. Unlike `eprintln!`, it never panics when stderr
+/// is closed, so a diagnostic that can't be delivered never changes the exit code.
+fn diag(message: std::fmt::Arguments) {
+    let _ = writeln!(io::stderr().lock(), "{message}");
+}
+
+/// Output that has no status line (`--help`, `--version`): exit 0, or 7 if stdout is gone.
+fn print_plain(text: &str) -> Exit {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Exit::Ok,
+        Err(e) => {
+            diag(format_args!("sqlh: output could not be delivered ({e})"));
+            Exit::Undelivered
+        }
+    }
+}
+
+/// Where the output goes (DESIGN.md §4.2, `-o`).
 enum Destination {
     Stdout,
-    File { partial: PathBuf, target: PathBuf },
+    /// A device or pipe, such as `-o NUL`: written directly, as there is no file to replace.
+    Stream,
+    /// A file. The run writes its own `.partial` file, which replaces the target whole when
+    /// the output is complete, or is deleted when it isn't.
+    File {
+        partial: files::Partial,
+        target: PathBuf,
+    },
 }
 
 impl Destination {
@@ -244,11 +279,10 @@ impl Destination {
         if target.is_dir() {
             return Err(Failure::usage(format!("-o {shown}: is a directory")));
         }
-        let partial = partial_path(target);
         let clash = sources.iter().find(|s| {
             s.path
                 .as_deref()
-                .is_some_and(|p| files::same_file(p, target) || files::same_file(p, &partial))
+                .is_some_and(|p| files::same_file(p, target))
         });
         if let Some(source) = clash {
             return Err(Failure::usage(format!(
@@ -256,49 +290,58 @@ impl Destination {
                 source.name
             )));
         }
-        let file =
-            File::create(&partial).map_err(|e| Failure::usage(format!("-o {shown}: {e}")))?;
+        let cannot = |e: io::Error| Failure::usage(format!("-o {shown}: {e}"));
+        // Opening an existing target (without truncating it) tells a device or pipe from a
+        // file, and finds a file that can't be replaced before anything runs.
+        match OpenOptions::new().write(true).open(target) {
+            Ok(file) if files::is_stream(&file) => {
+                return Ok((Destination::Stream, Box::new(file)));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(cannot(e)),
+        }
+        let partial = files::Partial::create(target).map_err(cannot)?;
+        let writer = partial.writer().map_err(cannot)?;
         let target = target.to_path_buf();
-        Ok((Destination::File { partial, target }, Box::new(file)))
+        Ok((Destination::File { partial, target }, Box::new(writer)))
     }
 
-    /// Moves `-o` output into place once it's complete. Undelivered output leaves the
-    /// destination as it was.
+    /// Moves `-o` output into place once it's complete. The writer must be closed by now.
+    /// Undelivered output leaves the destination as it was.
     fn commit(self, exit: Exit) -> Exit {
         let Destination::File { partial, target } = self else {
             return exit;
         };
         if exit == Exit::Undelivered {
-            let _ = fs::remove_file(&partial);
+            // Dropping `partial` deletes it.
+            diag(format_args!(
+                "sqlh: -o {} was left as it was",
+                target.display()
+            ));
             return exit;
         }
-        match fs::rename(&partial, &target) {
+        match partial.publish(&target) {
             Ok(()) => exit,
             Err(e) => {
-                let _ = fs::remove_file(&partial);
-                eprintln!(
-                    "sqlh: output could not be delivered: moving it into {}: {e}; the run itself ended with exit {}",
+                diag(format_args!(
+                    "sqlh: output could not be delivered: moving it into {}: {e}; the run itself \
+                     ended with exit {}",
                     target.display(),
                     exit as u8
-                );
+                ));
                 Exit::Undelivered
             }
         }
     }
 }
 
-fn partial_path(target: &Path) -> PathBuf {
-    let mut name = target.as_os_str().to_owned();
-    name.push(".partial");
-    PathBuf::from(name)
-}
-
 /// Input, batches and the guard's verdict: everything decided before any output is written.
 struct Prepared {
     sources: Vec<Source>,
     batches: Vec<Batch>,
-    /// Location and reason, when the guard refused the input.
-    blocked: Option<(String, String)>,
+    /// Where and why the guard refused the input, if it did.
+    blocked: Option<(String, guard::Blocked)>,
 }
 
 fn prepare(opts: &Opts, settings: &Settings) -> Result<Prepared, Failure> {
@@ -313,7 +356,7 @@ fn prepare(opts: &Opts, settings: &Settings) -> Result<Prepared, Failure> {
     let blocked = batches.iter().find_map(|batch| {
         guard::check(&batch.sql, policy).err().map(|blocked| {
             let line = batch.source_line(blocked.line);
-            (location(&sources, batch.source, line), blocked.reason)
+            (location(&sources, batch.source, line), blocked)
         })
     });
     Ok(Prepared {
@@ -329,8 +372,9 @@ fn execute(
     prepared: &Prepared,
     out: &mut Out,
 ) -> Result<Stats, Failure> {
-    if let Some((location, reason)) = &prepared.blocked {
-        out.blocked(location, reason).map_err(output_failure)?;
+    if let Some((location, blocked)) = &prepared.blocked {
+        out.blocked(location, &blocked.reason, &blocked.advice)
+            .map_err(output_failure)?;
         return Err(Failure::new(Exit::Blocked, ""));
     }
     if prepared.batches.is_empty() {
@@ -457,7 +501,7 @@ async fn run_session(
         if opts.show_connection {
             out.note(&line).map_err(output_failure)?;
         } else {
-            eprintln!("sqlh: {line}");
+            diag(format_args!("sqlh: {line}"));
         }
     }
     // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
@@ -627,14 +671,6 @@ mod tests {
         assert_eq!(
             finish(&mut out(usize::MAX, false), Ok(Stats::default()), started),
             Exit::Ok
-        );
-    }
-
-    #[test]
-    fn partial_path_appends_a_suffix() {
-        assert_eq!(
-            partial_path(Path::new(r"C:\out\r.txt")),
-            PathBuf::from(r"C:\out\r.txt.partial")
         );
     }
 }

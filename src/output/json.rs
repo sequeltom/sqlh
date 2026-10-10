@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use super::{BLOCKED_ADVICE, BatchInfo, Limits, Output, Summary, Tally, cut, cut_marker, hex};
+use super::{BatchInfo, Limits, Output, Summary, Tally, blocked_message, cut, cut_marker, hex};
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
@@ -301,8 +301,8 @@ impl<W: Write> Output for JsonSink<W> {
         Ok(())
     }
 
-    fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()> {
-        self.blocked = Some(format!("{location}: {reason}; {BLOCKED_ADVICE}"));
+    fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
+        self.blocked = Some(blocked_message(location, reason, advice));
         Ok(())
     }
 
@@ -445,15 +445,18 @@ mod tests {
         assert_eq!(parse(s)["batches"], json!([]));
 
         let mut s = JsonSink::new(Vec::new(), limits());
-        s.blocked("line 2", "UPDATE dbo.T would write").unwrap();
+        s.blocked(
+            "line 2",
+            "INSERT ##t would write to a global temp table",
+            "Use a #temp table",
+        )
+        .unwrap();
         s.finish(&summary("failed (exit 5): blocked, 0 ms"))
             .unwrap();
         let doc = parse(s);
-        assert!(
-            doc["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("line 2: UPDATE dbo.T would write; nothing was run")
+        assert_eq!(
+            doc["error"],
+            "line 2: INSERT ##t would write to a global temp table; nothing was run. Use a #temp table"
         );
     }
 

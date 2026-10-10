@@ -10,7 +10,12 @@ pub struct Blocked {
     /// 1-based line within the batch.
     pub line: u32,
     pub reason: String,
+    /// How to get past the refusal; the output puts it after "nothing was run.".
+    pub advice: String,
 }
+
+/// Advice for the refusals that `--allow-write` resolves.
+pub const WRITE_ADVICE: &str = "Rerun with --allow-write if the write is intended";
 
 /// Which checks apply to a batch.
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +224,9 @@ impl Guard<'_, '_> {
                 reason: "SET NOEXEC can't be used with --check: switching it off would run the \
                          SQL instead of only compiling it"
                     .into(),
+                advice: "Remove SET NOEXEC (--check sets it already); write a column named \
+                         NOEXEC as [NOEXEC]. --allow-write doesn't lift this"
+                    .into(),
             }),
             None => Ok(()),
         }
@@ -316,6 +324,7 @@ impl Guard<'_, '_> {
                             "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
                             self.name_at(i + 3)
                         ),
+                        advice: WRITE_ADVICE.into(),
                     });
                 }
                 word if BLOCKED.contains(&word) => {
@@ -325,6 +334,7 @@ impl Guard<'_, '_> {
                             "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
                             token.text
                         ),
+                        advice: WRITE_ADVICE.into(),
                     });
                 }
                 _ => {}
@@ -378,6 +388,7 @@ impl Guard<'_, '_> {
                     "{what} {} would write to a global temp table, which other sessions share",
                     t.text
                 ),
+                advice: "Use a #temp table, or rerun with --allow-write".into(),
             }),
             Some(t) if matches!(t.kind, Kind::Temp | Kind::Var) => Ok(()),
             _ => Err(self.blocked(at, &format!("{what} {}", self.name_at(target)))),
@@ -428,18 +439,27 @@ impl Guard<'_, '_> {
                      only read-only system procedures may run without --allow-write",
                     self.name_at(start)
                 ),
+                advice: "Fix it if it's a typo, or rerun with --allow-write to call the procedure"
+                    .into(),
             });
         }
         if !PROCS.contains(&name) {
             return Err(self.blocked(start, &format!("{what} {}", self.name_at(start))));
         }
         if !self.local_system_qualifier(start) {
+            // The policy, not a claim about what the name resolves to: it may well be the
+            // system procedure, but another schema, database or linked server can name a
+            // different one.
             return Err(Blocked {
                 line: self.tokens.get(start).map_or(1, |t| t.line),
                 reason: format!(
-                    "{what} {} is not a local system procedure: qualify it with nothing, sys. or \
-                     master. (linked servers and other schemas or databases need --allow-write)",
+                    "{what} {}: only a bare, sys. or master. name is taken as the system \
+                     procedure (another schema, database or linked server can name a different one)",
                     self.name_at(start)
+                ),
+                advice: format!(
+                    "Call it as sys.{}, or rerun with --allow-write to run it as written",
+                    last.map_or("", |t| t.text)
                 ),
             });
         }
@@ -448,6 +468,8 @@ impl Guard<'_, '_> {
                 line: self.tokens.get(start).map_or(1, |t| t.line),
                 reason: "sp_spaceused with @updateusage (named, or as the second argument) runs \
                          DBCC UPDATEUSAGE, which writes"
+                    .into(),
+                advice: "Leave @updateusage out to only read sizes, or rerun with --allow-write"
                     .into(),
             });
         }
@@ -541,6 +563,7 @@ impl Guard<'_, '_> {
         Blocked {
             line: self.tokens.get(at).map_or(1, |t| t.line),
             reason: format!("{what} would write"),
+            advice: WRITE_ADVICE.into(),
         }
     }
 }
@@ -762,7 +785,8 @@ mod tests {
             b,
             Blocked {
                 line: 2,
-                reason: "UPDATE dbo.Orders would write".into()
+                reason: "UPDATE dbo.Orders would write".into(),
+                advice: WRITE_ADVICE.into(),
             }
         );
         assert_eq!(
@@ -857,11 +881,38 @@ mod tests {
             "EXEC otherdb..sp_who",
             "Lnk.master.sys.sp_who",
         ] {
+            let b = blocked(sql);
             assert!(
-                blocked(sql).reason.contains("not a local system procedure"),
+                b.reason.contains("only a bare, sys. or master. name"),
+                "{sql}: {}",
+                b.reason
+            );
+            assert_eq!(
+                b.advice, "Call it as sys.sp_who, or rerun with --allow-write to run it as written",
                 "{sql}"
             );
         }
+    }
+
+    // R04: each refusal says how to get past it; --allow-write only where it helps.
+    #[test]
+    fn refusals_carry_their_own_advice() {
+        assert_eq!(
+            blocked("INSERT ##shared VALUES (1)").advice,
+            "Use a #temp table, or rerun with --allow-write"
+        );
+        assert!(
+            blocked("EXEC sp_spaceused N'dbo.T', N'true'")
+                .advice
+                .starts_with("Leave @updateusage out")
+        );
+        assert!(
+            blocked("SELEC 1")
+                .advice
+                .starts_with("Fix it if it's a typo")
+        );
+        assert_eq!(blocked("DELETE FROM dbo.T").advice, WRITE_ADVICE);
+        assert_eq!(blocked("SELECT NEXT VALUE FOR dbo.S").advice, WRITE_ADVICE);
     }
 
     #[test]
@@ -901,6 +952,9 @@ mod tests {
             ] {
                 let b = check(sql, policy).expect_err(sql);
                 assert!(b.reason.contains("--check"), "{}", b.reason);
+                // R04: --allow-write can't lift this refusal, so the advice mustn't suggest it.
+                assert!(b.advice.starts_with("Remove SET NOEXEC"), "{}", b.advice);
+                assert!(!b.advice.contains("Rerun"), "{}", b.advice);
             }
             assert_eq!(
                 check("SELECT 'NOEXEC' AS [NOEXEC] -- NOEXEC", policy),

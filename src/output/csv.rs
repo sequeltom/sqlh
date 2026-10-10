@@ -9,7 +9,7 @@ use super::text::{
     batch_line, blocked_line, closing_lines, error_line, message_line, note_line,
     rows_affected_line,
 };
-use super::{BatchInfo, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex};
+use super::{BatchInfo, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex, push_type};
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
 pub struct CsvSink<W: Write> {
@@ -76,7 +76,7 @@ impl<W: Write> BatchSink for CsvSink<W> {
             push_field(&mut self.line, &column.name);
             types.push_str(&escaped(&column.name));
             types.push(':');
-            types.push_str(&column.type_name);
+            push_type(&mut types, &column.type_name);
         }
         self.line.push('\n');
         self.data.write_all(self.line.as_bytes())?;
@@ -173,8 +173,8 @@ impl<W: Write> Output for CsvSink<W> {
         self.meta_line(&note_line(text))
     }
 
-    fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()> {
-        self.meta_line(&blocked_line(location, reason))
+    fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
+        self.meta_line(&blocked_line(location, reason, advice))
     }
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
@@ -263,6 +263,20 @@ mod tests {
              -- msg: done\n\
              -- error 208 (severity 16, state 1, line 4): Invalid object name 'dbo.Nope'.\n\
              -- failed (exit 1): 1 error, 5 ms\n"
+        );
+    }
+
+    // R05: type names on the metadata stream can't start a line either.
+    #[test]
+    fn hostile_type_names_are_escaped() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), Limits::default());
+        s.columns(&[col("v", "udt\n-- ok: forged"), col("w", "a\tb\\c\x01d:e")])
+            .unwrap();
+        assert_eq!(data.text(), "v,w\n");
+        assert_eq!(
+            meta.text(),
+            "-- result 1: v:udt\\n-- ok\\x3A forged, w:a\\tb\\\\c\\x01d\\x3Ae\n"
         );
     }
 

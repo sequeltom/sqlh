@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::{
-    BLOCKED_ADVICE, BatchInfo, Limits, Output, Summary, Tally, escaped, hex, push_escaped,
+    BatchInfo, Limits, Output, Summary, Tally, blocked_message, escaped, hex, push_escaped,
+    push_type,
 };
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
@@ -85,11 +86,10 @@ pub fn rows_affected_line(count: u64) -> String {
     format!("-- {count} row{s} affected")
 }
 
-pub fn blocked_line(location: &str, reason: &str) -> String {
+pub fn blocked_line(location: &str, reason: &str, advice: &str) -> String {
     format!(
-        "-- blocked: {}: {}; {BLOCKED_ADVICE}",
-        escaped(location),
-        escaped(reason)
+        "-- blocked: {}",
+        escaped(&blocked_message(location, reason, advice))
     )
 }
 
@@ -133,7 +133,7 @@ impl<W: Write> BatchSink for TextSink<W> {
             }
             push_escaped(&mut self.line, &column.name, 0);
             self.line.push(':');
-            self.line.push_str(&column.type_name);
+            push_type(&mut self.line, &column.type_name);
         }
         writeln!(self.out, "{}", self.line)
     }
@@ -199,8 +199,8 @@ impl<W: Write> Output for TextSink<W> {
         writeln!(self.out, "{}", note_line(text))
     }
 
-    fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()> {
-        writeln!(self.out, "{}", blocked_line(location, reason))
+    fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
+        writeln!(self.out, "{}", blocked_line(location, reason, advice))
     }
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
@@ -361,8 +361,12 @@ pub(super) mod tests {
             ..error(1)
         })
         .unwrap();
-        s.blocked("line 1", "UPDATE [a\n-- ok: fake] would write")
-            .unwrap();
+        s.blocked(
+            "line 1",
+            "UPDATE [a\n-- ok: fake] would write",
+            "Rerun\n-- ok: fake",
+        )
+        .unwrap();
         s.note("one\n-- ok: fake").unwrap();
         let out = text(s);
         assert!(
@@ -372,8 +376,25 @@ pub(super) mod tests {
         assert!(out.contains("(x\\n-- ok: fake:1)"), "{out}");
         assert!(out.contains("proc dbo.p\\n-- ok: fake, line 1"), "{out}");
         assert!(out.contains("[a\\n-- ok: fake]"), "{out}");
+        assert!(
+            out.contains("nothing was run. Rerun\\n-- ok: fake"),
+            "{out}"
+        );
         assert!(out.contains("-- note: one\\n-- ok: fake"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("-- ok")), "{out}");
+    }
+
+    // R05: a CLR UDT's type name comes from the server, so it's escaped like a column name,
+    // and a `:` in it can't move where the type starts.
+    #[test]
+    fn hostile_type_names_are_escaped() {
+        let mut s = TextSink::new(Vec::new(), limits());
+        s.columns(&[col("v", "udt\n-- ok: forged"), col("w", "a\tb\\c\x01d:e")])
+            .unwrap();
+        assert_eq!(
+            text(s),
+            "-- result 1\nv:udt\\n-- ok\\x3A forged\tw:a\\tb\\\\c\\x01d\\x3Ae\n"
+        );
     }
 
     #[test]

@@ -97,7 +97,7 @@ These flags are sqlcmd-compatible:
 | `-P` | **Rejected** with exit 3 and a message pointing to profiles or `SQLCMDPASSWORD`. Command lines end up in agent transcripts and process lists. |
 | `-Q sql` | SQL text to run. `-q` is treated as `-Q`, because there is no interactive mode. |
 | `-i file` | Input file. Repeatable. |
-| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Output goes to `file.partial` and is renamed over `file` when the run ends, so the file is replaced whole or not at all. Naming an input file (however spelled, including a hard link) is refused with exit 3. |
+| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed, leaves no `.partial` file behind (Windows deletes it), and sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
 | `-v n=v ...` | Values for `$(n)` substitution. Environment variables also resolve, as in sqlcmd. |
 | `-x` | Turn off `$(var)` substitution. |
 | `-l sec` | Login timeout covering TCP, TLS and login. Default 15. |
@@ -120,7 +120,7 @@ These long flags are our own:
 | `--max-cell N` | Characters shown per cell. Default 500; 0 means unlimited. |
 | `--max-results N` | Result sets shown per run. Default 20. The rest are counted, not printed. Messages are capped at 100. |
 | `--allow-write` | Turn off the read-only guard, if the profile's write policy allows it (§7). |
-| `--check` | Compile only: `SET NOEXEC ON`, executes nothing. Catches syntax errors and unknown columns of existing tables. Missing tables are only reported when a query runs, because SQL Server defers their resolution. Input that mentions `NOEXEC` is refused (exit 5), NOEXEC is re-armed before every batch, and the rolled-back wrapper transaction always applies. With `--allow-write`, write statements may be compiled; they still don't run. A later version could add `sp_describe_first_result_set` per statement. |
+| `--check` | Compile only: `SET NOEXEC ON`, executes nothing. Catches syntax errors and unknown columns of existing tables. Missing tables are only reported when a query runs, because SQL Server defers their resolution. Input that mentions `NOEXEC` is refused (exit 5; §7 lists the false positives), NOEXEC is re-armed before every batch, and the rolled-back wrapper transaction always applies. With `--allow-write`, write statements may be compiled; they still don't run. A later version could add `sp_describe_first_result_set` per statement. |
 | `--continue-on-error` | Keep running later batches after a failed one. |
 | `--stats` | Turn on `SET STATISTICS IO, TIME` and print a summary instead of the raw messages (M3). |
 | `--verbose` | Diagnostics to stderr. Never includes secrets. |
@@ -136,7 +136,9 @@ These long flags are our own:
 - **Error line numbers** are mapped back to the original input: a file and line, not just a line within the batch.
 - **Query timeout** sends a TDS attention, reports `-- error: query timeout after 60 s (batch 2)` and exits 4.
 - **Ctrl+C** sends an attention, waits up to 2 s for the acknowledgment, then exits 6. Ctrl+Break and console close are not handled yet (PLAN.md 2.4). A harness that kills sqlh outright also cancels the server's work: the server ends the request within about 200 ms of the connection dropping (measured for a waiting query; CPU-bound and blocked queries are PLAN.md 2.5).
-- **Malformed input never crashes sqlh.** Unterminated strings and names reach the server, which reports the syntax error. Any bug that panics still exits 10, with a status line in text output.
+- **Malformed input never crashes sqlh.** Unterminated strings and names reach the server, which reports the syntax error.
+- **Expected failures are results, never crashes,** including a closed stdout or stderr (§6).
+- **A bug that panics still exits 10,** never an abort. Everything else about it is best effort: a stderr line, and a status line on stdout in text output if stdout takes it. Output still buffered is lost, a JSON document stays unfinished, `-o` output isn't published, and a password prompt's console mode is restored. Panic injection (`SQLH_DEBUG_PANIC`) exists only in debug builds, so the tests exercise the hook there; release builds have the same hook.
 
 ### 4.4 Output limits
 
@@ -171,7 +173,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 
 - Lines starting with `-- ` are tool metadata. Every other line is data.
 - **Header line:** after `-- result N`, one `name:type` entry per column, tab-separated.
-  - The type is everything after the last `:`, so names can contain colons.
+  - The type is everything after the last `:`, so names can contain colons. A type name never does: a `:` in one (only a CLR UDT's name comes from the server as is) is written `\x3A`.
   - An unnamed column has an empty name, as in `:int`.
   - Types carry their length or precision: `nvarchar(50)`, `varchar(max)`, `decimal(18,2)`, `datetime2(7)`.
 - **Data rows:** tab-separated values.
@@ -185,7 +187,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 **Escaping (values, names, and every variable field in metadata lines)**
 
 - Backslash, tab, newline and CR are written as `\\`, `\t`, `\n` and `\r`. Other ASCII control characters become `\xNN`. A backslash before any other character means that character.
-- The same escaping applies to every variable field of a metadata line: column names, procedure names, source names in locations, guard reasons, notes and error text. Nothing a database or an input contains can start a new line or pass for a `-- ` line. (Windows paths in notes therefore show doubled backslashes.)
+- The same escaping applies to type names in headers, and to every variable field of a metadata line: column and type names, procedure names, source names in locations, guard reasons and advice, notes and error text. Nothing a database or an input contains can start a new line or pass for a `-- ` line. (Windows paths in notes therefore show doubled backslashes.)
 - Bare `NULL` means SQL NULL. A string whose entire value is `NULL` is written as `\NULL`.
 - A first-column value, or a first column name in a header, starting with `--` gets a leading backslash (`\--...`), so data and header lines never look like metadata.
 - An empty string is an empty field.
@@ -273,14 +275,17 @@ Usage errors found while parsing the arguments happen before `--format` is known
 | 5 | Blocked by the read-only guard. Nothing was executed. |
 | 6 | Cancelled (Ctrl+C). |
 | 7 | Output could not be delivered (see below). |
-| 10 | Internal error (a bug), including any panic. Details go to stderr. |
+| 10 | Internal error (a bug), including any panic. Details go to stderr, best effort (§4.3). |
 
 **Exit 7, undeliverable output.** sqlh couldn't hand its complete output, including the final status line, to its destination. That happens when:
-- the program reading stdout closed it early (a broken pipe), for example a harness that stopped reading;
+- the program reading stdout closed it early (a broken pipe), for example a harness that stopped reading. This covers `--help` and `--version` too;
+- in csv mode, stderr was closed: it carries the metadata and the status (§5.3);
 - writing or flushing `-o file` failed, for example a full disk or lost permissions;
-- the finished `file.partial` couldn't be renamed over `file`.
+- the finished `.partial` file couldn't be renamed over `file`.
 
-The SQL may have run, so exit 7 says nothing about the database: it means "don't trust what you received". It takes precedence over the run's own exit code, which goes to stderr instead, as in `sqlh: output could not be delivered (...); the run itself ended with exit 1: ...`. With `-o`, an undelivered run leaves the existing file untouched and removes the `.partial` file.
+The SQL may have run, so exit 7 says nothing about the database: it means "don't trust what you received", and it is no reason to retry a write before checking what happened. It takes precedence over the run's own exit code. When that code is known, stderr gives it, as in `sqlh: output could not be delivered (...); the run itself ended with exit 1: ...`. When the failure stopped the run partway, stderr says that the outcome is unknown: the batch being written may have run, and later batches did not. With `-o`, an undelivered run leaves the existing file untouched, and its `.partial` file is deleted.
+
+Diagnostics on stderr are best effort. If stderr is closed they are dropped, and the exit code stays what it would have been (csv mode aside, above).
 
 In the text, json and md formats, everything goes to stdout in order: results, messages, SQL errors, connection and usage errors, and the summary. That gives agents one stream to read. stderr carries only `--verbose` diagnostics, delivery failures (exit 7) and internal errors (exit 10), except in csv mode (§5.3).
 
@@ -320,16 +325,16 @@ In read-only mode, three layers apply:
      - `sp_who`, `sp_who2`, `sp_lock`
      - `sp_describe_first_result_set`, `sp_server_info`, `sp_databases`, `sp_depends`
 
-     The name may be bare or qualified only as `sys.`, `master.sys.`, `master.dbo.` or `master..`. Other qualifications are blocked: a linked server (`Lnk.master.sys.sp_who`), another database, or another schema (`sales.sp_who`, `dbo.sp_who`) can name a different procedure with the same name.
+     The name may be bare or qualified only as `sys.`, `master.sys.`, `master.dbo.` or `master..`. Other qualifications are blocked: a linked server (`Lnk.master.sys.sp_who`), another database, or another schema (`sales.sp_who`, `dbo.sp_who`) can name a different procedure with the same name. This is a conservative policy, not a claim about what a given name resolves to, and the refusal suggests the `sys.` spelling (`sys.sp_who`), as Microsoft recommends for system procedures.
 
      Dynamic SQL (`EXEC (...)`), `EXEC @variable`, `EXECUTE AS` and everything else are blocked, including `sp_executesql` and `xp_*`.
    - **Implicit calls count as EXEC.** A batch that begins with something other than a statement keyword (`dbo.Purge 5`, or `sp_who2` on its own) is treated as a procedure call and checked against the same allowlist.
    - **DBCC** is allowed only for `SHOW_STATISTICS`, `INPUTBUFFER`, `OPENTRAN`, `USEROPTIONS` and `TRACESTATUS`.
    - **These words are blocked anywhere:** `MERGE`, `COMMIT`, `ROLLBACK`, `SAVE`, `GRANT`, `REVOKE`, `DENY`, `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `RECONFIGURE`, `CHECKPOINT`, `BULK`, `OPENQUERY`, `OPENROWSET`, `OPENDATASOURCE`, `WAITFOR`, `RECEIVE`, `SEND`, `CONVERSATION`, `ENABLE`, `DISABLE`, `UPDATETEXT`, `WRITETEXT`, `SETUSER`. If one of these is really an unbracketed column name, the message suggests writing it as `[Name]`.
 
-   When it blocks something, nothing runs. It reports `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended` and exits 5.
+   When it blocks something, nothing runs. It reports `-- blocked: <where>: <reason>; nothing was run. <advice>` and exits 5, for example `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended`. The advice fits the refusal. `--allow-write` is suggested only where it helps, and a better spelling comes first where there is one: a `#temp` table instead of `##t`, `sys.sp_who` instead of `dbo.sp_who`, `sp_spaceused` without `@updateusage`, or fixing a typo.
 
-   **Under `--check`** one more rule applies, whether or not writes are allowed: input that mentions `NOEXEC` is refused, because `SET NOEXEC OFF` would run the SQL instead of compiling it.
+   **Under `--check`** one more rule applies, whether or not writes are allowed: input that mentions `NOEXEC` is refused, because `SET NOEXEC OFF` would run the SQL instead of compiling it. The rule is deliberately coarse. It refuses the word anywhere outside strings, comments and quoted names, so a bare column or alias named `NOEXEC` is refused too, while `[NOEXEC]` is fine. The advice says so, and that `--allow-write` doesn't lift this rule.
 
    Malformed input (an unterminated string, name or comment) never stops the classifier: everything after the opening quote is treated as quoted, and the server reports the syntax error, so nothing in that batch runs.
 2. **Transaction backstop.** The session-setup batch ends with `BEGIN TRANSACTION`, and the run ends with `ROLLBACK`. This catches classifier gaps, such as an allowlisted procedure that writes.
@@ -382,7 +387,7 @@ write_policy = "deny"
 
 **Profile commands**
 - `sqlh profile add NAME -S server [-d db] [-U login] [-C] [-N..] [--write-policy ..]`
-  - It asks for the password with echo off. This is the tool's only prompt, and it refuses to run if stdin isn't a console, or if echo can't actually be turned off (Git Bash's mintty: use PowerShell, cmd or `winpty`).
+  - It asks for the password with echo off. This is the tool's only prompt, and it refuses to run if stdin isn't a console, or if echo can't actually be turned off (Git Bash's mintty: use PowerShell, cmd or `winpty`). Echo comes back on every return path, errors included, and after a crash. A process killed at the prompt, by Ctrl+C for example, can leave echo off in that console (PLAN.md 2.4).
   - It saves the profile and runs `profile test`.
   - Options you leave out keep their saved values, so rerunning `sqlh profile add NAME` just replaces the password.
   - The first profile you add becomes the default.
@@ -441,8 +446,8 @@ The primary product measure is time to the next useful answer across repeated ag
   - the guard classifier, table-driven, including adversarial cases: keywords hidden in comments or strings, nested brackets, a CTE followed by `UPDATE`, `SELECT INTO`, `EXEC('...')`
   - "never panics" property tests for both lexers, over generated input
 - **Golden tests:** fixed outputs for text, json, csv and md on representative result sets.
-- **Process-level tests** (`tests/cli.rs`): run the real binary, isolated from the machine's profiles and `SQLCMD*` variables, and assert exit codes, files and output: `-o` safety, exit 7, the panic net, `--check`, guard blocks, auth precedence. Tests that need no server use an unreachable address.
-- **Live tests:** the `live` tests in `tests/cli.rs` skip themselves unless `SQLH_TEST_PROFILE` names a profile on the dev box. They use the scratch database `sqlh_test` (default; override with `SQLH_TEST_DATABASE`), created by `tests/fixtures/sqlh_test.sql` and removed by `tests/fixtures/drop_sqlh_test.sql`. Planned coverage (PLAN.md 3.4):
+- **Process-level tests** (`tests/cli.rs`): run the real binary, isolated from the machine's profiles and `SQLCMD*` variables, and assert exit codes, files and output: `-o` safety (identity, concurrent runs, files that can't be replaced, devices), exit 7, closed stdout/stderr in every format, the panic net, `--check`, guard blocks and their advice, auth precedence. Tests that need no server use an unreachable address. They run against the debug and the release binary (`cargo test --release --test cli`); the panic-injection tests exist only in debug builds.
+- **Live tests:** the `live` tests in `tests/cli.rs` are `#[ignore]`d, so a plain `cargo test` reports them as ignored rather than passing. Run them with `cargo test --test cli -- --ignored live` and `SQLH_TEST_PROFILE` naming a profile on the dev box; asked for without it, they fail. They use the scratch database `sqlh_test` (default; override with `SQLH_TEST_DATABASE`), created by `tests/fixtures/sqlh_test.sql` and removed by `tests/fixtures/drop_sqlh_test.sql`. A test that writes first checks the database's `dbo.sqlh_scratch` marker, then writes only to a table of its own, which it drops. Planned coverage (PLAN.md 3.4):
   - every data type
   - multiple result sets
   - PRINT and RAISERROR at severities 0–10 and 11–16

@@ -5,7 +5,7 @@
 What makes it agent-friendly:
 - **Compact, typed output** that costs few tokens, with hard limits on rows and value lengths. Hidden rows are counted, not lost.
 - **Errors that point at the input line**, and documented exit codes (`sqlh --help`).
-- **Never interactive:** it never waits for input. Passwords never appear on the command line.
+- **Never interactive:** queries never wait for input. The one exception is human setup: `sqlh profile add` asks for a password once and stores it in Windows Credential Manager. Passwords never appear on the command line.
 - **Read-only by default.**
 
 Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
@@ -58,6 +58,7 @@ Shared agent instructions are in [AGENTS.md](AGENTS.md); Claude Code imports the
 - [docs/PLAN.md](docs/PLAN.md): the current plan of attack
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
 - [code-review.md](code-review.md): the architecture review the plan responds to
+- [code-review-phase1.md](code-review-phase1.md): the follow-up review of Phase 1
 
 ## Local housekeeping
 

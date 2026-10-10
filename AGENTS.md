@@ -40,12 +40,12 @@ src/profile.rs   sqlh profile add | list | test | rm
 src/help.txt     --help text (models read it)
 src/error.rs     exit codes (DESIGN.md §6) and Failure
 src/console.rs   UTF-8 console output, echo-off password prompt
-src/files.rs     file identity (refusing -o onto an input file)
+src/files.rs     -o files: identity (refusing an input file) and the run's own .partial file
 src/script.rs    input decoding, GO splitting, $(var) substitution, line mapping
 src/guard.rs     read-only classifier (own T-SQL tokenizer)
 src/db/          the only mssql-tds user: connect, run a batch into a BatchSink, value/type rendering
 src/output/      Output trait + Tally (shared limits/counts); text.rs (default), json.rs, csv.rs
-tests/cli.rs     process-level tests of the real binary; `live` ones need SQLH_TEST_PROFILE
+tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
 tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server (manual)
 README.md        human-facing intro, build, quick start, safety note
@@ -54,6 +54,7 @@ docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
 docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike)
 docs/schema-commands.md, docs/mcp-mode.md   designs and plans for later phases
 code-review.md   the architecture review the plan responds to
+code-review-phase1.md   the follow-up review of Phase 1 (R01–R05)
 ```
 
 Planned, not built: `src/schema.rs` (subcommands) and an md format in `src/output/`.
@@ -69,7 +70,8 @@ Planned, not built: `src/schema.rs` (subcommands) and an md format in `src/outpu
 ```powershell
 cargo build --release                               # ~2 MB exe; full LTO takes ~1–2 min
 cargo test                                          # unit + process-level tests; no server needed
-$env:SQLH_TEST_PROFILE='test'; cargo test           # also the live tests (scratch db sqlh_test)
+cargo test --release --test cli                     # process-level tests against the release exe
+$env:SQLH_TEST_PROFILE='test'; cargo test --test cli -- --ignored live   # live tests (scratch db sqlh_test)
 cargo test -- --ignored credman                     # real Credential Manager round trip (cleans up)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
@@ -100,7 +102,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - The guard, splitter, renderer and formatter get table-driven unit tests next to the code.
   - Every new output shape gets an exact-output test (see `output/text.rs`).
   - Process-level behavior (exit codes, files, crashes) gets a test in `tests/cli.rs`, isolated from the machine's profiles and `SQLCMD*` variables.
-  - Live tests skip themselves unless `SQLH_TEST_PROFILE` is set, write only to the `sqlh_test` scratch database, and leave it as they found it.
+  - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop.
   - Test server details and credentials never go in the repo.
 - **`--help`:** models read it, so keep it example-first and under about 60 lines.
 
@@ -111,7 +113,7 @@ The MVP is built; DESIGN.md §13 lists what's in and out. Git repo on `main`.
 Profiles and Credential Manager are built, and so are the json and csv formats. The smoke test passes against the test server (SQL Server 2025); remaining unverified items are in `docs/notes/m0-driver-spike.md`.
 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of [code-review.md](code-review.md). Owner decisions are recorded in its §6. Work in order:
-1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9).
+1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
 2. Phase 2, fast, bounded, cancellable turns, starting with the connect-latency investigation.
 3. Phase 3, execution core, release checks and live fixtures.
 4. Phases 4–7: schema discovery, connection reuse, command categorization, evidence-based evaluations.
