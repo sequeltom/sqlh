@@ -1,12 +1,14 @@
 # sqlharness design
 
-Status: draft, pre-code (started 2026-10-09). Rows marked **Decided** in §2 are the owner's calls. Everything else is a proposal and open to change.
+Status: MVP built 2026-10-09; product direction updated 2026-10-10. [VISION.md](VISION.md) records the owner's strategy and takes precedence over older roadmap and compatibility assumptions. Rows marked **Decided** in §2 are the owner's calls. Unbuilt features remain proposals.
 
 ## 1. Purpose
 
 Agents such as Claude Code need to query SQL Server. `sqlcmd` works, but it fights them. The classic version needs the ODBC driver installed. Its output is padded for humans. It can block on prompts. It wants the password on the command line. It has no row or size limits, prints NULL ambiguously, and reports errors without enough context to fix them.
 
 sqlharness (`sqlh.exe`, working name) is a single exe with no dependencies that runs T-SQL and returns compact, unambiguous, size-limited output. It never waits for input, reports errors that point at the failing line, and refuses writes unless asked.
+
+The primary workflow is an agent with limited context making several queries across a human-led DBA or developer question-and-answer session. Optimize time to the next useful answer: focused discovery, concise output, low repeated-call overhead, and quick cancellation so the agent can try again. Bulk analytics are secondary. Exact total row-count usefulness remains open; the current draining/counting behavior is documented below and has not changed.
 
 **Non-goals:** an interactive REPL, the full sqlcmd scripting language (`:r`, `:connect`, `:!!`), a GUI, and non-Windows builds (they may come for free later).
 
@@ -20,9 +22,11 @@ sqlharness (`sqlh.exe`, working name) is a single exe with no dependencies that 
 | Writes | Read-only by default, §7. **Decided** |
 | Auth | SQL login and Windows integrated (SSPI). No Entra ID for now. **Decided** |
 | sqlcmd compatibility | Core flags, `GO` and `$(var)`. Agent-specific features get long flags. **Decided** |
-| Server targets | SQL Server 2012 through 2025, Azure SQL DB and Managed Instance. **Decided** |
+| First-release target | SQL Server 2025 Standard on Windows Server 2025 Standard, x64. **Decided** |
+| Compatibility expansion | Candidate Windows Server 2016 / SQL Server 2016 floor, conditional on acceptable technical debt. Other targets need separate assessment. **Decided** |
 | Test server | The owner's existing remote server. Its details stay out of the repo. **Decided** |
-| Modes | One-shot CLI first, then an MCP stdio server, with a persistent session later. The owner had no preference. |
+| Workflow | Repeated agent queries in human-led DBA/developer sessions; low context consumption and quick cancellation. **Decided** |
+| Modes | One-shot CLI exists. Connection reuse is a priority; MCP and persistent sessions are proposed mechanisms, subject to reliable cleanup and execution policy. |
 
 ### Why mssql-tds
 
@@ -43,11 +47,11 @@ Milestone 0 is a spike meant to find any deal-breakers early.
 
 ## 3. Platform and build
 
-- **Target:** `x86_64-pc-windows-msvc`. Rust's tier-1 MSVC targets need Windows 10 / Server 2016 or newer, which matches our floor. ARM64 may come later.
+- **Target:** `x86_64-pc-windows-msvc`, with Windows Server 2025 Standard as the first-release OS. A Windows Server 2016 floor is a later candidate, not a current support claim. ARM64 may come later.
 - **Static CRT:** set `-C target-feature=+crt-static` in `.cargo/config.toml`. Without it the exe needs `vcruntime140.dll`, which isn't on a clean server.
 - **Allowed imports:** only DLLs that ship with Windows (kernel32, advapi32, secur32/sspicli, crypt32, ncrypt, bcrypt, ws2_32, ntdll, and similar). Check with `dumpbin /dependents`.
 - **Release profile:** `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`.
-- **TLS:** SChannel, so Server 2016 tops out at TLS 1.2 (TLS 1.3 needs Server 2022 or Windows 11). That is enough for SQL Server 2016+, Azure SQL, and TDS 8 strict encryption.
+- **TLS:** SChannel. Validate encryption modes on the first-release platform; evaluate older-platform TLS behavior when assessing the candidate 2016 floor.
 
 ## 4. CLI
 
@@ -136,6 +140,8 @@ These long flags are our own:
 ### 4.4 Output limits
 
 These keep a careless query from flooding an agent's context:
+
+**Product direction:** quick cancellation is essential to iterative investigation. Whether exact total row counts justify draining hidden rows remains open. The current behavior below is retained until a separately designed and tested change defines early cutoff, partial counts, and response completion.
 
 - **Rows.** After `--max-rows`, rows stop being formatted but are still read and counted. Later statements still run, and the footer gives an exact total: `-- 100 of 48213 rows shown (limit 100)`. The query timeout still applies.
 - **Cells.** A cell longer than `--max-cell` is cut at a character boundary and ends with `…[+N]`, where N is the number of characters left out. A binary value shows at most `--max-cell / 2` bytes and ends with `…[+N bytes]`. The result set's footer counts the truncated cells.
@@ -283,7 +289,9 @@ Read-only is the default. Each profile sets a write policy:
 | `flag` (default) | `--allow-write` turns on writes for that run. |
 | `allow` | Writes are on by default. |
 
-An agent can pass `--allow-write` itself, so `flag` is only a speed bump. The real controls are `deny` and a read-only login.
+Database permissions are expected to provide the enforcement boundary. The tool's checks are also important when a DBA or developer has accidentally granted an agent excessive access. An agent can pass `--allow-write` itself, so `flag` is an accident guard; `deny` is the strongest tool policy, but does not replace restricted database permissions.
+
+Command categorization and the balance of allowlists/blocklists need further design using legitimate DBA workflows and their risks. The current classifier below is the MVP mechanism, not the final categorization system. See [VISION.md](VISION.md).
 
 In read-only mode, three layers apply:
 
@@ -373,9 +381,7 @@ The detailed design and plan is [schema-commands.md](schema-commands.md). It cov
 | `find <pattern> [--text]` | Objects and columns whose names match (substring, or a `*`/`?` glob; case-insensitive). `--text` also searches module bodies. |
 | `def <object>` | `OBJECT_DEFINITION`, printed raw and exempt from `--max-cell`. |
 
-All catalog SQL must run on SQL Server 2012 and Azure SQL DB. That rules out:
-- `STRING_AGG`, `STRING_SPLIT`, `TRIM`, `CONCAT_WS`, `OPENJSON`, and `DROP … IF EXISTS`
-- cross-database names, and `USE` on Azure SQL DB
+Catalog SQL must be validated on SQL Server 2025 Standard for the first release. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but evaluate compatibility costs rather than enforcing the earlier SQL Server 2012 restriction. Azure-specific constraints remain relevant to future expansion and are not first-release gates.
 
 The commands are canned SQL run through the normal pipeline, with lists aggregated server-side by `FOR XML PATH`; schema-commands.md §3 explains why.
 
@@ -393,6 +399,8 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md). Summary:
 - **Results:** the text format as a single text content item. `isError` is set when the exit code isn't 0.
 
 ## 11. Performance targets
+
+The primary product measure is time to the next useful answer across repeated agent turns. Measure repeated-call connection/setup overhead, response size/context consumption, and cancellation-to-retry time alongside the existing executable and startup targets. Bulk throughput is secondary; additional numerical interaction targets need measurement before being committed.
 
 - **Size:** a stripped exe under 6 MB. Measure at M0, and justify any growth over 10%.
 - **Startup:** under 10 ms from process start to the first TDS packet, on a warm cache.
@@ -420,10 +428,13 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md). Summary:
   - the guard's transaction backstop
 - **Compatibility:**
   - check each release's imports with `dumpbin /dependents`
-  - smoke-test each release on Server 2016 (or Windows 10 1607 LTSB)
-  - test against whatever server versions are available: 2012, 2014, 2016, 2019, 2022, 2025, and Azure SQL DB
+  - validate the first release on Windows Server 2025 Standard with SQL Server 2025 Standard, including supported authentication and cancellation paths
+  - assess Windows Server 2016 / SQL Server 2016 compatibility separately, including its maintenance cost, before committing to that floor
+  - other versions and Azure may be tested opportunistically; those results do not establish an unqualified support promise
 
 ## 13. Milestones
+
+**Current delivery priorities (2026-10-10):** fix known correctness and safety defects, make cancellation and bounded output reliable, then deliver focused schema discovery and reduce repeated connection/setup overhead. Develop command categorization further; assess exact row-count usefulness and compatibility expansion with evidence. The M0–M3 descriptions below group work and record the original plan; they do not override [VISION.md](VISION.md) or make older platforms first-release requirements.
 
 - **MVP (built 2026-10-09).** This is M0 plus most of M1 and the M2 guard:
   - connection flags and environment variables, `-Q`, `-i` and stdin input, `GO n` and `$(var)`
@@ -438,7 +449,7 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md). Summary:
   - SELECT every data type.
   - Capture PRINT, info messages, errors and the DONE row counts.
   - Cancel a running query with an attention.
-  - Measure the exe's size and imports, and run it on Server 2016.
+  - Measure the exe's size and imports, and validate the first-release Windows Server 2025 platform. Evaluate Server 2016 separately for the candidate expansion.
   - Deliverable: `docs/notes/m0-driver-spike.md` with findings and a go/no-go on mssql-tds (fallback: tiberius-ng).
 - **M1: core CLI.**
   - flags, environment variables, profiles and Credential Manager
@@ -463,13 +474,10 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md). Summary:
 ## 14. Open questions and risks
 
 - **Name.** `sqlh` is a working name.
-- **mssql-tds maturity.** We pin 0.2.0 (crates.io, 2026-10-06), while upstream main is already at 0.3.0. Size and imports are fine (`docs/notes/m0-driver-spike.md`). Still unverified:
-  - TDS 7.4 login against SQL Server 2012 and 2014
-  - Azure SQL gateway redirection
-  - attention and cancel on a live server
-  - data type rendering on a live server
-  - whether its Win32 calls stay within the Windows 10 1607 floor (needs a run on Server 2016)
-- **Old servers.** SQL Server 2012 and 2014 without their TLS 1.2 patches can't negotiate TLS 1.2. Even with optional encryption, TDS encrypts the login packet, so both sides still need a TLS version in common. Document `-No` and its limits.
+- **mssql-tds maturity.** We pin 0.2.0; size, imports, and SQL Server 2025 data rendering checks are recorded in `docs/notes/m0-driver-spike.md`. First-release validation still needs supported authentication, reliable attention/cancellation, and a clean Windows Server 2025 Standard deployment. Older-server negotiation and Azure redirection are future compatibility questions.
+- **Compatibility cost.** Assess a Windows Server 2016 / SQL Server 2016 floor without letting it complicate or delay the first release. SQL Server 2012/2014 and Azure are not current release gates. Supporting any expansion needs explicit tests and an acceptable maintenance budget.
+- **Exact row counts.** Their usefulness during investigation is unresolved; assess the latency and server work involved in draining hidden rows. Fast cancellation is a firm priority.
+- **Command categorization.** Develop the policy around legitimate DBA workflows and excessive database privileges. The current classifier is an initial implementation, and database permissions remain the enforcement boundary.
 - **ARITHABORT.** SSMS sets it ON, while ODBC and ADO.NET apps leave it OFF, so plans can differ ("fast in SSMS, slow in the app"). Consider an `--app-settings` switch for performance investigations.
-- **Environments.** The test server's details are still to come, from the owner and outside the repo. A Server 2016 machine is still needed for compatibility smoke tests.
+- **Environments.** The owner's existing test server is reached through a local profile; details stay outside the repo. A first-release Windows Server 2025 Standard / SQL Server 2025 Standard environment is required for release validation. A Server 2016 environment is only required if that expansion is pursued.
 - **Code signing.** An unsigned new exe can trip SmartScreen or antivirus on locked-down servers.

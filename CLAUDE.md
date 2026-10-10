@@ -2,13 +2,13 @@
 
 `sqlh.exe` (working name) is a SQL Server query tool for AI agents and harnesses. It does the job of `sqlcmd`, but as a single exe with no dependencies. Its output, errors and guardrails are built for models: compact typed output, hard row and size limits, errors with exit codes and real line numbers, no prompts, and read-only by default.
 
-The full spec is [docs/DESIGN.md](docs/DESIGN.md). Before changing CLI behavior, output formats, exit codes or the read-only guard, read the relevant section, and update it in the same change.
+The product vision and priorities are in [docs/VISION.md](docs/VISION.md): fast, context-efficient, human-led DBA investigation across repeated agent turns. The full technical spec is [docs/DESIGN.md](docs/DESIGN.md). Before changing CLI behavior, output formats, exit codes or the read-only guard, read the relevant section, and update it in the same change.
 
 ## Hard constraints
 
 Don't trade these away.
 
-- **Zero runtime dependencies.** It runs on a clean Windows 10 1607 / Server 2016 or newer x64 machine with no ODBC, OLE DB, VC++ redistributable, .NET or OpenSSL. It ships as one exe with the CRT statically linked (`+crt-static`), and imports only DLLs that ship with Windows. Check with `dumpbin /dependents`.
+- **Zero runtime dependencies.** The first release targets SQL Server 2025 Standard on Windows Server 2025 Standard, x64, with no ODBC, OLE DB, VC++ redistributable, .NET or OpenSSL. It ships as one exe with the CRT statically linked (`+crt-static`), and imports only DLLs that ship with the supported Windows version. Check with `dumpbin /dependents`. A Windows Server 2016 / SQL Server 2016 floor is a candidate expansion, conditional on acceptable technical debt; it is not a first-release gate.
 - **Lean and fast.** Every new crate needs a reason. Check what it adds to exe size (`cargo bloat --release --crates`) and build time, and prefer a few lines of our own code. Stream rows, never buffering a whole result set.
 - **Never interactive.** Only `sqlh profile add` reads from the console. With nothing to run and stdin attached to a console, print usage and exit 3. Never wait.
 - **No secrets on the command line or in output.** `-P` is rejected on purpose. Passwords come from Windows Credential Manager (through profiles) or `SQLCMDPASSWORD`. Never log, echo or format a password or a connection string that contains one.
@@ -74,7 +74,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 
 - **Errors:** one error enum in `src/error.rs`, mapped to the exit codes in DESIGN.md §6. No `unwrap` or `expect` on anything derived from user input, the network or the server.
 - **unsafe:** only in the FFI modules (`credman.rs`, `console.rs`), with a `// SAFETY:` comment on each block.
-- **Catalog SQL** must run on SQL Server 2012 and Azure SQL DB. That rules out `STRING_AGG`, `STRING_SPLIT`, `TRIM`, `CONCAT_WS`, `OPENJSON` and `DROP … IF EXISTS`, plus cross-database names.
+- **Catalog SQL** must be validated on the first-release target, SQL Server 2025 Standard. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but there is no unconditional SQL Server 2012 or Azure requirement. Additional version-specific paths need a supported-target decision and a maintenance justification.
 - **Tests:**
   - The guard, splitter, renderer and formatter get table-driven unit tests next to the code.
   - Every new output shape gets an exact-output test (see `output/text.rs`).
@@ -88,7 +88,9 @@ The MVP is built; DESIGN.md §13 lists what's in and out. Git repo on `main`.
 
 Profiles and Credential Manager are built, and so are the json and csv formats. The smoke test passes against the test server (SQL Server 2025); remaining unverified items are in `docs/notes/m0-driver-spike.md`.
 
-Next steps:
-1. The schema commands (`info`, `dbs`, `tables`, `describe`, `find`, `def`): see `docs/schema-commands.md` §9.
-2. MCP mode: see `docs/mcp-mode.md` §8. It reuses the Runner refactor from step 1.
-3. The md format, if wanted.
+Next steps, aligned with [docs/VISION.md](docs/VISION.md):
+1. Correctness and reliable outcomes: address the prioritized findings in [code-review.md](code-review.md), then make cancellation and whole-response limits dependable.
+2. Focused schema discovery (`info`, `dbs`, `tables`, `describe`, `find`, `def`): see `docs/schema-commands.md` §9.
+3. Reduce repeated connection/setup overhead. MCP is proposed in `docs/mcp-mode.md` §8 and shares the Runner refactor with schema commands; reuse and cleanup must be tested before pooling.
+4. Develop command categorization for legitimate DBA workflows and overprivileged connections. Exact row-count usefulness and the candidate 2016 compatibility floor remain open product questions.
+5. The md format, if wanted.

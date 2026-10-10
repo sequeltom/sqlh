@@ -2,15 +2,17 @@
 
 Status: proposed (2026-10-09). This doc expands DESIGN.md §9 and becomes the spec once built. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
 
+Product direction updated 2026-10-10: [VISION.md](VISION.md) prioritizes concise schema discovery for agents with limited context working through human-led DBA/developer questions. The first release targets SQL Server 2025 Standard on Windows Server 2025 Standard. A 2016 floor is a candidate expansion, conditional on acceptable technical debt.
+
 ## 1. Why
 
 Before an agent writes a query it needs the schema: which tables exist, their columns and types, keys, and how tables relate. Today it has to write catalog queries itself, and those go wrong in predictable ways:
-- `STRING_AGG` doesn't exist on SQL Server 2012–2016
+- catalog queries may assume functions or metadata absent on an older compatibility target
 - the length of `nvarchar` in `sys.columns` is in bytes
 - `sp_help` output is long and padded
 - several round trips are spent for each table
 
-The schema commands give compact, correct answers in one call each. They run on every supported server, and every output format applies to them.
+The schema commands give compact, correct answers in one call each, reducing repeated query-writing and context overhead. Validate them on the first-release target; expand their compatibility only when that support is accepted. Every output format applies to them.
 
 ## 2. Commands
 
@@ -39,8 +41,8 @@ Each command is canned T-SQL that goes through the normal pipeline: the session 
 - **Trusted SQL skips the classifier.** The SQL is written by the tool, not the agent, so the keyword classifier (guard layer 1) is skipped for it. The rolled-back wrapper transaction (layer 2) still applies.
 - **Arguments are bound as literals, never spliced into identifiers.** User arguments become `DECLARE @name nvarchar(776) = N'...';` at the top of the batch, with single quotes doubled. That is the only escaping an `N'...'` literal needs, and it is unit-tested with hostile names.
 - **Two steps for object commands.** `describe`, `def` and `deps` first resolve the name in a small batch that returns `object_id`, the schema-qualified name and the type, or raises an error (§5). The second batch is chosen by type, so its sections are known in advance. That costs one extra round trip, about 1–5 ms on a LAN.
-- **Version-specific features use property functions.** Using a catalog column that doesn't exist on older servers is a compile error, while property functions just return NULL there. So features from 2016 and later (temporal tables, generated-always columns, hidden columns) are read with `OBJECTPROPERTY(...)` and `COLUMNPROPERTY(...)`, which keeps one static query for every version.
-- **Aggregation uses FOR XML PATH.** Lists such as index key columns use `STUFF((SELECT N', ' + ... FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')`. It works on SQL Server 2012 and Azure SQL DB, and the `TYPE`/`.value()` form avoids XML entity escaping.
+- **Compatibility is deliberate.** The sketches use property functions for some metadata and `FOR XML PATH` for aggregation to retain inexpensive portability. They are proposals, not a requirement to maintain one query across every historical SQL Server version. Validate first-release metadata semantics and assess any added complexity against the candidate 2016 floor.
+- **Aggregation sketch.** Lists such as index key columns use `STUFF((SELECT N', ' + ... FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')`. The `TYPE`/`.value()` form avoids XML entity escaping; a different implementation can be selected when its maintainability and target compatibility justify it.
 
 ## 4. Sections: an addition to the output contract
 
@@ -198,8 +200,9 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
 
 ## 8. Compatibility rules
 
-- **SQL Server 2012 floor:** no `STRING_AGG`, `STRING_SPLIT`, `TRIM`, `CONCAT_WS`, `OPENJSON`, `DROP … IF EXISTS`, or catalog columns added after 2012. Version-specific facts come through property functions (§3).
-- **Azure SQL DB:** no cross-database names. `dbs` is limited, as noted above.
+- **First release:** SQL Server 2025 Standard on Windows Server 2025 Standard. Catalog fixtures and assertions must cover that target.
+- **Candidate floor:** SQL Server 2016 / Windows Server 2016, subject to acceptable technical debt. Prefer inexpensive portability; do not add speculative fallback paths or retain an unconditional SQL Server 2012 restriction.
+- **Azure SQL DB:** a future compatibility consideration, not a first-release gate. The scope restrictions and limited `dbs` behavior described above remain constraints if Azure support is pursued.
 - **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed. No command needs `VIEW SERVER STATE`.
 - **Temp tables:** `describe #t` works only on the session that created the table. That means MCP sessions (`docs/mcp-mode.md`), not one-shot CLI calls, so the help text says so.
 

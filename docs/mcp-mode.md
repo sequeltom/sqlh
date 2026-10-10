@@ -2,9 +2,13 @@
 
 Status: proposed (2026-10-09). This doc expands DESIGN.md §10 and becomes the spec once built. It targets MCP revision **2026-07-28** and also serves clients on the older handshake revisions. The tools it exposes are the CLI's query path and the schema commands (`docs/schema-commands.md`).
 
+Product direction updated 2026-10-10: [VISION.md](VISION.md) makes low repeated-call overhead and quick cancellation priorities for human-led DBA/developer investigations. MCP is a proposed way to serve that workflow, not a commitment to every pooling or session detail below. First-release validation targets SQL Server 2025 Standard on Windows Server 2025 Standard; a 2016 floor and Azure support are separate compatibility assessments.
+
 ## 1. Why
 
 The one-shot CLI starts a process, connects, logs in and sets up the session on every call, which costs about 150–250 ms on a LAN. It also loses all session state.
+
+An agent with limited context commonly makes several queries across turns. Reusing connections and exposing focused discovery tools should shorten time to the next useful answer. Fast cancellation and retry are essential; bulk analytics throughput is secondary. Exact total row-count usefulness remains unresolved, so the current CLI's draining/counting semantics must not silently become an immutable MCP requirement.
 
 `sqlh mcp` runs as a long-lived stdio server instead:
 - **Speed:** connections stay open, so a call costs one round trip plus execution.
@@ -102,7 +106,7 @@ Short names are used, because clients prefix them with the server name (Claude C
 - **Annotations:** all tools set `openWorldHint: false`; the database is a closed system.
 - **Input schemas:** JSON Schema 2020-12 with `additionalProperties: false`. Limits get bounds, for example `max_rows` ≤ 10,000 and `timeout` ≤ the launch `-t`.
 - **Read vs write:** keeping `execute` separate from `query` is the key safety property. Read tools can be auto-approved, and every write goes through the harness's confirmation prompt.
-- **Database argument:** `database` runs `USE [db]` (brackets escaped) at the start of that call only. With a session, it applies to the session from then on. Stateless calls never leak a database switch to the next call (§5).
+- **Database argument:** on the first-release SQL Server target, `database` runs `USE [db]` (brackets escaped) at the start of that call only. With a session, it applies to the session from then on. Stateless calls never leak a database switch to the next call (§5). Future Azure SQL Database support requires a connection directly to the selected database rather than this switching mechanism.
 
 **Results**
 - One `text` content item in the sqlh text format, with the same contract, limits and final status line as the CLI. The models using this were tuned for the CLI output, and it's the cheapest in tokens.
@@ -148,6 +152,8 @@ The `{version}` and `{db}` placeholders are filled from the profile without conn
 
 ## 7. Security
 
+Database permissions are expected to be configured appropriately. The tool's checks also protect against accidental damage when an agent receives excessive privileges. Command categorization and allowlist/blocklist policy need further design around legitimate DBA workflows; the current classifier is an MVP mechanism. Tool separation and annotations do not replace database enforcement.
+
 - **Fixed target:** connection target and credentials are fixed at launch (§3), and tool arguments never carry secrets.
 - **Writes are gated three ways:** the launch flag, the profile policy and a separate `execute` tool. The read-only guard covers `query`.
 - **Input limits:** a JSON message over 4 MB is answered with a protocol error and its connection state is left untouched. SQL text over 1 MB is refused. Pattern and object arguments are passed as literals (`docs/schema-commands.md` §3).
@@ -156,6 +162,8 @@ The `{version}` and `{db}` placeholders are filled from the profile without conn
 - **No secrets in logs:** stderr logs (`--verbose`) never include passwords or connection strings.
 
 ## 8. Implementation plan
+
+Prerequisites: fix the execution correctness findings in [../code-review.md](../code-review.md), make output and cancellation dependable, and validate response budgets plus connection cleanup. Product priority is fast, context-efficient investigation; the mechanisms below remain proposals until tested against that workflow. Bounded output must cover the collected MCP response as well as streamed rows.
 
 1. **Runner refactor** (shared with the schema commands)
    - pull the batch loop out of `main.rs` into `Runner::run(&mut Session, &[Batch], &mut dyn Output, &RunOptions) -> RunResult`
@@ -194,6 +202,11 @@ The `{version}` and `{db}` placeholders are filled from the profile without conn
 - **Client interop:** connect from Claude Code (`claude mcp add`, then use the tools in a session) and from the MCP Inspector, as both a modern and a legacy client.
 
 ## 10. Open questions
+
+- **Exact totals:** do total row counts improve investigation enough to justify draining results? Assess cutoff behavior separately; cancellation must be quick and partial counts must be explicit.
+- **Cancellation and reuse:** after abandoning a call, can the connection be proven clean and reusable promptly, or should it be discarded? Test before making reuse guarantees.
+- **Command categorization:** evolve checks for DBA workflows and overprivileged connections without relying on tool annotations as enforcement.
+- **Compatibility expansion:** assess the candidate 2016 floor and other platforms after validating the 2025 Standard first-release target.
 
 - **structuredContent:** worth adding as an option (`format: "structured"`) once a client benefits from it? Not by default (§4).
 - **Resources:** expose the schema as resources (`sqlh://schema/dbo.Users`) for clients that browse resources? Tools cover the need, so it's deferred.
