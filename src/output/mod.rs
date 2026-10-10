@@ -62,6 +62,8 @@ pub struct BatchInfo<'a> {
     pub multi_source: bool,
     /// Source line where the batch text starts.
     pub line: u32,
+    /// The batch's line map (`script::Batch::line_map`); empty when lines map one to one.
+    pub line_map: &'a [u32],
     pub run: u32,
     pub runs: u32,
 }
@@ -124,6 +126,7 @@ pub struct Tally {
     source: String,
     multi_source: bool,
     batch_line: u32,
+    line_map: Vec<u32>,
     results_seen: usize,
     hidden: bool,
     rows_total: u64,
@@ -141,6 +144,7 @@ impl Tally {
             source: String::new(),
             multi_source: false,
             batch_line: 1,
+            line_map: Vec::new(),
             results_seen: 0,
             hidden: false,
             rows_total: 0,
@@ -161,6 +165,8 @@ impl Tally {
         self.source.push_str(batch.source);
         self.multi_source = batch.multi_source;
         self.batch_line = batch.line;
+        self.line_map.clear();
+        self.line_map.extend_from_slice(batch.line_map);
         self.batch_max_severity = 0;
     }
 
@@ -238,7 +244,7 @@ impl Tally {
         message
             .line
             .filter(|line| *line > 0)
-            .map(|line| self.batch_line + line as u32 - 1)
+            .map(|line| crate::script::source_line(self.batch_line, &self.line_map, line as u32))
     }
 
     /// The current source's name, when there are several sources.
@@ -326,6 +332,14 @@ pub fn cut_marker(cut: usize, bytes: bool) -> String {
     }
 }
 
+/// `s` with the text format's escaping and no limit: for variable fields in metadata lines
+/// (names, locations, reasons, notes), so no value can start a line or fake a `-- ` line.
+pub fn escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    push_escaped(&mut out, s, 0);
+    out
+}
+
 /// Appends `s` with `\\ \t \n \r` and other control characters escaped (the text format's
 /// escaping), cut after `max` characters with a marker. Returns true when cut.
 pub fn push_escaped(out: &mut String, s: &str, max: usize) -> bool {
@@ -384,6 +398,7 @@ mod tests {
             source: "b.sql",
             multi_source: false,
             line: 14,
+            line_map: &[],
             run: 1,
             runs: 1,
         };

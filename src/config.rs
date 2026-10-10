@@ -45,12 +45,29 @@ impl WritePolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthKind {
+    Windows,
+    Sql,
+}
+
+impl AuthKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthKind::Windows => "windows",
+            AuthKind::Sql => "sql",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Profile {
     pub name: String,
     pub server: Option<String>,
     pub database: Option<String>,
-    /// Set means SQL auth; unset means Windows auth.
+    /// `auth` as written. Older files may omit it; then `user` decides (see `auth_kind`).
+    pub auth: Option<AuthKind>,
+    /// The SQL login; must be set exactly when the auth is SQL.
     pub user: Option<String>,
     pub encrypt: Option<Encrypt>,
     pub trust_server_certificate: Option<bool>,
@@ -59,6 +76,16 @@ pub struct Profile {
     pub query_timeout: Option<u32>,
     pub max_rows: Option<u64>,
     pub max_cell: Option<usize>,
+}
+
+impl Profile {
+    pub fn auth_kind(&self) -> AuthKind {
+        self.auth.unwrap_or(if self.user.is_some() {
+            AuthKind::Sql
+        } else {
+            AuthKind::Windows
+        })
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -148,12 +175,34 @@ pub struct Settings {
     pub profile: Option<String>,
 }
 
+/// What settings resolution reads from the machine, so tests can supply their own.
+pub struct Sources<'a> {
+    /// An environment variable, or `None` when unset or empty.
+    pub var: &'a dyn Fn(&str) -> Option<String>,
+    /// The profiles file.
+    pub load: &'a dyn Fn() -> Result<Config, String>,
+    /// A profile's stored password.
+    pub password: &'a dyn Fn(&str) -> std::io::Result<Option<String>>,
+}
+
 pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
-    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    resolve_with(
+        opts,
+        &Sources {
+            var: &var,
+            load: &load,
+            password: &credman::read,
+        },
+    )
+}
+
+pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure> {
+    let env = sources.var;
     let named = opts.profile.clone().or_else(|| env("SQLH_PROFILE"));
     let server_given = opts.server.is_some() || env("SQLCMDSERVER").is_some();
     let config = if named.is_some() || !server_given {
-        load().map_err(Failure::usage)?
+        (sources.load)().map_err(Failure::usage)?
     } else {
         Config::default()
     };
@@ -177,20 +226,33 @@ pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
         .or_else(|| env("SQLCMDSERVER"))
         .unwrap_or_else(|| ".".into());
 
-    let user = if opts.integrated {
-        None
+    // Decide the auth method first, with the same precedence as everything else, then the
+    // login. A Windows-auth profile stays Windows auth whatever SQLCMDUSER says.
+    let kind = if opts.integrated {
+        AuthKind::Windows
+    } else if opts.user.is_some() {
+        AuthKind::Sql
+    } else if let Some(profile) = &profile {
+        profile.auth_kind()
+    } else if env("SQLCMDUSER").is_some() {
+        AuthKind::Sql
     } else {
-        opts.user
-            .clone()
-            .or(p.user.clone())
-            .or_else(|| env("SQLCMDUSER"))
+        AuthKind::Windows
     };
-    let auth = match user {
-        None => Auth::Integrated,
-        Some(user) => Auth::Sql {
-            password: password(profile.as_ref(), &server, &user)?,
-            user,
-        },
+    let auth = match kind {
+        AuthKind::Windows => Auth::Integrated,
+        AuthKind::Sql => {
+            let user = opts
+                .user
+                .clone()
+                .or(p.user.clone())
+                .or_else(|| env("SQLCMDUSER"))
+                .ok_or_else(|| Failure::usage("SQL auth needs a login: pass -U"))?;
+            Auth::Sql {
+                password: password(sources, profile.as_ref(), &server, &user)?,
+                user,
+            }
+        }
     };
 
     let policy = p.write_policy.unwrap_or(WritePolicy::Flag);
@@ -211,8 +273,10 @@ pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
                 .or_else(|| env("SQLCMDDBNAME")),
             auth,
             encrypt: opts.encrypt.or(p.encrypt).unwrap_or(Encrypt::Mandatory),
-            trust_server_certificate: opts.trust_server_certificate
-                || p.trust_server_certificate.unwrap_or(false),
+            trust_server_certificate: opts
+                .trust_server_certificate
+                .or(p.trust_server_certificate)
+                .unwrap_or(false),
             login_timeout: opts.login_timeout.or(p.login_timeout).unwrap_or(15),
             read_only_intent: opts.read_only_intent,
             multi_subnet_failover: opts.multi_subnet_failover,
@@ -231,7 +295,12 @@ pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
 
 /// The profile's stored credential, else SQLCMDPASSWORD. A stored password is only ever sent
 /// to the profile's own server and login: `--profile x -S elsewhere` must not leak it.
-fn password(profile: Option<&Profile>, server: &str, user: &str) -> Result<String, Failure> {
+fn password(
+    sources: &Sources,
+    profile: Option<&Profile>,
+    server: &str,
+    user: &str,
+) -> Result<String, Failure> {
     let owns = |p: &Profile| {
         p.user.as_deref() == Some(user)
             && p.server
@@ -239,7 +308,7 @@ fn password(profile: Option<&Profile>, server: &str, user: &str) -> Result<Strin
                 .is_some_and(|s| s.eq_ignore_ascii_case(server))
     };
     if let Some(p) = profile.filter(|p| owns(p)) {
-        match credman::read(&p.name) {
+        match (sources.password)(&p.name) {
             Ok(Some(password)) => return Ok(password),
             Ok(None) => {}
             Err(e) => {
@@ -250,10 +319,7 @@ fn password(profile: Option<&Profile>, server: &str, user: &str) -> Result<Strin
             }
         }
     }
-    std::env::var("SQLCMDPASSWORD")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| match profile {
+    (sources.var)("SQLCMDPASSWORD").ok_or_else(|| match profile {
             Some(p) if owns(p) => Failure::usage(format!(
                 "no password stored for profile {0}; run: sqlh profile add {0}",
                 p.name
@@ -274,6 +340,10 @@ fn password(profile: Option<&Profile>, server: &str, user: &str) -> Result<Strin
 fn parse(text: &str) -> Result<Config, String> {
     let mut config = Config::default();
     let mut current: Option<usize> = None;
+    // Keys seen in the current table, so a repeated key is an error instead of last-wins.
+    let mut seen: Vec<String> = Vec::new();
+    // Line of each profile's header, for errors that span several keys.
+    let mut header_lines: Vec<usize> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
         let err = |message: String| format!("{line_no}: {message}");
@@ -282,6 +352,7 @@ fn parse(text: &str) -> Result<Config, String> {
             continue;
         }
         if let Some(header) = line.strip_prefix('[') {
+            seen.clear();
             let header = header
                 .strip_suffix(']')
                 .ok_or_else(|| err("expected ] at the end of the table header".into()))?
@@ -304,6 +375,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 name: name.to_owned(),
                 ..Profile::default()
             });
+            header_lines.push(line_no);
             current = Some(config.profiles.len() - 1);
             continue;
         }
@@ -311,6 +383,10 @@ fn parse(text: &str) -> Result<Config, String> {
             .split_once('=')
             .ok_or_else(|| err("expected key = value".into()))?;
         let key = key.trim();
+        if seen.iter().any(|k| k == key) {
+            return Err(err(format!("{key} is set twice")));
+        }
+        seen.push(key.to_owned());
         let value = Value::parse(value.trim()).map_err(err)?;
         let Some(index) = current else {
             match key {
@@ -328,14 +404,17 @@ fn parse(text: &str) -> Result<Config, String> {
             "server" => p.server = Some(value.string(key).map_err(err)?),
             "database" => p.database = Some(value.string(key).map_err(err)?),
             "user" => p.user = Some(value.string(key).map_err(err)?),
-            "auth" => match value.string(key).map_err(err)?.as_str() {
-                "sql" | "windows" => {} // implied by `user`; kept for readability
-                other => {
-                    return Err(err(format!(
-                        "auth {other:?}: expected \"sql\" or \"windows\""
-                    )));
-                }
-            },
+            "auth" => {
+                p.auth = Some(match value.string(key).map_err(err)?.as_str() {
+                    "sql" => AuthKind::Sql,
+                    "windows" => AuthKind::Windows,
+                    other => {
+                        return Err(err(format!(
+                            "auth {other:?}: expected \"sql\" or \"windows\""
+                        )));
+                    }
+                })
+            }
             "encrypt" => {
                 p.encrypt = Some(match value.string(key).map_err(err)?.as_str() {
                     "optional" => Encrypt::Optional,
@@ -366,6 +445,23 @@ fn parse(text: &str) -> Result<Config, String> {
             _ => return Err(err(format!("unknown key {key} in [profiles.{}]", p.name))),
         }
     }
+    for (p, line) in config.profiles.iter().zip(&header_lines) {
+        match (p.auth, &p.user) {
+            (Some(AuthKind::Windows), Some(_)) => {
+                return Err(format!(
+                    "{line}: [profiles.{}] has auth = \"windows\" but also a user; remove one",
+                    p.name
+                ));
+            }
+            (Some(AuthKind::Sql), None) => {
+                return Err(format!(
+                    "{line}: [profiles.{}] has auth = \"sql\" but no user",
+                    p.name
+                ));
+            }
+            _ => {}
+        }
+    }
     if let Some(default) = &config.default
         && config.find(default).is_none()
     {
@@ -391,10 +487,7 @@ fn render(config: &Config) -> String {
         };
         string("server", &p.server);
         string("database", &p.database);
-        string(
-            "auth",
-            &Some(if p.user.is_some() { "sql" } else { "windows" }.to_owned()),
-        );
+        string("auth", &Some(p.auth_kind().as_str().to_owned()));
         string("user", &p.user);
         string(
             "encrypt",
@@ -532,6 +625,7 @@ mod tests {
                     name: "dev".into(),
                     server: Some(r"srv\inst".into()),
                     database: Some("App \"Db\"".into()),
+                    auth: Some(AuthKind::Sql),
                     user: Some("reader".into()),
                     encrypt: Some(Encrypt::Strict),
                     trust_server_certificate: Some(true),
@@ -544,6 +638,7 @@ mod tests {
                 Profile {
                     name: "local".into(),
                     server: Some(".".into()),
+                    auth: Some(AuthKind::Windows),
                     ..Profile::default()
                 },
             ],
@@ -584,5 +679,137 @@ mod tests {
                 .unwrap_err()
                 .contains("defined twice")
         );
+    }
+
+    #[test]
+    fn duplicate_and_contradictory_keys_are_errors() {
+        assert_eq!(
+            parse("[profiles.a]\nserver = \"one\"\nserver = \"two\"").unwrap_err(),
+            "3: server is set twice"
+        );
+        assert_eq!(
+            parse("default = \"a\"\ndefault = \"a\"\n[profiles.a]").unwrap_err(),
+            "2: default is set twice"
+        );
+        // The same key in different tables is fine.
+        assert!(parse("[profiles.a]\nserver = \"x\"\n[profiles.b]\nserver = \"y\"").is_ok());
+        assert!(
+            parse("[profiles.a]\nauth = \"windows\"\nuser = \"bob\"")
+                .unwrap_err()
+                .contains("auth = \"windows\" but also a user")
+        );
+        assert!(
+            parse("[profiles.a]\nauth = \"sql\"")
+                .unwrap_err()
+                .contains("auth = \"sql\" but no user")
+        );
+    }
+
+    // F09: resolution precedence, with the machine's environment and stores injected.
+    mod precedence {
+        use super::*;
+        use crate::cli::Opts;
+
+        fn resolve_in(opts: &Opts, file: &str, env: &[(&str, &str)]) -> Result<Settings, Failure> {
+            let config = parse(file).unwrap();
+            let var = |name: &str| {
+                env.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            };
+            let load = || {
+                Ok(Config {
+                    default: config.default.clone(),
+                    profiles: config.profiles.clone(),
+                })
+            };
+            let password = |profile: &str| Ok((profile == "sqlp").then(|| "stored".to_owned()));
+            resolve_with(
+                opts,
+                &Sources {
+                    var: &var,
+                    load: &load,
+                    password: &password,
+                },
+            )
+        }
+
+        fn login(settings: &Settings) -> Option<String> {
+            match &settings.connect.auth {
+                Auth::Integrated => None,
+                Auth::Sql { user, .. } => Some(user.clone()),
+            }
+        }
+
+        const FILE: &str = "[profiles.win]\nserver = \"srv\"\nauth = \"windows\"\n\
+                            [profiles.legacy]\nserver = \"srv\"\n\
+                            [profiles.sqlp]\nserver = \"srv\"\nauth = \"sql\"\nuser = \"tom\"\ntrust_server_certificate = true\n";
+
+        fn with_profile(name: &str) -> Opts {
+            Opts {
+                profile: Some(name.into()),
+                ..Opts::default()
+            }
+        }
+
+        #[test]
+        fn a_windows_profile_ignores_sqlcmduser() {
+            let env = [
+                ("SQLCMDUSER", "environment_login"),
+                ("SQLCMDPASSWORD", "pw"),
+            ];
+            for name in ["win", "legacy"] {
+                let settings = resolve_in(&with_profile(name), FILE, &env).unwrap();
+                assert_eq!(login(&settings), None, "profile {name}");
+            }
+        }
+
+        #[test]
+        fn flags_beat_the_profile_and_the_profile_beats_the_environment() {
+            let env = [
+                ("SQLCMDUSER", "environment_login"),
+                ("SQLCMDPASSWORD", "pw"),
+            ];
+            let settings = resolve_in(&with_profile("sqlp"), FILE, &env).unwrap();
+            assert_eq!(login(&settings).as_deref(), Some("tom"));
+            let opts = Opts {
+                user: Some("flag_login".into()),
+                ..with_profile("win")
+            };
+            assert_eq!(
+                login(&resolve_in(&opts, FILE, &env).unwrap()).as_deref(),
+                Some("flag_login")
+            );
+            let opts = Opts {
+                integrated: true,
+                ..with_profile("sqlp")
+            };
+            assert_eq!(login(&resolve_in(&opts, FILE, &env).unwrap()), None);
+            // No profile at all: the environment decides.
+            let opts = Opts {
+                server: Some("srv".into()),
+                ..Opts::default()
+            };
+            assert_eq!(
+                login(&resolve_in(&opts, FILE, &env).unwrap()).as_deref(),
+                Some("environment_login")
+            );
+        }
+
+        #[test]
+        fn a_saved_trust_can_be_turned_off() {
+            let settings = resolve_in(&with_profile("sqlp"), FILE, &[]).unwrap();
+            assert!(settings.connect.trust_server_certificate);
+            let opts = Opts {
+                trust_server_certificate: Some(false),
+                ..with_profile("sqlp")
+            };
+            assert!(
+                !resolve_in(&opts, FILE, &[])
+                    .unwrap()
+                    .connect
+                    .trust_server_certificate
+            );
+        }
     }
 }

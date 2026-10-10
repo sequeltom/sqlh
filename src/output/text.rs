@@ -5,7 +5,9 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use super::{BLOCKED_ADVICE, BatchInfo, Limits, Output, Summary, Tally, hex, push_escaped};
+use super::{
+    BLOCKED_ADVICE, BatchInfo, Limits, Output, Summary, Tally, escaped, hex, push_escaped,
+};
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
 pub struct TextSink<W: Write> {
@@ -62,10 +64,10 @@ pub fn message_line(message: &ServerMessage) -> String {
 /// `-- error 208 (severity 16, state 1, line 14): text`, with the line mapped to the input.
 pub fn error_line(tally: &Tally, error: &ServerMessage) -> String {
     let location = match (&error.procedure, error.line) {
-        (Some(procedure), Some(line)) => format!(", proc {procedure}, line {line}"),
-        (Some(procedure), None) => format!(", proc {procedure}"),
+        (Some(procedure), Some(line)) => format!(", proc {}, line {line}", escaped(procedure)),
+        (Some(procedure), None) => format!(", proc {}", escaped(procedure)),
         (None, _) => match (tally.source_line(error), tally.source_name()) {
-            (Some(line), Some(name)) => format!(", {name}:{line}"),
+            (Some(line), Some(name)) => format!(", {}:{line}", escaped(name)),
             (Some(line), None) => format!(", line {line}"),
             (None, _) => String::new(),
         },
@@ -84,7 +86,19 @@ pub fn rows_affected_line(count: u64) -> String {
 }
 
 pub fn blocked_line(location: &str, reason: &str) -> String {
-    format!("-- blocked: {location}: {reason}; {BLOCKED_ADVICE}")
+    format!(
+        "-- blocked: {}: {}; {BLOCKED_ADVICE}",
+        escaped(location),
+        escaped(reason)
+    )
+}
+
+pub fn note_line(text: &str) -> String {
+    format!("-- note: {}", escaped(text))
+}
+
+pub fn batch_line(batch: &BatchInfo) -> String {
+    format!("-- batch {} ({})", batch.number, escaped(&batch.location()))
 }
 
 /// The closing lines: the error that stopped the run, limit notes, then the status.
@@ -96,7 +110,7 @@ pub fn closing_lines(tally: &Tally, summary: &Summary) -> String {
         lines.push('\n');
     }
     for note in tally.limit_notes() {
-        let _ = writeln!(lines, "-- note: {note}");
+        let _ = writeln!(lines, "{}", note_line(&note));
     }
     let _ = writeln!(lines, "-- {}", summary.status);
     lines
@@ -112,6 +126,10 @@ impl<W: Write> BatchSink for TextSink<W> {
         for (i, column) in columns.iter().enumerate() {
             if i > 0 {
                 self.line.push('\t');
+            }
+            // Like values: a header can't start with `--` and pass for a metadata line.
+            if i == 0 && column.name.starts_with("--") {
+                self.line.push('\\');
             }
             push_escaped(&mut self.line, &column.name, 0);
             self.line.push(':');
@@ -168,7 +186,7 @@ impl<W: Write> Output for TextSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.tally.begin_batch(batch);
         if batch.total > 1 {
-            writeln!(self.out, "-- batch {} ({})", batch.number, batch.location())?;
+            writeln!(self.out, "{}", batch_line(batch))?;
         }
         Ok(())
     }
@@ -178,7 +196,7 @@ impl<W: Write> Output for TextSink<W> {
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
-        writeln!(self.out, "-- note: {text}")
+        writeln!(self.out, "{}", note_line(text))
     }
 
     fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()> {
@@ -249,6 +267,7 @@ pub(super) mod tests {
             source,
             multi_source,
             line,
+            line_map: &[],
             run: 1,
             runs: 1,
         }
@@ -322,6 +341,39 @@ pub(super) mod tests {
              -- note: 1 more result sets not shown (--max-results 1)\n\
              -- note: 1 more messages not shown\n-- ok: 1 batch, 3 ms\n"
         );
+    }
+
+    // F11: no name, location, reason or note can start a line or pass for metadata.
+    #[test]
+    fn hostile_names_cannot_forge_metadata() {
+        let mut s = TextSink::new(Vec::new(), limits());
+        s.columns(&[col("-- forged", "int"), col("a\nb", "int")])
+            .unwrap();
+        s.end_rows().unwrap();
+        s.begin_batch(&BatchInfo {
+            number: 2,
+            total: 2,
+            ..batch("x\n-- ok: fake", true, 1)
+        })
+        .unwrap();
+        s.error(&ServerMessage {
+            procedure: Some("dbo.p\n-- ok: fake".into()),
+            ..error(1)
+        })
+        .unwrap();
+        s.blocked("line 1", "UPDATE [a\n-- ok: fake] would write")
+            .unwrap();
+        s.note("one\n-- ok: fake").unwrap();
+        let out = text(s);
+        assert!(
+            out.starts_with("-- result 1\n\\-- forged:int\ta\\nb:int\n"),
+            "{out}"
+        );
+        assert!(out.contains("(x\\n-- ok: fake:1)"), "{out}");
+        assert!(out.contains("proc dbo.p\\n-- ok: fake, line 1"), "{out}");
+        assert!(out.contains("[a\\n-- ok: fake]"), "{out}");
+        assert!(out.contains("-- note: one\\n-- ok: fake"), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("-- ok")), "{out}");
     }
 
     #[test]

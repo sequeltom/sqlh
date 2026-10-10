@@ -8,7 +8,7 @@ pub fn target(profile: &str) -> String {
 }
 
 #[cfg(windows)]
-pub use imp::{delete, read, write};
+pub use imp::{delete, exists, read, write};
 
 #[cfg(windows)]
 mod imp {
@@ -92,6 +92,25 @@ mod imp {
         })
     }
 
+    /// Whether the profile has a stored password, without copying the password anywhere.
+    pub fn exists(profile: &str) -> io::Result<bool> {
+        let target = wide(&super::target(profile));
+        let mut credential: *mut CREDENTIALW = null_mut();
+        // SAFETY: `target` is NUL-terminated; on success `credential` points to a buffer
+        // owned by the system, released at once below without reading the blob.
+        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(code) if code == ERROR_NOT_FOUND as i32 => Ok(false),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: CredReadW succeeded, so `credential` is a valid buffer that must be freed.
+        unsafe { CredFree(credential as *const _) };
+        Ok(true)
+    }
+
     /// Removes the profile's credential. Returns false when there was none.
     pub fn delete(profile: &str) -> io::Result<bool> {
         let target = wide(&super::target(profile));
@@ -132,6 +151,11 @@ pub fn read(_profile: &str) -> io::Result<Option<String>> {
 }
 
 #[cfg(not(windows))]
+pub fn exists(_profile: &str) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
 pub fn delete(_profile: &str) -> io::Result<bool> {
     Ok(false)
 }
@@ -145,8 +169,10 @@ mod tests {
     fn credman_round_trip() {
         let name = "__sqlh_selftest";
         super::write(name, "someone", "pässwörd").unwrap();
+        assert!(super::exists(name).unwrap());
         assert_eq!(super::read(name).unwrap().as_deref(), Some("pässwörd"));
         assert!(super::delete(name).unwrap());
+        assert!(!super::exists(name).unwrap());
         assert_eq!(super::read(name).unwrap(), None);
         assert!(!super::delete(name).unwrap());
     }

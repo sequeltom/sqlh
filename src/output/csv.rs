@@ -5,8 +5,11 @@
 
 use std::io::{self, Write};
 
-use super::text::{blocked_line, closing_lines, error_line, message_line, rows_affected_line};
-use super::{BatchInfo, Limits, Output, Summary, Tally, cut, cut_marker, hex};
+use super::text::{
+    batch_line, blocked_line, closing_lines, error_line, message_line, note_line,
+    rows_affected_line,
+};
+use super::{BatchInfo, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex};
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
 pub struct CsvSink<W: Write> {
@@ -71,7 +74,7 @@ impl<W: Write> BatchSink for CsvSink<W> {
                 types.push_str(", ");
             }
             push_field(&mut self.line, &column.name);
-            types.push_str(&column.name);
+            types.push_str(&escaped(&column.name));
             types.push(':');
             types.push_str(&column.type_name);
         }
@@ -156,7 +159,7 @@ impl<W: Write> Output for CsvSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.tally.begin_batch(batch);
         if batch.total > 1 {
-            let marker = format!("-- batch {} ({})", batch.number, batch.location());
+            let marker = batch_line(batch);
             self.meta_line(&marker)?;
         }
         Ok(())
@@ -167,7 +170,7 @@ impl<W: Write> Output for CsvSink<W> {
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
-        self.meta_line(&format!("-- note: {text}"))
+        self.meta_line(&note_line(text))
     }
 
     fn blocked(&mut self, location: &str, reason: &str) -> io::Result<()> {

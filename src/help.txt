@@ -31,7 +31,8 @@ EXECUTION
   -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
   -t seconds      query timeout per batch (default 60; 0 = none)
   --allow-write   permit writes. Without it, writes other than to #temp/@table are refused
-                  before anything runs, and all batches run in a transaction that is rolled back
+                  before anything runs, and all batches run in a transaction that is rolled back.
+                  This guards against accidents; it is not security. Use a read-only login.
   --check         compile only (SET NOEXEC ON), executes nothing: catches syntax errors and
                   unknown columns; missing tables only show up when the query really runs
   --continue-on-error   run later batches after one fails (default: stop)
@@ -42,7 +43,7 @@ OUTPUT
   --max-rows N    rows shown per result set (default 100; 0 = all). The rest are counted
   --max-cell N    characters shown per value (default 500; 0 = all)
   --max-results N result sets shown (default 20)
-  -o file         write output to a file
+  -o file         write output to a file (replaced whole when the run ends; never an input)
   --verbose       connection diagnostics on stderr
 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
@@ -58,3 +59,4 @@ FORMAT
 
 EXIT CODES
   0 ok  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled
+  7 output not delivered (reader closed stdout, or -o failed)  10 internal error

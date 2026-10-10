@@ -4,14 +4,17 @@ mod console;
 mod credman;
 mod db;
 mod error;
+mod files;
 mod guard;
 mod output;
 mod profile;
 mod script;
 
-use std::fs::File;
-use std::io::{self, IsTerminal, Read};
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cli::{Command, Opts};
@@ -31,6 +34,10 @@ const SESSION_SETUP: &str = "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WA
 
 type Out = Box<dyn Output>;
 
+/// Whether stdout carries the text format, so the panic hook may append a status line.
+/// JSON and CSV can't be completed by a stray line, so they only get the stderr message.
+static TEXT_ON_STDOUT: AtomicBool = AtomicBool::new(true);
+
 #[derive(Default)]
 struct Stats {
     batches_run: usize,
@@ -40,6 +47,7 @@ struct Stats {
 
 fn main() -> ExitCode {
     let started = Instant::now();
+    install_panic_hook();
     console::use_utf8();
     let exit = match cli::parse() {
         Ok(Command::Run(opts)) => run_command(*opts, started),
@@ -57,8 +65,40 @@ fn main() -> ExitCode {
     exit.into()
 }
 
+/// A panic is a bug, but it must still end with the documented exit code 10, and with a
+/// status line in text output, rather than an abort (0xC0000409) and no summary.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = info.payload_as_str().unwrap_or("unknown panic");
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!("sqlh: internal error: {message}{location}");
+        if TEXT_ON_STDOUT.load(Ordering::Relaxed) {
+            let mut line = String::new();
+            output::push_escaped(&mut line, message, 0);
+            let mut stdout = io::stdout();
+            let _ = write!(
+                stdout,
+                "\n-- error: internal error: {line}\n-- failed (exit 10): internal error\n"
+            );
+            let _ = stdout.flush();
+        }
+        std::process::exit(Exit::Internal as i32);
+    }));
+}
+
 fn run_command(opts: Opts, started: Instant) -> Exit {
     let format = opts.format.unwrap_or(Format::Text);
+    TEXT_ON_STDOUT.store(
+        format == Format::Text && opts.output.is_none(),
+        Ordering::Relaxed,
+    );
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SQLH_DEBUG_PANIC").is_some() {
+        panic!("forced by SQLH_DEBUG_PANIC");
+    }
     if opts.write_policy.is_some() || opts.new_password {
         return fail(
             Failure::usage("--write-policy and --new-password only apply to sqlh profile add"),
@@ -70,27 +110,30 @@ fn run_command(opts: Opts, started: Instant) -> Exit {
         Ok(settings) => settings,
         Err(failure) => return fail(failure, format, started),
     };
-    let mut out = match &opts.output {
-        Some(path) => match File::create(path) {
-            Ok(file) => output::create(format, Box::new(file), settings.limits),
-            Err(e) => {
-                return fail(
-                    Failure::usage(format!("-o {}: {e}", path.display())),
-                    format,
-                    started,
-                );
-            }
-        },
-        None => stdout_output(format, settings.limits),
+    // Everything that can fail before the run happens before `-o` is opened, so bad input
+    // never truncates or replaces an existing output file.
+    let prepared = match prepare(&opts, &settings) {
+        Ok(prepared) => prepared,
+        Err(failure) => return fail(failure, format, started),
     };
-    if !opts.ignored.is_empty() {
-        let _ = out.note(&format!(
+    let (destination, writer) = match Destination::open(opts.output.as_deref(), &prepared.sources) {
+        Ok(opened) => opened,
+        Err(failure) => return fail(failure, format, started),
+    };
+    let mut out = output::create(format, writer, settings.limits);
+    let result = if opts.ignored.is_empty() {
+        Ok(())
+    } else {
+        out.note(&format!(
             "ignored sqlcmd flags {} (sqlh output is always compact)",
             opts.ignored.join(" ")
-        ));
-    }
-    let result = run(&opts, &settings, &mut out);
-    finish(&mut out, result, started)
+        ))
+        .map_err(output_failure)
+    };
+    let result = result.and_then(|()| execute(&opts, &settings, &prepared, &mut out));
+    let exit = finish(&mut out, result, started);
+    drop(out);
+    destination.commit(exit)
 }
 
 fn stdout_output(format: Format, limits: Limits) -> Out {
@@ -111,18 +154,18 @@ fn fail(failure: Failure, format: Format, started: Instant) -> Exit {
     )
 }
 
-/// Ends the output with `ok: <detail>, N ms` and returns success.
+/// Ends the output with `ok: <detail>, N ms` and returns success, or exit 7 if the output
+/// couldn't be delivered.
 fn finish_ok(out: &mut Out, detail: &str, started: Instant) -> Exit {
     let elapsed_ms = started.elapsed().as_millis();
     let status = format!("ok: {detail}, {elapsed_ms} ms");
-    let _ = out.finish(&Summary {
+    let summary = Summary {
         exit: 0,
         status: &status,
         error: None,
         elapsed_ms,
-    });
-    let _ = out.flush();
-    Exit::Ok
+    };
+    deliver(out, &summary, Exit::Ok)
 }
 
 /// Ends the output with the run's status and returns the exit code.
@@ -161,33 +204,138 @@ fn finish(out: &mut Out, result: Result<Stats, Failure>, started: Instant) -> Ex
             )
         }
     };
-    let _ = out.finish(&Summary {
+    let summary = Summary {
         exit: exit as u8,
         status: &status,
         error: error.as_deref(),
         elapsed_ms: ms,
-    });
-    let _ = out.flush();
-    exit
+    };
+    deliver(out, &summary, exit)
 }
 
-fn run(opts: &Opts, settings: &Settings, out: &mut Out) -> Result<Stats, Failure> {
+/// Writes the closing lines and flushes. If that fails, the reader didn't get the complete
+/// output, so the exit code becomes 7 and stderr says what the run itself ended with.
+fn deliver(out: &mut Out, summary: &Summary, exit: Exit) -> Exit {
+    match out.finish(summary).and_then(|()| out.flush()) {
+        Ok(()) => exit,
+        Err(e) => {
+            eprintln!(
+                "sqlh: output could not be delivered ({e}); the run itself ended with exit {}: {}",
+                exit as u8, summary.status
+            );
+            Exit::Undelivered
+        }
+    }
+}
+
+/// Where the output goes. `-o` writes to `<path>.partial`, which is renamed over the
+/// destination when the run ends: the destination is replaced whole, or not at all.
+enum Destination {
+    Stdout,
+    File { partial: PathBuf, target: PathBuf },
+}
+
+impl Destination {
+    fn open(target: Option<&Path>, sources: &[Source]) -> Result<(Self, Box<dyn Write>), Failure> {
+        let Some(target) = target else {
+            return Ok((Destination::Stdout, Box::new(io::stdout().lock())));
+        };
+        let shown = target.display();
+        if target.is_dir() {
+            return Err(Failure::usage(format!("-o {shown}: is a directory")));
+        }
+        let partial = partial_path(target);
+        let clash = sources.iter().find(|s| {
+            s.path
+                .as_deref()
+                .is_some_and(|p| files::same_file(p, target) || files::same_file(p, &partial))
+        });
+        if let Some(source) = clash {
+            return Err(Failure::usage(format!(
+                "-o {shown} would overwrite the input file {}; write the output somewhere else",
+                source.name
+            )));
+        }
+        let file =
+            File::create(&partial).map_err(|e| Failure::usage(format!("-o {shown}: {e}")))?;
+        let target = target.to_path_buf();
+        Ok((Destination::File { partial, target }, Box::new(file)))
+    }
+
+    /// Moves `-o` output into place once it's complete. Undelivered output leaves the
+    /// destination as it was.
+    fn commit(self, exit: Exit) -> Exit {
+        let Destination::File { partial, target } = self else {
+            return exit;
+        };
+        if exit == Exit::Undelivered {
+            let _ = fs::remove_file(&partial);
+            return exit;
+        }
+        match fs::rename(&partial, &target) {
+            Ok(()) => exit,
+            Err(e) => {
+                let _ = fs::remove_file(&partial);
+                eprintln!(
+                    "sqlh: output could not be delivered: moving it into {}: {e}; the run itself ended with exit {}",
+                    target.display(),
+                    exit as u8
+                );
+                Exit::Undelivered
+            }
+        }
+    }
+}
+
+fn partial_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+/// Input, batches and the guard's verdict: everything decided before any output is written.
+struct Prepared {
+    sources: Vec<Source>,
+    batches: Vec<Batch>,
+    /// Location and reason, when the guard refused the input.
+    blocked: Option<(String, String)>,
+}
+
+fn prepare(opts: &Opts, settings: &Settings) -> Result<Prepared, Failure> {
     let sources = load_sources(opts)?;
     let vars = (!opts.no_substitution).then_some(opts.vars.as_slice());
     let terminator = opts.terminator.as_deref().unwrap_or("GO");
     let batches = script::prepare(&sources, terminator, vars).map_err(Failure::usage)?;
-    if batches.is_empty() {
-        let _ = out.note("no SQL to run");
-        return Ok(Stats::default());
+    let policy = guard::Policy {
+        writes: settings.allow_write,
+        compile_only: opts.check,
+    };
+    let blocked = batches.iter().find_map(|batch| {
+        guard::check(&batch.sql, policy).err().map(|blocked| {
+            let line = batch.source_line(blocked.line);
+            (location(&sources, batch.source, line), blocked.reason)
+        })
+    });
+    Ok(Prepared {
+        sources,
+        batches,
+        blocked,
+    })
+}
+
+fn execute(
+    opts: &Opts,
+    settings: &Settings,
+    prepared: &Prepared,
+    out: &mut Out,
+) -> Result<Stats, Failure> {
+    if let Some((location, reason)) = &prepared.blocked {
+        out.blocked(location, reason).map_err(output_failure)?;
+        return Err(Failure::new(Exit::Blocked, ""));
     }
-    if !settings.allow_write {
-        for batch in &batches {
-            if let Err(blocked) = guard::check(&batch.sql) {
-                let location = location(&sources, batch.source, batch.line + blocked.line - 1);
-                let _ = out.blocked(&location, &blocked.reason);
-                return Err(Failure::new(Exit::Blocked, ""));
-            }
-        }
+    if prepared.batches.is_empty() {
+        out.note("no SQL to run").map_err(output_failure)?;
+        return Ok(Stats::default());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -198,7 +346,13 @@ fn run(opts: &Opts, settings: &Settings, out: &mut Out) -> Result<Stats, Failure
                 format!("cannot start the async runtime: {e}"),
             )
         })?;
-    runtime.block_on(run_cancellable(opts, settings, &sources, &batches, out))
+    runtime.block_on(run_cancellable(
+        opts,
+        settings,
+        &prepared.sources,
+        &prepared.batches,
+        out,
+    ))
 }
 
 fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
@@ -208,20 +362,21 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
     if let Some(query) = &opts.query {
         return Ok(vec![Source {
             name: "-Q".into(),
+            path: None,
             text: query.clone(),
         }]);
     }
     let mut sources = Vec::new();
     for input in &opts.inputs {
-        let (name, bytes) = if input == "-" {
-            ("stdin".to_owned(), read_stdin()?)
+        let (name, path, bytes) = if input == "-" {
+            ("stdin".to_owned(), None, read_stdin()?)
         } else {
             let bytes =
                 std::fs::read(input).map_err(|e| Failure::usage(format!("-i {input}: {e}")))?;
-            (input.clone(), bytes)
+            (input.clone(), Some(PathBuf::from(input)), bytes)
         };
         let text = script::decode(bytes, &name).map_err(Failure::usage)?;
-        sources.push(Source { name, text });
+        sources.push(Source { name, path, text });
     }
     if sources.is_empty() {
         if io::stdin().is_terminal() {
@@ -232,6 +387,7 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
         let text = script::decode(read_stdin()?, "stdin").map_err(Failure::usage)?;
         sources.push(Source {
             name: "stdin".into(),
+            path: None,
             text,
         });
     }
@@ -304,22 +460,17 @@ async fn run_session(
             eprintln!("sqlh: {line}");
         }
     }
-    let read_only = !settings.allow_write;
+    // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
+    // `--check` always gets it too, as a second line of defense behind NOEXEC.
+    let wrap = !settings.allow_write || opts.check;
     let mut setup = String::from(SESSION_SETUP);
-    if read_only {
-        // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
+    if wrap {
         setup.push_str(" BEGIN TRANSACTION;");
     }
     session
         .exec_internal(&setup, timeout)
         .await
         .map_err(db_failure)?;
-    if opts.check {
-        session
-            .exec_internal("SET NOEXEC ON;", timeout)
-            .await
-            .map_err(db_failure)?;
-    }
 
     let mut stats = Stats::default();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
@@ -327,11 +478,19 @@ async fn run_session(
     'batches: for batch in batches {
         for run in 1..=batch.repeat {
             number += 1;
-            if read_only && !session.in_transaction() {
+            if wrap && !session.in_transaction() {
                 return Err(Failure::new(
                     Exit::SqlError,
                     "read-only guard: an error rolled back the wrapper transaction; stopping so nothing runs outside it",
                 ));
+            }
+            if opts.check {
+                // Re-armed before every batch. The guard already refuses input that mentions
+                // NOEXEC; this keeps compile-only mode in force regardless.
+                session
+                    .exec_internal("SET NOEXEC ON;", timeout)
+                    .await
+                    .map_err(db_failure)?;
             }
             out.begin_batch(&BatchInfo {
                 number,
@@ -339,6 +498,7 @@ async fn run_session(
                 source: &sources[batch.source].name,
                 multi_source: sources.len() > 1,
                 line: batch.line,
+                line_map: &batch.line_map,
                 run,
                 runs: batch.repeat,
             })
@@ -370,13 +530,13 @@ async fn run_session(
 
     if opts.check {
         out.note(
-            "--check compiled the SQL without running it. Missing tables are only reported when \
-             a query runs (SQL Server defers their name resolution)",
+            "--check compiled each batch without running it. Missing tables are only reported \
+             when a query runs (SQL Server defers their name resolution)",
         )
         .map_err(output_failure)?;
         let _ = session.exec_internal("SET NOEXEC OFF;", timeout).await;
     }
-    if read_only && session.in_transaction() {
+    if wrap && session.in_transaction() {
         let _ = session
             .exec_internal("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", timeout)
             .await;
@@ -399,6 +559,82 @@ fn db_failure(error: DbError) -> Failure {
     }
 }
 
+/// Writing output failed mid-run: the reader went away, or the `-o` file couldn't be written.
 fn output_failure(error: io::Error) -> Failure {
-    Failure::new(Exit::Internal, format!("writing output failed: {error}"))
+    Failure::new(Exit::Undelivered, format!("writing output failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that fails after accepting `ok` bytes, or only at flush.
+    struct Failing {
+        ok: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for Failing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.ok == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "reader went away",
+                ));
+            }
+            let n = buf.len().min(self.ok);
+            self.ok -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("disk full"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn out(ok: usize, fail_flush: bool) -> Out {
+        output::create(
+            Format::Text,
+            Box::new(Failing { ok, fail_flush }),
+            Limits::default(),
+        )
+    }
+
+    // F02: a failed final write or flush is exit 7, never success.
+    #[test]
+    fn undelivered_output_is_exit_7() {
+        let started = Instant::now();
+        assert_eq!(
+            finish(&mut out(0, false), Ok(Stats::default()), started),
+            Exit::Undelivered
+        );
+        assert_eq!(
+            finish(&mut out(10, false), Ok(Stats::default()), started),
+            Exit::Undelivered
+        );
+        assert_eq!(
+            finish(&mut out(usize::MAX, true), Ok(Stats::default()), started),
+            Exit::Undelivered
+        );
+        let sql_error = Err(Failure::new(Exit::Connect, "cannot connect"));
+        assert_eq!(
+            finish(&mut out(0, false), sql_error, started),
+            Exit::Undelivered
+        );
+        assert_eq!(
+            finish(&mut out(usize::MAX, false), Ok(Stats::default()), started),
+            Exit::Ok
+        );
+    }
+
+    #[test]
+    fn partial_path_appends_a_suffix() {
+        assert_eq!(
+            partial_path(Path::new(r"C:\out\r.txt")),
+            PathBuf::from(r"C:\out\r.txt.partial")
+        );
+    }
 }

@@ -12,6 +12,10 @@ pub enum Exit {
     Timeout = 4,
     Blocked = 5,
     Cancelled = 6,
+    /// The complete output, status line included, didn't reach its destination: the reader
+    /// closed stdout early, or a write, flush or the final rename of `-o` failed. The SQL
+    /// work may have run. Takes precedence over the run's own exit code (DESIGN.md §6).
+    Undelivered = 7,
     Internal = 10,
 }
 
@@ -26,6 +30,7 @@ impl Exit {
             Exit::Timeout => "timeout",
             Exit::Blocked => "blocked by the read-only guard",
             Exit::Cancelled => "cancelled",
+            Exit::Undelivered => "output could not be delivered",
             Exit::Internal => "internal error",
         }
     }

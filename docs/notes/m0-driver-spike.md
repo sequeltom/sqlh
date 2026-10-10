@@ -1,6 +1,6 @@
 # M0 driver spike: mssql-tds 0.2.0
 
-Status: **go** (2026-10-09). The build, size, import and live-server checks pass against SQL Server 2025. Older servers, Azure and Server 2016 are still unverified.
+Status: **go** (2026-10-09). The build, size, import and live-server checks pass against SQL Server 2025. This is a historical record; what remains to verify for the first release is tracked in [PLAN.md §7](../PLAN.md).
 
 ## Confirmed
 
@@ -49,7 +49,4 @@ Status: **go** (2026-10-09). The build, size, import and live-server checks pass
 
 ## Still to verify
 
-- [ ] Windows auth (SSPI) against a domain server
-- [ ] Ctrl+C cancellation (an attention sent mid-query) in an interactive terminal
-- [ ] the exe on a clean Windows Server 2016 box
-- [ ] SQL Server 2012/2014 (TDS 7.4) and Azure SQL DB (gateway redirect), if available
+Superseded by the first-release checklist in [PLAN.md §7](../PLAN.md). The first release runs on Windows 11 workstations against a remote SQL Server 2025 (VISION.md), so the Server 2016, SQL Server 2012/2014 and Azure checks once listed here are now compatibility assessments, not release gates. Windows auth (SSPI) and Ctrl+C mid-query still need verifying.

@@ -38,7 +38,8 @@ pub struct Opts {
     pub login_timeout: Option<u32>,
     pub query_timeout: Option<u32>,
     pub terminator: Option<String>,
-    pub trust_server_certificate: bool,
+    /// `-C` or `--trust-server-certificate[=true|false]`; unset defers to the profile.
+    pub trust_server_certificate: Option<bool>,
     pub encrypt: Option<Encrypt>,
     pub read_only_intent: bool,
     pub multi_subnet_failover: bool,
@@ -163,7 +164,21 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Short('t') | Long("query-timeout") => o.query_timeout = Some(number(p.value(), "-t")?),
             Short('b') => {} // stopping at the first failed batch is already the default
             Short('c') => o.terminator = Some(string(p.value())?),
-            Short('C') | Long("trust-server-certificate") => o.trust_server_certificate = true,
+            Short('C') => o.trust_server_certificate = Some(true),
+            Long("trust-server-certificate") => {
+                o.trust_server_certificate = Some(match p.optional_value() {
+                    None => true,
+                    Some(v) => match string(Ok(v))?.to_ascii_lowercase().as_str() {
+                        "true" | "yes" => true,
+                        "false" | "no" => false,
+                        other => {
+                            return Err(format!(
+                                "--trust-server-certificate={other}: expected true or false"
+                            ));
+                        }
+                    },
+                })
+            }
             Short('N') => {
                 o.encrypt = Some(match p.optional_value() {
                     None => Encrypt::Mandatory,
@@ -289,7 +304,7 @@ mod tests {
             vec![("a".into(), "1".into()), ("b".into(), "x=y".into())]
         );
         assert_eq!(o.encrypt, Some(Encrypt::Strict));
-        assert!(o.trust_server_certificate);
+        assert_eq!(o.trust_server_certificate, Some(true));
         assert_eq!(o.query_timeout, Some(5));
     }
 

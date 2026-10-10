@@ -2,12 +2,30 @@
 //! stream. It fails closed: any write keyword outside strings, comments and quoted names
 //! blocks the batch unless its target is a temp table (#t) or table variable (@t).
 //! Layer 2, the rolled-back wrapper transaction, lives in main.rs.
+//!
+//! The guard reduces accidents. It is not a security boundary: database permissions are.
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Blocked {
     /// 1-based line within the batch.
     pub line: u32,
     pub reason: String,
+}
+
+/// Which checks apply to a batch.
+#[derive(Clone, Copy, Debug)]
+pub struct Policy {
+    /// `--allow-write` (or a profile allowing writes): skip the write classifier.
+    pub writes: bool,
+    /// `--check`: refuse anything that could switch compile-only mode off.
+    pub compile_only: bool,
+}
+
+impl Policy {
+    /// True when no check applies, so the guard needn't run.
+    pub fn is_open(self) -> bool {
+        self.writes && !self.compile_only
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -168,9 +186,19 @@ const STATEMENT_START: &[&str] = &[
     "WRITETEXT",
 ];
 
-pub fn check(sql: &str) -> Result<(), Blocked> {
+pub fn check(sql: &str, policy: Policy) -> Result<(), Blocked> {
+    if policy.is_open() {
+        return Ok(());
+    }
     let tokens = tokenize(sql);
-    Guard { tokens: &tokens }.check()
+    let guard = Guard { tokens: &tokens };
+    if policy.compile_only {
+        guard.check_compile_only()?;
+    }
+    if !policy.writes {
+        guard.check_writes()?;
+    }
+    Ok(())
 }
 
 struct Guard<'t, 'a> {
@@ -178,7 +206,25 @@ struct Guard<'t, 'a> {
 }
 
 impl Guard<'_, '_> {
-    fn check(&self) -> Result<(), Blocked> {
+    /// Under `--check`, input must not touch NOEXEC: `SET NOEXEC OFF` would let the rest of
+    /// the batch, and every later batch, run for real.
+    fn check_compile_only(&self) -> Result<(), Blocked> {
+        match self
+            .tokens
+            .iter()
+            .find(|t| t.kind == Kind::Word && t.upper == "NOEXEC")
+        {
+            Some(token) => Err(Blocked {
+                line: token.line,
+                reason: "SET NOEXEC can't be used with --check: switching it off would run the \
+                         SQL instead of only compiling it"
+                    .into(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn check_writes(&self) -> Result<(), Blocked> {
         if let Some(first) = self.tokens.first() {
             let is_label = matches!(self.kind(1), Some(Kind::Punct(':')));
             let implicit_call = match first.kind {
@@ -262,6 +308,16 @@ impl Guard<'_, '_> {
                         return Err(self.blocked(i, &format!("DBCC {command}")));
                     }
                 }
+                // Sequence allocation survives a rollback, so the wrapper can't undo it.
+                "NEXT" if self.word(i + 1) == Some("VALUE") && self.word(i + 2) == Some("FOR") => {
+                    return Err(Blocked {
+                        line: token.line,
+                        reason: format!(
+                            "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
+                            self.name_at(i + 3)
+                        ),
+                    });
+                }
                 word if BLOCKED.contains(&word) => {
                     return Err(Blocked {
                         line: token.line,
@@ -312,10 +368,18 @@ impl Guard<'_, '_> {
         self.tokens.len()
     }
 
-    /// The token at `target` must be a temp table or table variable.
+    /// The token at `target` must be a session temp table (`#t`) or a table variable (`@t`).
+    /// Global temp tables (`##t`) are shared with other sessions, so writing to them blocks.
     fn require_scratch(&self, at: usize, target: usize, what: &str) -> Result<(), Blocked> {
-        match self.kind(target) {
-            Some(Kind::Temp | Kind::Var) => Ok(()),
+        match self.tokens.get(target) {
+            Some(t) if t.kind == Kind::Temp && t.text.starts_with("##") => Err(Blocked {
+                line: self.tokens.get(at).map_or(1, |t| t.line),
+                reason: format!(
+                    "{what} {} would write to a global temp table, which other sessions share",
+                    t.text
+                ),
+            }),
+            Some(t) if matches!(t.kind, Kind::Temp | Kind::Var) => Ok(()),
             _ => Err(self.blocked(at, &format!("{what} {}", self.name_at(target)))),
         }
     }
@@ -347,8 +411,9 @@ impl Guard<'_, '_> {
 
     /// Checks the (possibly multi-part) procedure name starting at `start` against the allowlist.
     fn check_proc(&self, start: usize, what: &str) -> Result<(), Blocked> {
-        let last = self
-            .dotted(start)
+        let dotted = self.dotted(start);
+        let end = start + dotted.len();
+        let last = dotted
             .into_iter()
             .last()
             .filter(|t| matches!(t.kind, Kind::Word | Kind::Quoted));
@@ -368,10 +433,81 @@ impl Guard<'_, '_> {
         if !PROCS.contains(&name) {
             return Err(self.blocked(start, &format!("{what} {}", self.name_at(start))));
         }
-        if name == "SP_SPACEUSED" && self.tokens.iter().any(|t| t.upper == "@UPDATEUSAGE") {
-            return Err(self.blocked(start, "sp_spaceused @updateusage"));
+        if !self.local_system_qualifier(start) {
+            return Err(Blocked {
+                line: self.tokens.get(start).map_or(1, |t| t.line),
+                reason: format!(
+                    "{what} {} is not a local system procedure: qualify it with nothing, sys. or \
+                     master. (linked servers and other schemas or databases need --allow-write)",
+                    self.name_at(start)
+                ),
+            });
+        }
+        if name == "SP_SPACEUSED" && self.spaceused_updates_usage(end) {
+            return Err(Blocked {
+                line: self.tokens.get(start).map_or(1, |t| t.line),
+                reason: "sp_spaceused with @updateusage (named, or as the second argument) runs \
+                         DBCC UPDATEUSAGE, which writes"
+                    .into(),
+            });
         }
         Ok(())
+    }
+
+    /// Only these qualifications reach the real system procedure: none, `sys.`, `master.sys.`,
+    /// `master.dbo.` and `master..`. Others can name a user procedure that shares the name, or
+    /// a procedure on a linked server.
+    fn local_system_qualifier(&self, start: usize) -> bool {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut after_dot = true;
+        for t in self.dotted(start) {
+            if t.kind == Kind::Punct('.') {
+                if after_dot {
+                    parts.push("");
+                }
+                after_dot = true;
+            } else {
+                parts.push(t.upper.as_str());
+                after_dot = false;
+            }
+        }
+        parts.pop(); // the procedure name itself
+        matches!(
+            parts.as_slice(),
+            [] | ["SYS"] | ["MASTER", "SYS" | "DBO" | ""]
+        )
+    }
+
+    /// `sp_spaceused`'s second positional parameter is `@updateusage`.
+    fn spaceused_updates_usage(&self, args_start: usize) -> bool {
+        let mut positional = 0;
+        let mut depth = 0usize;
+        let mut arg_start = true;
+        for (i, t) in self.tokens.iter().enumerate().skip(args_start) {
+            match t.kind {
+                Kind::Punct(';') if depth == 0 => break,
+                Kind::Word if depth == 0 && STATEMENT_START.contains(&t.upper.as_str()) => break,
+                Kind::Punct('(') => depth += 1,
+                Kind::Punct(')') => depth = depth.saturating_sub(1),
+                Kind::Punct(',') if depth == 0 => {
+                    arg_start = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if arg_start {
+                arg_start = false;
+                let named =
+                    t.kind == Kind::Var && matches!(self.kind(i + 1), Some(Kind::Punct('=')));
+                if named && t.upper == "@UPDATEUSAGE" {
+                    return true;
+                }
+                if !named {
+                    positional += 1;
+                }
+            }
+        }
+        positional >= 2
     }
 
     /// The tokens of the dotted name starting at `start` (`db..obj` allowed): name parts and dots.
@@ -422,6 +558,8 @@ fn tokenize(sql: &str) -> Vec<Token<'_>> {
         let next = bytes.get(i + 1).copied();
         let start = i;
         let start_line = line;
+        // Whether a string or quoted name found its closing delimiter.
+        let mut closed = true;
         let kind = match c {
             b'\n' => {
                 line += 1;
@@ -461,19 +599,19 @@ fn tokenize(sql: &str) -> Vec<Token<'_>> {
                 continue;
             }
             b'\'' => {
-                i = skip_quoted(bytes, i + 1, b'\'', &mut line);
+                (i, closed) = skip_quoted(bytes, i + 1, b'\'', &mut line);
                 Kind::Str
             }
             b'N' | b'n' if next == Some(b'\'') => {
-                i = skip_quoted(bytes, i + 2, b'\'', &mut line);
+                (i, closed) = skip_quoted(bytes, i + 2, b'\'', &mut line);
                 Kind::Str
             }
             b'[' => {
-                i = skip_quoted(bytes, i + 1, b']', &mut line);
+                (i, closed) = skip_quoted(bytes, i + 1, b']', &mut line);
                 Kind::Quoted
             }
             b'"' => {
-                i = skip_quoted(bytes, i + 1, b'"', &mut line);
+                (i, closed) = skip_quoted(bytes, i + 1, b'"', &mut line);
                 Kind::Quoted
             }
             b'@' | b'#' => {
@@ -505,7 +643,11 @@ fn tokenize(sql: &str) -> Vec<Token<'_>> {
         let text = &sql[start..i];
         let upper = match kind {
             Kind::Word | Kind::Var | Kind::Temp => text.to_ascii_uppercase(),
-            Kind::Quoted => text[1..text.len().saturating_sub(1).max(1)].to_ascii_uppercase(),
+            // Both delimiters are single ASCII bytes, so these slices fall on char
+            // boundaries. An unterminated name runs to the end of the input and has no
+            // closing delimiter to strip; the server reports the syntax error.
+            Kind::Quoted if closed => text[1..text.len() - 1].to_ascii_uppercase(),
+            Kind::Quoted => text[1..].to_ascii_uppercase(),
             _ => String::new(),
         };
         tokens.push(Token {
@@ -518,8 +660,9 @@ fn tokenize(sql: &str) -> Vec<Token<'_>> {
     tokens
 }
 
-/// Returns the index just past the closing quote (doubled quotes are escapes).
-fn skip_quoted(bytes: &[u8], mut i: usize, close: u8, line: &mut u32) -> usize {
+/// Returns the index just past the closing quote (doubled quotes are escapes), and whether
+/// the closing quote was found before the end of the input.
+fn skip_quoted(bytes: &[u8], mut i: usize, close: u8, line: &mut u32) -> (usize, bool) {
     while i < bytes.len() {
         match bytes[i] {
             b if b == close => {
@@ -527,26 +670,31 @@ fn skip_quoted(bytes: &[u8], mut i: usize, close: u8, line: &mut u32) -> usize {
                     i += 2;
                     continue;
                 }
-                return i + 1;
+                return (i + 1, true);
             }
             b'\n' => *line += 1,
             _ => {}
         }
         i += 1;
     }
-    bytes.len()
+    (bytes.len(), false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const READ_ONLY: Policy = Policy {
+        writes: false,
+        compile_only: false,
+    };
+
     fn allowed(sql: &str) {
-        assert_eq!(check(sql), Ok(()), "should be allowed: {sql}");
+        assert_eq!(check(sql, READ_ONLY), Ok(()), "should be allowed: {sql}");
     }
 
     fn blocked(sql: &str) -> Blocked {
-        check(sql).expect_err(&format!("should be blocked: {sql}"))
+        check(sql, READ_ONLY).expect_err(&format!("should be blocked: {sql}"))
     }
 
     #[test]
@@ -662,5 +810,202 @@ mod tests {
     fn blanket_word_mentions_brackets() {
         let b = blocked("SELECT Send FROM t");
         assert!(b.reason.contains("[Send]"), "{}", b.reason);
+    }
+
+    // F03: side effects a rollback can't undo, and procedures that aren't what they seem.
+    #[test]
+    fn sequences_are_blocked() {
+        let b = blocked("SELECT NEXT VALUE FOR dbo.OrderSeq");
+        assert!(
+            b.reason.contains("dbo.OrderSeq") && b.reason.contains("rollback can't undo"),
+            "{}",
+            b.reason
+        );
+        blocked("DECLARE @n bigint = NEXT VALUE FOR s;");
+        allowed("FETCH NEXT FROM c INTO @x");
+    }
+
+    #[test]
+    fn global_temp_tables_are_blocked() {
+        for sql in [
+            "INSERT INTO ##shared VALUES (1)",
+            "UPDATE ##shared SET x = 1",
+            "DELETE FROM ##shared",
+            "SELECT 1 AS x INTO ##shared",
+            "CREATE TABLE ##shared (x int)",
+            "DROP TABLE #mine, ##shared",
+            "TRUNCATE TABLE ##shared",
+        ] {
+            assert!(blocked(sql).reason.contains("global temp table"), "{sql}");
+        }
+        allowed("SELECT * FROM ##shared");
+    }
+
+    #[test]
+    fn only_local_system_procedures() {
+        allowed("EXEC sp_who");
+        allowed("EXEC sys.sp_who");
+        allowed("EXEC master.sys.sp_who");
+        allowed("EXEC master.dbo.sp_who");
+        allowed("EXEC master..sp_who");
+        allowed("EXEC [master].[sys].[sp_who]");
+        for sql in [
+            "EXEC Lnk.master.sys.sp_who",
+            "EXEC sales.sp_who",
+            "EXEC dbo.sp_who",
+            "EXEC otherdb.sys.sp_who",
+            "EXEC otherdb..sp_who",
+            "Lnk.master.sys.sp_who",
+        ] {
+            assert!(
+                blocked(sql).reason.contains("not a local system procedure"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn sp_spaceused_update_usage_is_blocked() {
+        allowed("EXEC sp_spaceused");
+        allowed("EXEC sp_spaceused N'dbo.T'");
+        allowed("EXEC sp_spaceused @objname = N'dbo.T'");
+        allowed("EXEC sp_spaceused N'dbo.T', @oneresultset = 1");
+        allowed("EXEC sp_spaceused N'dbo.T'; SELECT 1, 2");
+        allowed("EXEC sp_spaceused N'dbo.T'\nSELECT 1, 2");
+        for sql in [
+            "EXEC sys.sp_spaceused N'dbo.T', N'true'",
+            "EXEC sp_spaceused @objname = N'dbo.T', @updateusage = 'true'",
+            "EXEC sp_spaceused @updateusage = N'true'",
+            "EXEC sp_spaceused NULL, 'true'",
+        ] {
+            assert!(blocked(sql).reason.contains("UPDATEUSAGE"), "{sql}");
+        }
+    }
+
+    // F04: --check must not be switchable back to execution by its own input.
+    #[test]
+    fn compile_only_refuses_noexec() {
+        let check_writes = Policy {
+            writes: true,
+            compile_only: true,
+        };
+        let check_read_only = Policy {
+            writes: false,
+            compile_only: true,
+        };
+        for policy in [check_writes, check_read_only] {
+            for sql in [
+                "SET NOEXEC OFF",
+                "SET NOEXEC ON",
+                "select 1\nset noexec off\nselect 2",
+            ] {
+                let b = check(sql, policy).expect_err(sql);
+                assert!(b.reason.contains("--check"), "{}", b.reason);
+            }
+            assert_eq!(
+                check("SELECT 'NOEXEC' AS [NOEXEC] -- NOEXEC", policy),
+                Ok(())
+            );
+        }
+        assert_eq!(check("INSERT dbo.T VALUES (1)", check_writes), Ok(()));
+        assert!(check("INSERT dbo.T VALUES (1)", check_read_only).is_err());
+        let open = Policy {
+            writes: true,
+            compile_only: false,
+        };
+        assert_eq!(check("SET NOEXEC OFF; DROP TABLE dbo.T", open), Ok(()));
+    }
+
+    // F05: malformed input must never panic.
+    #[test]
+    fn unterminated_quotes_do_not_panic() {
+        for sql in [
+            "SELECT [é",
+            "SELECT \"é",
+            "SELECT 'é",
+            "SELECT N'é",
+            "[é",
+            "\"",
+            "[",
+            "[]]",
+            "SELECT [a]]é",
+        ] {
+            let _ = check(sql, READ_ONLY);
+            let _ = check(
+                sql,
+                Policy {
+                    writes: true,
+                    compile_only: true,
+                },
+            );
+        }
+        // An unterminated string hides everything after it; the server then reports the
+        // syntax error, and nothing in the batch runs.
+        allowed("SELECT 'unterminated; DELETE FROM t");
+    }
+
+    #[test]
+    fn arbitrary_input_never_panics() {
+        const PIECES: &[&str] = &[
+            "[",
+            "]",
+            "]]",
+            "'",
+            "''",
+            "\"",
+            "N'",
+            "/*",
+            "*/",
+            "--",
+            "\n",
+            "\r\n",
+            " ",
+            "é",
+            "😀",
+            "SELECT",
+            "EXEC",
+            "sp_spaceused",
+            ",",
+            "(",
+            ")",
+            ";",
+            ".",
+            "..",
+            "#",
+            "##",
+            "@",
+            "@x",
+            "=",
+            "NEXT",
+            "VALUE",
+            "FOR",
+            "NOEXEC",
+            "INSERT",
+            "INTO",
+            "TOP",
+            "GO",
+            "x",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 12) as usize;
+            let sql: String = (0..len)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect();
+            let _ = check(&sql, READ_ONLY);
+            let _ = check(
+                &sql,
+                Policy {
+                    writes: true,
+                    compile_only: true,
+                },
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use crate::cli::{Opts, ProfileCommand};
-use crate::config::{self, Profile};
+use crate::config::{self, AuthKind, Profile};
 use crate::db::{Column, Value};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
@@ -90,13 +90,16 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         name: name.to_owned(),
         server: opts.server.clone().or(base.server),
         database: opts.database.clone().or(base.database),
+        auth: Some(if user.is_some() {
+            AuthKind::Sql
+        } else {
+            AuthKind::Windows
+        }),
         user: user.clone(),
         encrypt: opts.encrypt.or(base.encrypt),
-        trust_server_certificate: if opts.trust_server_certificate {
-            Some(true)
-        } else {
-            base.trust_server_certificate
-        },
+        trust_server_certificate: opts
+            .trust_server_certificate
+            .or(base.trust_server_certificate),
         write_policy: opts.write_policy.or(base.write_policy),
         login_timeout: opts.login_timeout.or(base.login_timeout),
         query_timeout: opts.query_timeout.or(base.query_timeout),
@@ -108,7 +111,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         .clone()
         .ok_or_else(|| Failure::usage("profile add needs -S server"))?;
 
-    let stored = user.is_some() && matches!(credman::read(name), Ok(Some(_)));
+    let stored = user.is_some() && matches!(credman::exists(name), Ok(true));
     let mut kept_password = false;
     match &user {
         Some(_) if stored && !login_changed && !opts.new_password => kept_password = true,
@@ -130,7 +133,15 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         }
         // Windows auth: drop any password left from an earlier SQL-auth version of the profile.
         None => {
-            let _ = credman::delete(name);
+            credman::delete(name).map_err(|e| {
+                Failure::new(
+                    Exit::Internal,
+                    format!(
+                        "removing the old password {} from Credential Manager: {e}; nothing was saved",
+                        credman::target(name)
+                    ),
+                )
+            })?;
         }
     }
 
@@ -192,18 +203,19 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
                 .default
                 .as_deref()
                 .is_some_and(|d| d.eq_ignore_ascii_case(&p.name));
-            let password = match (&p.user, credman::read(&p.name)) {
-                (None, _) => "-",
-                (Some(_), Ok(Some(_))) => "stored",
-                (Some(_), Ok(None)) => "missing",
-                (Some(_), Err(_)) => "unreadable",
+            let sql = p.auth_kind() == AuthKind::Sql;
+            let password = match (sql, credman::exists(&p.name)) {
+                (false, _) => "-",
+                (true, Ok(true)) => "stored",
+                (true, Ok(false)) => "missing",
+                (true, Err(_)) => "unreadable",
             };
             out.row(&[
                 Value::Text(p.name.clone()),
                 Value::Int(is_default.into()),
                 text(&p.server),
                 text(&p.database),
-                Value::Text(if p.user.is_some() { "sql" } else { "windows" }.into()),
+                Value::Text(p.auth_kind().as_str().into()),
                 text(&p.user),
                 Value::Text(password.into()),
                 Value::Text(p.write_policy.map_or("flag", |w| w.as_str()).into()),
@@ -211,7 +223,8 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
         }
         out.end_rows()
     };
-    write(out).map_err(|e| Failure::new(Exit::Internal, format!("writing output failed: {e}")))?;
+    write(out)
+        .map_err(|e| Failure::new(Exit::Undelivered, format!("writing output failed: {e}")))?;
     Ok(config.profiles.len())
 }
 
@@ -223,11 +236,26 @@ fn remove(name: &str, out: &mut Out) -> Result<(), Failure> {
         )));
     }
     config::save(&config).map_err(Failure::usage)?;
-    if credman::delete(name).unwrap_or(false) {
-        let _ = out.note(&format!(
-            "deleted {} from Credential Manager",
-            credman::target(name)
-        ));
+    match credman::delete(name) {
+        Ok(true) => {
+            let _ = out.note(&format!(
+                "deleted {} from Credential Manager",
+                credman::target(name)
+            ));
+        }
+        Ok(false) => {}
+        // The profile is gone; say so, and that rerunning `rm` won't help but cmdkey will.
+        Err(e) => {
+            return Err(Failure::new(
+                Exit::Internal,
+                format!(
+                    "removed profile {name}, but deleting {} from Credential Manager failed: {e}; \
+                     remove it with: cmdkey /delete:{}",
+                    credman::target(name),
+                    credman::target(name)
+                ),
+            ));
+        }
     }
     Ok(())
 }
