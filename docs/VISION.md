@@ -34,7 +34,7 @@ The usefulness of exact total row counts is unresolved. Assess whether those cou
 
 ## Compatibility
 
-- **First release:** SQL Server 2025 Standard on Windows Server 2025 Standard, x64.
+- **First release:** `sqlh.exe` runs on Windows x64 workstations, validated on Windows 11. It connects to SQL Server 2025 Standard, which is on a remote server in about 90% of use cases (typically Windows Server 2025 Standard). Running sqlh on the database server itself is not a first-release target. (Owner decision, 2026-10-10.)
 - **Candidate expansion:** a Windows Server 2016 / SQL Server 2016 floor, provided supporting it does not introduce excessive technical debt.
 - **Other targets:** SQL Server 2012/2014 and Azure targets appear in earlier plans, but are not first-release requirements. Assess additional support explicitly before making commitments.
 

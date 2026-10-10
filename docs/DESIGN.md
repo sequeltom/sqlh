@@ -22,7 +22,7 @@ The primary workflow is an agent with limited context making several queries acr
 | Writes | Read-only by default, §7. **Decided** |
 | Auth | SQL login and Windows integrated (SSPI). No Entra ID for now. **Decided** |
 | sqlcmd compatibility | Core flags, `GO` and `$(var)`. Agent-specific features get long flags. **Decided** |
-| First-release target | SQL Server 2025 Standard on Windows Server 2025 Standard, x64. **Decided** |
+| First-release target | `sqlh.exe` on Windows x64 workstations (validated on Windows 11), connecting to SQL Server 2025 Standard, which is remote in about 90% of use cases. Running on the database server is not a first-release target. **Decided** |
 | Compatibility expansion | Candidate Windows Server 2016 / SQL Server 2016 floor, conditional on acceptable technical debt. Other targets need separate assessment. **Decided** |
 | Test server | The owner's existing remote server. Its details stay out of the repo. **Decided** |
 | Workflow | Repeated agent queries in human-led DBA/developer sessions; low context consumption and quick cancellation. **Decided** |
@@ -47,11 +47,11 @@ Milestone 0 is a spike meant to find any deal-breakers early.
 
 ## 3. Platform and build
 
-- **Target:** `x86_64-pc-windows-msvc`, with Windows Server 2025 Standard as the first-release OS. A Windows Server 2016 floor is a later candidate, not a current support claim. ARM64 may come later.
+- **Target:** `x86_64-pc-windows-msvc`. The first release runs on Windows x64 workstations, validated on Windows 11; the database server is usually remote, so network latency is part of every call. A Windows 10 / Windows Server 2016 floor is a later candidate, not a current support claim. ARM64 may come later.
 - **Static CRT:** set `-C target-feature=+crt-static` in `.cargo/config.toml`. Without it the exe needs `vcruntime140.dll`, which isn't on a clean server.
 - **Allowed imports:** only DLLs that ship with Windows (kernel32, advapi32, secur32/sspicli, crypt32, ncrypt, bcrypt, ws2_32, ntdll, and similar). Check with `dumpbin /dependents`.
 - **Release profile:** `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`.
-- **TLS:** SChannel. Validate encryption modes on the first-release platform; evaluate older-platform TLS behavior when assessing the candidate 2016 floor.
+- **TLS:** SChannel. Validate the encryption modes (mandatory and strict) from a first-release workstation against SQL Server 2025; evaluate older-platform TLS behavior when assessing the candidate 2016 floor.
 
 ## 4. CLI
 
@@ -428,7 +428,7 @@ The primary product measure is time to the next useful answer across repeated ag
   - the guard's transaction backstop
 - **Compatibility:**
   - check each release's imports with `dumpbin /dependents`
-  - validate the first release on Windows Server 2025 Standard with SQL Server 2025 Standard, including supported authentication and cancellation paths
+  - validate the first release on a clean Windows 11 x64 workstation against a remote SQL Server 2025 Standard, including supported authentication and cancellation paths
   - assess Windows Server 2016 / SQL Server 2016 compatibility separately, including its maintenance cost, before committing to that floor
   - other versions and Azure may be tested opportunistically; those results do not establish an unqualified support promise
 
@@ -449,7 +449,7 @@ The primary product measure is time to the next useful answer across repeated ag
   - SELECT every data type.
   - Capture PRINT, info messages, errors and the DONE row counts.
   - Cancel a running query with an attention.
-  - Measure the exe's size and imports, and validate the first-release Windows Server 2025 platform. Evaluate Server 2016 separately for the candidate expansion.
+  - Measure the exe's size and imports, and validate the first-release platform: a Windows 11 workstation against a remote SQL Server 2025. Evaluate a 2016 floor separately for the candidate expansion.
   - Deliverable: `docs/notes/m0-driver-spike.md` with findings and a go/no-go on mssql-tds (fallback: tiberius-ng).
 - **M1: core CLI.**
   - flags, environment variables, profiles and Credential Manager
@@ -474,10 +474,10 @@ The primary product measure is time to the next useful answer across repeated ag
 ## 14. Open questions and risks
 
 - **Name.** `sqlh` is a working name.
-- **mssql-tds maturity.** We pin 0.2.0; size, imports, and SQL Server 2025 data rendering checks are recorded in `docs/notes/m0-driver-spike.md`. First-release validation still needs supported authentication, reliable attention/cancellation, and a clean Windows Server 2025 Standard deployment. Older-server negotiation and Azure redirection are future compatibility questions.
+- **mssql-tds maturity.** We pin 0.2.0; size, imports, and SQL Server 2025 data rendering checks are recorded in `docs/notes/m0-driver-spike.md`. First-release validation still needs supported authentication, reliable attention/cancellation, and a clean Windows 11 workstation deployment. Older-server negotiation and Azure redirection are future compatibility questions.
 - **Compatibility cost.** Assess a Windows Server 2016 / SQL Server 2016 floor without letting it complicate or delay the first release. SQL Server 2012/2014 and Azure are not current release gates. Supporting any expansion needs explicit tests and an acceptable maintenance budget.
 - **Exact row counts.** Their usefulness during investigation is unresolved; assess the latency and server work involved in draining hidden rows. Fast cancellation is a firm priority.
 - **Command categorization.** Develop the policy around legitimate DBA workflows and excessive database privileges. The current classifier is an initial implementation, and database permissions remain the enforcement boundary.
 - **ARITHABORT.** SSMS sets it ON, while ODBC and ADO.NET apps leave it OFF, so plans can differ ("fast in SSMS, slow in the app"). Consider an `--app-settings` switch for performance investigations.
-- **Environments.** The owner's existing test server is reached through a local profile; details stay outside the repo. A first-release Windows Server 2025 Standard / SQL Server 2025 Standard environment is required for release validation. A Server 2016 environment is only required if that expansion is pursued.
-- **Code signing.** An unsigned new exe can trip SmartScreen or antivirus on locked-down servers.
+- **Environments.** The owner's existing test server is reached through a local profile; details stay outside the repo. Release validation needs a clean Windows 11 x64 workstation and a SQL Server 2025 Standard server reached over the network. A 2016 environment is only required if that expansion is pursued.
+- **Code signing.** An unsigned new exe can trip SmartScreen or antivirus on locked-down workstations.
