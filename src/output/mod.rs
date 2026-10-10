@@ -39,6 +39,8 @@ pub struct Limits {
     pub max_results: usize,
     /// Server messages shown per run; 0 = all.
     pub max_messages: usize,
+    /// Bytes of output per run, across all streams; 0 = no limit (DESIGN.md §4.4).
+    pub max_output: u64,
 }
 
 impl Default for Limits {
@@ -48,9 +50,17 @@ impl Default for Limits {
             max_cell: 500,
             max_results: 20,
             max_messages: 100,
+            max_output: 1_000_000,
         }
     }
 }
+
+/// The part of `max_output` kept for the closing lines (error, notes, status), which are
+/// always written.
+pub const OUTPUT_RESERVE: u64 = 1024;
+
+/// The smallest `--max-output` other than 0: room for some output plus the reserve.
+pub const MIN_MAX_OUTPUT: u64 = 4096;
 
 /// Where a batch comes from, for markers and error line mapping.
 pub struct BatchInfo<'a> {
@@ -123,6 +133,18 @@ pub fn blocked_message(location: &str, reason: &str, advice: &str) -> String {
     format!("{location}: {reason}; nothing was run. {advice}")
 }
 
+/// What the output budget kept back after it ran out, for the closing note. The result set
+/// that was being shown reports its own rows in its footer.
+#[derive(Default)]
+struct Withheld {
+    results: u64,
+    messages: u64,
+    errors: u64,
+    /// Statements whose row counts weren't shown.
+    row_counts: u64,
+    batches: u64,
+}
+
 /// Limits and counts shared by all formats.
 pub struct Tally {
     limits: Limits,
@@ -132,6 +154,13 @@ pub struct Tally {
     line_map: Vec<u32>,
     results_seen: usize,
     hidden: bool,
+    /// The output budget ran out: nothing more of the body is written.
+    exhausted: bool,
+    /// The budget ran out while the current result set was being shown.
+    cut: bool,
+    withheld: Withheld,
+    /// Consecutive row counts not written yet, as (statements, rows): they become one line.
+    affected: Option<(u64, u64)>,
     rows_total: u64,
     rows_shown: u64,
     cells_cut: u64,
@@ -150,6 +179,10 @@ impl Tally {
             line_map: Vec::new(),
             results_seen: 0,
             hidden: false,
+            exhausted: false,
+            cut: false,
+            withheld: Withheld::default(),
+            affected: None,
             rows_total: 0,
             rows_shown: 0,
             cells_cut: 0,
@@ -157,6 +190,62 @@ impl Tally {
             errors: 0,
             batch_max_severity: 0,
         }
+    }
+
+    /// Whether `bytes` more of the body fit in the output budget, given the `used` bytes
+    /// written so far. The budget keeps `OUTPUT_RESERVE` for the closing lines. Once
+    /// something doesn't fit, nothing more does, so output never resumes after a gap.
+    pub fn admit(&mut self, used: u64, bytes: usize) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        let max = self.limits.max_output;
+        if max == 0 || used + bytes as u64 <= max.saturating_sub(OUTPUT_RESERVE) {
+            return true;
+        }
+        self.exhausted = true;
+        false
+    }
+
+    /// A result set's header didn't fit the budget: the whole result set is withheld.
+    pub fn withhold_result(&mut self) {
+        self.hidden = true;
+        self.withheld.results += 1;
+    }
+
+    /// A row didn't fit the budget; it still counts toward the result set's total.
+    pub fn row_withheld(&mut self) {
+        self.rows_total += 1;
+        self.cut = true;
+    }
+
+    pub fn withhold_message(&mut self) {
+        self.withheld.messages += 1;
+    }
+
+    pub fn withhold_error(&mut self) {
+        self.withheld.errors += 1;
+    }
+
+    pub fn withhold_batch(&mut self) {
+        self.withheld.batches += 1;
+    }
+
+    /// Row counts of `statements` statements didn't fit the budget.
+    pub fn withhold_row_counts(&mut self, statements: u64) {
+        self.withheld.row_counts += statements;
+    }
+
+    /// Adds one statement's row count to the run that becomes one line.
+    pub fn add_affected(&mut self, rows: u64) {
+        let (statements, total) = self.affected.unwrap_or((0, 0));
+        self.affected = Some((statements + 1, total + rows));
+    }
+
+    /// The pending run of row counts as (statements, rows), to be written before any other
+    /// event.
+    pub fn take_affected(&mut self) -> Option<(u64, u64)> {
+        self.affected.take()
     }
 
     pub fn limits(&self) -> &Limits {
@@ -179,6 +268,7 @@ impl Tally {
         self.rows_total = 0;
         self.rows_shown = 0;
         self.cells_cut = 0;
+        self.cut = false;
         let max = self.limits.max_results;
         self.hidden = max > 0 && self.results_seen > max;
         (!self.hidden).then_some(self.results_seen)
@@ -189,7 +279,9 @@ impl Tally {
     }
 
     pub fn wants_values(&self) -> bool {
-        !self.hidden && (self.limits.max_rows == 0 || self.rows_shown < self.limits.max_rows)
+        !self.hidden
+            && !self.exhausted
+            && (self.limits.max_rows == 0 || self.rows_shown < self.limits.max_rows)
     }
 
     pub fn row_shown(&mut self) {
@@ -260,6 +352,11 @@ impl Tally {
         let mut footer = if self.rows_shown == self.rows_total {
             let s = if self.rows_total == 1 { "" } else { "s" };
             format!("{} row{s}", self.rows_total)
+        } else if self.cut {
+            format!(
+                "{} of {} rows shown (--max-output)",
+                self.rows_shown, self.rows_total
+            )
         } else {
             format!(
                 "{} of {} rows shown (--max-rows {})",
@@ -293,6 +390,32 @@ impl Tally {
                 "{} more messages not shown",
                 self.messages_seen - max_messages
             ));
+        }
+        if self.exhausted {
+            let w = &self.withheld;
+            let counts: Vec<String> = [
+                (w.results, "result set", "result sets"),
+                (w.messages, "message", "messages"),
+                (w.errors, "error", "errors"),
+                (
+                    w.row_counts,
+                    "statement's row count",
+                    "statements' row counts",
+                ),
+                (w.batches, "batch", "batches"),
+            ]
+            .iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .collect();
+            let mut note = format!(
+                "output stopped at the --max-output limit of {} bytes; the run continued",
+                self.limits.max_output
+            );
+            if !counts.is_empty() {
+                let _ = write!(note, ", and these weren't shown: {}", counts.join(", "));
+            }
+            notes.push(note);
         }
         notes
     }
@@ -449,6 +572,31 @@ mod tests {
         assert_eq!(cut("héllo", 2), ("hé", 3));
         assert_eq!(hex(&[0xAB, 0xCD, 0xEF], 0), ("0xABCDEF".into(), 0));
         assert_eq!(hex(&[0xAB, 0xCD, 0xEF], 5), ("0xABCD".into(), 1));
+    }
+
+    // F06: a refusal is final, and the closing note doesn't list counts that are all zero.
+    #[test]
+    fn the_output_budget_is_sticky() {
+        let mut tally = Tally::new(Limits {
+            max_output: OUTPUT_RESERVE + 100,
+            ..Limits::default()
+        });
+        assert!(tally.admit(0, 100));
+        assert!(!tally.admit(100, 1));
+        assert!(
+            !tally.admit(0, 1),
+            "nothing fits once the budget has run out"
+        );
+        assert!(!tally.wants_values());
+        assert_eq!(
+            tally.limit_notes(),
+            ["output stopped at the --max-output limit of 1124 bytes; the run continued"]
+        );
+        let mut unlimited = Tally::new(Limits {
+            max_output: 0,
+            ..Limits::default()
+        });
+        assert!(unlimited.admit(u64::MAX / 2, usize::MAX / 2));
     }
 
     #[test]

@@ -116,6 +116,6 @@ Profiles and Credential Manager are built, and so are the json and csv formats. 
 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of [code-review.md](code-review.md). Owner decisions are recorded in its §6. Work in order:
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
-2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). Next come the release requirements 2.2–2.4: the response budget, a stalled reader, and cancellation.
+2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2, the response budget (`--max-output`, input caps), is done. Next come the other release requirements, 2.3 and 2.4: a stalled reader, and cancellation.
 3. Phase 3, execution core, release checks and live fixtures.
 4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

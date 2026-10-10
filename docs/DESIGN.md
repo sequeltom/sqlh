@@ -119,6 +119,7 @@ These long flags are our own:
 | `--max-rows N` | Rows shown per result set. Default 100; 0 means unlimited. |
 | `--max-cell N` | Characters shown per cell. Default 500; 0 means unlimited. |
 | `--max-results N` | Result sets shown per run. Default 20. The rest are counted, not printed. Messages are capped at 100. |
+| `--max-output N` | Bytes of output per run, across stdout and stderr. Default 1000000; 0 means no limit, and otherwise it must be at least 4096. See §4.4. |
 | `--allow-write` | Turn off the read-only guard, if the profile's write policy allows it (§7). |
 | `--check` | Compile only: `SET NOEXEC ON`, executes nothing. Catches syntax errors and unknown columns of existing tables. Missing tables are only reported when a query runs, because SQL Server defers their resolution. Input that mentions `NOEXEC` is refused (exit 5; §7 lists the false positives), NOEXEC is re-armed before every batch, and the rolled-back wrapper transaction always applies. With `--allow-write`, write statements may be compiled; they still don't run. A later version could add `sp_describe_first_result_set` per statement. |
 | `--continue-on-error` | Keep running later batches after a failed one. |
@@ -146,9 +147,16 @@ These keep a careless query from flooding an agent's context:
 
 **Product direction:** quick cancellation is essential to iterative investigation. Whether exact total row counts justify draining hidden rows remains open. The current behavior below is retained until a separately designed and tested change defines early cutoff, partial counts, and response completion.
 
-- **Rows.** After `--max-rows`, rows stop being formatted but are still read and counted. Later statements still run, and the footer gives an exact total: `-- 100 of 48213 rows shown (limit 100)`. The query timeout still applies.
+- **Rows.** After `--max-rows`, rows stop being formatted but are still read and counted. Later statements still run, and the footer gives an exact total: `-- 100 of 48213 rows shown (--max-rows 100)`. The query timeout still applies.
 - **Cells.** A cell longer than `--max-cell` is cut at a character boundary and ends with `…[+N]`, where N is the number of characters left out. A binary value shows at most `--max-cell / 2` bytes and ends with `…[+N bytes]`. The result set's footer counts the truncated cells.
 - **Result sets and messages.** Past their caps (for example, a `WHILE` loop that selects or prints), output is counted, not printed.
+- **Row counts.** Consecutive row counts within a batch become one line, `-- 300 statements, 300 rows affected`, so a loop of inserts prints one line rather than 300. A result set, message or error in between starts a new line.
+- **Total output.** `--max-output` (default 1,000,000 bytes) caps everything a run writes, in every format, across stdout and stderr.
+  - Once the next piece wouldn't fit, nothing more of the body is written: no result sets, rows, messages, errors, row counts or batch markers.
+  - The result set being shown still ends with its footer: `-- 80 of 500 rows shown (--max-output)`. Notes and a guard refusal are always written too.
+  - The last 1,024 bytes are kept for the closing lines, which are always written: a note that the output stopped and what wasn't shown, then the status. JSON stays a valid document, with the cut result marked `"truncated":true`.
+- **Limits never change what runs.** Like the row limit, the output limit only stops printing: the run continues to the end, and the counts (rows, errors, the status line) stay exact. Whether to stop early instead is the open drain question (PLAN.md 2.6).
+- **Input.** At most 10 MB of SQL per run, across `-Q`, `-i` files and stdin, and again after `$(var)` substitution; `GO n` runs a batch at most 1000 times. Past either, the run is refused with exit 3 before anything connects.
 
 ## 5. Output formats
 
@@ -179,7 +187,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 - **Data rows:** tab-separated values.
 - **Batch marker:** `-- batch N (line L)` appears only when the input has more than one batch.
 - **Footer** after each result set: `-- N rows`, plus any truncation notes.
-- **Statement summaries:** `-- N rows affected` for DML.
+- **Statement summaries:** `-- N rows affected` for DML. Consecutive ones become one line, `-- 300 statements, 300 rows affected` (§4.4).
 - **Messages:** `-- msg: text` for PRINT and messages of severity 10 or lower.
 - **Errors:** `-- error <num> (severity S, state T, line L[, proc P]): message`.
 - **Final summary:** the last line of complete output, either `-- ok: ...` or `-- failed (exit N): ...`. Output is cut short only when it couldn't be delivered (exit 7) or sqlh crashed (exit 10, where the line is best effort). Then the exit code is what counts (§4.3, §6).
@@ -239,6 +247,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
   - `rows` holds only the shown rows (`--max-rows`), and `row_count` counts all of them.
   - `truncated` means rows were hidden; `cells_cut` counts values cut by `--max-cell` (they end in `…[+N]`).
   - Result sets hidden by `--max-results` emit no event; a note counts them.
+- **rows_affected:** `count` is the number of rows. A run of consecutive statements is one event, which then also carries `statements`: `{"type":"rows_affected","count":300,"statements":300}`.
 - **error:**
   - `line` is mapped to the input, as in the text format. `source` is added when there are several inputs.
   - Inside a procedure, the event has `procedure`, and `line` is the procedure's own line.

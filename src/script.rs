@@ -5,6 +5,12 @@
 
 use std::path::PathBuf;
 
+/// The most SQL a run takes, before and after `$(var)` substitution (DESIGN.md §4.4).
+pub const MAX_INPUT_BYTES: usize = 10_000_000;
+
+/// The most times `GO n` may run a batch.
+pub const MAX_REPEAT: u32 = 1000;
+
 pub struct Source {
     /// How the source is named in locations: a file path, `stdin` or `-Q`.
     pub name: String,
@@ -79,8 +85,15 @@ pub fn prepare(
     vars: Option<&[(String, String)]>,
 ) -> Result<Vec<Batch>, String> {
     let mut batches = Vec::new();
+    let mut total = 0usize;
     for (index, source) in sources.iter().enumerate() {
         for raw in split(&source.text, terminator) {
+            if raw.repeat > MAX_REPEAT {
+                return Err(format!(
+                    "{}:{}: {terminator} {} would run the batch {} times; the most is {MAX_REPEAT}",
+                    source.name, raw.terminator_line, raw.repeat, raw.repeat
+                ));
+            }
             let (sql, line_map) = match vars {
                 Some(vars) => substitute(&raw.text, vars).map_err(|(name, offset)| {
                     let line = raw.line + raw.text[..offset].matches('\n').count() as u32;
@@ -91,6 +104,13 @@ pub fn prepare(
                 })?,
                 None => (raw.text, Vec::new()),
             };
+            total += sql.len();
+            if total > MAX_INPUT_BYTES {
+                return Err(format!(
+                    "after $(var) substitution the SQL is over the {} MB limit; run it in parts",
+                    MAX_INPUT_BYTES / 1_000_000
+                ));
+            }
             batches.push(Batch {
                 sql,
                 source: index,
@@ -107,6 +127,8 @@ struct RawBatch {
     text: String,
     line: u32,
     repeat: u32,
+    /// The line of the terminator that ended the batch (0 for the last batch, which has none).
+    terminator_line: u32,
 }
 
 /// Splits on lines that hold only the terminator (plus an optional repeat count and
@@ -117,12 +139,13 @@ fn split(text: &str, terminator: &str) -> Vec<RawBatch> {
     let mut current = String::new();
     let mut start = 1u32;
     let mut lexer = Lexer::default();
-    let mut push = |text: &mut String, line: u32, repeat: u32| {
+    let mut push = |text: &mut String, line: u32, repeat: u32, terminator_line: u32| {
         if !text.trim().is_empty() {
             batches.push(RawBatch {
                 text: std::mem::take(text),
                 line,
                 repeat,
+                terminator_line,
             });
         }
         text.clear();
@@ -132,14 +155,14 @@ fn split(text: &str, terminator: &str) -> Vec<RawBatch> {
         if lexer.is_clear()
             && let Some(repeat) = terminator_repeat(line, terminator)
         {
-            push(&mut current, start, repeat);
+            push(&mut current, start, repeat, number);
             start = number + 1;
             continue;
         }
         lexer.scan(line);
         current.push_str(line);
     }
-    push(&mut current, start, 1);
+    push(&mut current, start, 1, 0);
     batches
 }
 
@@ -406,6 +429,31 @@ mod tests {
         let plain = &prepare(&sources, "GO", Some(&[("cols".into(), "a".into())])).unwrap()[1];
         assert!(plain.line_map.is_empty());
         assert_eq!(plain.source_line(4), 6);
+    }
+
+    // F06: a batch repeats at most 1000 times, and substitution can't grow the SQL past the
+    // input limit.
+    #[test]
+    fn repeats_and_expansion_are_bounded() {
+        let ok = prepare(&[source("a.sql", "SELECT 1\nGO 1000\n")], "GO", None).unwrap();
+        assert_eq!(ok[0].repeat, 1000);
+        let err = prepare(&[source("a.sql", "SELECT 1\ngo 1001\n")], "GO", None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            "a.sql:2: GO 1001 would run the batch 1001 times; the most is 1000"
+        );
+        let half = "x".repeat(MAX_INPUT_BYTES / 2 + 1);
+        let vars = [("v".to_owned(), half)];
+        let err = prepare(
+            &[source("a.sql", "SELECT '$(v)', '$(v)'")],
+            "GO",
+            Some(&vars),
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("over the 10 MB limit"), "{err}");
     }
 
     #[test]

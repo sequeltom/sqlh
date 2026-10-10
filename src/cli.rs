@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::config::{WritePolicy, valid_name};
 use crate::db::Encrypt;
-use crate::output::Format;
+use crate::output::{Format, MIN_MAX_OUTPUT};
 
 pub enum Command {
     Run(Box<Opts>),
@@ -46,6 +46,7 @@ pub struct Opts {
     pub max_rows: Option<u64>,
     pub max_cell: Option<usize>,
     pub max_results: Option<usize>,
+    pub max_output: Option<u64>,
     pub allow_write: bool,
     pub check: bool,
     pub continue_on_error: bool,
@@ -198,6 +199,15 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Long("max-rows") => o.max_rows = Some(number(p.value(), "--max-rows")?),
             Long("max-cell") => o.max_cell = Some(number(p.value(), "--max-cell")?),
             Long("max-results") => o.max_results = Some(number(p.value(), "--max-results")?),
+            Long("max-output") => {
+                let bytes: u64 = number(p.value(), "--max-output")?;
+                if bytes != 0 && bytes < MIN_MAX_OUTPUT {
+                    return Err(format!(
+                        "--max-output {bytes}: use 0 for no limit, or at least {MIN_MAX_OUTPUT} bytes"
+                    ));
+                }
+                o.max_output = Some(bytes);
+            }
             Long("allow-write") => o.allow_write = true,
             Long("check") => o.check = true,
             Long("continue-on-error") => o.continue_on_error = true,
@@ -330,6 +340,15 @@ mod tests {
     #[test]
     fn two_queries_are_an_error() {
         assert!(parse_args(&["-Q", "SELECT 1", "SELECT 2"]).is_err());
+    }
+
+    #[test]
+    fn max_output_is_zero_or_at_least_the_minimum() {
+        assert_eq!(opts(&["--max-output", "0", "x"]).max_output, Some(0));
+        assert_eq!(opts(&["--max-output", "4096", "x"]).max_output, Some(4096));
+        let err = parse_args(&["--max-output", "100", "x"]).err().unwrap();
+        assert!(err.contains("at least 4096"), "{err}");
+        assert!(parse_args(&["--max-output", "1MB", "x"]).is_err());
     }
 
     #[test]

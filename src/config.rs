@@ -286,6 +286,7 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
             max_cell: opts.max_cell.or(p.max_cell).unwrap_or(defaults.max_cell),
             max_results: opts.max_results.unwrap_or(defaults.max_results),
             max_messages: defaults.max_messages,
+            max_output: opts.max_output.unwrap_or(defaults.max_output),
         },
         query_timeout: opts.query_timeout.or(p.query_timeout).unwrap_or(60),
         allow_write: opts.allow_write || policy == WritePolicy::Allow,

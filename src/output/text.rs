@@ -15,6 +15,8 @@ pub struct TextSink<W: Write> {
     out: W,
     tally: Tally,
     line: String,
+    /// Bytes written so far, for the output budget.
+    written: u64,
 }
 
 impl<W: Write> TextSink<W> {
@@ -23,36 +25,64 @@ impl<W: Write> TextSink<W> {
             out,
             tally: Tally::new(limits),
             line: String::with_capacity(1024),
+            written: 0,
         }
     }
 
-    fn push_value(&mut self, value: &Value, first: bool) {
-        let max = self.tally.limits().max_cell;
-        match value {
-            Value::Null => self.line.push_str("NULL"),
-            Value::Int(v) => {
-                let _ = write!(self.line, "{v}");
+    /// Writes `text` (whole lines, without the last newline) if the output budget admits
+    /// it, and says whether it did.
+    fn emit(&mut self, text: &str) -> io::Result<bool> {
+        if !self.tally.admit(self.written, text.len() + 1) {
+            return Ok(false);
+        }
+        self.write_line(text)?;
+        Ok(true)
+    }
+
+    /// Writes a line whatever the budget: the footer of a result set that was shown, notes,
+    /// the guard's refusal. There are few of these, and the closing lines use the reserve.
+    fn write_line(&mut self, text: &str) -> io::Result<()> {
+        self.written += text.len() as u64 + 1;
+        self.out.write_all(text.as_bytes())?;
+        self.out.write_all(b"\n")
+    }
+
+    /// Writes the pending run of row counts as one line, before any other event.
+    fn flush_affected(&mut self) -> io::Result<()> {
+        if let Some((statements, rows)) = self.tally.take_affected()
+            && !self.emit(&rows_affected_line(statements, rows))?
+        {
+            self.tally.withhold_row_counts(statements);
+        }
+        Ok(())
+    }
+}
+
+/// Appends one value in the text format. Returns true when `--max-cell` cut it.
+fn push_value(line: &mut String, max: usize, value: &Value, first: bool) -> bool {
+    match value {
+        Value::Null => line.push_str("NULL"),
+        Value::Int(v) => {
+            let _ = write!(line, "{v}");
+        }
+        Value::Num(s) | Value::Lit(s) => line.push_str(s),
+        Value::Text(s) if s == "NULL" => line.push_str("\\NULL"),
+        Value::Text(s) => {
+            if first && s.starts_with("--") {
+                line.push('\\');
             }
-            Value::Num(s) | Value::Lit(s) => self.line.push_str(s),
-            Value::Text(s) if s == "NULL" => self.line.push_str("\\NULL"),
-            Value::Text(s) => {
-                if first && s.starts_with("--") {
-                    self.line.push('\\');
-                }
-                if push_escaped(&mut self.line, s, max) {
-                    self.tally.cell_cut();
-                }
-            }
-            Value::Bin(bytes) => {
-                let (text, cut) = hex(bytes, max);
-                self.line.push_str(&text);
-                if cut > 0 {
-                    self.line.push_str(&super::cut_marker(cut, true));
-                    self.tally.cell_cut();
-                }
+            return push_escaped(line, s, max);
+        }
+        Value::Bin(bytes) => {
+            let (text, cut) = hex(bytes, max);
+            line.push_str(&text);
+            if cut > 0 {
+                line.push_str(&super::cut_marker(cut, true));
+                return true;
             }
         }
     }
+    false
 }
 
 /// `-- msg: text`
@@ -81,9 +111,14 @@ pub fn error_line(tally: &Tally, error: &ServerMessage) -> String {
     line
 }
 
-pub fn rows_affected_line(count: u64) -> String {
-    let s = if count == 1 { "" } else { "s" };
-    format!("-- {count} row{s} affected")
+/// `-- 5 rows affected`, or for a run of statements `-- 300 statements, 300 rows affected`.
+pub fn rows_affected_line(statements: u64, rows: u64) -> String {
+    let s = if rows == 1 { "" } else { "s" };
+    if statements == 1 {
+        format!("-- {rows} row{s} affected")
+    } else {
+        format!("-- {statements} statements, {rows} row{s} affected")
+    }
 }
 
 pub fn blocked_line(location: &str, reason: &str, advice: &str) -> String {
@@ -118,24 +153,31 @@ pub fn closing_lines(tally: &Tally, summary: &Summary) -> String {
 
 impl<W: Write> BatchSink for TextSink<W> {
     fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+        self.flush_affected()?;
         let Some(number) = self.tally.start_result() else {
             return Ok(());
         };
-        self.line.clear();
-        let _ = writeln!(self.line, "-- result {number}");
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
+        let _ = writeln!(line, "-- result {number}");
         for (i, column) in columns.iter().enumerate() {
             if i > 0 {
-                self.line.push('\t');
+                line.push('\t');
             }
             // Like values: a header can't start with `--` and pass for a metadata line.
             if i == 0 && column.name.starts_with("--") {
-                self.line.push('\\');
+                line.push('\\');
             }
-            push_escaped(&mut self.line, &column.name, 0);
-            self.line.push(':');
-            push_type(&mut self.line, &column.type_name);
+            push_escaped(&mut line, &column.name, 0);
+            line.push(':');
+            push_type(&mut line, &column.type_name);
         }
-        writeln!(self.out, "{}", self.line)
+        let shown = self.emit(&line)?;
+        self.line = line;
+        if !shown {
+            self.tally.withhold_result();
+        }
+        Ok(())
     }
 
     fn wants_values(&self) -> bool {
@@ -143,15 +185,29 @@ impl<W: Write> BatchSink for TextSink<W> {
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
-        self.tally.row_shown();
-        self.line.clear();
+        let max = self.tally.limits().max_cell;
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
+        let mut cut = 0;
         for (i, value) in values.iter().enumerate() {
             if i > 0 {
-                self.line.push('\t');
+                line.push('\t');
             }
-            self.push_value(value, i == 0);
+            if push_value(&mut line, max, value, i == 0) {
+                cut += 1;
+            }
         }
-        writeln!(self.out, "{}", self.line)
+        let shown = self.emit(&line)?;
+        self.line = line;
+        if shown {
+            self.tally.row_shown();
+            for _ in 0..cut {
+                self.tally.cell_cut();
+            }
+        } else {
+            self.tally.row_withheld();
+        }
+        Ok(())
     }
 
     fn skipped_row(&mut self) {
@@ -162,50 +218,66 @@ impl<W: Write> BatchSink for TextSink<W> {
         if self.tally.result_hidden() {
             return Ok(());
         }
-        writeln!(self.out, "-- {}", self.tally.footer())
+        let footer = format!("-- {}", self.tally.footer());
+        self.write_line(&footer)
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
-        writeln!(self.out, "{}", rows_affected_line(count))
+        self.tally.add_affected(count);
+        Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
         }
-        writeln!(self.out, "{}", message_line(message))
+        if !self.emit(&message_line(message))? {
+            self.tally.withhold_message();
+        }
+        Ok(())
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.error(error.severity);
-        writeln!(self.out, "{}", error_line(&self.tally, error))
+        let line = error_line(&self.tally, error);
+        if !self.emit(&line)? {
+            self.tally.withhold_error();
+        }
+        Ok(())
     }
 }
 
 impl<W: Write> Output for TextSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.begin_batch(batch);
-        if batch.total > 1 {
-            writeln!(self.out, "{}", batch_line(batch))?;
+        if batch.total > 1 && !self.emit(&batch_line(batch))? {
+            self.tally.withhold_batch();
         }
         Ok(())
     }
 
     fn end_batch(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_affected()
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
-        writeln!(self.out, "{}", note_line(text))
+        self.flush_affected()?;
+        self.write_line(&note_line(text))
     }
 
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
-        writeln!(self.out, "{}", blocked_line(location, reason, advice))
+        self.flush_affected()?;
+        self.write_line(&blocked_line(location, reason, advice))
     }
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
-        self.out
-            .write_all(closing_lines(&self.tally, summary).as_bytes())
+        self.flush_affected()?;
+        let lines = closing_lines(&self.tally, summary);
+        self.written += lines.len() as u64;
+        self.out.write_all(lines.as_bytes())
     }
 
     fn tally(&self) -> &Tally {
@@ -227,6 +299,7 @@ pub(super) mod tests {
             max_cell: 5,
             max_results: 1,
             max_messages: 1,
+            max_output: 0,
         }
     }
 
@@ -382,6 +455,73 @@ pub(super) mod tests {
         );
         assert!(out.contains("-- note: one\\n-- ok: fake"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("-- ok")), "{out}");
+    }
+
+    // F06: a loop's row counts become one line per run; a message or batch end splits runs.
+    #[test]
+    fn consecutive_row_counts_become_one_line() {
+        let mut s = TextSink::new(Vec::new(), limits());
+        for rows in [1, 5, 6] {
+            s.rows_affected(rows).unwrap();
+        }
+        s.message(&msg("done")).unwrap();
+        s.rows_affected(1).unwrap();
+        s.end_batch().unwrap();
+        s.rows_affected(0).unwrap();
+        s.rows_affected(0).unwrap();
+        s.finish(&summary("ok: 2 batches, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- 3 statements, 12 rows affected\n-- msg: done\n-- 1 row affected\n\
+             -- 2 statements, 0 rows affected\n-- ok: 2 batches, 3 ms\n"
+        );
+    }
+
+    /// Limits that leave only the output budget: `body` bytes before the closing reserve.
+    fn budget(body: u64) -> Limits {
+        Limits {
+            max_rows: 0,
+            max_cell: 0,
+            max_results: 0,
+            max_messages: 0,
+            max_output: crate::output::OUTPUT_RESERVE + body,
+        }
+    }
+
+    // F06: past the budget nothing more of the body is written, the run's counts stay
+    // exact, the cut result set says why in its footer, and the closing note says what else
+    // was withheld.
+    #[test]
+    fn output_budget_stops_the_body_and_says_what_was_withheld() {
+        let mut s = TextSink::new(Vec::new(), budget(50));
+        s.columns(&[col("v", "varchar(9)")]).unwrap();
+        for _ in 0..5 {
+            if s.wants_values() {
+                s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        s.message(&msg("later")).unwrap();
+        s.error(&error(1)).unwrap();
+        s.columns(&[col("w", "int")]).unwrap();
+        assert!(!s.wants_values());
+        s.end_rows().unwrap();
+        s.rows_affected(3).unwrap();
+        s.rows_affected(4).unwrap();
+        assert_eq!(s.tally().errors(), 1, "a withheld error still counts");
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        assert_eq!(
+            text(s),
+            "-- result 1\nv:varchar(9)\naaaaaaaaa\naaaaaaaaa\n\
+             -- 2 of 5 rows shown (--max-output)\n\
+             -- note: output stopped at the --max-output limit of 1074 bytes; the run \
+             continued, and these weren't shown: 1 result set, 1 message, 1 error, \
+             2 statements' row counts\n\
+             -- failed (exit 1): 1 error, 3 ms\n"
+        );
     }
 
     // R05: a CLR UDT's type name comes from the server, so it's escaped like a column name,

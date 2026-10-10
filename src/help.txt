@@ -41,8 +41,8 @@ OUTPUT
   --format F      text (default) | json (one document; ordered events per batch; exit
                   status at the end) | csv (data only on stdout/-o; -- lines on stderr)
   --max-rows N    rows shown per result set (default 100; 0 = all). The rest are counted
-  --max-cell N    characters shown per value (default 500; 0 = all)
-  --max-results N result sets shown (default 20)
+  --max-cell N    characters per value (default 500)   --max-results N  result sets (default 20)
+  --max-output N  total output bytes (default 1000000; 0 = no limit); the run still finishes
   -o file         write output to a file (replaced whole when the run ends; never an input)
   --verbose       connection diagnostics on stderr
 

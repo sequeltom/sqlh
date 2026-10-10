@@ -18,6 +18,8 @@ pub struct CsvSink<W: Write> {
     tally: Tally,
     line: String,
     results_written: usize,
+    /// Bytes written to both streams so far: the output budget covers what the agent reads.
+    written: u64,
 }
 
 impl<W: Write> CsvSink<W> {
@@ -28,11 +30,33 @@ impl<W: Write> CsvSink<W> {
             tally: Tally::new(limits),
             line: String::with_capacity(1024),
             results_written: 0,
+            written: 0,
         }
     }
 
+    /// Writes a metadata line whatever the budget (see `TextSink::write_line`).
     fn meta_line(&mut self, line: &str) -> io::Result<()> {
+        self.written += line.len() as u64 + 1;
         writeln!(self.meta, "{line}")
+    }
+
+    /// Writes a metadata line if the output budget admits it, and says whether it did.
+    fn emit_meta(&mut self, line: &str) -> io::Result<bool> {
+        if !self.tally.admit(self.written, line.len() + 1) {
+            return Ok(false);
+        }
+        self.meta_line(line)?;
+        Ok(true)
+    }
+
+    /// Writes the pending run of row counts as one line, before any other event.
+    fn flush_affected(&mut self) -> io::Result<()> {
+        if let Some((statements, rows)) = self.tally.take_affected()
+            && !self.emit_meta(&rows_affected_line(statements, rows))?
+        {
+            self.tally.withhold_row_counts(statements);
+        }
+        Ok(())
     }
 }
 
@@ -59,28 +83,42 @@ fn push_field(out: &mut String, s: &str) {
 
 impl<W: Write> BatchSink for CsvSink<W> {
     fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+        self.flush_affected()?;
         let Some(number) = self.tally.start_result() else {
             return Ok(());
         };
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
         if self.results_written > 0 {
-            self.data.write_all(b"\n")?;
+            line.push('\n');
         }
-        self.results_written += 1;
-        self.line.clear();
         let mut types = String::new();
         for (i, column) in columns.iter().enumerate() {
             if i > 0 {
-                self.line.push(',');
+                line.push(',');
                 types.push_str(", ");
             }
-            push_field(&mut self.line, &column.name);
+            push_field(&mut line, &column.name);
             types.push_str(&escaped(&column.name));
             types.push(':');
             push_type(&mut types, &column.type_name);
         }
-        self.line.push('\n');
-        self.data.write_all(self.line.as_bytes())?;
-        self.meta_line(&format!("-- result {number}: {types}"))
+        line.push('\n');
+        let marker = format!("-- result {number}: {types}");
+        // The header row and its metadata line are shown together or not at all.
+        if self
+            .tally
+            .admit(self.written, line.len() + marker.len() + 1)
+        {
+            self.results_written += 1;
+            self.written += line.len() as u64;
+            self.data.write_all(line.as_bytes())?;
+            self.meta_line(&marker)?;
+        } else {
+            self.tally.withhold_result();
+        }
+        self.line = line;
+        Ok(())
     }
 
     fn wants_values(&self) -> bool {
@@ -88,41 +126,54 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
-        self.tally.row_shown();
         let max = self.tally.limits().max_cell;
-        self.line.clear();
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
+        let mut cells_cut = 0;
         for (i, value) in values.iter().enumerate() {
             if i > 0 {
-                self.line.push(',');
+                line.push(',');
             }
             match value {
                 Value::Null => {}
-                Value::Int(v) => self.line.push_str(&v.to_string()),
-                Value::Num(s) | Value::Lit(s) => push_field(&mut self.line, s),
+                Value::Int(v) => line.push_str(&v.to_string()),
+                Value::Num(s) | Value::Lit(s) => push_field(&mut line, s),
                 Value::Text(s) => {
                     let (kept, cut_count) = cut(s, max);
                     if cut_count > 0 {
-                        self.tally.cell_cut();
+                        cells_cut += 1;
                         push_field(
-                            &mut self.line,
+                            &mut line,
                             &format!("{kept}{}", cut_marker(cut_count, false)),
                         );
                     } else {
-                        push_field(&mut self.line, kept);
+                        push_field(&mut line, kept);
                     }
                 }
                 Value::Bin(bytes) => {
                     let (mut text, cut_count) = hex(bytes, max);
                     if cut_count > 0 {
-                        self.tally.cell_cut();
+                        cells_cut += 1;
                         text.push_str(&cut_marker(cut_count, true));
                     }
-                    self.line.push_str(&text);
+                    line.push_str(&text);
                 }
             }
         }
-        self.line.push('\n');
-        self.data.write_all(self.line.as_bytes())
+        line.push('\n');
+        let result = if self.tally.admit(self.written, line.len()) {
+            self.tally.row_shown();
+            for _ in 0..cells_cut {
+                self.tally.cell_cut();
+            }
+            self.written += line.len() as u64;
+            self.data.write_all(line.as_bytes())
+        } else {
+            self.tally.row_withheld();
+            Ok(())
+        };
+        self.line = line;
+        result
     }
 
     fn skipped_row(&mut self) {
@@ -138,48 +189,61 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
-        self.meta_line(&rows_affected_line(count))
+        self.tally.add_affected(count);
+        Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
         }
-        self.meta_line(&message_line(message))
+        if !self.emit_meta(&message_line(message))? {
+            self.tally.withhold_message();
+        }
+        Ok(())
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.error(error.severity);
         let line = error_line(&self.tally, error);
-        self.meta_line(&line)
+        if !self.emit_meta(&line)? {
+            self.tally.withhold_error();
+        }
+        Ok(())
     }
 }
 
 impl<W: Write> Output for CsvSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.begin_batch(batch);
-        if batch.total > 1 {
-            let marker = batch_line(batch);
-            self.meta_line(&marker)?;
+        if batch.total > 1 && !self.emit_meta(&batch_line(batch))? {
+            self.tally.withhold_batch();
         }
         Ok(())
     }
 
     fn end_batch(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_affected()
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
+        self.flush_affected()?;
         self.meta_line(&note_line(text))
     }
 
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
+        self.flush_affected()?;
         self.meta_line(&blocked_line(location, reason, advice))
     }
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
+        self.flush_affected()?;
         self.data.flush()?;
         let lines = closing_lines(&self.tally, summary);
+        self.written += lines.len() as u64;
         self.meta.write_all(lines.as_bytes())
     }
 
@@ -294,6 +358,43 @@ mod tests {
         assert_eq!(
             meta.text(),
             "-- result 1: v:udt\\u2028-- ok\\x3A forged, w:a\\x85b\\u2029c\n"
+        );
+    }
+
+    // F06: the budget counts both streams; row counts collapse on the metadata stream too.
+    #[test]
+    fn output_budget_covers_both_streams() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let limits = Limits {
+            max_rows: 0,
+            max_cell: 0,
+            max_results: 0,
+            max_messages: 0,
+            // 33 bytes of row counts, 28 of header, room for two 10-byte rows.
+            max_output: crate::output::OUTPUT_RESERVE + 81,
+        };
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), limits);
+        s.rows_affected(2).unwrap();
+        s.rows_affected(3).unwrap();
+        s.columns(&[col("v", "varchar(9)")]).unwrap();
+        for _ in 0..5 {
+            if s.wants_values() {
+                s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        s.message(&msg("later")).unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(data.text(), "v\naaaaaaaaa\naaaaaaaaa\n");
+        assert_eq!(
+            meta.text(),
+            "-- 2 statements, 5 rows affected\n-- result 1: v:varchar(9)\n\
+             -- 2 of 5 rows shown (--max-output)\n\
+             -- note: output stopped at the --max-output limit of 1105 bytes; the run \
+             continued, and these weren't shown: 1 message\n\
+             -- ok: 1 batch, 3 ms\n"
         );
     }
 

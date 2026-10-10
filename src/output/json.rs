@@ -16,6 +16,8 @@ pub struct JsonSink<W: Write> {
     out: W,
     tally: Tally,
     buf: String,
+    /// Bytes already written from `buf`, for the output budget.
+    drained: u64,
     opened: bool,
     batches: usize,
     in_batch: bool,
@@ -25,12 +27,23 @@ pub struct JsonSink<W: Write> {
     blocked: Option<String>,
 }
 
+/// The buffer and document state before an event, so that an event the output budget
+/// refuses can be taken back whole, including a batch it opened and its comma.
+struct Mark {
+    len: usize,
+    opened: bool,
+    batches: usize,
+    in_batch: bool,
+    events: usize,
+}
+
 impl<W: Write> JsonSink<W> {
     pub fn new(out: W, limits: Limits) -> Self {
         JsonSink {
             out,
             tally: Tally::new(limits),
             buf: String::with_capacity(1024),
+            drained: 0,
             opened: false,
             batches: 0,
             in_batch: false,
@@ -39,6 +52,48 @@ impl<W: Write> JsonSink<W> {
             notes: Vec::new(),
             blocked: None,
         }
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            len: self.buf.len(),
+            opened: self.opened,
+            batches: self.batches,
+            in_batch: self.in_batch,
+            events: self.events,
+        }
+    }
+
+    /// Whether what was appended since `mark` fits the output budget; if not, takes it back.
+    fn admit_since(&mut self, mark: Mark) -> bool {
+        let used = self.drained + mark.len as u64;
+        if self.tally.admit(used, self.buf.len() - mark.len) {
+            return true;
+        }
+        self.buf.truncate(mark.len);
+        self.opened = mark.opened;
+        self.batches = mark.batches;
+        self.in_batch = mark.in_batch;
+        self.events = mark.events;
+        false
+    }
+
+    /// Writes the pending run of row counts as one event, before any other event.
+    fn flush_affected(&mut self) -> io::Result<()> {
+        let Some((statements, rows)) = self.tally.take_affected() else {
+            return Ok(());
+        };
+        let mark = self.mark();
+        self.start_event();
+        let _ = write!(self.buf, "{{\"type\":\"rows_affected\",\"count\":{rows}");
+        if statements > 1 {
+            let _ = write!(self.buf, ",\"statements\":{statements}");
+        }
+        self.buf.push('}');
+        if !self.admit_since(mark) {
+            self.tally.withhold_row_counts(statements);
+        }
+        self.drain(false)
     }
 
     /// Writes the document head once: `{"batches":[`.
@@ -97,12 +152,14 @@ impl<W: Write> JsonSink<W> {
     fn drain(&mut self, force: bool) -> io::Result<()> {
         if force || self.buf.len() >= 32 * 1024 {
             self.out.write_all(self.buf.as_bytes())?;
+            self.drained += self.buf.len() as u64;
             self.buf.clear();
         }
         Ok(())
     }
 
-    fn push_value(&mut self, value: &Value) {
+    /// Appends one value. Returns true when `--max-cell` cut it.
+    fn push_value(&mut self, value: &Value) -> bool {
         let max = self.tally.limits().max_cell;
         match value {
             Value::Null => self.buf.push_str("null"),
@@ -120,9 +177,9 @@ impl<W: Write> JsonSink<W> {
                 push_escaped(&mut self.buf, kept);
                 if cut_count > 0 {
                     self.buf.push_str(&cut_marker(cut_count, false));
-                    self.tally.cell_cut();
                 }
                 self.buf.push('"');
+                return cut_count > 0;
             }
             Value::Bin(bytes) => {
                 let (text, cut_count) = hex(bytes, max);
@@ -130,11 +187,12 @@ impl<W: Write> JsonSink<W> {
                 self.buf.push_str(&text);
                 if cut_count > 0 {
                     self.buf.push_str(&cut_marker(cut_count, true));
-                    self.tally.cell_cut();
                 }
                 self.buf.push('"');
+                return cut_count > 0;
             }
         }
+        false
     }
 }
 
@@ -164,9 +222,11 @@ fn push_escaped(out: &mut String, s: &str) {
 
 impl<W: Write> BatchSink for JsonSink<W> {
     fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+        self.flush_affected()?;
         if self.tally.start_result().is_none() {
             return Ok(());
         }
+        let mark = self.mark();
         self.start_event();
         self.buf.push_str("{\"type\":\"result\",\"columns\":[");
         for (i, column) in columns.iter().enumerate() {
@@ -180,7 +240,11 @@ impl<W: Write> BatchSink for JsonSink<W> {
             let _ = write!(self.buf, ",\"nullable\":{}}}", column.nullable);
         }
         self.buf.push_str("],\"rows\":[");
-        self.in_result = true;
+        if self.admit_since(mark) {
+            self.in_result = true;
+        } else {
+            self.tally.withhold_result();
+        }
         self.drain(false)
     }
 
@@ -189,18 +253,29 @@ impl<W: Write> BatchSink for JsonSink<W> {
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        let mark = self.mark();
         if self.tally.rows_shown() > 0 {
             self.buf.push(',');
         }
-        self.tally.row_shown();
         self.buf.push('[');
+        let mut cells_cut = 0;
         for (i, value) in values.iter().enumerate() {
             if i > 0 {
                 self.buf.push(',');
             }
-            self.push_value(value);
+            if self.push_value(value) {
+                cells_cut += 1;
+            }
         }
         self.buf.push(']');
+        if self.admit_since(mark) {
+            self.tally.row_shown();
+            for _ in 0..cells_cut {
+                self.tally.cell_cut();
+            }
+        } else {
+            self.tally.row_withheld();
+        }
         self.drain(false)
     }
 
@@ -214,24 +289,30 @@ impl<W: Write> BatchSink for JsonSink<W> {
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
-        self.start_event();
-        let _ = write!(self.buf, "{{\"type\":\"rows_affected\",\"count\":{count}}}");
-        self.drain(false)
+        self.tally.add_affected(count);
+        Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
         }
+        let mark = self.mark();
         self.start_event();
         self.buf.push_str("{\"type\":\"msg\",\"text\":");
         push_str(&mut self.buf, &message.text);
         self.buf.push('}');
+        if !self.admit_since(mark) {
+            self.tally.withhold_message();
+        }
         self.drain(false)
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.error(error.severity);
+        let mark = self.mark();
         self.start_event();
         let _ = write!(
             self.buf,
@@ -266,15 +347,20 @@ impl<W: Write> BatchSink for JsonSink<W> {
         self.buf.push_str(",\"text\":");
         push_str(&mut self.buf, &error.text);
         self.buf.push('}');
+        if !self.admit_since(mark) {
+            self.tally.withhold_error();
+        }
         self.drain(false)
     }
 }
 
 impl<W: Write> Output for JsonSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
+        self.flush_affected()?;
         self.tally.begin_batch(batch);
         self.open();
         self.close_batch();
+        let mark = self.mark();
         if self.batches > 0 {
             self.buf.push(',');
         }
@@ -288,25 +374,32 @@ impl<W: Write> Output for JsonSink<W> {
         self.batches += 1;
         self.in_batch = true;
         self.events = 0;
+        if !self.admit_since(mark) {
+            self.tally.withhold_batch();
+        }
         self.drain(false)
     }
 
     fn end_batch(&mut self) -> io::Result<()> {
+        self.flush_affected()?;
         self.close_batch();
         self.drain(false)
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
+        self.flush_affected()?;
         self.notes.push(text.to_owned());
         Ok(())
     }
 
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
+        self.flush_affected()?;
         self.blocked = Some(blocked_message(location, reason, advice));
         Ok(())
     }
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
+        self.flush_affected()?;
         self.open();
         self.close_batch();
         self.buf.push(']');
@@ -416,6 +509,88 @@ mod tests {
                 "elapsed_ms": 9
             })
         );
+    }
+
+    // F06: a run of row counts is one event; `statements` appears only when it's a run.
+    #[test]
+    fn row_counts_collapse_into_one_event() {
+        let mut s = JsonSink::new(Vec::new(), limits());
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        for rows in [1, 2, 3] {
+            s.rows_affected(rows).unwrap();
+        }
+        s.message(&msg("done")).unwrap();
+        s.rows_affected(5).unwrap();
+        s.end_batch().unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            parse(s)["batches"][0]["events"],
+            json!([
+                {"type": "rows_affected", "count": 6, "statements": 3},
+                {"type": "msg", "text": "done"},
+                {"type": "rows_affected", "count": 5}
+            ])
+        );
+    }
+
+    // F06: past the budget the document stays valid: the cut result closes with exact
+    // counts, later events and batches are left out, and a note says so.
+    #[test]
+    fn output_budget_keeps_the_document_valid() {
+        let max_output = crate::output::OUTPUT_RESERVE + 200;
+        let limits = Limits {
+            max_rows: 0,
+            max_cell: 0,
+            max_results: 0,
+            max_messages: 0,
+            max_output,
+        };
+        let mut s = JsonSink::new(Vec::new(), limits);
+        s.begin_batch(&BatchInfo {
+            total: 2,
+            ..batch("-Q", false, 1)
+        })
+        .unwrap();
+        s.columns(&[col("v", "varchar(9)")]).unwrap();
+        for _ in 0..5 {
+            if s.wants_values() {
+                s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        s.message(&msg("later")).unwrap();
+        s.error(&error(1)).unwrap();
+        s.end_batch().unwrap();
+        s.begin_batch(&BatchInfo {
+            number: 2,
+            total: 2,
+            ..batch("-Q", false, 3)
+        })
+        .unwrap();
+        s.rows_affected(1).unwrap();
+        s.end_batch().unwrap();
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        let length = s.out.len() as u64;
+        let doc = parse(s);
+        assert!(length <= max_output, "{length} bytes");
+        let batches = doc["batches"].as_array().unwrap();
+        assert_eq!(batches.len(), 1, "{doc}");
+        let events = batches[0]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "only the result: {doc}");
+        let shown = events[0]["rows"].as_array().unwrap().len();
+        assert!((1..5).contains(&shown), "{doc}");
+        assert_eq!(events[0]["row_count"], 5);
+        assert_eq!(events[0]["truncated"], true);
+        let note = doc["notes"][0].as_str().unwrap();
+        assert!(
+            note.contains("--max-output limit")
+                && note.contains("1 message, 1 error, 1 statement's row count, 1 batch"),
+            "{note}"
+        );
+        assert_eq!(doc["exit_code"], 0);
     }
 
     #[test]

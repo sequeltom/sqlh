@@ -411,12 +411,16 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
         }]);
     }
     let mut sources = Vec::new();
+    let mut left = script::MAX_INPUT_BYTES;
     for input in &opts.inputs {
         let (name, path, bytes) = if input == "-" {
-            ("stdin".to_owned(), None, read_stdin()?)
+            let bytes = read_capped(io::stdin().lock(), "stdin", &mut left)?;
+            ("stdin".to_owned(), None, bytes)
         } else {
-            let bytes =
-                std::fs::read(input).map_err(|e| Failure::usage(format!("-i {input}: {e}")))?;
+            let label = format!("-i {input}");
+            let file =
+                std::fs::File::open(input).map_err(|e| Failure::usage(format!("{label}: {e}")))?;
+            let bytes = read_capped(file, &label, &mut left)?;
             (input.clone(), Some(PathBuf::from(input)), bytes)
         };
         let text = script::decode(bytes, &name).map_err(Failure::usage)?;
@@ -428,7 +432,8 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
                 "no SQL given: pass -Q \"...\", -i file.sql, or pipe SQL on stdin",
             ));
         }
-        let text = script::decode(read_stdin()?, "stdin").map_err(Failure::usage)?;
+        let bytes = read_capped(io::stdin().lock(), "stdin", &mut left)?;
+        let text = script::decode(bytes, "stdin").map_err(Failure::usage)?;
         sources.push(Source {
             name: "stdin".into(),
             path: None,
@@ -438,12 +443,21 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
     Ok(sources)
 }
 
-fn read_stdin() -> Result<Vec<u8>, Failure> {
+/// Reads all of `reader`, refusing to go past `left` bytes: the input limit is shared by all
+/// of a run's sources (DESIGN.md §4.4). Reads at most one byte more than allowed.
+fn read_capped(reader: impl Read, label: &str, left: &mut usize) -> Result<Vec<u8>, Failure> {
     let mut bytes = Vec::new();
-    io::stdin()
-        .lock()
+    reader
+        .take(*left as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| Failure::usage(format!("reading stdin: {e}")))?;
+        .map_err(|e| Failure::usage(format!("{label}: {e}")))?;
+    if bytes.len() > *left {
+        return Err(Failure::usage(format!(
+            "{label}: the SQL input is over the {} MB limit; run it in parts",
+            script::MAX_INPUT_BYTES / 1_000_000
+        )));
+    }
+    *left -= bytes.len();
     Ok(bytes)
 }
 

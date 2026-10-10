@@ -479,6 +479,33 @@ fn sequences_and_global_temp_writes_are_blocked() {
     }
 }
 
+// F06: input and repeats are bounded before anything connects or runs.
+#[test]
+fn input_size_and_repeats_are_bounded() {
+    let mut args = DEAD.to_vec();
+    args.extend(["-Q", "SELECT 1\nGO 1001"]);
+    let r = sqlh_args(&args);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("GO 1001 would run the batch 1001 times; the most is 1000")
+    );
+
+    let dir = scratch("f06_input");
+    let file = dir.join("big.sql");
+    fs::write(&file, "-".repeat(10_000_001)).unwrap();
+    let mut args = DEAD.to_vec();
+    let path = file.display().to_string();
+    args.extend(["-i", &path]);
+    let r = sqlh_args(&args);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(r.stdout.contains("over the 10 MB limit"), "{}", r.stdout);
+
+    let r = sqlh_args(&["--max-output", "100", "-Q", "SELECT 1"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
+}
+
 // F10: a truncated UTF-16 file is an error, not a silent loss of the last byte.
 #[test]
 fn odd_length_utf16_is_rejected() {
@@ -654,6 +681,72 @@ mod live {
             "{}",
             r.stdout
         );
+    }
+
+    // F06 / PLAN.md 2.2: a loop's row counts are one line, not 300.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_loop_of_inserts_prints_one_row_count_line() {
+        let (p, db) = target();
+        let sql = "CREATE TABLE #t (i int);\nDECLARE @i int = 0;\n\
+                   WHILE @i < 300 BEGIN INSERT #t VALUES (@i); SET @i += 1; END";
+        let r = live(&p, &db, &["-Q", sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let counts: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter(|l| l.contains("affected"))
+            .collect();
+        assert_eq!(
+            counts,
+            ["-- 300 statements, 300 rows affected"],
+            "{}",
+            r.stdout
+        );
+    }
+
+    // F06 / PLAN.md 2.2: a run over the output budget ends with a valid status and a note,
+    // in text and in json, and stays within the budget.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_run_over_the_output_budget_ends_cleanly() {
+        let (p, db) = target();
+        let sql = "SELECT TOP (500) o.name, o.object_id, o.type_desc FROM sys.all_objects AS o \
+                   ORDER BY o.object_id; PRINT 'after';";
+        let r = live(&p, &db, &["--max-output", "4096", "-Q", sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.len() <= 4096, "{} bytes", r.stdout.len());
+        assert!(
+            r.stdout.contains(" of 500 rows shown (--max-output)"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("weren't shown: 1 message"),
+            "{}",
+            r.stdout
+        );
+        assert!(last_line(&r.stdout).starts_with("-- ok: "), "{}", r.stdout);
+
+        let r = live(
+            &p,
+            &db,
+            &["--max-output", "4096", "--format", "json", "-Q", sql],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.len() <= 4096, "{} bytes", r.stdout.len());
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["row_count"], 500, "{doc}");
+        assert_eq!(result["truncated"], true);
+        assert!(
+            doc["notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("--max-output limit"),
+            "{doc}"
+        );
+        assert_eq!(doc["ok"], true);
     }
 
     // PLAN.md 2.1: --verbose says where the time to the first batch went; a build with
