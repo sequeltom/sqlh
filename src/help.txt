@@ -54,8 +54,8 @@ PROFILES  (passwords live in Windows Credential Manager, never in files or argum
 FORMAT
   Lines starting with "-- " are metadata. A result set is "-- result N", a header of
   name:type columns, tab-separated rows, then "-- N rows". NULL is NULL; the string 'NULL'
-  is \NULL; \t \n \r \\ are escapes; a cut value ends with …[+N]. The last line is always
-  "-- ok: ..." or "-- failed (exit N): ...". Errors map to input lines.
+  is \NULL; \t \n \r \\ are escapes; a cut value ends with …[+N]. Errors map to input lines.
+  The last line is "-- ok: ..." or "-- failed (exit N): ...", unless exit 7 or 10 cut it off.
 
 EXIT CODES
   0 ok  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled

@@ -97,7 +97,7 @@ These flags are sqlcmd-compatible:
 | `-P` | **Rejected** with exit 3 and a message pointing to profiles or `SQLCMDPASSWORD`. Command lines end up in agent transcripts and process lists. |
 | `-Q sql` | SQL text to run. `-q` is treated as `-Q`, because there is no interactive mode. |
 | `-i file` | Input file. Repeatable. |
-| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed, leaves no `.partial` file behind (Windows deletes it), and sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
+| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed while writing, leaves no `.partial` file behind (Windows deletes it); only a kill in the moment between finishing and the rename can leave one. sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
 | `-v n=v ...` | Values for `$(n)` substitution. Environment variables also resolve, as in sqlcmd. |
 | `-x` | Turn off `$(var)` substitution. |
 | `-l sec` | Login timeout covering TCP, TLS and login. Default 15. |
@@ -182,7 +182,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 - **Statement summaries:** `-- N rows affected` for DML.
 - **Messages:** `-- msg: text` for PRINT and messages of severity 10 or lower.
 - **Errors:** `-- error <num> (severity S, state T, line L[, proc P]): message`.
-- **Final summary:** always the last line, either `-- ok: ...` or `-- failed (exit N): ...`.
+- **Final summary:** the last line of complete output, either `-- ok: ...` or `-- failed (exit N): ...`. Output is cut short only when it couldn't be delivered (exit 7) or sqlh crashed (exit 10, where the line is best effort). Then the exit code is what counts (§4.3, §6).
 
 **Escaping (values, names, and every variable field in metadata lines)**
 

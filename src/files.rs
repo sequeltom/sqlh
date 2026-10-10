@@ -62,9 +62,9 @@ pub fn is_stream(file: &File) -> bool {
 /// - The name is unique (`out.txt.<pid>-<n>.partial`) and the file is created new, so it
 ///   never truncates or takes over an existing file, such as another run's.
 /// - No other process can write, rename or delete it while it's open.
-/// - Until `publish`, it is marked for deletion, so a failed run, or a process that is
-///   killed, leaves nothing behind: Windows removes it when the last handle closes. While
-///   marked, others can't open it at all.
+/// - Until `publish`, it is marked for deletion, so a failed run, or a process killed
+///   while writing, leaves nothing behind: Windows removes it when the last handle
+///   closes. While marked, others can't open it at all.
 pub struct Partial {
     file: Option<File>,
     path: PathBuf,
@@ -117,7 +117,8 @@ impl Partial {
     }
 
     /// Moves the finished file over `target`, replacing it whole. On failure the `.partial`
-    /// file is removed and `target` stays as it was.
+    /// file is removed and `target` stays as it was. A process killed between clearing the
+    /// deletion mark and the rename leaves the `.partial` file behind.
     pub fn publish(mut self, target: &Path) -> io::Result<()> {
         if self.armed {
             let file = self
