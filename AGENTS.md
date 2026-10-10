@@ -116,4 +116,4 @@ The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
 2. Phase 2, fast, bounded, cancellable turns, starting with the connect-latency investigation.
 3. Phase 3, execution core, release checks and live fixtures.
-4. Phases 4–7: schema discovery, connection reuse, command categorization, evidence-based evaluations.
+4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

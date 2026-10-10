@@ -166,6 +166,16 @@ Classifier v2 implements the result. Showplan support (`SET SHOWPLAN_XML`, summa
 
 Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor, the md format, and code signing.
 
+### Phase 8: delivery to agents (skill, connector, plugin)
+
+Raised 2026-10-10. Not a VISION priority: the exe is the product, and these are wrappers that get it to agents. Nothing is decided or started; the owner deferred drafting the skill. In order:
+
+1. **Skill** (S, no code). A `SKILL.md` for Bash-driven agents. `--help` already carries the syntax, so the skill covers workflow: describe before querying, how to read the output format, the limits and exit codes, and when to reach for sqlh. It can be drafted at any time, and is more useful once Phase 4's schema commands exist.
+2. **Connector = local stdio MCP server** (built in Phase 5(a), not here). It is not a hosted, remote connector: credentials come from Credential Manager and SSPI on the workstation, and the workstation reaches the SQL Server, and neither survives a hosted deployment. Packaging it as a Claude Desktop extension (`.mcpb`) is a possible later step and is unresearched.
+3. **Plugin** (S, after 2). Bundles the skill, the MCP config and the exe location so installing is one step. Open: whether the plugin carries the exe or points at an installed path, which ties into the code-signing decision in Phase 7.
+
+If Phase 5 chooses the local daemon (b) over MCP, step 2 drops out and the skill carries more of the load.
+
 ## 5. Sequencing rationale
 
 - **1.1 (F04) first.** It is the only finding where the tool states something false while possibly executing writes.
