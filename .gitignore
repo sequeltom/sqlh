@@ -1,0 +1,35 @@
+# Rust build output. Cargo.lock stays committed: sqlh is a binary, so builds must be reproducible.
+/target/
+
+# rustfmt backups; coverage and mutation-testing output
+**/*.rs.bk
+*.profraw
+*.profdata
+lcov.info
+mutants.out*/
+
+# MSVC debug symbols and incremental-link files built outside target/
+*.pdb
+*.ilk
+
+# sqlh connection profiles: they normally live in %APPDATA%, but SQLH_CONFIG can point
+# anywhere. They hold server names and logins (never passwords), so keep them out of git.
+profiles.toml
+*.toml.tmp
+
+# Editors and IDEs
+.vscode/
+.idea/
+.vs/
+*.swp
+*~
+
+# Personal Claude Code settings (shared settings in .claude/settings.json stay tracked)
+.claude/settings.local.json
+
+# OS clutter
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

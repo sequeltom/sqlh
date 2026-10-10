@@ -1,0 +1,60 @@
+sqlh - SQL Server query tool for agents. Read-only by default; compact typed output.
+
+USAGE
+  sqlh [connection] [options] -Q "SQL"          (or the SQL as the only argument)
+  sqlh [connection] [options] -i file.sql [-i more.sql]
+  <SQL on stdin> | sqlh [connection] [options]
+
+EXAMPLES
+  sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders ORDER BY Id DESC"
+  sqlh -S myserver,1433 -U reader -d AppDb -i report.sql   (password: env SQLCMDPASSWORD)
+  sqlh -S myserver -d AppDb <<'SQL'
+  SELECT name, create_date FROM sys.tables ORDER BY name;
+  SQL
+
+CONNECTION
+  --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
+  -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
+  -d database     (env SQLCMDDBNAME)
+  -E              Windows integrated auth (the default when there is no -U)
+  -U login        SQL login (env SQLCMDUSER); password from the profile or env SQLCMDPASSWORD.
+                  -P is refused
+  -C              trust the server certificate (self-signed dev servers)
+  -Ns | -Nm | -No encryption strict | mandatory (default) | optional
+  -K ReadOnly     read-only application intent      -M  multi-subnet failover
+  -l seconds      login timeout (default 15)
+
+EXECUTION
+  -Q sql          SQL to run
+  -i file         input file, repeatable; "-i -" reads stdin. UTF-8, or UTF-16 with a BOM
+  -v n=v ...      values for $(n); environment variables also resolve. -x turns this off
+  -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
+  -t seconds      query timeout per batch (default 60; 0 = none)
+  --allow-write   permit writes. Without it, writes other than to #temp/@table are refused
+                  before anything runs, and all batches run in a transaction that is rolled back
+  --check         compile only (SET NOEXEC ON), executes nothing: catches syntax errors and
+                  unknown columns; missing tables only show up when the query really runs
+  --continue-on-error   run later batches after one fails (default: stop)
+
+OUTPUT
+  --format F      text (default) | json (one document; ordered events per batch; exit
+                  status at the end) | csv (data only on stdout/-o; -- lines on stderr)
+  --max-rows N    rows shown per result set (default 100; 0 = all). The rest are counted
+  --max-cell N    characters shown per value (default 500; 0 = all)
+  --max-results N result sets shown (default 20)
+  -o file         write output to a file
+  --verbose       connection diagnostics on stderr
+
+PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
+  sqlh profile add NAME -S server [-d db] [-U login] [-C] [--write-policy deny|flag|allow] [--new-password]
+                  prompts for the password (again only if server or login change), tests it
+  sqlh profile list | test NAME | rm NAME
+
+FORMAT
+  Lines starting with "-- " are metadata. A result set is "-- result N", a header of
+  name:type columns, tab-separated rows, then "-- N rows". NULL is NULL; the string 'NULL'
+  is \NULL; \t \n \r \\ are escapes; a cut value ends with …[+N]. The last line is always
+  "-- ok: ..." or "-- failed (exit N): ...". Errors map to input lines.
+
+EXIT CODES
+  0 ok  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled

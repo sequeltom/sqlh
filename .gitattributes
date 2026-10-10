@@ -1,0 +1,6 @@
+# Keep text files LF in the repo and in every working copy, whatever core.autocrlf says.
+* text=auto eol=lf
+
+# cmd.exe misparses some batch files with LF endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
