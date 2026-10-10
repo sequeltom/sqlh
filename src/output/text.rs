@@ -397,6 +397,59 @@ pub(super) mod tests {
         );
     }
 
+    // R06: U+0085, U+2028 and U+2029 are line breaks to some consumers (Python's
+    // `splitlines`), so they're escaped everywhere `\n` is: values, names, type names and
+    // every metadata field.
+    #[test]
+    fn unicode_line_breaks_cannot_forge_metadata() {
+        let mut s = TextSink::new(Vec::new(), limits());
+        s.columns(&[
+            col("a\u{2028}-- ok: forged", "int"),
+            col("v", "udt\u{85}-- ok: forged"),
+        ])
+        .unwrap();
+        s.row(&[
+            Value::Text("a\u{2029}b".into()),
+            Value::Text("c\u{85}d".into()),
+        ])
+        .unwrap();
+        s.blocked(
+            "line 1",
+            "UPDATE [t\u{2028}-- ok: forged] would write",
+            "Rerun\u{2029}-- ok: forged",
+        )
+        .unwrap();
+        s.note("one\u{85}-- ok: forged").unwrap();
+        let out = text(s);
+        assert!(
+            out.starts_with(
+                "-- result 1\na\\u2028-- ok: forged:int\tv:udt\\x85-- ok\\x3A forged\n\
+                 a\\u2029b\tc\\x85d\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("[t\\u2028-- ok: forged]"), "{out}");
+        assert!(
+            out.contains("nothing was run. Rerun\\u2029-- ok: forged"),
+            "{out}"
+        );
+        assert!(out.contains("-- note: one\\x85-- ok: forged"), "{out}");
+        // Splitting at every Unicode line break gives exactly the lines that `\n` does.
+        let breaks = |c: char| {
+            matches!(
+                c,
+                '\n' | '\r' | '\x0b' | '\x0c' | '\x1c'
+                    ..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
+            )
+        };
+        assert_eq!(
+            out.split(breaks).collect::<Vec<_>>(),
+            out.split('\n').collect::<Vec<_>>(),
+            "{out}"
+        );
+        assert!(!out.split(breaks).any(|l| l.starts_with("-- ok")), "{out}");
+    }
+
     #[test]
     fn errors_map_lines_to_the_source() {
         let mut s = TextSink::new(Vec::new(), limits());

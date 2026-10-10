@@ -97,7 +97,7 @@ These flags are sqlcmd-compatible:
 | `-P` | **Rejected** with exit 3 and a message pointing to profiles or `SQLCMDPASSWORD`. Command lines end up in agent transcripts and process lists. |
 | `-Q sql` | SQL text to run. `-q` is treated as `-Q`, because there is no interactive mode. |
 | `-i file` | Input file. Repeatable. |
-| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed while writing, leaves no `.partial` file behind (Windows deletes it); only a kill in the moment between finishing and the rename can leave one. sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
+| `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed while writing, leaves no `.partial` file behind: Windows deletes it when the last handle closes, because the file is marked for deletion as soon as it is created. If that mark can't be set (not expected), a run that ends normally still removes the file by name, but a kill, or an error while removing it, can leave it behind. A kill in the moment between finishing and the rename can leave one in either case. sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
 | `-v n=v ...` | Values for `$(n)` substitution. Environment variables also resolve, as in sqlcmd. |
 | `-x` | Turn off `$(var)` substitution. |
 | `-l sec` | Login timeout covering TCP, TLS and login. Default 15. |
@@ -173,7 +173,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 
 - Lines starting with `-- ` are tool metadata. Every other line is data.
 - **Header line:** after `-- result N`, one `name:type` entry per column, tab-separated.
-  - The type is everything after the last `:`, so names can contain colons. A type name never does: a `:` in one (only a CLR UDT's name comes from the server as is) is written `\x3A`.
+  - The type is everything after the last `:`, so names can contain colons. A type name never does: a `:` in one (only a CLR UDT's name comes from the server as is) is written `\x3A`. A reader splits a header entry at its last literal `:` first, then unescapes the name and the type separately.
   - An unnamed column has an empty name, as in `:int`.
   - Types carry their length or precision: `nvarchar(50)`, `varchar(max)`, `decimal(18,2)`, `datetime2(7)`.
 - **Data rows:** tab-separated values.
@@ -186,8 +186,12 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 
 **Escaping (values, names, and every variable field in metadata lines)**
 
-- Backslash, tab, newline and CR are written as `\\`, `\t`, `\n` and `\r`. Other ASCII control characters become `\xNN`. A backslash before any other character means that character.
-- The same escaping applies to type names in headers, and to every variable field of a metadata line: column and type names, procedure names, source names in locations, guard reasons and advice, notes and error text. Nothing a database or an input contains can start a new line or pass for a `-- ` line. (Windows paths in notes therefore show doubled backslashes.)
+- Backslash, tab, newline and CR are written as `\\`, `\t`, `\n` and `\r`.
+- Every other control character becomes `\xNN`, with exactly two uppercase hex digits: the C0 controls and DEL (U+0000–U+001F, U+007F) and the C1 controls (U+0080–U+009F). U+0085 is one of Unicode's line breaks, and U+009B is a control sequence introducer on some 8-bit terminals.
+- U+2028 and U+2029, the other two Unicode line breaks, become `\u2028` and `\u2029`: `\u` and exactly four hex digits.
+- A backslash before any other character means that character. A reader decodes `\xNN` and `\uNNNN` to the character they name, so a literal backslash is always doubled (`\\x3A` is a backslash followed by `x3A`, while `\x3A` is a colon).
+- Other Unicode text (accents, no-break space, CJK) is written as it is.
+- The same escaping applies to type names in headers, and to every variable field of a metadata line: column and type names, procedure names, source names in locations, guard reasons and advice, notes and error text. Nothing a database or an input contains can start a new line or pass for a `-- ` line, whether the consumer splits at `\n` only or at every Unicode line break (Python's `splitlines`, for instance). (Windows paths in notes therefore show doubled backslashes.) This is for text, and the metadata lines of csv. A csv data row follows csv's own quoting, and a json string keeps these characters as JSON allows (§5.2, §5.3).
 - Bare `NULL` means SQL NULL. A string whose entire value is `NULL` is written as `\NULL`.
 - A first-column value, or a first column name in a header, starting with `--` gets a leading backslash (`\--...`), so data and header lines never look like metadata.
 - An empty string is an empty field.

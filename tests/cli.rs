@@ -435,6 +435,37 @@ fn noexec_refusal_advice_fits_in_every_format() {
     }
 }
 
+// R06: a blocked statement's own text can't start a metadata line through a Unicode line
+// break (U+0085, U+2028, U+2029) either. The run is refused before it connects, so no server
+// is needed. json is left out: its strings may hold these characters, and it has no
+// metadata lines.
+#[test]
+fn unicode_line_breaks_in_blocked_text_cannot_forge_metadata() {
+    for separator in ['\u{85}', '\u{2028}', '\u{2029}'] {
+        for format in ["text", "csv"] {
+            let sql = format!("UPDATE [t{separator}-- ok: forged] SET x = 1");
+            let r = sqlh_args(&["--format", format, "-Q", &sql]);
+            let what = format!("U+{:04X} {format}", separator as u32);
+            assert_eq!(r.code, 5, "{what}: {}", r.stdout);
+            // csv keeps its metadata on stderr; text uses stdout.
+            let shown = if format == "csv" {
+                &r.stderr
+            } else {
+                &r.stdout
+            };
+            assert!(
+                !shown.contains(separator),
+                "{what}: raw separator in {shown:?}"
+            );
+            // Whatever splits lines at Unicode breaks sees no forged status line.
+            let forged = shown
+                .split(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
+                .any(|line| line.starts_with("-- ok"));
+            assert!(!forged, "{what}: {shown:?}");
+        }
+    }
+}
+
 // F03 at process level (the cases themselves are unit-tested in guard.rs).
 #[test]
 fn sequences_and_global_temp_writes_are_blocked() {

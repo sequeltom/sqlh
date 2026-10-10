@@ -62,9 +62,12 @@ pub fn is_stream(file: &File) -> bool {
 /// - The name is unique (`out.txt.<pid>-<n>.partial`) and the file is created new, so it
 ///   never truncates or takes over an existing file, such as another run's.
 /// - No other process can write, rename or delete it while it's open.
-/// - Until `publish`, it is marked for deletion, so a failed run, or a process killed
-///   while writing, leaves nothing behind: Windows removes it when the last handle
-///   closes. While marked, others can't open it at all.
+/// - Until `publish`, it is marked for deletion: Windows removes it when the last handle
+///   closes, so a failed run, or a process killed while writing, leaves nothing behind.
+///   While marked, others can't open it at all.
+/// - That holds only once the mark is set. When setting it fails (not expected), `armed` is
+///   false and `Drop` removes the file by name instead. That is best effort: it covers a
+///   run that ends normally, but not a kill, and an error removing the file is ignored.
 pub struct Partial {
     file: Option<File>,
     path: PathBuf,

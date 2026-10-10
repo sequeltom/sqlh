@@ -280,6 +280,23 @@ mod tests {
         );
     }
 
+    // R06: the Unicode line breaks are escaped on the metadata stream too. Data rows follow
+    // CSV's own quoting and are left alone.
+    #[test]
+    fn unicode_line_breaks_are_escaped_in_metadata() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), Limits::default());
+        s.columns(&[
+            col("v", "udt\u{2028}-- ok: forged"),
+            col("w", "a\u{85}b\u{2029}c"),
+        ])
+        .unwrap();
+        assert_eq!(
+            meta.text(),
+            "-- result 1: v:udt\\u2028-- ok\\x3A forged, w:a\\x85b\\u2029c\n"
+        );
+    }
+
     #[test]
     fn result_sets_are_separated_by_a_blank_line() {
         let data = Shared::default();

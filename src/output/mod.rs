@@ -357,6 +357,12 @@ pub fn push_type(out: &mut String, type_name: &str) {
 
 /// Appends `s` with `\\ \t \n \r` and other control characters escaped (the text format's
 /// escaping), cut after `max` characters with a marker. Returns true when cut.
+/// - Every control character, C0 and DEL and C1 (U+0080..U+009F), becomes `\xNN`. U+0085 is
+///   one of Unicode's line breaks, and U+009B is a control sequence introducer on some
+///   8-bit terminals.
+/// - The other two Unicode line breaks, U+2028 and U+2029, become `\u2028` and `\u2029`.
+///   Together with `\n`, `\r` and the C0 breaks, that leaves no character a consumer could
+///   split a line at (Python's `splitlines`, say), so a value can't pass for a `-- ` line.
 pub fn push_escaped(out: &mut String, s: &str, max: usize) -> bool {
     let (kept, cut_count) = cut(s, max);
     for ch in kept.chars() {
@@ -365,9 +371,12 @@ pub fn push_escaped(out: &mut String, s: &str, max: usize) -> bool {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            c if c.is_control() && (c as u32) < 0x80 => {
+            // Control characters are all below U+0100, so two hex digits are enough.
+            c if c.is_control() => {
                 let _ = write!(out, "\\x{:02X}", c as u32);
             }
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c => out.push(c),
         }
     }
@@ -395,6 +404,43 @@ mod tests {
         );
         assert_eq!(escaped("héllo wörld", 5), ("héllo…[+6]".into(), true));
         assert_eq!(escaped("abc", 3), ("abc".into(), false));
+    }
+
+    // R06: C1 controls and the two Unicode-only line breaks are escaped, ordinary Unicode
+    // text (accents, a no-break space, CJK) is not.
+    #[test]
+    fn escapes_c1_controls_and_unicode_line_breaks() {
+        assert_eq!(
+            escaped("a\u{7f}b\u{80}c\u{85}d\u{9b}e\u{9f}f", 0),
+            ("a\\x7Fb\\x80c\\x85d\\x9Be\\x9Ff".into(), false)
+        );
+        assert_eq!(
+            escaped("x\u{2028}y\u{2029}z", 0),
+            ("x\\u2028y\\u2029z".into(), false)
+        );
+        assert_eq!(
+            escaped("é\u{a0}日本\u{2027}\u{202a}", 0),
+            ("é\u{a0}日本\u{2027}\u{202a}".into(), false)
+        );
+        // The cut counts characters before escaping, as it always did.
+        assert_eq!(escaped("a\u{2028}b", 2), ("a\\u2028…[+1]".into(), true));
+    }
+
+    // R06: whatever the character, its escaped form holds nothing a consumer splits lines at
+    // (the set is Python's `str.splitlines`, the widest in common use).
+    #[test]
+    fn no_character_survives_as_a_line_break() {
+        const BREAKS: [char; 10] = [
+            '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+        ];
+        for c in '\0'..=char::MAX {
+            let (out, _) = escaped(&c.to_string(), 0);
+            assert!(
+                !out.chars().any(|o| BREAKS.contains(&o)),
+                "U+{:04X} -> {out:?}",
+                c as u32
+            );
+        }
     }
 
     #[test]

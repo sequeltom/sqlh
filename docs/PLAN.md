@@ -93,7 +93,7 @@ The follow-up review asked for changes before Phase 1 counts as complete. Each f
 
 | # | Finding | Fix | Tests |
 |---|---|---|---|
-| R01 (P1) | Every run shared `<path>.partial`, so a run could write into output that another run had already published, and it took over any existing `.partial` file. | Each run creates its own `<path>.<pid>-<n>.partial` (CREATE_NEW, marked for deletion until published; no other process can change it, or open it while it's marked), closes it, then renames it. A failed run, or one killed while writing, leaves nothing. An existing target that can't be written is refused before anything runs. Overlapping runs: the last complete file wins. | `files.rs` units; CLI: concurrent runs, a held destination, an existing `.partial` file |
+| R01 (P1) | Every run shared `<path>.partial`, so a run could write into output that another run had already published, and it took over any existing `.partial` file. | Each run creates its own `<path>.<pid>-<n>.partial` (CREATE_NEW, marked for deletion until published; no other process can change it, or open it while it's marked), closes it, then renames it. A failed run, or one killed while writing, leaves nothing (see R07 for when the deletion mark can't be set). An existing target that can't be written is refused before anything runs. Overlapping runs: the last complete file wins. | `files.rs` units; CLI: concurrent runs, a held destination, an existing `.partial` file |
 | R02 | `eprintln!` and the panic hook could panic on a closed stream: exit 10 or an abort instead of 7. | Every diagnostic is a best-effort write. `--help` and `--version` write fallibly (exit 7). The password prompt returns write errors, so echo is restored, and the panic hook restores it too. stderr says when a failure mid-run leaves the outcome unknown. | CLI: stdout, stderr or both closed, across text, json, csv, help, version, usage errors and the panic path |
 | R03 | The panic test failed in release builds. | Built only in debug builds, like `SQLH_DEBUG_PANIC`, and aimed at the unreachable address. | `cargo test --release --test cli` |
 | R04 | The NOEXEC refusal advised `--allow-write`, which can't help. | Each refusal carries its own advice; `--allow-write` is suggested only where it helps. Specific advice for NOEXEC, `##` tables, `sp_spaceused`, qualified procedure names (`sys.sp_who`) and typos. | guard units; CLI: all three formats |
@@ -108,6 +108,13 @@ Also from the review:
   - The `dbo.` rule is described as a policy, with the `sys.` spelling suggested.
 - **Found while fixing:** Phase 1's rename broke `-o NUL` (exit 7). Devices and pipes are written directly again.
 - **Still open, as planned:** the response budget (2.2), stalled-reader cancellation (2.3), Windows cancellation coverage (2.4), and F12's lock and config/credential ordering and F14's wiping (3.2).
+
+Second round: the reviewer's verification of `817ab03` and `e3556bf` accepted R01–R05 and found two follow-ups for before the first release. Both are fixed. As a negative control, four unit tests and the CLI test fail against the old escaper.
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| R06 (P2) | U+0085, U+2028 and U+2029 are line breaks to some consumers (Python's `splitlines`), and the escaper let them through, so a blocked statement's text could appear to start a `-- ok:` line. | `push_escaped` writes every control character as `\xNN`: C0, DEL and the whole C1 range, not only U+0085, so the rule is simply "every control character" and U+009B (a control sequence introducer on some 8-bit terminals) is covered. U+2028 and U+2029 become `\u2028` and `\u2029`. Other Unicode text is untouched. csv data rows (csv quoting) and json strings (valid as they are) are left alone. DESIGN.md §5.1 specifies the escapes and how a reader decodes them. | `output/mod.rs` units, including a check of every `char` against the break characters of Python's `splitlines`; text and csv exact output; CLI: blocked text holding each separator, in text and csv |
+| R07 (P3) | The cleanup promise for the `.partial` file left out the case where the deletion mark can't be set. | Wording only. The mark is what deletes the file, even after a kill. Without it (not expected), `Drop` removes the file by name when the run ends normally, which is best effort, and a kill can leave it. `files.rs` and DESIGN.md §4.2 say so. | none: the failure can't be forced |
 
 ### Phase 2: fast, bounded, cancellable turns (VISION priority 2)
 
