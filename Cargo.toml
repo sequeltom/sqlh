@@ -12,6 +12,14 @@ mssql-tds = "=0.2.0"
 # mssql-tds already pulls tokio with "full"; we name only what we use.
 tokio = { version = "1", default-features = false, features = ["rt", "time", "signal", "macros"] }
 lexopt = "0.3"
+# Feature `timing` only. Already in the tree through mssql-tds's tracing.
+log = { version = "0.4", optional = true }
+
+[features]
+# Developer builds (PLAN.md 2.1): --verbose and `profile test` also time each connect step
+# (tcp, prelogin, tls, login) from the driver's log events. Off by default: listening to the
+# driver's logging keeps all of its log formatting in the exe (+270 KB, about 12%).
+timing = ["dep:log"]
 
 [target.'cfg(windows)'.dependencies]
 # Same version mssql-tds already uses; we add the console API (password prompt) and

@@ -123,7 +123,7 @@ These long flags are our own:
 | `--check` | Compile only: `SET NOEXEC ON`, executes nothing. Catches syntax errors and unknown columns of existing tables. Missing tables are only reported when a query runs, because SQL Server defers their resolution. Input that mentions `NOEXEC` is refused (exit 5; §7 lists the false positives), NOEXEC is re-armed before every batch, and the rolled-back wrapper transaction always applies. With `--allow-write`, write statements may be compiled; they still don't run. A later version could add `sp_describe_first_result_set` per statement. |
 | `--continue-on-error` | Keep running later batches after a failed one. |
 | `--stats` | Turn on `SET STATISTICS IO, TIME` and print a summary instead of the raw messages (M3). |
-| `--verbose` | Diagnostics to stderr. Never includes secrets. |
+| `--verbose` | Diagnostics to stderr. Never includes secrets. One line after connecting: the profile, how long the connect and the session setup took, and the server, version, database and encryption. A build with `--features timing` also splits the connect into steps: `connected in 194 ms (tcp 5, prelogin 9, tls 29, login 150)`. |
 | `--help`, `--version` | `--help` is read by models: example-first and under about 60 lines. |
 
 ### 4.3 Execution semantics
@@ -395,7 +395,7 @@ write_policy = "deny"
   - It saves the profile and runs `profile test`.
   - Options you leave out keep their saved values, so rerunning `sqlh profile add NAME` just replaces the password.
   - The first profile you add becomes the default.
-- `sqlh profile test NAME` connects and reports server, version, edition, database, login, user, encryption and auth scheme. Encryption and auth scheme come from `CONNECTIONPROPERTY`, which needs no extra permission. This is the first thing to run when a connection misbehaves.
+- `sqlh profile test NAME` connects and reports server, version, edition, database, login, user, encryption and auth scheme, with a note on how long connecting took (the `--verbose` line). Encryption and auth scheme come from `CONNECTIONPROPERTY`, which needs no extra permission. This is the first thing to run when a connection misbehaves.
 - `sqlh profile list` shows every profile and whether its password is stored, without revealing it.
 - `sqlh profile rm NAME` removes the profile and its credential.
 
@@ -435,6 +435,7 @@ The primary product measure is time to the next useful answer across repeated ag
 
 - **Size:** a stripped exe under 6 MB. Measure at M0, and justify any growth over 10%.
 - **Startup:** under 10 ms from process start to the first TDS packet, on a warm cache.
+- **Connect:** measured in [notes/connect-latency.md](notes/connect-latency.md). Against SQL Server 2025 with SQL authentication, a connect takes about 195 ms on the dev LAN, and about 150 ms of it is the server hashing the password (PBKDF2), by design. sqlh and the driver add about 5 ms. Fast repeated turns therefore need connection reuse (PLAN.md Phase 5), not client tuning.
 - **Memory:** rows stream through one locked 64 KB `BufWriter` on stdout. It flushes at the end of each batch and before exit, and no result set is ever buffered.
 - **Runtime:** Tokio `current_thread`, with only the features we use enabled in our crate.
 - **Lazy setup:** the profile file isn't read when flags alone are enough.

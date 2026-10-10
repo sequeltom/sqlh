@@ -898,6 +898,7 @@ name = "sqlh"
 version = "0.1.0"
 dependencies = [
  "lexopt",
+ "log",
  "mssql-tds",
  "serde_json",
  "tokio",

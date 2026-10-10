@@ -54,6 +54,7 @@ The vision update is coherent, and AGENTS.md, DESIGN.md and the two plans now ag
   - `-No` didn't help, so it isn't data-path TLS.
   - About 70 round trips' worth of time for a handshake that needs perhaps 5 points at something in the connect path: name lookups, SChannel credential setup, certificate parsing, or driver retries.
   - This is the largest lever on VISION's "time to the next useful answer". It also decides how urgent pooling is.
+  - **Explained by 2.1** ([notes/connect-latency.md](notes/connect-latency.md)): about 150 ms of each connect is the server hashing the SQL login's password (PBKDF2, new in SQL Server 2025), by design. sqlh and the driver add about 5 ms.
 - **A harness kill cancels server work promptly, for waits at least.** sqlh was killed with TerminateProcess during a 20 s `WAITFOR`. Within about 200 ms (the observer's own connect time) the server request and session were gone. CPU-bound and lock-blocked queries aren't measured yet.
 - **The test login is sysadmin.** The over-privileged connection VISION.md worries about is the default situation here, and the read-only guard is the only thing standing between an agent and writes.
 - **Draining has a cost.** Showing 100 of 299,398 `Users` rows took 1.3 s, all of it spent counting rows nobody sees. Bigger tables scale linearly.
@@ -120,7 +121,7 @@ Second round: the reviewer's verification of `817ab03` and `e3556bf` accepted R0
 
 | # | Task | Acceptance | Size |
 |---|---|---|---|
-| 2.1 | **Connect-latency investigation** (§3), time-boxed. Time each phase (TCP, prelogin, TLS, login, setup) behind `--verbose`, find where the roughly 150 ms goes, then fix it in our code or file it upstream. An upstream investigation must not hold up 2.2–2.4, which are release requirements (follow-up review, answer 5). | A breakdown is recorded in `docs/notes/`. Target: under 40 ms connect on this LAN, or a documented reason why not. | M |
+| 2.1 | **Connect-latency investigation** (§3), time-boxed. Time each phase (TCP, prelogin, TLS, login, setup) behind `--verbose`, find where the roughly 150 ms goes, then fix it in our code or file it upstream. An upstream investigation must not hold up 2.2–2.4, which are release requirements (follow-up review, answer 5). **Done 2026-10-10** ([notes/connect-latency.md](notes/connect-latency.md)):<br>• Of a 195 ms connect, about 150 ms is the server's PBKDF2 check of the SQL login's password (SQL Server 2025, by design), about 26 ms is TLS over Wi-Fi, and about 5 ms is sqlh and the driver.<br>• `--verbose` and `profile test` report the connect and setup times. A build with `--features timing` also splits the connect into steps. That isn't in default builds because it costs 270 KB.<br>• Found on the way: the driver's debug logging dumps packets in clear text, including the login packet (§6.9). | A breakdown is recorded in `docs/notes/`. Target: under 40 ms connect on this LAN, or a documented reason why not. **Met by the documented reason:** with SQL authentication on SQL Server 2025, the login alone exceeds 40 ms. | M |
 | 2.2 | **F06, the response budget.** Collapse consecutive `rows affected` lines into one (`-- 300 statements, 300 rows affected`). Cap `GO n` at 1,000. Cap input at 10 MB. Add a total output budget (proposed default 1 MB, `--max-output`) that keeps room for the closing lines and reports what was withheld. | The temp-table loop prints one line. A run over the budget ends with a valid status (text and JSON) and a note. | M |
 | 2.3 | **F07, separate output from the database.** A writer thread fed by a bounded channel, so the runtime keeps handling timers and cancellation while a pipe is stalled. | Test: with a stalled reader, `-t 2` still fires. | M |
 | 2.4 | **F08, cancellation everywhere.** Ctrl+Break, close, logoff and shutdown handlers. Pass the cancel handle through connect, setup, NOEXEC and rollback. Report "attention acknowledged" vs "connection dropped". Make an unreachable server end the same way every time: today the TCP connect timeout (exit 2) and the login deadline (exit 4) race. **Fail fast on a refused connection:** today sqlh retries until the login deadline, taking 14.2 s with the default `-l 15`, although one refused attempt takes about 2 s on Windows (measured 2026-10-10). Restore console echo when Ctrl+C or a close arrives at the `profile add` password prompt. | Tests for each signal and for cancelling during connect and setup. An unreachable server always gives the same exit code. A refused connection fails after one attempt. | M |
@@ -161,8 +162,8 @@ Validate on SQL Server 2025, and keep 2016 portability cheap but untested. (L)
 ### Phase 5: connection reuse (VISION priority 3b)
 
 Decide the mechanism using the 2.1 results:
-- **If connect gets fast** (around 40 ms), one-shot CLI calls may be good enough for much of the workflow, and reuse becomes an optimization.
-- **If not, choose:**
+- **2.1's answer: connecting doesn't get fast** with SQL authentication on SQL Server 2025. Each login spends about 150 ms in the server's password hashing, by design, so reuse is needed rather than an optimization. Windows authentication skips that hash and may be fast enough without reuse; it wasn't measured.
+- **Choose:**
   - **(a) MCP** as designed in `docs/mcp-mode.md`, with the review's prerequisites: a response byte cap, bounded request queues, reset-hygiene tests, and discarding any connection whose cancellation can't be proven clean.
   - **(b) A local per-profile daemon** that the CLI talks to over a named pipe, which gives reuse to Bash-driven agents without MCP.
 - **Either way:** replace the hour-long read-only session transaction with per-call wrappers, unless 2.5 and 2.6 show that a long transaction is cheap. (L)
@@ -220,11 +221,12 @@ Still open:
 6. **The drain default after 2.6.** Exact counts as today, or a bounded drain with `≥N`?
 7. **Agent session defaults.** `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY LOW`: yes or no, and which values? Also `READ UNCOMMITTED` for read-only runs (owner, 2026-10-10: worth considering as a default); the trade-offs are in 2.8.
 8. **A Git remote and CI?** That decides whether 3.3 stays a local script.
+9. **Ask upstream to redact the password in packet dumps?** At debug level, mssql-tds hex-dumps every TDS packet before TLS encrypts it (`io/packet_writer.rs`), including the login packet ([notes/connect-latency.md](notes/connect-latency.md)). The password in it carries only the scramble the TDS protocol requires (nibble swap and XOR 0xA5), which anyone can reverse. It's a logging-hygiene issue (CWE-532), not a remote vulnerability: nothing leaks unless an application turns on debug logging for the driver. Other drivers' traces usually mask the password. The channel is the owner's choice: a GitHub issue, or Microsoft's security process. Check `main` first; this was read in 0.2.0.
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
 
 - [ ] Clean Windows 11 x64 workstation (§6.1): runs with no installs, `dumpbin` imports are in-box only, and the size is within budget
-- [ ] Against a remote SQL Server 2025 over a real network: connect latency measured (2.1), encryption modes mandatory and strict
+- [ ] Against a remote SQL Server 2025 over a real network: connect latency measured (2.1 measured the dev LAN; the release environment is still to do), encryption modes mandatory and strict
 - [ ] SQL Server 2025 **Standard** (not only Standard Developer): SQL auth, and Windows auth if it's in scope
 - [ ] Every finding in §1 fixed or explicitly accepted, each with a regression test
 - [ ] Cancellation: Ctrl+C, Ctrl+Break, console close, harness kill, `-t`, during connect and during execution

@@ -655,4 +655,30 @@ mod live {
             r.stdout
         );
     }
+
+    // PLAN.md 2.1: --verbose says where the time to the first batch went; a build with
+    // `--features timing` also names the connect steps.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn verbose_reports_connect_timing() {
+        let (p, db) = target();
+        let r = live(&p, &db, &["--verbose", "-Q", "SELECT 1 AS x"]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let line = r
+            .stderr
+            .lines()
+            .find(|l| l.starts_with("sqlh: profile "))
+            .unwrap_or_else(|| panic!("no --verbose line: {}", r.stderr));
+        assert!(
+            line.contains("; connected in ") && line.contains(", session setup "),
+            "{line}"
+        );
+        if cfg!(feature = "timing") {
+            for step in [" (tcp ", ", tls ", ", login "] {
+                assert!(line.contains(step), "{step}: {line}");
+            }
+        } else {
+            assert!(!line.contains("(tcp "), "{line}");
+        }
+    }
 }

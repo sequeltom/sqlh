@@ -51,7 +51,7 @@ tests/smoke.sql  read-only end-to-end script for a real server (manual)
 README.md        human-facing intro, build, quick start, safety note
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
-docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike)
+docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency)
 docs/schema-commands.md, docs/mcp-mode.md   designs and plans for later phases
 code-review.md   the architecture review the plan responds to
 code-review-phase1.md   the follow-up review of Phase 1 (R01–R05)
@@ -71,6 +71,7 @@ Planned, not built: `src/schema.rs` (subcommands) and an md format in `src/outpu
 cargo build --release                               # ~2 MB exe; full LTO takes ~1–2 min
 cargo test                                          # unit + process-level tests; no server needed
 cargo test --release --test cli                     # process-level tests against the release exe
+cargo build --release --features timing             # --verbose also times each connect step (dev builds; +270 KB)
 $env:SQLH_TEST_PROFILE='test'; cargo test --test cli -- --ignored live   # live tests (scratch db sqlh_test)
 cargo test -- --ignored credman                     # real Credential Manager round trip (cleans up)
 cargo clippy --all-targets -- -D warnings
@@ -97,6 +98,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 
 - **Errors:** one error enum in `src/error.rs`, mapped to the exit codes in DESIGN.md §6. No `unwrap` or `expect` on anything derived from user input, the network or the server.
 - **unsafe:** only in the FFI modules (`credman.rs`, `console.rs`, `files.rs`), with a `// SAFETY:` comment on each block.
+- **Driver logging:** never install a general logger (an `env_logger`, a tracing subscriber, a `log::Log` that prints) while mssql-tds runs. At debug level it dumps TDS packets before encryption, including the login packet and its password. `db::phases`, built only with `--features timing`, keeps timestamps of a few events and never their text.
 - **Catalog SQL** must be validated on the first-release target, SQL Server 2025 Standard. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but there is no unconditional SQL Server 2012 or Azure requirement. Additional version-specific paths need a supported-target decision and a maintenance justification.
 - **Tests:**
   - The guard, splitter, renderer and formatter get table-driven unit tests next to the code.
@@ -114,6 +116,6 @@ Profiles and Credential Manager are built, and so are the json and csv formats. 
 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of [code-review.md](code-review.md). Owner decisions are recorded in its §6. Work in order:
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
-2. Phase 2, fast, bounded, cancellable turns, starting with the connect-latency investigation.
+2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). Next come the release requirements 2.2–2.4: the response budget, a stalled reader, and cancellation.
 3. Phase 3, execution core, release checks and live fixtures.
 4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

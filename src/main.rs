@@ -487,15 +487,38 @@ async fn run_session(
     cancel: &Cancel,
 ) -> Result<Stats, Failure> {
     let timeout = settings.query_timeout;
+    // --verbose and `profile test` say where the time to the first batch went (PLAN.md 2.1).
+    let report = opts.verbose || opts.show_connection;
     let connect_started = Instant::now();
-    let mut session = Session::connect(&settings.connect, cancel)
+    if report {
+        db::phases::start();
+    }
+    let connected = Session::connect(&settings.connect, cancel).await;
+    let steps = if report {
+        db::phases::stop(connect_started)
+    } else {
+        Vec::new()
+    };
+    let mut session = connected.map_err(db_failure)?;
+    let connect_ms = connect_started.elapsed().as_millis();
+    // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
+    // `--check` always gets it too, as a second line of defense behind NOEXEC.
+    let wrap = !settings.allow_write || opts.check;
+    let mut setup = String::from(SESSION_SETUP);
+    if wrap {
+        setup.push_str(" BEGIN TRANSACTION;");
+    }
+    let setup_started = Instant::now();
+    session
+        .exec_internal(&setup, timeout)
         .await
         .map_err(db_failure)?;
-    if opts.verbose || opts.show_connection {
+    if report {
         let profile = settings.profile.as_deref().unwrap_or("(none)");
         let line = format!(
-            "profile {profile}; connected in {} ms; {}",
-            connect_started.elapsed().as_millis(),
+            "profile {profile}; connected in {connect_ms} ms{}, session setup {} ms; {}",
+            db::phases::describe(&steps),
+            setup_started.elapsed().as_millis(),
             session.describe()
         );
         if opts.show_connection {
@@ -504,17 +527,6 @@ async fn run_session(
             diag(format_args!("sqlh: {line}"));
         }
     }
-    // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
-    // `--check` always gets it too, as a second line of defense behind NOEXEC.
-    let wrap = !settings.allow_write || opts.check;
-    let mut setup = String::from(SESSION_SETUP);
-    if wrap {
-        setup.push_str(" BEGIN TRANSACTION;");
-    }
-    session
-        .exec_internal(&setup, timeout)
-        .await
-        .map_err(db_failure)?;
 
     let mut stats = Stats::default();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();

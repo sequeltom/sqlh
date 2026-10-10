@@ -1,6 +1,7 @@
 //! The only module that touches mssql-tds. Everything it exposes is our own type, so the
 //! driver can be upgraded or swapped here without touching the rest of the tool.
 
+pub mod phases;
 mod types;
 mod value;
 
