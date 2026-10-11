@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use crate::cli::Opts;
+use crate::console;
 use crate::credman;
 use crate::db::{Auth, ConnectOptions, Encrypt, check_server};
 use crate::error::Failure;
@@ -135,7 +136,21 @@ pub fn valid_name(name: &str) -> bool {
 
 pub fn path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("SQLH_CONFIG").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        // A Git Bash path (`/c/Users/me/profiles.toml`) in cmd.exe or PowerShell names a
+        // folder on the current drive, which usually doesn't exist. A missing file is just
+        // "no profiles yet", and saving would create the folder, so refuse it here instead
+        // (DESIGN.md §4.2).
+        let hint = path.to_str().and_then(console::git_bash_hint);
+        if let Some(hint) = hint
+            && path.parent().is_some_and(|folder| !folder.is_dir())
+        {
+            return Err(format!(
+                "SQLH_CONFIG {}: the folder wasn't found; {hint}",
+                path.display()
+            ));
+        }
+        return Ok(path);
     }
     let appdata = std::env::var_os("APPDATA")
         .filter(|p| !p.is_empty())

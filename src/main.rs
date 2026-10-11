@@ -63,7 +63,6 @@ struct Stats {
 fn main() -> ExitCode {
     let started = Instant::now();
     install_panic_hook();
-    console::use_utf8();
     let exit = match cli::parse() {
         Ok(Command::Run(opts)) => run_command(*opts, started),
         Ok(Command::Profile(command)) => profile::run(command, started),
@@ -603,7 +602,11 @@ impl Destination {
                 source.name
             )));
         }
-        let cannot = |e: io::Error| Failure::usage(format!("-o {shown}: {e}"));
+        let cannot = |e: io::Error| {
+            let message = format!("-o {shown}: {e}");
+            let path = target.to_str().unwrap_or_default();
+            Failure::usage(console::path_error(message, path, &e))
+        };
         // Opening an existing target (without truncating it) tells a device or pipe from a
         // file, and finds a file that can't be replaced before anything runs.
         match OpenOptions::new().write(true).open(target) {
@@ -729,12 +732,13 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
             ("stdin".to_owned(), None, bytes)
         } else {
             let label = format!("-i {input}");
-            let file =
-                std::fs::File::open(input).map_err(|e| Failure::usage(format!("{label}: {e}")))?;
+            let file = std::fs::File::open(input).map_err(|e| {
+                Failure::usage(console::path_error(format!("{label}: {e}"), input, &e))
+            })?;
             let bytes = read_capped(file, &label, &mut left)?;
             (input.clone(), Some(PathBuf::from(input)), bytes)
         };
-        let text = script::decode(bytes, &name).map_err(Failure::usage)?;
+        let text = decode_source(bytes, &name)?;
         sources.push(Source { name, path, text });
     }
     if sources.is_empty() {
@@ -744,7 +748,7 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
             ));
         }
         let bytes = read_capped(io::stdin().lock(), "stdin", &mut left)?;
-        let text = script::decode(bytes, "stdin").map_err(Failure::usage)?;
+        let text = decode_source(bytes, "stdin")?;
         sources.push(Source {
             name: "stdin".into(),
             path: None,
@@ -752,6 +756,22 @@ fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
         });
     }
     Ok(sources)
+}
+
+/// Decodes one source (DESIGN.md §4.1). Piped text that isn't UTF-8 was encoded by the sending
+/// shell, not saved by the user, so "save it as UTF-8" alone doesn't help: say what to change.
+fn decode_source(bytes: Vec<u8>, name: &str) -> Result<String, Failure> {
+    script::decode(bytes, name).map_err(|message| {
+        if name == "stdin" && message.contains("not valid UTF-8") {
+            Failure::usage(format!(
+                "{message}. Piped text is encoded by the shell: in cmd.exe run chcp 65001 first, \
+                 in Windows PowerShell run $OutputEncoding = [Text.Encoding]::UTF8 first, or pass \
+                 the SQL with -Q or -i"
+            ))
+        } else {
+            Failure::usage(message)
+        }
+    })
 }
 
 /// Reads all of `reader`, refusing to go past `left` bytes: the input limit is shared by all

@@ -2,16 +2,17 @@ sqlh - SQL Server query tool for agents. Read-only by default; compact typed out
 
 USAGE
   sqlh [connection] [options] -Q "SQL"          (or the SQL as the only argument)
-  sqlh [connection] [options] -i file.sql [-i more.sql]
-  <SQL on stdin> | sqlh [connection] [options]
+  sqlh [connection] [options] -i file.sql [-i more.sql]     (or SQL on stdin: <SQL> | sqlh ...)
 
-EXAMPLES
-  sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders ORDER BY Id DESC"
+EXAMPLES  (same in cmd.exe, PowerShell and Git Bash)
+  sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders WHERE Status = 'Open' ORDER BY Id DESC"
   sqlh -S myserver,1433 -U reader -d AppDb -i report.sql   (password: env SQLCMDPASSWORD)
   sqlh --profile dev -Q "SELECT TOP 0 * FROM sys.dm_exec_requests"   (columns and types only)
-  sqlh -S myserver -d AppDb <<'SQL'
-  SELECT name, create_date FROM sys.tables ORDER BY name;
-  SQL
+  sqlh --profile dev -i "my queries\report.sql" -o report.txt
+  SQL with " $ % ` or several lines goes in a file (-i). Quote -S "host\inst" and paths with spaces.
+  Paths: C:/dir/f.sql works everywhere; C:\dir\f.sql needs quotes in Git Bash; /c/dir/f.sql is Git Bash only.
+  Piped non-ASCII text becomes "?" or an error unless the shell sends UTF-8: cmd.exe needs chcp 65001
+  first, Windows PowerShell 5.1 needs $OutputEncoding = [Text.Encoding]::UTF8 first. -Q and -i don't.
 
 CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
@@ -25,7 +26,6 @@ CONNECTION
   -l seconds      login timeout (default 15; 0 = none); one attempt, no retries
 
 EXECUTION
-  -Q sql          SQL to run
   -i file         input file, repeatable; "-i -" reads stdin. UTF-8, or UTF-16 with a BOM
   -v n=v ...      values for $(n); environment variables also resolve. -x turns this off
   -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
