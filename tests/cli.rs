@@ -2599,6 +2599,112 @@ mod live {
             r.stdout
         );
         assert!(peak < 25 << 20, "peak working set {} MB", peak >> 20);
+    // PLAN.md 2.5 (docs/notes/harness-kill.md): a harness that kills sqlh outright, here with
+    // TerminateProcess, leaves no work running on the server. The session is gone within
+    // seconds, for a waiting query and for a CPU-bound one that sends nothing. The note measured
+    // 46 runs of this kind, the slowest 0.14 s; the bound here is wide because the observer is
+    // a fresh connection that takes a few hundred ms to log in. Sessions are matched on id and
+    // login time, since the server hands the freed id to the next login.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_killed_run_leaves_no_work_on_the_server() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+
+        /// Kills the run if the test fails before it does.
+        struct Victim(std::process::Child);
+        impl Drop for Victim {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let (p, db) = target();
+        // The sessions with that id and login time, and the requests of that id, on the server.
+        let watch = |spid: &str, login: &str| -> (u32, u32) {
+            let sql = format!(
+                "SELECT (SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {spid} \
+                 AND login_time = CONVERT(datetime, '{login}', 126)) AS sessions, \
+                 (SELECT COUNT(*) FROM sys.dm_exec_requests WHERE session_id = {spid}) AS requests"
+            );
+            let r = live(&p, &db, &["-Q", &sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            r.stdout
+                .lines()
+                .find_map(|line| {
+                    let (a, b) = line.split_once('\t')?;
+                    Some((a.parse().ok()?, b.parse().ok()?))
+                })
+                .unwrap_or_else(|| panic!("no counts in {}", r.stdout))
+        };
+        let ident = "SELECT @@SPID AS spid, CONVERT(varchar(27), (SELECT login_time FROM \
+                     sys.dm_exec_sessions WHERE session_id = @@SPID), 126) AS lt";
+        // About 28 s on one scheduler, with no waits and no output until it ends.
+        let cpu = "SELECT COUNT_BIG(*) AS n, SUM(CONVERT(bigint, a.object_id) * (b.object_id % 7) \
+                   + c.column_id) AS s FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b \
+                   CROSS JOIN (SELECT TOP (20) column_id FROM sys.all_columns ORDER BY object_id, \
+                   column_id) AS c OPTION (MAXDOP 1)";
+        // WAITFOR needs --allow-write; the CPU-bound query runs read-only, in the wrapper.
+        for (what, work, write) in [
+            ("waiting", "WAITFOR DELAY '00:01:00'", true),
+            ("CPU-bound", cpu, false),
+        ] {
+            let script = format!("{ident}\nGO\n{work}");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(["--profile", &p, "-d", &db, "-t", "0"]);
+            if write {
+                command.arg("--allow-write");
+            }
+            let mut victim = Victim(command.args(["-Q", &script]).spawn().expect("sqlh starts"));
+            // The first batch's row says which session to watch; it is written when that batch
+            // ends, long before the second one does.
+            let stdout = victim.0.stdout.take().unwrap();
+            let (lines, rows) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if lines.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let (spid, login) = loop {
+                let line = rows
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap_or_else(|_| panic!("{what}: sqlh didn't report its session"));
+                if let Some((spid, login)) = line.split_once('\t')
+                    && spid.parse::<u32>().is_ok()
+                    && login.contains('T')
+                {
+                    break (spid.to_string(), login.to_string());
+                }
+            };
+            // The server is doing the work before the kill.
+            let waiting = Instant::now();
+            while watch(&spid, &login) != (1, 1) {
+                assert!(
+                    waiting.elapsed() < Duration::from_secs(20),
+                    "{what}: the work never showed on the server"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            victim.0.kill().expect("TerminateProcess");
+            let killed = Instant::now();
+            let _ = victim.0.wait();
+            while watch(&spid, &login).0 != 0 {
+                assert!(
+                    killed.elapsed() < Duration::from_secs(10),
+                    "{what}: session {spid} was still on the server {:?} after the kill",
+                    killed.elapsed()
+                );
+            }
+            let gone = killed.elapsed();
+            assert!(gone < Duration::from_secs(5), "{what}: {gone:?}");
+        }
     }
 
     // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the
