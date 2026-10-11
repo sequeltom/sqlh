@@ -335,6 +335,10 @@ impl<W: Write> BatchSink for TextSink<W> {
         self.tally.row_skipped();
     }
 
+    fn counting_stopped(&mut self) {
+        self.tally.stop_counting();
+    }
+
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
         if self.tally.result_hidden() {
@@ -668,6 +672,8 @@ pub(super) mod tests {
                 out.skipped_row();
             }
         }
+        // The count stopped: the footer and the notes are at their longest.
+        out.counting_stopped();
         out.end_rows().unwrap();
         out.message(&msg("a message after the rows")).unwrap();
         out.end_batch(5).unwrap();
@@ -682,9 +688,60 @@ pub(super) mod tests {
         .unwrap();
     }
 
+    /// PLAN.md 2.15: two batches, the first with a result whose count was stopped after 1,003
+    /// rows (`--max-rows 3`), and a status line that says so. The same calls for every format.
+    pub fn stopped_run(out: &mut dyn Output) {
+        let first = BatchInfo {
+            total: 2,
+            ..batch("-Q", false, 1)
+        };
+        out.begin_batch(&first).unwrap();
+        out.rows_affected(2).unwrap();
+        out.columns(&[col("id", "int"), col("v", "varchar(20)")])
+            .unwrap();
+        for i in 0..1003 {
+            if out.wants_values() {
+                out.row(&[Value::Int(i), Value::Text(format!("v{i}"))])
+                    .unwrap();
+            } else {
+                out.skipped_row();
+            }
+        }
+        out.counting_stopped();
+        out.end_rows().unwrap();
+        out.end_batch(5).unwrap();
+        let second = BatchInfo {
+            number: 2,
+            total: 2,
+            started_ms: 5,
+            ..batch("-Q", false, 6)
+        };
+        out.begin_batch(&second).unwrap();
+        out.columns(&[col("next", "int")]).unwrap();
+        out.row(&[Value::Int(1)]).unwrap();
+        out.end_rows().unwrap();
+        out.end_batch(6).unwrap();
+        out.finish(&Summary {
+            exit: 0,
+            status: STOPPED_STATUS,
+            error: None,
+            elapsed_ms: 7,
+        })
+        .unwrap();
+    }
+
+    pub const STOPPED_STATUS: &str = "ok: 2 batches, counting stopped in 1, 7 ms";
+
+    pub fn stopped_limits() -> Limits {
+        Limits {
+            max_rows: 3,
+            ..capped(0)
+        }
+    }
+
     pub const FILLING_STATUS: &str = "failed (exit 1): 4294967295 errors, first in batch \
         18446744073709551615; 18446744073709551615 later batches not run (--continue-on-error \
-        runs them), 340282366920938463463374607431768211455 ms";
+        runs them), counting stopped in 18446744073709551615, 340282366920938463463374607431768211455 ms";
 
     /// PLAN.md 2.12, the same calls for every format (with `limits()`: one result set and one
     /// message shown). A message, an error and a row count that arrive between a result set's
@@ -780,13 +837,13 @@ pub(super) mod tests {
     }
 
     // R08, exact output: the arithmetic of a tight cap. A note may use what the cap has left
-    // less the 512-byte status reserve: 600 - 512 = 88 bytes, of which "-- note: " and the
+    // less the 640-byte status reserve: 728 - 640 = 88 bytes, of which "-- note: " and the
     // newline take 10, "…[+131]" 9 and 69 characters the other 69. The error and the status
-    // then share the 512 bytes that are left: 23 for the status line, 11 around the error,
-    // 10 for "…[+1000]"'s widest form, so 468 characters of the error and "…[+532]".
+    // then share the 640 bytes that are left: 23 for the status line, 11 around the error,
+    // 10 for "…[+1000]"'s widest form, so 468 characters of the error and "…[+404]".
     #[test]
     fn a_tight_cap_shortens_exactly() {
-        let (mut s, main, _) = sink(capped(600));
+        let (mut s, main, _) = sink(capped(728));
         s.note(&"x".repeat(200)).unwrap();
         let error = "e".repeat(1000);
         s.finish(&Summary {
@@ -799,10 +856,38 @@ pub(super) mod tests {
         assert_eq!(
             main.text(),
             format!(
-                "-- note: {}…[+131]\n-- error: {}…[+532]\n-- ok: 0 batches, 3 ms\n",
+                "-- note: {}…[+131]\n-- error: {}…[+404]\n-- ok: 0 batches, 3 ms\n",
                 "x".repeat(69),
-                "e".repeat(468)
+                "e".repeat(596)
             )
+        );
+    }
+
+    // PLAN.md 2.15, exact output: a stopped count reads `≥` with the total floored to one
+    // digit, says what stopped it inside the parentheses, and the closing note and the status
+    // line say that the rest of the batch was cancelled. The batch after it runs as usual.
+    #[test]
+    fn a_stopped_count_is_a_lower_bound_in_the_footer_note_and_status() {
+        let (mut s, main, _) = sink(stopped_limits());
+        stopped_run(&mut s);
+        assert_eq!(
+            main.text(),
+            "-- batch 1 (line 1)\n\
+             -- 2 rows affected\n\
+             -- result 1\n\
+             id:int\tv:varchar(20)\n\
+             0\tv0\n\
+             1\tv1\n\
+             2\tv2\n\
+             -- 3 of ≥1000 rows shown (--max-rows 3; counting stopped)\n\
+             -- batch 2 (line 6)\n\
+             -- result 2\n\
+             next:int\n\
+             1\n\
+             -- 1 row\n\
+             -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
+             later statements did not run; --exact-count counts every row\n\
+             -- ok: 2 batches, counting stopped in 1, 7 ms\n"
         );
     }
 

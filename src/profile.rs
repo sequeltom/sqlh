@@ -107,6 +107,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         max_cell: opts.max_cell.or(base.max_cell),
         lock_timeout: opts.lock_timeout.or(base.lock_timeout),
         read_uncommitted: opts.read_uncommitted.or(base.read_uncommitted),
+        exact_count: opts.exact_count.or(base.exact_count),
     };
     let server = profile
         .server
@@ -209,6 +210,11 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
             type_name: "bit".into(),
             nullable: false,
         },
+        Column {
+            name: "exact_count".into(),
+            type_name: "bit".into(),
+            nullable: false,
+        },
     ];
     let text = |v: &Option<String>| v.clone().map_or(Value::Null, Value::Text);
     let write = |out: &mut Out| -> std::io::Result<()> {
@@ -237,6 +243,7 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
                 // What a run with this profile gets, so an unset key shows its default.
                 Value::Int(p.lock_timeout.unwrap_or(DEFAULT_LOCK_TIMEOUT).into()),
                 Value::Int(p.read_uncommitted.unwrap_or(false).into()),
+                Value::Int(p.exact_count.unwrap_or(false).into()),
             ])?;
         }
         out.end_rows()

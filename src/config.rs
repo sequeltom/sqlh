@@ -101,6 +101,8 @@ pub struct Profile {
     pub lock_timeout: Option<u32>,
     /// Read without shared locks in read-only runs; ignored when writes are allowed.
     pub read_uncommitted: Option<bool>,
+    /// Count every row that is not shown, however long it takes (DESIGN.md §4.4).
+    pub exact_count: Option<bool>,
 }
 
 impl Profile {
@@ -216,6 +218,9 @@ pub struct Settings {
     /// Whether reads run under READ UNCOMMITTED: asked for by `--read-uncommitted` or the
     /// profile, and never when writes are allowed.
     pub read_uncommitted: bool,
+    /// Whether hidden rows are all counted: asked for by `--exact-count` or the profile. Runs
+    /// that can write count exactly whatever this says (decided in `main`, with the input).
+    pub exact_count: bool,
     pub profile: Option<String>,
 }
 
@@ -372,6 +377,7 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
             .or(p.lock_timeout)
             .unwrap_or(DEFAULT_LOCK_TIMEOUT),
         read_uncommitted,
+        exact_count: opts.exact_count.or(p.exact_count).unwrap_or(false),
         profile: profile.map(|p| p.name),
     })
 }
@@ -540,6 +546,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 );
             }
             "read_uncommitted" => p.read_uncommitted = Some(value.boolean(key).map_err(err)?),
+            "exact_count" => p.exact_count = Some(value.boolean(key).map_err(err)?),
             _ => return Err(err(format!("unknown key {key} in [profiles.{}]", p.name))),
         }
     }
@@ -618,6 +625,9 @@ fn render(config: &Config) -> String {
         }
         if let Some(v) = p.read_uncommitted {
             let _ = writeln!(out, "read_uncommitted = {v}");
+        }
+        if let Some(v) = p.exact_count {
+            let _ = writeln!(out, "exact_count = {v}");
         }
     }
     out
@@ -738,6 +748,7 @@ mod tests {
                     max_cell: Some(1000),
                     lock_timeout: Some(0),
                     read_uncommitted: Some(true),
+                    exact_count: Some(true),
                 },
                 Profile {
                     name: "local".into(),
@@ -757,6 +768,34 @@ mod tests {
         let config = parse(text).unwrap();
         assert_eq!(config.find("A").unwrap().server.as_deref(), Some("x#1"));
         assert_eq!(config.find("a").unwrap().max_rows, Some(10));
+    }
+
+    // PLAN.md 2.15: `exact_count` is a boolean profile key; unset it is not written.
+    #[test]
+    fn exact_count_key() {
+        let config = parse(
+            "[profiles.a]\nexact_count = true\n[profiles.b]\nexact_count = false\n[profiles.c]\n",
+        )
+        .unwrap();
+        let get = |name: &str| config.find(name).unwrap().exact_count;
+        assert_eq!(
+            (get("a"), get("b"), get("c")),
+            (Some(true), Some(false), None)
+        );
+        let text = render(&config);
+        assert!(
+            !text
+                .split("[profiles.c]")
+                .nth(1)
+                .unwrap()
+                .contains("exact_count")
+        );
+        assert_eq!(
+            parse("[profiles.a]\nexact_count = 1\n")
+                .unwrap_err()
+                .to_string(),
+            "2: exact_count must be true or false"
+        );
     }
 
     #[test]
@@ -1056,6 +1095,25 @@ mod tests {
                              [profiles.dirty]\nserver = \"srv\"\nauth = \"windows\"\nread_uncommitted = true\n\
                              [profiles.dirty_writer]\nserver = \"srv\"\nauth = \"windows\"\nread_uncommitted = true\nwrite_policy = \"allow\"\n\
                              [profiles.writer]\nserver = \"srv\"\nauth = \"windows\"\nwrite_policy = \"allow\"\n";
+
+        // Decision 6: exact counting is asked for by the flag or the profile, and the flag wins.
+        // (Runs that can write count exactly whatever this says; that is decided in `main`.)
+        #[test]
+        fn exact_count_comes_from_the_flag_or_the_profile() {
+            const PROFILES: &str = "[profiles.plain]\nserver = \"srv\"\nauth = \"windows\"\n\
+                                    [profiles.exact]\nserver = \"srv\"\nauth = \"windows\"\nexact_count = true\n";
+            let exact = |name: &str, flag: Option<bool>| {
+                let opts = Opts {
+                    exact_count: flag,
+                    ..with_profile(name)
+                };
+                resolve_in(&opts, PROFILES, &[]).unwrap().exact_count
+            };
+            assert!(!exact("plain", None));
+            assert!(exact("plain", Some(true)));
+            assert!(exact("exact", None));
+            assert!(!exact("exact", Some(false)));
+        }
 
         // Decision 7: READ UNCOMMITTED is opt-in, for read-only runs only.
         #[test]

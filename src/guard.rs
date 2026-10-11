@@ -246,6 +246,16 @@ pub fn check(sql: &str, policy: Policy) -> Result<(), Blocked> {
     Ok(())
 }
 
+/// Whether `sql` has the bare word `XACT_ABORT` among its tokens, which is how `SET XACT_ABORT`
+/// is written (a comment, a string or a `[bracketed]` name is not one). Not a guard check: a
+/// run whose input says it counts rows exactly (DESIGN.md §4.4), because with XACT_ABORT ON an
+/// attention rolls the transaction back, and a counting that stopped early would end with the
+/// wrapper transaction gone. Dynamic SQL in a string is not seen; that run is cut like any
+/// other.
+pub fn mentions_xact_abort(sql: &str) -> bool {
+    Lexer::new(sql).any(|t| t.is_word("XACT_ABORT"))
+}
+
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
 /// therefore doesn't depend on how many tokens the input has (PLAN.md 2.14); only a
@@ -1075,6 +1085,28 @@ mod tests {
             "EXEC sp_spaceused NULL, 'true'",
         ] {
             assert!(blocked(sql).reason.contains("UPDATEUSAGE"), "{sql}");
+        }
+    }
+
+    // PLAN.md 2.15: input that says XACT_ABORT gets exact counting.
+    #[test]
+    fn xact_abort_is_found_among_the_tokens() {
+        for sql in [
+            "SET XACT_ABORT ON",
+            "select 1\nset xact_abort on\nselect 2",
+            "SET NOCOUNT ON; SET /* x */ Xact_Abort OFF;",
+            "CREATE PROC p AS SET XACT_ABORT ON",
+        ] {
+            assert!(mentions_xact_abort(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT 'XACT_ABORT' AS [XACT_ABORT] -- XACT_ABORT",
+            "/* SET XACT_ABORT ON */ SELECT 1",
+            "SELECT XACT_ABORT_2 FROM t",
+            "",
+        ] {
+            assert!(!mentions_xact_abort(sql), "{sql}");
         }
     }
 

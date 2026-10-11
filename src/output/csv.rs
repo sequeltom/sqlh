@@ -216,6 +216,10 @@ impl<W: Write> BatchSink for CsvSink<W> {
         self.tally.row_skipped();
     }
 
+    fn counting_stopped(&mut self) {
+        self.tally.stop_counting();
+    }
+
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
         if self.tally.result_hidden() {
@@ -465,6 +469,29 @@ mod tests {
         assert_eq!(data.text(), "x\na\n\nx\nb\n");
     }
 
+    // PLAN.md 2.15, exact output: the stopped count's footer, note and status are metadata
+    // lines; the data stream is rows only.
+    #[test]
+    fn a_stopped_count_is_a_lower_bound_in_the_footer_note_and_status() {
+        use super::super::text::tests::{stopped_limits, stopped_run};
+        let (mut s, data, meta) = sink(stopped_limits());
+        stopped_run(&mut s);
+        assert_eq!(data.text(), "id,v\n0,v0\n1,v1\n2,v2\n\nnext\n1\n");
+        assert_eq!(
+            meta.text(),
+            "-- batch 1 (line 1)\n\
+             -- 2 rows affected\n\
+             -- result 1: id:int, v:varchar(20)\n\
+             -- 3 of ≥1000 rows shown (--max-rows 3; counting stopped)\n\
+             -- batch 2 (line 6)\n\
+             -- result 2: next:int\n\
+             -- 1 row\n\
+             -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
+             later statements did not run; --exact-count counts every row\n\
+             -- ok: 2 batches, counting stopped in 1, 7 ms\n"
+        );
+    }
+
     // The whole-response budget (R08): the same cases as the text format, on the metadata
     // stream, which is where csv puts notes, refusals, diagnostics and the status.
 
@@ -516,7 +543,7 @@ mod tests {
     // stream. The data stream is empty.
     #[test]
     fn a_tight_cap_shortens_exactly() {
-        let (mut s, data, meta) = sink(capped(600));
+        let (mut s, data, meta) = sink(capped(728));
         s.note(&"x".repeat(200)).unwrap();
         let error = "e".repeat(1000);
         s.finish(&Summary {
@@ -530,9 +557,9 @@ mod tests {
         assert_eq!(
             meta.text(),
             format!(
-                "-- note: {}…[+131]\n-- error: {}…[+532]\n-- ok: 0 batches, 3 ms\n",
+                "-- note: {}…[+131]\n-- error: {}…[+404]\n-- ok: 0 batches, 3 ms\n",
                 "x".repeat(69),
-                "e".repeat(468)
+                "e".repeat(596)
             )
         );
     }

@@ -54,6 +54,9 @@ pub struct Opts {
     /// `--read-uncommitted[=true|false]`: read without shared locks, in read-only runs
     /// (DESIGN.md §4.3). Unset defers to the profile.
     pub read_uncommitted: Option<bool>,
+    /// `--exact-count[=true|false]`: count every row that is not shown, however long that takes
+    /// (DESIGN.md §4.4). Unset defers to the profile.
+    pub exact_count: Option<bool>,
     pub check: bool,
     pub continue_on_error: bool,
     pub verbose: bool,
@@ -178,6 +181,7 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Long("read-uncommitted") => {
                 o.read_uncommitted = Some(switch(&mut p, "--read-uncommitted")?)
             }
+            Long("exact-count") => o.exact_count = Some(switch(&mut p, "--exact-count")?),
             Short('N') => {
                 o.encrypt = Some(match p.optional_value() {
                     None => Encrypt::Mandatory,
@@ -395,6 +399,21 @@ mod tests {
             );
         }
         assert!(err(&["--lock-timeout"]).contains("lock-timeout"));
+    }
+
+    // PLAN.md 2.15: `--exact-count` is a switch like the others.
+    #[test]
+    fn exact_count_is_a_switch() {
+        assert_eq!(opts(&["x"]).exact_count, None);
+        assert_eq!(opts(&["--exact-count", "x"]).exact_count, Some(true));
+        assert_eq!(opts(&["--exact-count=no", "x"]).exact_count, Some(false));
+        let o = opts(&["--exact-count", "SELECT 1"]);
+        assert_eq!(o.exact_count, Some(true));
+        assert_eq!(o.query.as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            parse_args(&["--exact-count=maybe", "x"]).err().unwrap(),
+            "--exact-count=maybe: expected true or false"
+        );
     }
 
     #[test]

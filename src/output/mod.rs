@@ -86,7 +86,7 @@ pub const OUTPUT_RESERVE: u64 = 1024;
 /// In text and csv the status line also ends with where the run went (`Tally::reserve_ending`).
 /// That tail is as long as the names in it, so it isn't part of this constant: both reserves
 /// grow by exactly its length once the sink has it.
-pub const STATUS_RESERVE: u64 = 512;
+pub const STATUS_RESERVE: u64 = 640;
 
 /// The most characters of a name from the server (the server, the database, the version) that
 /// the output carries: the `connection` object of JSON and the tail of the status line in
@@ -490,6 +490,15 @@ pub struct Tally {
     exhausted: bool,
     /// The budget ran out while the current result set was being shown.
     cut: bool,
+    /// The count of the current result set's rows was stopped early (`stop_counting`): its
+    /// total is a lower bound.
+    stopped: bool,
+    /// The current batch's number in the run, for the note and the status line.
+    batch_number: usize,
+    /// The current batch had a count stopped (JSON's `counting_stopped`).
+    batch_stopped: bool,
+    /// The batches (by number, in order) in which a count was stopped.
+    stopped_batches: Vec<usize>,
     withheld: Withheld,
     /// Consecutive row counts not written yet, as (statements, rows): they become one line.
     affected: Option<(u64, u64)>,
@@ -521,6 +530,10 @@ impl Tally {
             rows_open: false,
             exhausted: false,
             cut: false,
+            stopped: false,
+            batch_number: 0,
+            batch_stopped: false,
+            stopped_batches: Vec::new(),
             withheld: Withheld::default(),
             affected: None,
             rows_total: 0,
@@ -671,6 +684,8 @@ impl Tally {
         self.line_map.clear();
         self.line_map.extend_from_slice(batch.line_map);
         self.batch_max_severity = 0;
+        self.batch_number = batch.number;
+        self.batch_stopped = false;
         // A batch starts with no result open. One that a failure cut short is closed by the
         // sink (json marks it interrupted), and must not leave every event refused.
         self.rows_open = false;
@@ -684,6 +699,7 @@ impl Tally {
         self.rows_shown = 0;
         self.cells_cut = 0;
         self.cut = false;
+        self.stopped = false;
         let max = self.limits.max_results;
         self.hidden = max > 0 && self.results_seen > max;
         (!self.hidden).then_some(self.results_seen)
@@ -749,8 +765,41 @@ impl Tally {
         self.cells_cut += 1;
     }
 
+    /// The count of hidden rows was stopped early (`BatchSink::counting_stopped`): the rest of
+    /// the batch was cancelled and the result set's total is a lower bound.
+    pub fn stop_counting(&mut self) {
+        self.stopped = true;
+        self.batch_stopped = true;
+        if self.stopped_batches.last() != Some(&self.batch_number) {
+            self.stopped_batches.push(self.batch_number);
+        }
+    }
+
+    /// Whether the current result set's total is exact. False once its count was stopped.
+    pub fn rows_exact(&self) -> bool {
+        !self.stopped
+    }
+
+    /// Whether a count was stopped in the current batch.
+    pub fn batch_stopped(&self) -> bool {
+        self.batch_stopped
+    }
+
+    /// How many batches had a count stopped, for the status line.
+    pub fn stopped_batches(&self) -> usize {
+        self.stopped_batches.len()
+    }
+
+    /// The result set's total as the output reports it: the rows counted, or when the count
+    /// was stopped, that number floored to one significant digit (`floor_digit`) and never
+    /// below the rows shown. A count that ran for a fixed time differs from run to run by the
+    /// speed of the link; the first digit mostly doesn't, so the same query reads the same.
     pub fn rows_total(&self) -> u64 {
-        self.rows_total
+        if self.stopped {
+            floor_digit(self.rows_total).max(self.rows_shown)
+        } else {
+            self.rows_total
+        }
     }
 
     pub fn rows_shown(&self) -> u64 {
@@ -801,18 +850,27 @@ impl Tally {
 
     /// `3 rows`, or `5 of 2775 rows shown (--max-rows 5); 2 values cut (--max-cell 40)`.
     pub fn footer(&self) -> String {
-        let mut footer = if self.rows_shown == self.rows_total {
-            let s = if self.rows_total == 1 { "" } else { "s" };
-            format!("{} row{s}", self.rows_total)
-        } else if self.cut {
+        let total = self.rows_total();
+        let mut footer = if self.stopped {
+            // A lower bound: `≥`, and what stopped the count after the limit that hid the rows.
+            let limit = if self.cut {
+                "--max-output".to_owned()
+            } else {
+                format!("--max-rows {}", self.limits.max_rows)
+            };
             format!(
-                "{} of {} rows shown (--max-output)",
-                self.rows_shown, self.rows_total
+                "{} of ≥{total} rows shown ({limit}; counting stopped)",
+                self.rows_shown
             )
+        } else if self.rows_shown == total {
+            let s = if total == 1 { "" } else { "s" };
+            format!("{total} row{s}")
+        } else if self.cut {
+            format!("{} of {total} rows shown (--max-output)", self.rows_shown)
         } else {
             format!(
-                "{} of {} rows shown (--max-rows {})",
-                self.rows_shown, self.rows_total, self.limits.max_rows
+                "{} of {total} rows shown (--max-rows {})",
+                self.rows_shown, self.limits.max_rows
             )
         };
         if self.cells_cut > 0 {
@@ -842,6 +900,9 @@ impl Tally {
                 "{} more messages not shown",
                 self.messages_seen - max_messages
             ));
+        }
+        if !self.stopped_batches.is_empty() {
+            notes.push(stopped_note(&self.stopped_batches));
         }
         if self.exhausted {
             let w = &self.withheld;
@@ -877,6 +938,50 @@ impl Tally {
         }
         notes
     }
+}
+
+/// `n` floored to one significant digit: 852359 gives 800000, 1003 gives 1000, 99 gives 90, and
+/// anything under 10 stays as it is.
+pub fn floor_digit(n: u64) -> u64 {
+    let mut unit = 1;
+    while n / unit >= 10 {
+        unit *= 10;
+    }
+    n / unit * unit
+}
+
+/// The most batches the note about stopped counts names; the rest are counted.
+const NOTE_BATCHES: usize = 5;
+
+/// The run's note that counting stopped (DESIGN.md §5.1): where, and what that cost. A stopped
+/// count cancels the rest of its batch, and nothing else says its later statements didn't run.
+fn stopped_note(batches: &[usize]) -> String {
+    let shown: Vec<String> = batches
+        .iter()
+        .take(NOTE_BATCHES)
+        .map(usize::to_string)
+        .collect();
+    let mut note = if batches.len() == 1 {
+        format!(
+            "counting stopped in batch {}: the rest of that batch was cancelled, so its later \
+             statements did not run",
+            shown[0]
+        )
+    } else {
+        let more = batches.len() - shown.len();
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        format!(
+            "counting stopped in batches {}{more}: the rest of each was cancelled, so their \
+             later statements did not run",
+            shown.join(", ")
+        )
+    };
+    note.push_str("; --exact-count counts every row");
+    note
 }
 
 /// Cuts `s` after `max` characters (0 = no limit). Returns the kept prefix and how many
@@ -1038,6 +1143,74 @@ mod tests {
     }
 
     // F06: a refusal is final, and the closing note doesn't list counts that are all zero.
+    // PLAN.md 2.15: a stopped count reports its first digit and never less than was shown.
+    #[test]
+    fn a_count_is_floored_to_one_significant_digit() {
+        for (n, floored) in [
+            (0, 0),
+            (7, 7),
+            (9, 9),
+            (10, 10),
+            (99, 90),
+            (100, 100),
+            (101, 100),
+            (852_359, 800_000),
+            (1_003, 1_000),
+            (1_999_999, 1_000_000),
+            (u64::MAX, 10_000_000_000_000_000_000),
+        ] {
+            assert_eq!(floor_digit(n), floored, "{n}");
+        }
+        let mut t = Tally::new(Limits::default());
+        t.start_result();
+        for _ in 0..15 {
+            t.row_shown();
+        }
+        for _ in 0..4 {
+            t.row_skipped();
+        }
+        // 19 rows counted floor to 10, below the 15 shown: the shown rows are the bound.
+        t.stop_counting();
+        assert_eq!(t.rows_total(), 15);
+        assert!(!t.rows_exact());
+        assert!(
+            t.footer().starts_with("15 of ≥15 rows shown"),
+            "{}",
+            t.footer()
+        );
+        // A new result is exact again; the batch keeps what happened.
+        t.start_result();
+        assert!(t.rows_exact());
+        assert_eq!((t.batch_stopped(), t.stopped_batches()), (true, 1));
+    }
+
+    #[test]
+    fn the_note_names_the_batches_where_counting_stopped() {
+        let note = |batches: &[usize]| stopped_note(batches);
+        let tail = "; --exact-count counts every row";
+        assert_eq!(
+            note(&[4]),
+            format!(
+                "counting stopped in batch 4: the rest of that batch was cancelled, so its \
+                 later statements did not run{tail}"
+            )
+        );
+        assert_eq!(
+            note(&[2, 3, 4, 5, 6]),
+            format!(
+                "counting stopped in batches 2, 3, 4, 5, 6: the rest of each was cancelled, so \
+                 their later statements did not run{tail}"
+            )
+        );
+        assert_eq!(
+            note(&[2, 3, 4, 5, 6, 7, 8, 9]),
+            format!(
+                "counting stopped in batches 2, 3, 4, 5, 6 (+3 more): the rest of each was \
+                 cancelled, so their later statements did not run{tail}"
+            )
+        );
+    }
+
     #[test]
     fn the_output_budget_is_sticky() {
         let mut tally = Tally::new(Limits {
@@ -1388,13 +1561,17 @@ mod tests {
         tally.rows_total = u64::MAX;
         tally.rows_shown = u64::MAX - 1;
         tally.cells_cut = u64::MAX;
+        // A stopped count, cut by the output budget: the longest footer.
+        tally.stopped = true;
+        tally.cut = true;
         let footer = format!("-- {}\n", tally.footer());
         let status = format!("-- {}\n", text::tests::FILLING_STATUS);
         // The status the sweeps use is the longest main.rs builds: every count at its widest.
         let widest = format!(
             "failed (exit 1): {} errors, first in batch {}; {} later batches not run \
-             (--continue-on-error runs them), {} ms",
+             (--continue-on-error runs them), counting stopped in {}, {} ms",
             u32::MAX,
+            usize::MAX,
             usize::MAX,
             usize::MAX,
             u128::MAX

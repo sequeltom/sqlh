@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use cli::{Command, Opts};
 use config::Settings;
-use db::{Cancel, DbError, Session};
+use db::{Cancel, Counting, DbError, Session};
 use error::{Exit, Failure};
 use output::{BatchInfo, Format, Limits, Summary};
 use script::{Batch, Source};
@@ -291,10 +291,16 @@ impl Closing {
 
     fn of(out: &Out, result: Result<Stats, Failure>, started: Instant) -> Closing {
         let ms = started.elapsed().as_millis();
+        // A stopped count is in the status line, so that a reader of that line alone learns
+        // that part of the input was cancelled (DESIGN.md §5.1).
+        let stopped = match out.tally().stopped_batches() {
+            0 => String::new(),
+            n => format!(", counting stopped in {n}"),
+        };
         match result {
             Ok(stats) if out.tally().errors() == 0 => {
                 let s = if stats.batches_run == 1 { "" } else { "es" };
-                Closing::ok(&format!("{} batch{s}", stats.batches_run), started)
+                Closing::ok(&format!("{} batch{s}{stopped}", stats.batches_run), started)
             }
             Ok(stats) => {
                 let errors = out.tally().errors();
@@ -309,7 +315,7 @@ impl Closing {
                         stats.batches_skipped
                     ));
                 }
-                status.push_str(&format!(", {ms} ms"));
+                status.push_str(&format!("{stopped}, {ms} ms"));
                 Closing {
                     exit: Exit::SqlError,
                     status,
@@ -947,6 +953,22 @@ async fn run_session(
         }
     }
 
+    // Hidden rows are counted for a bounded time (DESIGN.md §4.4), except where a stopped count
+    // would lose something: with writes allowed it can skip a COMMIT; with XACT_ABORT in the
+    // input the attention rolls the wrapper transaction back; and on request.
+    let exact = settings.allow_write
+        || settings.exact_count
+        || batches
+            .iter()
+            .any(|batch| guard::mentions_xact_abort(&batch.sql));
+    let mut counting = if exact {
+        Counting::EXACT
+    } else {
+        Counting::BOUNDED
+    };
+    // `-t` ending the count of hidden rows is no failure in a run that cannot write: the rows
+    // shown are complete. With writes allowed it still is, because it skips what follows.
+    counting.timeout_stops = !settings.allow_write;
     let mut stats = Stats::default();
     let gate = out.gate();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
@@ -988,7 +1010,14 @@ async fn run_session(
             })
             .map_err(output_failure)?;
             session
-                .run(batch.sql.clone(), timeout, cancel, &mut **out, &gate)
+                .run(
+                    batch.sql.clone(),
+                    timeout,
+                    counting,
+                    cancel,
+                    &mut **out,
+                    &gate,
+                )
                 .await
                 .map_err(|e| match e {
                     DbError::Timeout(_) => Failure::new(
@@ -1127,6 +1156,70 @@ mod tests {
             Box::new(Failing { ok, fail_flush }),
             Limits::default(),
         )
+    }
+
+    // PLAN.md 2.15: the status line says how many batches had a count stopped, in a run that
+    // succeeded and in one that failed, and says nothing otherwise.
+    #[test]
+    fn the_status_line_says_where_counting_stopped() {
+        let mut o = out(usize::MAX, false);
+        let batch = |number| BatchInfo {
+            number,
+            total: 3,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+        };
+        let stats = || Stats {
+            batches_run: 3,
+            ..Stats::default()
+        };
+        o.begin_batch(&batch(1)).unwrap();
+        o.end_batch(1).unwrap();
+        let clean = Closing::of(&o, Ok(stats()), Instant::now());
+        assert!(
+            clean.status.starts_with("ok: 3 batches, ") && !clean.status.contains("stopped"),
+            "{}",
+            clean.status
+        );
+        for number in [2, 3] {
+            o.begin_batch(&batch(number)).unwrap();
+            o.columns(&[]).unwrap();
+            o.counting_stopped();
+            o.end_rows().unwrap();
+            o.end_batch(1).unwrap();
+        }
+        let stopped = Closing::of(&o, Ok(stats()), Instant::now());
+        assert!(
+            stopped
+                .status
+                .starts_with("ok: 3 batches, counting stopped in 2, "),
+            "{}",
+            stopped.status
+        );
+        assert_eq!(stopped.exit, Exit::Ok);
+        // A failure keeps its own exit code and first words, and adds the same words.
+        o.error(&db::ServerMessage {
+            number: 208,
+            severity: 16,
+            state: 1,
+            line: Some(1),
+            procedure: None,
+            text: "x".into(),
+        })
+        .unwrap();
+        let failed = Closing::of(&o, Ok(stats()), Instant::now());
+        assert_eq!(failed.exit, Exit::SqlError);
+        assert!(
+            failed.status.starts_with("failed (exit 1): 1 error")
+                && failed.status.contains(", counting stopped in 2, "),
+            "{}",
+            failed.status
+        );
     }
 
     /// A reader that never reads: every write blocks until the test lets go (drops

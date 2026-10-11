@@ -10,8 +10,9 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{
@@ -112,6 +113,10 @@ pub trait BatchSink {
     fn cell_limit(&self) -> usize;
     fn row(&mut self, values: &[Value]) -> io::Result<()>;
     fn skipped_row(&mut self);
+    /// The count of hidden rows was stopped (`Counting`): the rows counted so far are a lower
+    /// bound, and the rest of the batch was cancelled. Called once, in place of the rows that
+    /// would have followed, just before `end_rows`.
+    fn counting_stopped(&mut self);
     fn end_rows(&mut self) -> io::Result<()>;
     fn rows_affected(&mut self, count: u64) -> io::Result<()>;
     fn message(&mut self, message: &ServerMessage) -> io::Result<()>;
@@ -236,8 +241,144 @@ async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(),
     }
 }
 
+/// How long a read-only run goes on counting the rows it does not show (DESIGN.md §4.4).
+pub const COUNT_BUDGET: Duration = Duration::from_millis(250);
+
+/// How a batch counts the rows it does not show: past `--max-rows`, in a result `--max-results`
+/// hides, and after the `--max-output` budget ran out.
+///
+/// Exact counting reads them all, which costs the size of the result (1 to 4 s for millions of
+/// narrow rows, minutes for a few gigabytes) to learn a number. A bounded count stops after
+/// `budget`, counted from the first hidden row of a result, and sends the server an attention,
+/// the cancel Ctrl+C uses: the total is then a lower bound, and the rest of the batch does not
+/// run (`BatchSink::counting_stopped`). A stopped count can skip a `COMMIT`, so the caller picks
+/// exact counting wherever that would lose something (docs/notes/drain-experiment.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counting {
+    /// `None`: count to the end of every result.
+    pub budget: Option<Duration>,
+    /// When `-t` expires while only hidden rows are being counted, the rows shown are complete,
+    /// so the count stops there instead of failing the run (exit 4). Not with writes allowed:
+    /// the stop skips what follows, and a skipped `COMMIT` has to be a failure.
+    pub timeout_stops: bool,
+}
+
+impl Counting {
+    /// Count to the end, and let `-t` fail the run as it always did.
+    pub const EXACT: Counting = Counting {
+        budget: None,
+        timeout_stops: false,
+    };
+
+    /// Stop after `COUNT_BUDGET`.
+    pub const BOUNDED: Counting = Counting {
+        budget: Some(COUNT_BUDGET),
+        timeout_stops: true,
+    };
+}
+
+/// One batch's counting: the budget, the cancel handles that end the batch when it runs out,
+/// and the clock. The driver gets `handle`, a child of `root`, which is a child of the run's
+/// handle. Cancelling `root` therefore cancels the batch's statement without cancelling the
+/// run, and the run's own cancel (Ctrl+C) still reaches the statement. The driver then does what
+/// it does for any cancel of a read in progress: it sends an attention, reads on to the server's
+/// acknowledgement (DONE with the ATTN flag) and settles its state.
+struct Drain {
+    budget: Option<Duration>,
+    /// What the driver gets for the batch; `None` without a budget, and then the run's own
+    /// handle is used as it always was.
+    handle: Option<CancelHandle>,
+    /// Holds `root` until the budget fires or the result ends. Taken by whichever comes first.
+    root: Arc<Mutex<Option<CancelHandle>>>,
+    /// Set just before `root` is cancelled: it tells the budget's cancel from a user's.
+    fired: Arc<AtomicBool>,
+    /// When the first hidden row of the current result was counted.
+    began: Option<Instant>,
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drain {
+    fn new(budget: Option<Duration>, run: &CancelHandle) -> Drain {
+        let (handle, root) = match budget {
+            Some(_) => {
+                let root = run.child_handle();
+                (Some(root.child_handle()), Some(root))
+            }
+            None => (None, None),
+        };
+        Drain {
+            budget,
+            handle,
+            root: Arc::new(Mutex::new(root)),
+            fired: Arc::default(),
+            began: None,
+            timer: None,
+        }
+    }
+
+    /// The handle for the driver's `execute`.
+    fn handle<'a>(&'a self, run: &'a CancelHandle) -> &'a CancelHandle {
+        self.handle.as_ref().unwrap_or(run)
+    }
+
+    /// Whether the budget ended the work, as opposed to the user.
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// A result begins, or ends however it ends. The timer stops, so that it can't cancel the
+    /// statements that follow.
+    fn reset(&mut self) {
+        self.began = None;
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+    }
+
+    /// One more row counted without being shown. The first starts the clock and a timer, which
+    /// cancels even while the server is looking for the next row (a check between rows cannot);
+    /// the check here ends the count on time when rows keep coming.
+    fn counted_row(&mut self) {
+        let Some(budget) = self.budget else {
+            return;
+        };
+        match self.began {
+            None => {
+                self.began = Some(Instant::now());
+                let (root, fired) = (Arc::clone(&self.root), Arc::clone(&self.fired));
+                self.timer = Some(tokio::spawn(async move {
+                    tokio::time::sleep(budget).await;
+                    fire(&root, &fired);
+                }));
+            }
+            Some(began) if began.elapsed() >= budget => fire(&self.root, &self.fired),
+            Some(_) => {}
+        }
+    }
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
+/// Cancels the batch's statement, once.
+fn fire(root: &Mutex<Option<CancelHandle>>, fired: &AtomicBool) {
+    if let Ok(mut cell) = root.lock()
+        && let Some(handle) = cell.take()
+    {
+        fired.store(true, Ordering::SeqCst);
+        handle.cancel();
+    }
+}
+
 pub struct Session {
     client: TdsClient,
+    /// Debug builds only (`SQLH_DEBUG_STOP_HOLD_MS`): how long to wait after a count stops,
+    /// before telling it from a user's cancel, so that a test can cancel in that gap.
+    #[cfg(debug_assertions)]
+    stop_hold: Option<Duration>,
     /// How the login was made (`Auth::method`), for `connection`.
     auth: &'static str,
     /// Buffers for reading large values, made on first use.
@@ -319,6 +460,11 @@ impl Session {
         client.take_info_messages();
         Ok(Session {
             client,
+            #[cfg(debug_assertions)]
+            stop_hold: std::env::var("SQLH_DEBUG_STOP_HOLD_MS")
+                .ok()
+                .and_then(|ms| ms.trim().parse().ok())
+                .map(Duration::from_millis),
             auth: options.auth.method(),
             scratch: stream::Scratch::default(),
         })
@@ -362,24 +508,48 @@ impl Session {
     /// top of each step, before that step's result set, row count or errors, and none is
     /// handed over while a result set's rows are being read. SQL errors go to the sink and
     /// don't fail the call; only transport, timeout and output problems do.
+    ///
+    /// With a bounded `counting`, a result whose hidden rows outrun the budget (or `-t`, when
+    /// `Counting::timeout_stops`) ends the batch instead: the rest of it is cancelled, so the
+    /// statements after that result do not run, and the sink is told (`counting_stopped`).
     pub async fn run(
         &mut self,
         sql: String,
         timeout_secs: u32,
+        counting: Counting,
         cancel: &Cancel,
         sink: &mut dyn BatchSink,
         gate: &dyn Backpressure,
     ) -> Result<(), DbError> {
+        let mut drain = Drain::new(counting.budget, &cancel.handle);
         let options = ExecuteOptions::new()
             .timeout_secs(timeout_secs)
-            .cancel(&cancel.handle)
+            .cancel(drain.handle(&cancel.handle))
             .on_error(BatchErrorMode::Continue);
         let mut step = self.client.execute(sql, options).await;
         loop {
             self.flush_messages(sink)?;
             wait_for_output(gate, cancel).await?;
             match step {
-                Ok(StatementResult::Rows) => self.read_rows(sink, gate, cancel).await?,
+                Ok(StatementResult::Rows) => {
+                    if self
+                        .read_rows(sink, gate, cancel, &mut drain, counting)
+                        .await?
+                    {
+                        // The count stopped and the driver has settled the cancel; there is
+                        // nothing left to walk.
+                        break;
+                    }
+                }
+                // The budget fired as a result's last row came in, so that the cancel met the
+                // next step instead of a read of hidden rows. The count was complete, but the
+                // rest of the batch is gone all the same, and the output says so.
+                Err(TdsError::OperationCancelledError(_))
+                    if self.stopped_by_budget(&drain, cancel) =>
+                {
+                    sink.counting_stopped();
+                    break;
+                }
                 Ok(StatementResult::NoRows {
                     rows_affected: Some(count),
                 }) => sink.rows_affected(count)?,
@@ -434,12 +604,36 @@ impl Session {
     /// cut as it arrives, and a row nobody will see is skipped without being decoded. Any other
     /// result set is read a row at a time, which is faster for narrow rows, and a hidden row is
     /// decoded into nothing: no value is built, and no string is copied out of the read buffer.
+    ///
+    /// True when the count was stopped (see `run`).
     async fn read_rows(
         &mut self,
         sink: &mut dyn BatchSink,
         gate: &dyn Backpressure,
         cancel: &Cancel,
-    ) -> Result<(), DbError> {
+        drain: &mut Drain,
+        counting: Counting,
+    ) -> Result<bool, DbError> {
+        drain.reset();
+        let stopped = self.count_rows(sink, gate, cancel, drain, counting).await;
+        drain.reset();
+        stopped
+    }
+
+    /// Whether `drain`'s budget, not the user, cancelled the work, and the driver settled the
+    /// cancel and kept the connection (it marks it dead when the server doesn't acknowledge).
+    fn stopped_by_budget(&self, drain: &Drain, cancel: &Cancel) -> bool {
+        drain.fired() && !cancel.is_cancelled() && !self.client.is_connection_dead()
+    }
+
+    async fn count_rows(
+        &mut self,
+        sink: &mut dyn BatchSink,
+        gate: &dyn Backpressure,
+        cancel: &Cancel,
+        drain: &mut Drain,
+        counting: Counting,
+    ) -> Result<bool, DbError> {
         let metadata = self.client.get_metadata();
         let columns: Vec<Column> = metadata.iter().map(types::column).collect();
         let plan = stream::plan(metadata);
@@ -454,12 +648,22 @@ impl Session {
                 }
                 None => self.plain_row(shown).await,
             };
+            #[cfg(debug_assertions)]
+            if step.is_err()
+                && drain.fired()
+                && let Some(hold) = self.stop_hold
+            {
+                tokio::time::sleep(hold).await;
+            }
             match step {
                 Ok(Row::Values(values)) => {
                     sink.row(&values)?;
                     wait_for_output(gate, cancel).await?;
                 }
-                Ok(Row::Hidden) => sink.skipped_row(),
+                Ok(Row::Hidden) => {
+                    sink.skipped_row();
+                    drain.counted_row();
+                }
                 Ok(Row::End) => break,
                 Err(TdsError::SqlServerError { diagnostics }) => {
                     sink.end_rows()?;
@@ -467,13 +671,33 @@ impl Session {
                     for error in &diagnostics.errors {
                         sink.error(&from_error(error))?;
                     }
-                    return Ok(());
+                    return Ok(false);
+                }
+                // The budget ran out, or `-t` did while only hidden rows were being read (the
+                // rows shown are complete): the driver has settled the cancel and kept the
+                // connection, and what was counted is a lower bound.
+                Err(TdsError::OperationCancelledError(_))
+                    if self.stopped_by_budget(drain, cancel) =>
+                {
+                    sink.counting_stopped();
+                    sink.end_rows()?;
+                    return Ok(true);
+                }
+                Err(TdsError::TimeoutError(_))
+                    if !shown
+                        && counting.timeout_stops
+                        && !cancel.is_cancelled()
+                        && !self.client.is_connection_dead() =>
+                {
+                    sink.counting_stopped();
+                    sink.end_rows()?;
+                    return Ok(true);
                 }
                 Err(error) => return Err(self.failure(error)),
             }
         }
         sink.end_rows()?;
-        Ok(())
+        Ok(false)
     }
 
     /// The next row of a result set with nothing to stream. Every value is at most 8,016 bytes
@@ -891,7 +1115,76 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, data_source, filled, split_protocol, tcp_form, tls_hint};
+    use super::{Counting, Drain, check, data_source, filled, split_protocol, tcp_form, tls_hint};
+    use mssql_tds::core::CancelHandle;
+    use std::time::Duration;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    // PLAN.md 2.15: the budget starts with the first hidden row, a timer ends it while the server
+    // is still looking for the next row, and a result that ends first leaves nothing behind.
+    #[test]
+    fn the_count_budget_fires_from_the_first_hidden_row() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let mut drain = Drain::new(Some(Duration::from_millis(20)), &run);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(!drain.fired(), "the clock starts at the first hidden row");
+            drain.counted_row();
+            assert!(!drain.fired());
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(drain.fired(), "the timer fires with no further row");
+            drain.reset();
+        });
+    }
+
+    #[test]
+    fn a_result_that_ends_in_time_cancels_nothing() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let mut drain = Drain::new(Some(Duration::from_millis(20)), &run);
+            drain.counted_row();
+            drain.reset();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(!drain.fired(), "the timer ended with its result");
+            // The next result starts a new clock.
+            drain.counted_row();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(drain.fired());
+        });
+    }
+
+    #[test]
+    fn rows_that_keep_coming_stop_on_time_too() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let mut drain = Drain::new(Some(Duration::from_millis(10)), &run);
+            drain.counted_row();
+            // No await, so the timer task never runs: the check in the row does the work.
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(!drain.fired());
+            drain.counted_row();
+            assert!(drain.fired());
+        });
+    }
+
+    #[test]
+    fn exact_counting_has_no_budget_and_no_handle_of_its_own() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let mut drain = Drain::new(Counting::EXACT.budget, &run);
+            drain.counted_row();
+            assert!(drain.handle.is_none() && !drain.fired() && drain.timer.is_none());
+        });
+        let (bounded, exact) = (Counting::BOUNDED, Counting::EXACT);
+        assert!(bounded.timeout_stops && bounded.budget.is_some());
+        assert!(!exact.timeout_stops);
+    }
 
     // A count from the driver that doesn't fit the buffer it was given is an error, not a panic.
     #[test]

@@ -191,8 +191,9 @@ impl<W: Write> JsonSink<W> {
         }
         let _ = write!(
             self.buf,
-            "],\"row_count\":{},\"truncated\":{},\"cells_cut\":{}",
+            "],\"row_count\":{},\"row_count_exact\":{},\"truncated\":{},\"cells_cut\":{}",
             self.tally.rows_total(),
+            self.tally.rows_exact(),
             self.tally.rows_shown() < self.tally.rows_total(),
             self.tally.cells_cut()
         );
@@ -216,7 +217,11 @@ impl<W: Write> JsonSink<W> {
                     ended_ms.saturating_sub(started_ms)
                 );
             }
-            self.buf.push('}');
+            let _ = write!(
+                self.buf,
+                ",\"counting_stopped\":{}}}",
+                self.tally.batch_stopped()
+            );
             self.in_batch = false;
         }
     }
@@ -432,6 +437,10 @@ impl<W: Write> BatchSink for JsonSink<W> {
         self.tally.row_skipped();
     }
 
+    fn counting_stopped(&mut self) {
+        self.tally.stop_counting();
+    }
+
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
         self.end_result(false);
@@ -530,10 +539,11 @@ impl<W: Write> Output for JsonSink<W> {
 
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.flush_affected()?;
-        self.tally.begin_batch(batch);
-        // The previous batch's closers are not up for admission. The document head is: it
-        // comes back out with the batch if the budget refuses both.
+        // The previous batch's closers are not up for admission (they read its tally, which
+        // `begin_batch` resets). The document head is: it comes back out with the batch if the
+        // budget refuses both.
         self.close_batch(batch.started_ms);
+        self.tally.begin_batch(batch);
         let mark = self.mark();
         self.open();
         if self.batches > 0 {
@@ -733,12 +743,12 @@ mod tests {
                              {"name": "b", "type": "varbinary(4)", "nullable": true}],
                          "rows": [["9007199254740993", "a\nbcd…[+3]", "0x0102…[+1 bytes]"],
                                   [-5, null, "12.50"]],
-                         "row_count": 3, "truncated": true, "cells_cut": 2},
+                         "row_count": 3, "row_count_exact": true, "truncated": true, "cells_cut": 2},
                         {"type": "rows_affected", "count": 3},
                         {"type": "error", "number": 208, "severity": 16, "state": 1,
                          "line": 2, "text": "Invalid object name 'dbo.Nope'."}
                     ],
-                    "elapsed_ms": 5
+                    "elapsed_ms": 5, "counting_stopped": false
                 }],
                 "notes": ["ignored sqlcmd flags -W"],
                 "ok": false, "exit_code": 1, "summary": "failed (exit 1): 1 error, 9 ms",
@@ -890,6 +900,38 @@ mod tests {
         assert_eq!(events[1]["line"], json!(7));
     }
 
+    // PLAN.md 2.15, exact output: a stopped count says so in the result (`row_count` is the
+    // floored lower bound and `row_count_exact` false) and in its batch (`counting_stopped`);
+    // the batch after it is exact. The note and the status say it in words.
+    #[test]
+    fn a_stopped_count_is_a_lower_bound_in_the_result_batch_note_and_status() {
+        use super::super::text::tests::{stopped_limits, stopped_run};
+        let (mut s, main, _) = sink(stopped_limits());
+        stopped_run(&mut s);
+        assert_eq!(
+            main.text(),
+            concat!(
+                r#"{"contract_version":"1.0","batches":["#,
+                r#"{"batch":1,"source":"-Q","line":1,"events":["#,
+                r#"{"type":"rows_affected","count":2},"#,
+                r#"{"type":"result","columns":[{"name":"id","type":"int","nullable":true},"#,
+                r#"{"name":"v","type":"varchar(20)","nullable":true}],"#,
+                r#""rows":[[0,"v0"],[1,"v1"],[2,"v2"]],"row_count":1000,"#,
+                r#""row_count_exact":false,"truncated":true,"cells_cut":0}],"#,
+                r#""elapsed_ms":5,"counting_stopped":true},"#,
+                r#"{"batch":2,"source":"-Q","line":6,"events":["#,
+                r#"{"type":"result","columns":[{"name":"next","type":"int","nullable":true}],"#,
+                r#""rows":[[1]],"row_count":1,"row_count_exact":true,"truncated":false,"#,
+                r#""cells_cut":0}],"elapsed_ms":1,"counting_stopped":false}],"#,
+                r#""notes":["counting stopped in batch 1: the rest of that batch was cancelled, "#,
+                r#"so its later statements did not run; --exact-count counts every row"],"#,
+                r#""ok":true,"exit_code":0,"summary":"ok: 2 batches, counting stopped in 1, 7 ms","#,
+                r#""elapsed_ms":7}"#,
+                "\n"
+            )
+        );
+    }
+
     // The whole-response budget (R08). A json sink with a stream each for the document and
     // the diagnostics; the document is parsed, so every test also proves it is valid JSON.
 
@@ -974,8 +1016,8 @@ mod tests {
                 r#""encrypted":true,"server_version":"17.0.1000"},"connect_ms":195,"#,
                 r#""batches":[{"batch":1,"source":"-Q","line":1,"events":["#,
                 r#"{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
-                r#""rows":[[1]],"row_count":1,"truncated":false,"cells_cut":0}],"#,
-                r#""elapsed_ms":12}],"#,
+                r#""rows":[[1]],"row_count":1,"row_count_exact":true,"truncated":false,"cells_cut":0}],"#,
+                r#""elapsed_ms":12,"counting_stopped":false}],"#,
                 r#""ok":true,"exit_code":0,"summary":"ok: 1 batch, 215 ms","elapsed_ms":215}"#,
                 "\n"
             )
@@ -1333,12 +1375,13 @@ mod tests {
                 "batches": [{"events": [
                     {"type": "result",
                      "columns": [{"name": "v", "type": "int", "nullable": true}],
-                     "rows": [[1], [2]], "row_count": 2, "truncated": false, "cells_cut": 0},
+                     "rows": [[1], [2]], "row_count": 2, "row_count_exact": true,
+                     "truncated": false, "cells_cut": 0},
                     {"type": "msg", "text": "kept"},
                     {"type": "rows_affected", "count": 3},
                     {"type": "error", "number": 208, "severity": 16, "state": 1, "line": 2,
                      "text": "Invalid object name 'dbo.Nope'."}
-                ]}],
+                ], "counting_stopped": false}],
                 "notes": ["1 more result sets not shown (--max-results 1)"],
                 "ok": true, "exit_code": 0,
                 "summary": "failed (exit 1): 1 error, 3 ms", "elapsed_ms": 3
@@ -1424,14 +1467,14 @@ mod tests {
     }
 
     // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
-    // the 512-byte status reserve, 600 - 512 = 88 bytes, 13 of them for the array and quotes
+    // the 640-byte status reserve, 728 - 640 = 88 bytes, 13 of them for the array and quotes
     // around the first note: 66 characters and "…[+134]". The document head
     // (`{"contract_version":"1.0","batches":[`) and `]` take 38, and what the notes array,
-    // the error's wrapper and the outcome leave of the other 562 goes to the error: 379
-    // characters and "…[+621]".
+    // the error's wrapper and the outcome leave of the other 690 goes to the error: 507
+    // characters and "…[+493]".
     #[test]
     fn a_tight_cap_shortens_exactly() {
-        let (mut s, main, _) = sink(capped(600));
+        let (mut s, main, _) = sink(capped(728));
         s.note(&"x".repeat(200)).unwrap();
         let error = "e".repeat(1000);
         s.finish(&Summary {
@@ -1445,14 +1488,14 @@ mod tests {
             main.text(),
             format!(
                 "{{\"contract_version\":\"1.0\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
-                 \"error\":\"{}…[+621]\",\"ok\":false,\"exit_code\":1,\
+                 \"error\":\"{}…[+493]\",\"ok\":false,\"exit_code\":1,\
                  \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":3}}\n",
                 "x".repeat(66),
-                "e".repeat(379)
+                "e".repeat(507)
             )
         );
         // One byte of the cap is left over: the marker is sized for the widest count.
-        assert_eq!(main.bytes(), 599);
+        assert_eq!(main.bytes(), 727);
     }
 
     // A huge closing error is shortened; the outcome fields are not.
@@ -1597,7 +1640,7 @@ mod tests {
         s.diagnostic(&"d".repeat(20_000)).unwrap();
         let line = meta.text();
         assert_eq!(line.matches('d').count() + cut_by(&line), 20_000);
-        assert!(meta.bytes() <= 4096 - 512);
+        assert!(meta.bytes() <= 4096 - 640);
 
         // Too little room for even a marker: the line is dropped and counted.
         let (mut s, main, meta) = sink(capped(520));
@@ -1635,10 +1678,12 @@ mod tests {
     // of the body, admitted when it is written.
     #[test]
     fn the_worst_case_ending_fits_the_status_reserve() {
-        let closers = |rows: u64, cut: u64, truncated: bool, elapsed: u128| {
+        let closers = |rows: u64, cut: u64, truncated: bool, elapsed: u128, stopped: bool| {
             format!(
-                "],\"row_count\":{rows},\"truncated\":{truncated},\"cells_cut\":{cut},\
-                 \"interrupted\":true}}],\"elapsed_ms\":{elapsed}}}"
+                "],\"row_count\":{rows},\"row_count_exact\":{},\"truncated\":{truncated},\
+                 \"cells_cut\":{cut},\"interrupted\":true}}],\"elapsed_ms\":{elapsed},\
+                 \"counting_stopped\":{stopped}}}",
+                !stopped
             )
         };
         let (mut s, main, _) = sink(capped(0));
@@ -1655,15 +1700,16 @@ mod tests {
         })
         .unwrap();
         assert!(
-            main.text().contains(&closers(1, 0, false, 7)),
+            main.text().contains(&closers(1, 0, false, 7, false)),
             "{}",
             main.text()
         );
 
         let status = format!(
             "failed (exit 1): {} errors, first in batch {}; {} later batches not run \
-             (--continue-on-error runs them), {} ms",
+             (--continue-on-error runs them), counting stopped in {}, {} ms",
             u32::MAX,
+            usize::MAX,
             usize::MAX,
             usize::MAX,
             u128::MAX
@@ -1674,7 +1720,7 @@ mod tests {
             error: None,
             elapsed_ms: u128::MAX,
         });
-        let worst = closers(u64::MAX, u64::MAX, false, u128::MAX).len()
+        let worst = closers(u64::MAX, u64::MAX, false, u128::MAX, true).len()
             + "]".len()
             + ",\"notes\":[\"\"]".len()
             + ",\"error\":\"\"".len()
