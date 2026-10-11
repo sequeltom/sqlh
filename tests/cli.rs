@@ -1521,12 +1521,13 @@ fn a_git_bash_path_that_is_not_found_names_the_windows_spelling() {
         vec!["--profile", "dev", "-Q", "SELECT 1"],
     ] {
         let r = run(sqlh().env("SQLH_CONFIG", config).args(&args));
-        let line = error_line(&r);
-        assert!(
-            line.starts_with(
-                "-- error: SQLH_CONFIG /c/sqlh-no-such-dir/profiles.toml: the folder wasn't found; "
-            ) && line.ends_with(&hint),
-            "{args:?}: {line}"
+        assert_eq!(
+            error_line(&r),
+            format!(
+                "-- error: SQLH_CONFIG /c/sqlh-no-such-dir/profiles.toml: the folder wasn't \
+                 found; {hint}"
+            ),
+            "{args:?}"
         );
     }
     assert!(!gone.exists(), "a command created the folder");
@@ -1697,13 +1698,13 @@ fn piped_text_in_another_encoding_is_refused_and_utf8_is_read_as_it_is() {
     let oem = b"UPDATE [Caf\x82] SET x = 1";
     for args in [vec![], vec!["-i", "-"]] {
         let r = run_with_stdin(sqlh().args(&args), oem);
-        assert_eq!(r.code, 3, "{args:?}: {}", r.stdout);
-        let line = r.stdout.lines().next().unwrap_or("");
-        assert!(
-            line.starts_with("-- error: stdin: not valid UTF-8 (byte 11);")
-                && line.contains("in cmd.exe run chcp 65001 first")
-                && line.contains("$OutputEncoding = [Text.Encoding]::UTF8"),
-            "{args:?}: {line}"
+        assert_eq!(
+            error_line(&r),
+            "-- error: stdin: not valid UTF-8 (byte 11); save it as UTF-8, or UTF-16 with a BOM. \
+             Piped text is encoded by the shell: in cmd.exe run chcp 65001 first, in Windows \
+             PowerShell run $OutputEncoding = [Text.Encoding]::UTF8 first, or pass the SQL with \
+             -Q or -i",
+            "{args:?}"
         );
     }
     // The same bytes in a file were saved that way, so the advice is about saving it.
