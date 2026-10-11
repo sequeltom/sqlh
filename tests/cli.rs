@@ -1620,6 +1620,56 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
+// PLAN.md 2.14: the read-only guard takes memory in proportion to the size of the input, not to
+// the number of tokens in it. It used to keep about 56 bytes for each token: 10 MB of
+// one-character tokens peaked at 795 MB of working set, 9.9 MB of `SELECT 1` lines at 233 MB.
+// Now it keeps none, and each run below peaks at about what it takes without the guard (36 MB:
+// the input as read, as decoded and as split into batches), 54 MB for the one whose refusal
+// quotes a 10 MB name. The guard runs before anything connects, so no server is needed: the
+// first two pass it and end at the dead address, the others are refused.
+#[cfg(windows)]
+#[test]
+fn the_guard_takes_memory_in_proportion_to_the_input() {
+    // A small multiple of the 10 MB input limit; the old guard needed 23 to 86 times.
+    const LIMIT: usize = 80_000_000;
+    let dir = scratch("guard_memory");
+    let file = dir.join("input.sql");
+    let cases = [
+        ("one-character tokens", "(".repeat(10_000_000), 2, "exit 2"),
+        (
+            "SELECT 1 lines",
+            "SELECT 1\n".repeat(1_111_111),
+            2,
+            "exit 2",
+        ),
+        (
+            "a refusal after 9,999,000 one-character tokens",
+            format!("{}\nDELETE FROM dbo.T", "(".repeat(9_999_000)),
+            5,
+            "-- blocked: line 2: DELETE dbo.T would write; nothing was run.",
+        ),
+        (
+            "a refusal quoting a 10 MB name",
+            format!("EXEC {}a", "a.".repeat(4_999_990)),
+            5,
+            "-- blocked: line 1: EXEC a.a.a.a.",
+        ),
+    ];
+    for (what, sql, code, expected) in cases {
+        assert!(sql.len() <= 10_000_000, "{what}: {} bytes", sql.len());
+        fs::write(&file, &sql).unwrap();
+        let (r, peak) = run_measured(sqlh().args(DEAD).arg("-i").arg(&file));
+        assert_eq!(r.code, code, "{what}: {}", r.stdout);
+        assert!(
+            r.stdout.contains(expected) || r.stderr.contains(expected),
+            "{what}: {} {}",
+            r.stdout.chars().take(300).collect::<String>(),
+            r.stderr.chars().take(300).collect::<String>()
+        );
+        assert!(peak < LIMIT, "{what}: peak working set {} MB", peak >> 20);
+    }
+}
+
 /// Runs `command` to its end and also returns the child's peak working set in bytes. Windows
 /// keeps that with the process handle, which `Child` holds until it is dropped, so it can be
 /// read after the child has exited. The pipes are drained in the order a run writes them: a
