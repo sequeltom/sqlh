@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
-use crate::db::{BatchSink, Connection, ServerMessage};
+use crate::db::{BatchSink, Connection, ServerMessage, Stop};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -499,6 +499,10 @@ pub struct Tally {
     batch_stopped: bool,
     /// The batches (by number, in order) in which a count was stopped.
     stopped_batches: Vec<usize>,
+    /// What stopped them, for the note's advice: the budget (`--exact-count` lifts it), `-t`
+    /// (raising it does).
+    stopped_by_budget: bool,
+    stopped_by_timeout: bool,
     withheld: Withheld,
     /// Consecutive row counts not written yet, as (statements, rows): they become one line.
     affected: Option<(u64, u64)>,
@@ -534,6 +538,8 @@ impl Tally {
             batch_number: 0,
             batch_stopped: false,
             stopped_batches: Vec::new(),
+            stopped_by_budget: false,
+            stopped_by_timeout: false,
             withheld: Withheld::default(),
             affected: None,
             rows_total: 0,
@@ -765,11 +771,15 @@ impl Tally {
         self.cells_cut += 1;
     }
 
-    /// The count of hidden rows was stopped early (`BatchSink::counting_stopped`): the rest of
-    /// the batch was cancelled and the result set's total is a lower bound.
-    pub fn stop_counting(&mut self) {
+    /// The count of hidden rows was stopped early (`BatchSink::counting_stopped`), by `by`: the
+    /// rest of the batch was cancelled and the result set's total is a lower bound.
+    pub fn stop_counting(&mut self, by: Stop) {
         self.stopped = true;
         self.batch_stopped = true;
+        match by {
+            Stop::Budget => self.stopped_by_budget = true,
+            Stop::Timeout => self.stopped_by_timeout = true,
+        }
         if self.stopped_batches.last() != Some(&self.batch_number) {
             self.stopped_batches.push(self.batch_number);
         }
@@ -778,6 +788,13 @@ impl Tally {
     /// Whether the current result set's total is exact. False once its count was stopped.
     pub fn rows_exact(&self) -> bool {
         !self.stopped
+    }
+
+    /// Whether rows were hidden from the current result set that the count reached: more rows
+    /// arrived than were shown. This is the raw count, which the floored bound of a stopped
+    /// count (`rows_total`) can't contradict: JSON's `truncated` reads it.
+    pub fn rows_hidden(&self) -> bool {
+        self.rows_total > self.rows_shown
     }
 
     /// Whether a count was stopped in the current batch.
@@ -791,14 +808,23 @@ impl Tally {
     }
 
     /// The result set's total as the output reports it: the rows counted, or when the count
-    /// was stopped, that number floored to one significant digit (`floor_digit`) and never
-    /// below the rows shown. A count that ran for a fixed time differs from run to run by the
-    /// speed of the link; the first digit mostly doesn't, so the same query reads the same.
+    /// was stopped, a lower bound.
+    /// - The rows counted floored to one significant digit (`floor_digit`). A count that ran
+    ///   for a fixed time differs from run to run by the speed of the link; the first digit
+    ///   mostly doesn't, so the same query mostly reads the same.
+    /// - But once a hidden row was counted, never less than one more than the rows shown, so
+    ///   flooring can't make the output say that nothing was hidden (154 rows counted with
+    ///   100 shown read `100 of ≥101`, not `≥100`).
+    /// - When no hidden row arrived (`-t` ended the wait for the first one), the rows shown:
+    ///   that many rows are known to exist, and the stopped count says there may be more.
     pub fn rows_total(&self) -> u64 {
-        if self.stopped {
-            floor_digit(self.rows_total).max(self.rows_shown)
+        if !self.stopped {
+            return self.rows_total;
+        }
+        if self.rows_hidden() {
+            floor_digit(self.rows_total).max(self.rows_shown.saturating_add(1))
         } else {
-            self.rows_total
+            self.rows_shown
         }
     }
 
@@ -902,7 +928,11 @@ impl Tally {
             ));
         }
         if !self.stopped_batches.is_empty() {
-            notes.push(stopped_note(&self.stopped_batches));
+            notes.push(stopped_note(
+                &self.stopped_batches,
+                self.stopped_by_budget,
+                self.stopped_by_timeout,
+            ));
         }
         if self.exhausted {
             let w = &self.withheld;
@@ -953,9 +983,12 @@ pub fn floor_digit(n: u64) -> u64 {
 /// The most batches the note about stopped counts names; the rest are counted.
 const NOTE_BATCHES: usize = 5;
 
-/// The run's note that counting stopped (DESIGN.md §5.1): where, and what that cost. A stopped
-/// count cancels the rest of its batch, and nothing else says its later statements didn't run.
-fn stopped_note(batches: &[usize]) -> String {
+/// The run's note that counting stopped (DESIGN.md §5.1): where, what that cost, and the way
+/// to count further. A stopped count cancels the rest of its batch, and nothing else says its
+/// later statements didn't run. The advice follows what stopped the counts: the budget, which
+/// `--exact-count` lifts (a run that has it can't be stopped by the budget, so it is never
+/// advised to it again), or `-t`, which only raising it lifts. A run with both kinds gets both.
+fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool) -> String {
     let shown: Vec<String> = batches
         .iter()
         .take(NOTE_BATCHES)
@@ -980,7 +1013,17 @@ fn stopped_note(batches: &[usize]) -> String {
             shown.join(", ")
         )
     };
-    note.push_str("; --exact-count counts every row");
+    for advice in [
+        (by_budget, "--exact-count counts every row"),
+        (by_timeout, "raise -t to count longer"),
+    ]
+    .iter()
+    .filter(|(applies, _)| *applies)
+    .map(|(_, advice)| advice)
+    {
+        note.push_str("; ");
+        note.push_str(advice);
+    }
     note
 }
 
@@ -1142,8 +1185,7 @@ mod tests {
         assert_eq!(hex(&[0xAB, 0xCD, 0xEF], 5), ("0xABCD".into(), 1));
     }
 
-    // F06: a refusal is final, and the closing note doesn't list counts that are all zero.
-    // PLAN.md 2.15: a stopped count reports its first digit and never less than was shown.
+    // PLAN.md 2.15: a stopped count reports its first digit.
     #[test]
     fn a_count_is_floored_to_one_significant_digit() {
         for (n, floored) in [
@@ -1161,24 +1203,85 @@ mod tests {
         ] {
             assert_eq!(floor_digit(n), floored, "{n}");
         }
-        let mut t = Tally::new(Limits::default());
+    }
+
+    /// A result of `shown` rows, `--max-rows` equal to that, and `hidden` rows counted past
+    /// them before the count was stopped by `by`.
+    fn stopped_result(shown: u64, hidden: u64, by: Stop) -> Tally {
+        let mut t = Tally::new(Limits {
+            max_rows: shown,
+            ..Limits::default()
+        });
         t.start_result();
-        for _ in 0..15 {
+        for _ in 0..shown {
             t.row_shown();
         }
-        for _ in 0..4 {
+        for _ in 0..hidden {
             t.row_skipped();
         }
-        // 19 rows counted floor to 10, below the 15 shown: the shown rows are the bound.
-        t.stop_counting();
-        assert_eq!(t.rows_total(), 15);
-        assert!(!t.rows_exact());
-        assert!(
-            t.footer().starts_with("15 of ≥15 rows shown"),
-            "{}",
-            t.footer()
+        t.stop_counting(by);
+        t
+    }
+
+    // PLAN.md 2.15: flooring must not make the output say that nothing was hidden. Once a
+    // hidden row was counted the bound is above the rows shown, whatever the floor says, and
+    // `rows_hidden` (JSON's `truncated`) reads the raw count.
+    #[test]
+    fn a_stopped_count_never_hides_that_rows_were_hidden() {
+        // Plenty hidden: one significant digit.
+        let t = stopped_result(100, 852_259, Stop::Budget);
+        assert_eq!(
+            (t.rows_total(), t.rows_hidden(), t.rows_exact()),
+            (800_000, true, false)
+        );
+        assert_eq!(
+            t.footer(),
+            "100 of ≥800000 rows shown (--max-rows 100; counting stopped)"
+        );
+        // A few hidden: 101 to 199 floor to 100, which is not above the 100 shown, so the
+        // bound is one more than the rows shown. 200 floors to 200 and stays.
+        for hidden in [1, 54, 99] {
+            let t = stopped_result(100, hidden, Stop::Budget);
+            assert_eq!((t.rows_total(), t.rows_hidden()), (101, true), "{hidden}");
+            assert_eq!(
+                t.footer(),
+                "100 of ≥101 rows shown (--max-rows 100; counting stopped)",
+                "{hidden}"
+            );
+        }
+        assert_eq!(stopped_result(100, 100, Stop::Budget).rows_total(), 200);
+        // The floor can land under the rows shown: 19 counted floor to 10, 15 were shown.
+        assert_eq!(stopped_result(15, 4, Stop::Budget).rows_total(), 16);
+        // Nothing hidden arrived (`-t` ended the wait for the first hidden row): the rows
+        // shown are the bound, and no rows are said to be hidden.
+        let t = stopped_result(7, 0, Stop::Timeout);
+        assert_eq!(
+            (t.rows_total(), t.rows_hidden(), t.rows_exact()),
+            (7, false, false)
+        );
+        assert_eq!(
+            t.footer(),
+            "7 of ≥7 rows shown (--max-rows 7; counting stopped)"
+        );
+        // The output budget as the limit that hid them: it is named in place of --max-rows.
+        let mut t = stopped_result(100, 0, Stop::Budget);
+        t.row_withheld();
+        assert_eq!(
+            t.footer(),
+            "100 of ≥101 rows shown (--max-output; counting stopped)"
+        );
+        // A count that ended on its own is exact, however many rows were hidden.
+        let mut t = Tally::new(Limits::default());
+        t.start_result();
+        for _ in 0..105 {
+            t.row_skipped();
+        }
+        assert_eq!(
+            (t.rows_total(), t.rows_exact(), t.rows_hidden()),
+            (105, true, true)
         );
         // A new result is exact again; the batch keeps what happened.
+        let mut t = stopped_result(100, 5, Stop::Budget);
         t.start_result();
         assert!(t.rows_exact());
         assert_eq!((t.batch_stopped(), t.stopped_batches()), (true, 1));
@@ -1186,7 +1289,7 @@ mod tests {
 
     #[test]
     fn the_note_names_the_batches_where_counting_stopped() {
-        let note = |batches: &[usize]| stopped_note(batches);
+        let note = |batches: &[usize]| stopped_note(batches, true, false);
         let tail = "; --exact-count counts every row";
         assert_eq!(
             note(&[4]),
@@ -1211,6 +1314,64 @@ mod tests {
         );
     }
 
+    // PLAN.md 2.15: the advice follows what stopped the count. `--exact-count` lifts the
+    // budget and nothing else, so a run that `-t` stopped is told to raise `-t` instead,
+    // which is also what a run that already has `--exact-count` needs; a run with both kinds
+    // of stop gets both.
+    #[test]
+    fn the_notes_advice_follows_what_stopped_the_count() {
+        let first = "counting stopped in batch 2: the rest of that batch was cancelled, so its \
+                     later statements did not run";
+        assert_eq!(
+            stopped_note(&[2], true, false),
+            format!("{first}; --exact-count counts every row")
+        );
+        assert_eq!(
+            stopped_note(&[2], false, true),
+            format!("{first}; raise -t to count longer")
+        );
+        assert_eq!(
+            stopped_note(&[2], true, true),
+            format!("{first}; --exact-count counts every row; raise -t to count longer")
+        );
+        // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
+        let batch = |number| BatchInfo {
+            number,
+            total: 2,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+        };
+        let mut t = Tally::new(Limits::default());
+        t.begin_batch(&batch(1));
+        t.start_result();
+        t.stop_counting(Stop::Timeout);
+        assert_eq!(
+            t.limit_notes(),
+            [
+                "counting stopped in batch 1: the rest of that batch was cancelled, so its \
+                 later statements did not run; raise -t to count longer"
+            ]
+        );
+        t.begin_batch(&batch(2));
+        t.start_result();
+        t.stop_counting(Stop::Budget);
+        assert_eq!(
+            t.limit_notes(),
+            [
+                "counting stopped in batches 1, 2: the rest of each was cancelled, so their \
+                 later statements did not run; --exact-count counts every row; raise -t to \
+                 count longer"
+            ]
+        );
+        assert_eq!(t.stopped_batches(), 2);
+    }
+
+    // F06: a refusal is final, and the closing note doesn't list counts that are all zero.
     #[test]
     fn the_output_budget_is_sticky() {
         let mut tally = Tally::new(Limits {

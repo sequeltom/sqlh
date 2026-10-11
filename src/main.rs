@@ -327,7 +327,10 @@ impl Closing {
                 let code = failure.exit as u8;
                 Closing {
                     exit: failure.exit,
-                    status: format!("failed (exit {code}): {}, {ms} ms", failure.exit.label()),
+                    status: format!(
+                        "failed (exit {code}): {}{stopped}, {ms} ms",
+                        failure.exit.label()
+                    ),
                     error: (!failure.message.is_empty()).then_some(failure.message),
                     elapsed_ms: ms,
                 }
@@ -894,6 +897,28 @@ async fn run_cancellable(
     }
 }
 
+/// How a run counts the rows it does not show (DESIGN.md §4.4): for a bounded time, except
+/// where a stopped count would lose something, and on request.
+/// - **Writes allowed:** a stopped count skips the statements after it, and one can be the
+///   `COMMIT`. Exact counting, and `-t` stays a failure (exit 4), since stopping there skips
+///   the same statements.
+/// - **`XACT_ABORT` in the input:** with it on, the attention rolls the transaction back, and
+///   the read-only wrapper with it, which would end the run. Exact counting, and `-t` stays a
+///   failure, since it sends the same attention.
+/// - **`--exact-count`** or the profile's `exact_count`: exact counting. `-t` still ends a
+///   count of rows nobody sees, in a run that can lose nothing by it.
+fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> Counting {
+    let base = if allow_write || exact_requested || xact_abort {
+        Counting::EXACT
+    } else {
+        Counting::BOUNDED
+    };
+    Counting {
+        timeout_stops: !allow_write && !xact_abort,
+        ..base
+    }
+}
+
 async fn run_session(
     opts: &Opts,
     settings: &Settings,
@@ -953,22 +978,10 @@ async fn run_session(
         }
     }
 
-    // Hidden rows are counted for a bounded time (DESIGN.md §4.4), except where a stopped count
-    // would lose something: with writes allowed it can skip a COMMIT; with XACT_ABORT in the
-    // input the attention rolls the wrapper transaction back; and on request.
-    let exact = settings.allow_write
-        || settings.exact_count
-        || batches
-            .iter()
-            .any(|batch| guard::mentions_xact_abort(&batch.sql));
-    let mut counting = if exact {
-        Counting::EXACT
-    } else {
-        Counting::BOUNDED
-    };
-    // `-t` ending the count of hidden rows is no failure in a run that cannot write: the rows
-    // shown are complete. With writes allowed it still is, because it skips what follows.
-    counting.timeout_stops = !settings.allow_write;
+    let xact_abort = batches
+        .iter()
+        .any(|batch| guard::mentions_xact_abort(&batch.sql));
+    let counting = counting_for(settings.allow_write, settings.exact_count, xact_abort);
     let mut stats = Stats::default();
     let gate = out.gate();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
@@ -1159,7 +1172,8 @@ mod tests {
     }
 
     // PLAN.md 2.15: the status line says how many batches had a count stopped, in a run that
-    // succeeded and in one that failed, and says nothing otherwise.
+    // succeeded and in one that failed (with a SQL error or any other failure), and says
+    // nothing otherwise.
     #[test]
     fn the_status_line_says_where_counting_stopped() {
         let mut o = out(usize::MAX, false);
@@ -1186,13 +1200,33 @@ mod tests {
             "{}",
             clean.status
         );
-        for number in [2, 3] {
+        let timeout = || Failure::new(Exit::Timeout, "query timeout");
+        let clean = Closing::of(&o, Err(timeout()), Instant::now());
+        assert!(
+            clean.status.starts_with("failed (exit 4): timeout, ")
+                && !clean.status.contains("stopped"),
+            "{}",
+            clean.status
+        );
+        for (number, by) in [(2, db::Stop::Budget), (3, db::Stop::Timeout)] {
             o.begin_batch(&batch(number)).unwrap();
             o.columns(&[]).unwrap();
-            o.counting_stopped();
+            o.counting_stopped(by);
             o.end_rows().unwrap();
             o.end_batch(1).unwrap();
         }
+        // A failure that is not a SQL error keeps its exit code and first words, and adds the
+        // same words, before the time.
+        let failed = Closing::of(&o, Err(timeout()), Instant::now());
+        assert_eq!(failed.exit, Exit::Timeout);
+        assert!(
+            failed
+                .status
+                .starts_with("failed (exit 4): timeout, counting stopped in 2, "),
+            "{}",
+            failed.status
+        );
+        assert_eq!(failed.error.as_deref(), Some("query timeout"));
         let stopped = Closing::of(&o, Ok(stats()), Instant::now());
         assert!(
             stopped
@@ -1220,6 +1254,41 @@ mod tests {
             "{}",
             failed.status
         );
+    }
+
+    // PLAN.md 2.15, decision 6 (DESIGN.md §4.4): which runs stop their count, and which let `-t`
+    // end it. Writes allowed, and `XACT_ABORT` in the input, count exactly and keep `-t` a
+    // failure, because both would lose something to a stop (a skipped COMMIT, a rolled-back
+    // wrapper); a request for exact counting changes the count only.
+    #[test]
+    fn the_run_picks_how_it_counts() {
+        let bounded = Counting::BOUNDED;
+        let exact = Counting::EXACT;
+        let exact_but_for_timeouts = Counting {
+            timeout_stops: true,
+            ..exact
+        };
+        // (writes allowed, exact requested, XACT_ABORT in the input) and what each gets.
+        let table = [
+            ((false, false, false), bounded),
+            ((false, true, false), exact_but_for_timeouts),
+            ((false, false, true), exact),
+            ((false, true, true), exact),
+            ((true, false, false), exact),
+            ((true, true, false), exact),
+            ((true, false, true), exact),
+            ((true, true, true), exact),
+        ];
+        for ((allow_write, requested, xact_abort), want) in table {
+            assert_eq!(
+                counting_for(allow_write, requested, xact_abort),
+                want,
+                "allow_write {allow_write}, exact_count {requested}, XACT_ABORT {xact_abort}"
+            );
+        }
+        // The two kinds the table separates.
+        assert!(bounded.budget.is_some() && bounded.timeout_stops);
+        assert!(exact.budget.is_none() && !exact.timeout_stops);
     }
 
     /// A reader that never reads: every write blocks until the test lets go (drops

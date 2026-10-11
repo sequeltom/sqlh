@@ -113,10 +113,14 @@ pub trait BatchSink {
     fn cell_limit(&self) -> usize;
     fn row(&mut self, values: &[Value]) -> io::Result<()>;
     fn skipped_row(&mut self);
-    /// The count of hidden rows was stopped (`Counting`): the rows counted so far are a lower
-    /// bound, and the rest of the batch was cancelled. Called once, in place of the rows that
-    /// would have followed, just before `end_rows`.
-    fn counting_stopped(&mut self);
+    /// The count of hidden rows was stopped (`Counting`), by `by`: the rows counted so far are
+    /// a lower bound, and the rest of the batch was cancelled. Called once, in place of the rows
+    /// that would have followed: just before `end_rows`, or, when the budget ran out as the
+    /// result's last row arrived and the cancel met the next step instead of a read, after
+    /// `end_rows`, with no result open (the count was complete then, but the batch's later
+    /// statements are gone all the same). Either way it is the last call the batch's results
+    /// get; held messages may still follow.
+    fn counting_stopped(&mut self, by: Stop);
     fn end_rows(&mut self) -> io::Result<()>;
     fn rows_affected(&mut self, count: u64) -> io::Result<()>;
     fn message(&mut self, message: &ServerMessage) -> io::Result<()>;
@@ -244,6 +248,16 @@ async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(),
 /// How long a read-only run goes on counting the rows it does not show (DESIGN.md §4.4).
 pub const COUNT_BUDGET: Duration = Duration::from_millis(250);
 
+/// What stopped a count of hidden rows (`BatchSink::counting_stopped`). The output tells the
+/// two apart in its advice: the budget is lifted by `--exact-count`, `-t` by raising it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The count's own time budget ran out (`Counting::budget`).
+    Budget,
+    /// `-t` ran out while only hidden rows were being read (`Counting::timeout_stops`).
+    Timeout,
+}
+
 /// How a batch counts the rows it does not show: past `--max-rows`, in a result `--max-results`
 /// hides, and after the `--max-output` budget ran out.
 ///
@@ -253,13 +267,18 @@ pub const COUNT_BUDGET: Duration = Duration::from_millis(250);
 /// the cancel Ctrl+C uses: the total is then a lower bound, and the rest of the batch does not
 /// run (`BatchSink::counting_stopped`). A stopped count can skip a `COMMIT`, so the caller picks
 /// exact counting wherever that would lose something (docs/notes/drain-experiment.md).
+///
+/// The clock starts with the first hidden row. Until one arrives there is nothing being counted,
+/// and a server that is slow to produce it is waited for, up to `-t`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Counting {
     /// `None`: count to the end of every result.
     pub budget: Option<Duration>,
     /// When `-t` expires while only hidden rows are being counted, the rows shown are complete,
-    /// so the count stops there instead of failing the run (exit 4). Not with writes allowed:
-    /// the stop skips what follows, and a skipped `COMMIT` has to be a failure.
+    /// so the count stops there instead of failing the run (exit 4). Not where a stop would lose
+    /// something, which `main` decides: with writes allowed the stop skips what follows (a
+    /// skipped `COMMIT` has to be a failure), and with `XACT_ABORT` in the input the attention
+    /// rolls the read-only wrapper transaction back, which would end the run anyway.
     pub timeout_stops: bool,
 }
 
@@ -547,7 +566,7 @@ impl Session {
                 Err(TdsError::OperationCancelledError(_))
                     if self.stopped_by_budget(&drain, cancel) =>
                 {
-                    sink.counting_stopped();
+                    sink.counting_stopped(Stop::Budget);
                     break;
                 }
                 Ok(StatementResult::NoRows {
@@ -565,7 +584,8 @@ impl Session {
                         break;
                     }
                 }
-                Err(error) => return Err(self.failure(error)),
+                // A cancel here can still be sqlh's own stop of a count (see `counting_failure`).
+                Err(error) => return Err(self.counting_failure(error, &drain, cancel)),
             }
             step = self.client.advance().await;
         }
@@ -584,17 +604,16 @@ impl Session {
     /// `send_attention_with_timeout` would send a new attention rather than report the old one.
     /// So that case says only what was observed, and "the server confirmed" is never claimed.
     fn failure(&self, error: TdsError) -> DbError {
-        match error {
-            TdsError::OperationCancelledError(_) if !self.client.is_connection_dead() => {
-                DbError::Cancelled(
-                    "the statement was cancelled; the connection stayed usable".into(),
-                )
-            }
-            TdsError::OperationCancelledError(_) => DbError::Cancelled(
-                "the server didn't confirm the cancel, so the connection was closed".into(),
-            ),
-            error => runtime_error(error),
-        }
+        classify(error, self.client.is_connection_dead(), false)
+    }
+
+    /// `failure` for an error met in a batch that has a count of hidden rows (`Drain`). When the
+    /// budget's own cancel went unacknowledged (it fired, the user did not cancel, and the driver
+    /// marked the connection dead), the message says that it was sqlh's count that ended the
+    /// run, not a cancel from outside (DESIGN.md §6, exit 6).
+    fn counting_failure(&self, error: TdsError, drain: &Drain, cancel: &Cancel) -> DbError {
+        let own_stop = drain.fired() && !cancel.is_cancelled();
+        classify(error, self.client.is_connection_dead(), own_stop)
     }
 
     /// Streams one result set's rows to `sink`, holding one row at a time (DESIGN.md §11).
@@ -653,6 +672,14 @@ impl Session {
                 && drain.fired()
                 && let Some(hold) = self.stop_hold
             {
+                // The marker tells a test when the hold begins; a failed write is ignored.
+                let _ = io::Write::write_fmt(
+                    &mut io::stderr(),
+                    format_args!(
+                        "sqlh: debug: holding {} ms after the count was cancelled\n",
+                        hold.as_millis()
+                    ),
+                );
                 tokio::time::sleep(hold).await;
             }
             match step {
@@ -679,7 +706,7 @@ impl Session {
                 Err(TdsError::OperationCancelledError(_))
                     if self.stopped_by_budget(drain, cancel) =>
                 {
-                    sink.counting_stopped();
+                    sink.counting_stopped(Stop::Budget);
                     sink.end_rows()?;
                     return Ok(true);
                 }
@@ -689,11 +716,11 @@ impl Session {
                         && !cancel.is_cancelled()
                         && !self.client.is_connection_dead() =>
                 {
-                    sink.counting_stopped();
+                    sink.counting_stopped(Stop::Timeout);
                     sink.end_rows()?;
                     return Ok(true);
                 }
-                Err(error) => return Err(self.failure(error)),
+                Err(error) => return Err(self.counting_failure(error, drain, cancel)),
             }
         }
         sink.end_rows()?;
@@ -870,6 +897,32 @@ fn sql_errors(errors: &[SqlErrorInfo]) -> String {
         .map(|e| format!("{} (error {}, severity {})", e.message, e.number, e.class))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// What a count that sqlh itself stopped says when the server never acknowledged the cancel
+/// (the driver waits 5 s, then marks the connection dead and the run ends with exit 6). It
+/// names the count, because the user cancelled nothing: the rows shown are complete, since the
+/// clock starts only after them, and `--exact-count` is the way to read on without cancelling.
+const COUNT_STOP_UNCONFIRMED: &str = "stopped counting the rows that are not shown, but the \
+    server didn't confirm the cancel, so the connection was closed; the rows shown are \
+    complete (--exact-count reads every row instead)";
+
+/// A driver error mid-run, as `DbError` (see `Session::failure`). `dead` is whether the driver
+/// marked the connection dead. `own_stop` is whether the error ends a count that sqlh itself
+/// stopped, and not a cancel from outside.
+fn classify(error: TdsError, dead: bool, own_stop: bool) -> DbError {
+    match error {
+        TdsError::OperationCancelledError(_) if !dead => {
+            DbError::Cancelled("the statement was cancelled; the connection stayed usable".into())
+        }
+        TdsError::OperationCancelledError(_) if own_stop => {
+            DbError::Cancelled(COUNT_STOP_UNCONFIRMED.into())
+        }
+        TdsError::OperationCancelledError(_) => DbError::Cancelled(
+            "the server didn't confirm the cancel, so the connection was closed".into(),
+        ),
+        error => runtime_error(error),
+    }
 }
 
 fn runtime_error(error: TdsError) -> DbError {
@@ -1115,7 +1168,10 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Counting, Drain, check, data_source, filled, split_protocol, tcp_form, tls_hint};
+    use super::{
+        COUNT_STOP_UNCONFIRMED, Counting, DbError, Drain, TdsError, check, classify, data_source,
+        filled, split_protocol, tcp_form, tls_hint,
+    };
     use mssql_tds::core::CancelHandle;
     use std::time::Duration;
 
@@ -1184,6 +1240,40 @@ mod tests {
         let (bounded, exact) = (Counting::BOUNDED, Counting::EXACT);
         assert!(bounded.timeout_stops && bounded.budget.is_some());
         assert!(!exact.timeout_stops);
+    }
+
+    // PLAN.md 2.15: what a cancel is called depends only on what sqlh observed. A count that
+    // sqlh itself stopped and the server never acknowledged (the driver marked the connection
+    // dead) names the count and the way round it; the user's cancel, and any other error,
+    // keep their words.
+    #[test]
+    fn a_count_stop_the_server_did_not_confirm_names_the_count() {
+        let cancelled = || TdsError::OperationCancelledError("x".into());
+        let words = |error: DbError| match error {
+            DbError::Cancelled(words) => words,
+            other => panic!("not a cancel: {other:?}"),
+        };
+        let usable = "the statement was cancelled; the connection stayed usable";
+        let closed = "the server didn't confirm the cancel, so the connection was closed";
+        // A usable connection says so, whoever cancelled.
+        assert_eq!(words(classify(cancelled(), false, false)), usable);
+        assert_eq!(words(classify(cancelled(), false, true)), usable);
+        // A dead one: the user's cancel, and sqlh's own stop of the count.
+        assert_eq!(words(classify(cancelled(), true, false)), closed);
+        let own = words(classify(cancelled(), true, true));
+        assert_eq!(own, COUNT_STOP_UNCONFIRMED);
+        assert!(
+            own.starts_with("stopped counting the rows that are not shown, but the server didn't")
+                && own.contains("the connection was closed")
+                && own.contains("the rows shown are complete")
+                && own.contains("--exact-count"),
+            "{own}"
+        );
+        // Not a cancel: unchanged.
+        assert!(matches!(
+            classify(TdsError::ConnectionClosed("x".into()), true, true),
+            DbError::Lost(_)
+        ));
     }
 
     // A count from the driver that doesn't fit the buffer it was given is an error, not a panic.

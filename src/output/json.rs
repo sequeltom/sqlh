@@ -18,15 +18,17 @@ use super::{
     BatchInfo, Layout, Limits, NAME_CHARS, OutOfOrder, Output, Summary, Tally, cut, cut_marker,
     hex, push_blocked, push_within,
 };
-use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
 /// The version of the JSON document (DESIGN.md §5.2): `major.minor`, the document's first
 /// field, and what `sqlh --version` reports. The major changes only for an incompatible
 /// change, such as a field or event removed or renamed, or its type or meaning changed. A
 /// minor may add optional fields, event types or enum values, so a reader written for a
 /// version has to ignore what it doesn't know. 1.0 is the document with `contract_version`,
-/// `connection`, `connect_ms` and the batches' `elapsed_ms`.
-pub const CONTRACT_VERSION: &str = "1.0";
+/// `connection`, `connect_ms` and the batches' `elapsed_ms`. 1.1 adds `row_count_exact` to
+/// every result and `counting_stopped` to every batch (the bounded count of hidden rows,
+/// PLAN.md 2.15).
+pub const CONTRACT_VERSION: &str = "1.1";
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;
@@ -145,7 +147,7 @@ impl<W: Write> JsonSink<W> {
         self.drain(false)
     }
 
-    /// Writes the document head once, if nothing has: `{"contract_version":"1.0","batches":[`.
+    /// Writes the document head once, if nothing has: `{"contract_version":"1.1","batches":[`.
     fn open(&mut self) {
         if !self.opened {
             self.push_head(None);
@@ -189,12 +191,15 @@ impl<W: Write> JsonSink<W> {
         if !self.in_result {
             return;
         }
+        // A result a failure cut short has only the rows that arrived, so its count is not the
+        // total either, whether or not a count was stopped. `truncated` is the raw question:
+        // did rows arrive that were not shown? The bound of a stopped count can't answer it.
         let _ = write!(
             self.buf,
             "],\"row_count\":{},\"row_count_exact\":{},\"truncated\":{},\"cells_cut\":{}",
             self.tally.rows_total(),
-            self.tally.rows_exact(),
-            self.tally.rows_shown() < self.tally.rows_total(),
+            !interrupted && self.tally.rows_exact(),
+            self.tally.rows_hidden(),
             self.tally.cells_cut()
         );
         if interrupted {
@@ -437,8 +442,8 @@ impl<W: Write> BatchSink for JsonSink<W> {
         self.tally.row_skipped();
     }
 
-    fn counting_stopped(&mut self) {
-        self.tally.stop_counting();
+    fn counting_stopped(&mut self, by: Stop) {
+        self.tally.stop_counting(by);
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
@@ -681,8 +686,9 @@ impl<W: Write> Output for JsonSink<W> {
 #[cfg(test)]
 mod tests {
     use super::super::text::tests::{
-        ADVICE, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, batch, capped, col, cut_by, error,
-        interrupted_run, limits, mid_result_events_are_refused, msg, quoting, ragged_run, summary,
+        ADVICE, FILLING_STATUS, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, batch, capped, col,
+        cut_by, error, filling_run, interrupted_run, limits, mid_result_events_are_refused, msg,
+        quoting, ragged_run, summary,
     };
     use super::*;
     use serde_json::{Value as Json, json};
@@ -731,7 +737,7 @@ mod tests {
         assert_eq!(
             parse(s),
             json!({
-                "contract_version": "1.0",
+                "contract_version": "1.1",
                 "batches": [{
                     "batch": 1, "source": "q.sql", "line": 1,
                     "events": [
@@ -855,6 +861,10 @@ mod tests {
         .unwrap();
         let doc = parse(s);
         assert_eq!(doc["batches"][0]["events"][0]["interrupted"], json!(true));
+        assert_eq!(
+            doc["batches"][0]["events"][0]["row_count_exact"],
+            json!(false)
+        );
         assert_eq!(doc["error"], json!("query timeout after 2 s in batch 1"));
         assert_eq!(doc["exit_code"], json!(4));
     }
@@ -911,7 +921,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.0","batches":["#,
+                r#"{"contract_version":"1.1","batches":["#,
                 r#"{"batch":1,"source":"-Q","line":1,"events":["#,
                 r#"{"type":"rows_affected","count":2},"#,
                 r#"{"type":"result","columns":[{"name":"id","type":"int","nullable":true},"#,
@@ -930,6 +940,100 @@ mod tests {
                 "\n"
             )
         );
+    }
+
+    // PLAN.md 2.15 (review), exact output: a stopped count is `truncated` whenever a hidden row
+    // was counted, even when flooring to one digit leaves the bound no higher than the rows
+    // shown: eleven rows counted with ten shown are `row_count` 11 and `truncated`, not 10 and
+    // not truncated. A count `-t` stopped before any hidden row arrived has none to report: the
+    // rows shown are the bound, `truncated` is false, and `row_count_exact` still says that
+    // more rows may exist.
+    #[test]
+    fn a_stopped_count_is_truncated_when_a_hidden_row_was_counted() {
+        use super::super::text::tests::{short_limits, stopped_short_run};
+        let (mut s, main, _) = sink(short_limits());
+        stopped_short_run(&mut s);
+        let result = |count: u32, truncated: bool| {
+            format!(
+                concat!(
+                    r#"{{"type":"result","columns":[{{"name":"n","type":"int","nullable":true}}],"#,
+                    r#""rows":[[0],[1],[2],[3],[4],[5],[6],[7],[8],[9]],"row_count":{},"#,
+                    r#""row_count_exact":false,"truncated":{},"cells_cut":0}}"#
+                ),
+                count, truncated
+            )
+        };
+        assert_eq!(
+            main.text(),
+            format!(
+                concat!(
+                    r#"{{"contract_version":"1.1","batches":["#,
+                    r#"{{"batch":1,"source":"-Q","line":1,"events":[{}],"#,
+                    r#""elapsed_ms":5,"counting_stopped":true}},"#,
+                    r#"{{"batch":2,"source":"-Q","line":6,"events":[{}],"#,
+                    r#""elapsed_ms":5,"counting_stopped":true}}],"#,
+                    r#""notes":["counting stopped in batches 1, 2: the rest of each was "#,
+                    r#"cancelled, so their later statements did not run; --exact-count counts "#,
+                    r#"every row; raise -t to count longer"],"#,
+                    r#""ok":true,"exit_code":0,"#,
+                    r#""summary":"ok: 2 batches, counting stopped in 2, 7 ms","elapsed_ms":7}}"#,
+                    "\n"
+                ),
+                result(11, true),
+                result(10, false)
+            )
+        );
+    }
+
+    // PLAN.md 2.15 (review): a result a failure cut short has only the rows that arrived, so
+    // its count is never exact, whether or not anything was hidden. A reader that looks only at
+    // `row_count_exact` is not told that a partial count is the total.
+    #[test]
+    fn an_interrupted_result_never_claims_an_exact_count() {
+        let (mut s, main, _) = sink(Limits {
+            max_rows: 2,
+            ..capped(0)
+        });
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.row(&[Value::Int(2)]).unwrap();
+        s.skipped_row();
+        s.finish(&Summary {
+            exit: 4,
+            status: "failed (exit 4): timeout, 2000 ms",
+            error: Some("query timeout after 2 s in batch 1"),
+            elapsed_ms: 2000,
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            concat!(
+                r#"{"contract_version":"1.1","batches":[{"batch":1,"source":"-Q","line":1,"#,
+                r#""events":[{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
+                r#""rows":[[1],[2]],"row_count":3,"row_count_exact":false,"truncated":true,"#,
+                r#""cells_cut":0,"interrupted":true}],"elapsed_ms":2000,"counting_stopped":false}],"#,
+                r#""error":"query timeout after 2 s in batch 1","ok":false,"exit_code":4,"#,
+                r#""summary":"failed (exit 4): timeout, 2000 ms","elapsed_ms":2000}"#,
+                "\n"
+            )
+        );
+        // The same result that ended on its own is exact.
+        let (mut s, main, _) = sink(Limits {
+            max_rows: 2,
+            ..capped(0)
+        });
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.row(&[Value::Int(2)]).unwrap();
+        s.skipped_row();
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        let result = &document(&main)["batches"][0]["events"][0];
+        assert_eq!(result["row_count_exact"], true, "{result}");
+        assert!(result.get("interrupted").is_none(), "{result}");
     }
 
     // The whole-response budget (R08). A json sink with a stream each for the document and
@@ -1011,7 +1115,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.0","#,
+                r#"{"contract_version":"1.1","#,
                 r#""connection":{"server":"SQL01","database":"master","auth":"sql","#,
                 r#""encrypted":true,"server_version":"17.0.1000"},"connect_ms":195,"#,
                 r#""batches":[{"batch":1,"source":"-Q","line":1,"events":["#,
@@ -1034,7 +1138,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.0","batches":[],"ok":false,"exit_code":3,"#,
+                r#"{"contract_version":"1.1","batches":[],"ok":false,"exit_code":3,"#,
                 r#""summary":"failed (exit 3): usage error, 0 ms","elapsed_ms":0}"#,
                 "\n"
             )
@@ -1329,7 +1433,11 @@ mod tests {
     fn the_cap_holds_with_the_connection_in_the_document() {
         use crate::output::OUTPUT_RESERVE;
         for max in OUTPUT_RESERVE..OUTPUT_RESERVE + 1800 {
-            for (run, exit) in [(ragged_run as fn(&mut dyn Output), 1), (interrupted_run, 4)] {
+            for (run, exit) in [
+                (ragged_run as fn(&mut dyn Output), 1),
+                (interrupted_run, 4),
+                (filling_run, 1),
+            ] {
                 let (mut s, main, meta) = sink(capped(max));
                 s.connected(&named("N"), 12).unwrap();
                 run(&mut s);
@@ -1371,7 +1479,7 @@ mod tests {
         assert_eq!(
             document(&main),
             json!({
-                "contract_version": "1.0",
+                "contract_version": "1.1",
                 "batches": [{"events": [
                     {"type": "result",
                      "columns": [{"name": "v", "type": "int", "nullable": true}],
@@ -1469,7 +1577,7 @@ mod tests {
     // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
     // the 640-byte status reserve, 728 - 640 = 88 bytes, 13 of them for the array and quotes
     // around the first note: 66 characters and "…[+134]". The document head
-    // (`{"contract_version":"1.0","batches":[`) and `]` take 38, and what the notes array,
+    // (`{"contract_version":"1.1","batches":[`) and `]` take 38, and what the notes array,
     // the error's wrapper and the outcome leave of the other 690 goes to the error: 507
     // characters and "…[+493]".
     #[test]
@@ -1487,7 +1595,7 @@ mod tests {
         assert_eq!(
             main.text(),
             format!(
-                "{{\"contract_version\":\"1.0\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
+                "{{\"contract_version\":\"1.1\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
                  \"error\":\"{}…[+493]\",\"ok\":false,\"exit_code\":1,\
                  \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":3}}\n",
                 "x".repeat(66),
@@ -1585,6 +1693,8 @@ mod tests {
                     RAGGED_STATUS,
                 ),
                 (interrupted_run, 4, "query timeout ", INTERRUPTED_STATUS),
+                // A stopped count at the widest numbers: the longest closers and status.
+                (filling_run, 1, "closing error ", FILLING_STATUS),
             ] {
                 let (mut s, main, meta) = sink(capped(max));
                 run(&mut s);
@@ -1666,7 +1776,7 @@ mod tests {
         s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
         assert_eq!(
             main.text(),
-            "{\"contract_version\":\"1.0\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
+            "{\"contract_version\":\"1.1\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
              \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":0}\n"
         );
     }
@@ -1678,12 +1788,12 @@ mod tests {
     // of the body, admitted when it is written.
     #[test]
     fn the_worst_case_ending_fits_the_status_reserve() {
+        // An interrupted result is never exact (`false`, the longer word), whatever else holds.
         let closers = |rows: u64, cut: u64, truncated: bool, elapsed: u128, stopped: bool| {
             format!(
-                "],\"row_count\":{rows},\"row_count_exact\":{},\"truncated\":{truncated},\
+                "],\"row_count\":{rows},\"row_count_exact\":false,\"truncated\":{truncated},\
                  \"cells_cut\":{cut},\"interrupted\":true}}],\"elapsed_ms\":{elapsed},\
-                 \"counting_stopped\":{stopped}}}",
-                !stopped
+                 \"counting_stopped\":{stopped}}}"
             )
         };
         let (mut s, main, _) = sink(capped(0));
@@ -1720,7 +1830,7 @@ mod tests {
             error: None,
             elapsed_ms: u128::MAX,
         });
-        let worst = closers(u64::MAX, u64::MAX, false, u128::MAX, true).len()
+        let worst = closers(u64::MAX, u64::MAX, false, u128::MAX, false).len()
             + "]".len()
             + ",\"notes\":[\"\"]".len()
             + ",\"error\":\"\"".len()

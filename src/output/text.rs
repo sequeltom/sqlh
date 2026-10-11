@@ -9,7 +9,7 @@ use super::{
     BatchInfo, Layout, Limits, NAME_CHARS, Output, Summary, Tally, escaped, hex, push_blocked,
     push_char, push_escaped, push_type,
 };
-use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
 pub struct TextSink<W: Write> {
     out: W,
@@ -335,8 +335,8 @@ impl<W: Write> BatchSink for TextSink<W> {
         self.tally.row_skipped();
     }
 
-    fn counting_stopped(&mut self) {
-        self.tally.stop_counting();
+    fn counting_stopped(&mut self, by: Stop) {
+        self.tally.stop_counting(by);
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
@@ -673,7 +673,7 @@ pub(super) mod tests {
             }
         }
         // The count stopped: the footer and the notes are at their longest.
-        out.counting_stopped();
+        out.counting_stopped(Stop::Budget);
         out.end_rows().unwrap();
         out.message(&msg("a message after the rows")).unwrap();
         out.end_batch(5).unwrap();
@@ -707,7 +707,7 @@ pub(super) mod tests {
                 out.skipped_row();
             }
         }
-        out.counting_stopped();
+        out.counting_stopped(Stop::Budget);
         out.end_rows().unwrap();
         out.end_batch(5).unwrap();
         let second = BatchInfo {
@@ -738,6 +738,51 @@ pub(super) mod tests {
             ..capped(0)
         }
     }
+
+    /// `--max-rows 10`, for `stopped_short_run`.
+    pub fn short_limits() -> Limits {
+        Limits {
+            max_rows: 10,
+            ..capped(0)
+        }
+    }
+
+    /// PLAN.md 2.15 (review), with `short_limits()`: the two stopped counts whose bound one
+    /// significant digit would flatten to "nothing was hidden". Batch 1 was stopped by the budget
+    /// after one hidden row: 11 rows counted floor to 10, which is the rows shown, so the bound
+    /// is one more, 11. Batch 2 was stopped by `-t` before any hidden row arrived: the bound is
+    /// the 10 rows shown, and none is said to be hidden. The same calls for every format.
+    pub fn stopped_short_run(out: &mut dyn Output) {
+        for (number, hidden, by) in [(1, 1, Stop::Budget), (2, 0, Stop::Timeout)] {
+            let info = BatchInfo {
+                number,
+                total: 2,
+                started_ms: (number as u128 - 1) * 5,
+                ..batch("-Q", false, 1 + (number as u32 - 1) * 5)
+            };
+            out.begin_batch(&info).unwrap();
+            out.columns(&[col("n", "int")]).unwrap();
+            for i in 0..10 + hidden {
+                if out.wants_values() {
+                    out.row(&[Value::Int(i)]).unwrap();
+                } else {
+                    out.skipped_row();
+                }
+            }
+            out.counting_stopped(by);
+            out.end_rows().unwrap();
+            out.end_batch(number as u128 * 5).unwrap();
+        }
+        out.finish(&Summary {
+            exit: 0,
+            status: STOPPED_SHORT_STATUS,
+            error: None,
+            elapsed_ms: 7,
+        })
+        .unwrap();
+    }
+
+    pub const STOPPED_SHORT_STATUS: &str = "ok: 2 batches, counting stopped in 2, 7 ms";
 
     pub const FILLING_STATUS: &str = "failed (exit 1): 4294967295 errors, first in batch \
         18446744073709551615; 18446744073709551615 later batches not run (--continue-on-error \
@@ -840,7 +885,7 @@ pub(super) mod tests {
     // less the 640-byte status reserve: 728 - 640 = 88 bytes, of which "-- note: " and the
     // newline take 10, "…[+131]" 9 and 69 characters the other 69. The error and the status
     // then share the 640 bytes that are left: 23 for the status line, 11 around the error,
-    // 10 for "…[+1000]"'s widest form, so 468 characters of the error and "…[+404]".
+    // 10 for "…[+1000]"'s widest form, so 596 characters of the error and "…[+404]".
     #[test]
     fn a_tight_cap_shortens_exactly() {
         let (mut s, main, _) = sink(capped(728));
@@ -888,6 +933,36 @@ pub(super) mod tests {
              -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
              later statements did not run; --exact-count counts every row\n\
              -- ok: 2 batches, counting stopped in 1, 7 ms\n"
+        );
+    }
+
+    // PLAN.md 2.15 (review), exact output: flooring to one digit never makes a stopped count
+    // say that nothing was hidden. Eleven rows counted with ten shown read `≥11`, not `≥10`;
+    // a count that `-t` stopped before any hidden row arrived reads `≥10`, the rows shown. The
+    // note gives each kind of stop its own advice, and the status counts both batches.
+    #[test]
+    fn a_stopped_count_never_says_that_nothing_was_hidden() {
+        let (mut s, main, _) = sink(short_limits());
+        stopped_short_run(&mut s);
+        let rows = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        assert_eq!(
+            main.text(),
+            format!(
+                "-- batch 1 (line 1)\n\
+                 -- result 1\n\
+                 n:int\n\
+                 {rows}\
+                 -- 10 of ≥11 rows shown (--max-rows 10; counting stopped)\n\
+                 -- batch 2 (line 6)\n\
+                 -- result 2\n\
+                 n:int\n\
+                 {rows}\
+                 -- 10 of ≥10 rows shown (--max-rows 10; counting stopped)\n\
+                 -- note: counting stopped in batches 1, 2: the rest of each was cancelled, so \
+                 their later statements did not run; --exact-count counts every row; raise -t \
+                 to count longer\n\
+                 -- ok: 2 batches, counting stopped in 2, 7 ms\n"
+            )
         );
     }
 

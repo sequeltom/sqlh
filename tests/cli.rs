@@ -1479,7 +1479,7 @@ fn verbose_runs_stay_within_max_output() {
     }
 }
 
-/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 1.0)`.
+/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 1.1)`.
 fn contract_version() -> String {
     let r = sqlh_args(&["--version"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -1535,7 +1535,7 @@ fn json_documents_start_with_the_contract_version() {
 }
 
 // PLAN.md 2.11: `--version` names the JSON contract version after the program's own, in
-// `sqlh 0.1.0 (json contract 1.0)` form, and nothing else. The contract is pinned here: a
+// `sqlh 0.1.0 (json contract 1.1)` form, and nothing else. The contract is pinned here: a
 // new version is an updated DESIGN.md §5.2 and an updated test.
 #[test]
 fn version_reports_the_json_contract() {
@@ -1544,9 +1544,9 @@ fn version_reports_the_json_contract() {
     assert_eq!(r.stderr, "");
     assert_eq!(
         r.stdout,
-        format!("sqlh {} (json contract 1.0)\n", env!("CARGO_PKG_VERSION"))
+        format!("sqlh {} (json contract 1.1)\n", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract_version(), "1.0");
+    assert_eq!(contract_version(), "1.1");
 }
 
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
@@ -4272,21 +4272,26 @@ mod live {
         assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
     }
 
+    /// The server answers with 20,000 rows at once and then searches 15 billion combinations
+    /// for a match that does not exist: a wait with no row coming, for the count to end or for
+    /// `-t` to. (`-t` is the time the driver spends waiting for the server, summed over reads,
+    /// not the time a slow client spends reading, so a stall is what makes it expire.)
+    const STALL_AFTER_20000_ROWS: &str = "SELECT TOP (20000) 1 AS n FROM sys.all_objects AS x \
+        CROSS JOIN sys.all_objects AS y UNION ALL SELECT 2 FROM sys.all_objects AS a \
+        CROSS JOIN sys.all_objects AS b CROSS JOIN sys.all_objects AS c \
+        WHERE CONVERT(bigint, a.object_id) + b.object_id + c.object_id = -1";
+
     // `-t` expiring while only hidden rows are counted is no failure of a read-only run: the
     // rows shown are complete, so the run reports a lower bound and ends with its own exit
-    // code. With writes allowed it stays exit 4, because the stop would skip what follows.
-    // The server answers with 20,000 rows at once and then searches 15 billion combinations,
-    // so the count waits on it: a wait is what the driver's `-t` measures (it adds up the time
-    // spent waiting for the server, not the time a slow client spends reading). The bounded
-    // count ends such a wait on its own, after 250 ms.
+    // code, and the note advises raising `-t` (not `--exact-count`, which is already on).
+    // With writes allowed it stays exit 4, because the stop would skip what follows. The
+    // bounded count ends such a wait on its own, after 250 ms, and then advises
+    // `--exact-count`.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_timeout_during_the_count_reports_a_bound_not_exit_4() {
         let (p, db) = target();
-        let sql = "SELECT TOP (20000) 1 AS n FROM sys.all_objects AS x CROSS JOIN sys.all_objects AS y UNION ALL SELECT 2 FROM \
-                   sys.all_objects AS a CROSS JOIN sys.all_objects AS b \
-                   CROSS JOIN sys.all_objects AS c \
-                   WHERE CONVERT(bigint, a.object_id) + b.object_id + c.object_id = -1";
+        let sql = STALL_AFTER_20000_ROWS;
         let stopped = " rows shown (--max-rows 5; counting stopped)\n";
         let started = Instant::now();
         let args = ["--exact-count", "-t", "1", "--max-rows", "5", "-Q", sql];
@@ -4299,6 +4304,14 @@ mod live {
         );
         assert!(r.stdout.contains(stopped), "{}", r.stdout);
         assert!([10_000, 20_000].contains(&bound(&r.stdout)), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
+                 so its later statements did not run; raise -t to count longer\n"
+            ),
+            "{}",
+            r.stdout
+        );
         assert!(
             last_line(&r.stdout).starts_with("-- ok: 1 batch, counting stopped in 1, "),
             "{}",
@@ -4330,33 +4343,141 @@ mod live {
         );
         assert!(r.stdout.contains(stopped), "{}", r.stdout);
         assert!([10_000, 20_000].contains(&bound(&r.stdout)), "{}", r.stdout);
+        assert!(
+            r.stdout
+                .contains("so its later statements did not run; --exact-count counts every row\n"),
+            "{}",
+            r.stdout
+        );
+
+        // The same stop in JSON: a bound is not an exact count, the batch says it was stopped,
+        // and `truncated` follows the rows that were counted past the ones shown.
+        let r = live(&p, &db, &["--format", "json", "--max-rows", "5", "-Q", sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["row_count_exact"], false, "{doc}");
+        assert_eq!(result["truncated"], true, "{doc}");
+        assert!(
+            [10_000, 20_000].contains(&result["row_count"].as_u64().unwrap()),
+            "{doc}"
+        );
+        assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
+    }
+
+    // The other side of the `-t` rule: it is the rows shown being complete that makes the stop
+    // no failure. A wait for a row that would be shown (here `--max-rows 0`, which shows every
+    // row) is still exit 4, with the rows that arrived and no stopped count. So is a wait with
+    // XACT_ABORT in the input: the attention that stops a count would roll the read-only
+    // wrapper transaction back, which ends the run with exit 1 (sqlh's own invariant) and hides
+    // the timeout, so that run counts exactly and `-t` is a failure as it always was.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_timeout_that_is_not_in_hidden_rows_is_still_exit_4() {
+        let (p, db) = target();
+        let with_xact_abort = format!("SET XACT_ABORT ON\nGO\n{STALL_AFTER_20000_ROWS}");
+        // What the run is called, its flags, its input and the batch that times out.
+        let cases: [(&str, &[&str], &str, u32); 3] = [
+            // Every row is shown, so the wait is for a row that would be shown.
+            (
+                "max-rows 0",
+                &["--max-rows", "0"],
+                STALL_AFTER_20000_ROWS,
+                1,
+            ),
+            // Rows 6 and on are hidden, but the attention would roll the wrapper back.
+            ("XACT_ABORT", &["--max-rows", "5"], &with_xact_abort, 2),
+            // Both at once.
+            ("both", &["--max-rows", "0"], &with_xact_abort, 2),
+        ];
+        for (what, flags, sql, batch) in cases {
+            let started = Instant::now();
+            let r = live(&p, &db, &[flags, &["-t", "2", "-Q", sql]].concat());
+            assert_eq!(r.code, 4, "{what}: {}{}", r.stdout, r.stderr);
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "{what}: {:?}",
+                started.elapsed()
+            );
+            let timeout = format!(
+                "-- error: query timeout after 2 s in batch {batch}; raise -t or narrow the query\n"
+            );
+            assert!(r.stdout.contains(&timeout), "{what}: {}", r.stdout);
+            assert!(
+                !r.stdout.contains("counting stopped"),
+                "{what}: {}",
+                r.stdout
+            );
+            assert!(
+                last_line(&r.stdout).starts_with("-- failed (exit 4): timeout, "),
+                "{what}: {}",
+                r.stdout
+            );
+        }
+        // In JSON the result that was cut short is not exact, and says it was interrupted.
+        let r = live(
+            &p,
+            &db,
+            &[
+                "--format",
+                "json",
+                "--max-rows",
+                "0",
+                "-t",
+                "2",
+                "-Q",
+                STALL_AFTER_20000_ROWS,
+            ],
+        );
+        assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["interrupted"], true, "{doc}");
+        assert_eq!(result["row_count_exact"], false, "{doc}");
+        assert_eq!(doc["batches"][0]["counting_stopped"], false, "{doc}");
     }
 
     // Ctrl+Break while a stopped count is being cancelled ends the run as a cancel, exit 6,
-    // not as a stopped count. Debug builds can hold the run in that gap
-    // (SQLH_DEBUG_STOP_HOLD_MS), which makes the moment certain.
-    #[cfg(windows)]
+    // not as a stopped count (DESIGN.md §4.4, §6): the user's cancel wins, though the budget's
+    // own cancel got there first.
+    //
+    // A debug build can hold the run between the moment the budget's cancel has been
+    // acknowledged and the moment the run decides whose cancel it was
+    // (SQLH_DEBUG_STOP_HOLD_MS), and it says when the hold begins (a line on stderr), which
+    // makes the moment certain. The break lands in the middle of a 2 s hold, which then ends
+    // 1 s later, inside the 2 s that a break gives the work. The run therefore ends through the
+    // real decision, and says so: `the statement was cancelled; the connection stayed usable`.
+    // (A break that landed after the grace would end the run by the grace, with `nothing
+    // confirmed the cancel`, without reaching that decision, and the test could not tell
+    // whether the user's cancel is honored. A build without debug assertions has no hold, so
+    // the test exists only in a build that has one.)
+    #[cfg(all(windows, debug_assertions))]
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn ctrl_break_while_a_count_is_being_cancelled_is_exit_6() {
-        if !cfg!(debug_assertions) {
-            eprintln!("skipped: SQLH_DEBUG_STOP_HOLD_MS exists only in debug builds");
-            return;
-        }
+        use std::io::BufRead;
         let (p, _) = target();
         let mut child = spawn_in_group(
             Command::new(env!("CARGO_BIN_EXE_sqlh"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .env("SQLH_DEBUG_STOP_HOLD_MS", "6000")
+                .env("SQLH_DEBUG_STOP_HOLD_MS", "2000")
                 .args(["--profile", &p, "-d", SO, "-Q", &votes(5_000_000)]),
         );
-        // Connect (0.2 s), 0.25 s of counting, then the hold: 3 s in is inside it.
-        std::thread::sleep(Duration::from_millis(3000));
+        // The hold begins when the count has been stopped and the cancel acknowledged.
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        while !line.starts_with("sqlh: debug: holding 2000 ms") {
+            line.clear();
+            let read = stderr.read_line(&mut line).unwrap();
+            assert_ne!(read, 0, "sqlh ended before it stopped counting");
+        }
+        std::thread::sleep(Duration::from_millis(1000));
         let started = Instant::now();
         ctrl_break(&child);
         let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+        let elapsed = started.elapsed();
         let mut stdout = String::new();
         child
             .stdout
@@ -4364,16 +4485,23 @@ mod live {
             .unwrap()
             .read_to_string(&mut stdout)
             .unwrap();
-        assert_eq!(status.code(), Some(6), "{stdout}");
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        assert_eq!(status.code(), Some(6), "{stdout}{rest}");
         assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "{:?}",
-            started.elapsed()
-        );
-        assert!(
-            stdout.contains("-- error: cancelled by Ctrl+Break: "),
+            stdout.contains(
+                "-- error: cancelled by Ctrl+Break: the statement was cancelled; the connection \
+                 stayed usable\n"
+            ),
             "{stdout}"
         );
-        assert!(!stdout.contains("counting stopped)"), "{stdout}");
+        assert!(!stdout.contains("nothing confirmed"), "{stdout}");
+        assert!(!stdout.contains("counting stopped"), "{stdout}");
+        assert!(
+            last_line(&stdout).starts_with("-- failed (exit 6): cancelled, "),
+            "{stdout}"
+        );
+        // The hold had a second left, and the closing lines get another.
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     }
 }

@@ -13,7 +13,7 @@ use super::{
     BatchInfo, Layout, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex, push_char,
     push_type,
 };
-use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
 pub struct CsvSink<W: Write> {
     data: W,
@@ -216,8 +216,8 @@ impl<W: Write> BatchSink for CsvSink<W> {
         self.tally.row_skipped();
     }
 
-    fn counting_stopped(&mut self) {
-        self.tally.stop_counting();
+    fn counting_stopped(&mut self, by: Stop) {
+        self.tally.stop_counting(by);
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
@@ -489,6 +489,31 @@ mod tests {
              -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
              later statements did not run; --exact-count counts every row\n\
              -- ok: 2 batches, counting stopped in 1, 7 ms\n"
+        );
+    }
+
+    // PLAN.md 2.15 (review), exact output: as in the text format, a stopped count never says
+    // that nothing was hidden (`≥11` with ten shown), one that `-t` stopped before any hidden
+    // row arrived reads `≥10`, and the note advises each kind of stop on its own.
+    #[test]
+    fn a_stopped_count_never_says_that_nothing_was_hidden() {
+        use super::super::text::tests::{short_limits, stopped_short_run};
+        let (mut s, data, meta) = sink(short_limits());
+        stopped_short_run(&mut s);
+        let rows = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        assert_eq!(data.text(), format!("n\n{rows}\nn\n{rows}"));
+        assert_eq!(
+            meta.text(),
+            "-- batch 1 (line 1)\n\
+             -- result 1: n:int\n\
+             -- 10 of ≥11 rows shown (--max-rows 10; counting stopped)\n\
+             -- batch 2 (line 6)\n\
+             -- result 2: n:int\n\
+             -- 10 of ≥10 rows shown (--max-rows 10; counting stopped)\n\
+             -- note: counting stopped in batches 1, 2: the rest of each was cancelled, so \
+             their later statements did not run; --exact-count counts every row; raise -t \
+             to count longer\n\
+             -- ok: 2 batches, counting stopped in 2, 7 ms\n"
         );
     }
 
