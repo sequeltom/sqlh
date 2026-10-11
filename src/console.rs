@@ -24,16 +24,18 @@ unsafe extern "system" {
 /// Reads one line from the console with echo off. The prompt goes to stderr. Callers
 /// must check that stdin is a console first; this is the tool's only interactive read.
 ///
-/// Refuses to read at all unless echo was really turned off. Terminals such as Git Bash's
-/// mintty look like a console to `IsTerminal` but have no console mode, so the password
-/// would be shown as it's typed.
+/// Refuses to read at all unless echo was really turned off, and the handler that puts it
+/// back on Ctrl+C, Ctrl+Break or a close is in place. Terminals such as Git Bash's mintty
+/// look like a console to `IsTerminal` but have no console mode, so the password would be
+/// shown as it's typed.
 pub fn read_password(prompt: &str) -> io::Result<String> {
     let _echo = EchoOff::new().map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
-                "can't hide the password in this terminal ({e}). Git Bash (mintty) has no \
-                 Windows console: run the command from PowerShell or cmd, or prefix it with winpty"
+                "can't hide the password in this terminal ({e}). In Git Bash (mintty), which has \
+                 no Windows console, run the command from PowerShell or cmd, or prefix it with \
+                 winpty"
             ),
         )
     })?;
@@ -115,12 +117,22 @@ impl EchoOff {
                 return Err(io::Error::other("echo is still on"));
             }
         }
+        // Both are set before the handler is registered, so a signal that arrives right after
+        // the registration finds what it needs to put echo back.
         SAVED_MODE.store(saved, std::sync::atomic::Ordering::SeqCst);
         ECHO_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: registers a handler that stays valid for the life of the process; it is
-        // removed again in `drop`.
-        unsafe {
-            SetConsoleCtrlHandler(Some(restore_on_signal), 1);
+        // removed again in `drop`. The call takes the function pointer and a flag by value.
+        if unsafe { SetConsoleCtrlHandler(Some(restore_on_signal), 1) } == 0 {
+            // Without the handler, Ctrl+C or a close at the prompt would leave echo off in the
+            // shell's console. The prompt must not run: put the mode back and fail. The
+            // handler isn't registered, so nothing else can be using `SAVED_MODE`.
+            let error = io::Error::last_os_error();
+            restore_echo();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("can't register the handler that puts echo back on Ctrl+C: {error}"),
+            ));
         }
         Ok(EchoOff { saved })
     }
