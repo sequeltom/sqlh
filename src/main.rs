@@ -51,6 +51,24 @@ const SESSION_SETUP: &str = "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WA
     SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; \
     SET NUMERIC_ROUNDABORT OFF; SET XACT_ABORT OFF;";
 
+/// The failure for a read-only run whose wrapper transaction is gone after the last batch with
+/// no batch having failed: nothing else says the run went wrong, so it must not be a success
+/// (R14). `None` when the wrapper is there, when the run has no wrapper, or when a batch
+/// failed and said so (a deadlock victim's rollback needs no second message).
+fn wrapper_lost_unreported(
+    wrap: bool,
+    in_transaction: bool,
+    a_batch_failed: bool,
+) -> Option<Failure> {
+    (wrap && !in_transaction && !a_batch_failed).then(|| {
+        Failure::new(
+            Exit::SqlError,
+            "read-only guard: the wrapper transaction was gone after the last batch (something \
+             rolled it back without an error); the run is not reported as a success",
+        )
+    })
+}
+
 /// Agent defaults on every connection, writes allowed or not (PLAN.md 2.8, owner decision
 /// 7): sqlh's session is the one that loses a deadlock (error 1205) and gives up on a lock
 /// after `--lock-timeout` (error 1222), so it gives way to production work.
@@ -1071,12 +1089,10 @@ async fn run_session(
     // (above), which leaves the last one: a run whose wrapper was rolled back without an error
     // (an attention under XACT_ABORT ON) must not end as a success (R14). A batch that failed
     // already says so, and its rollback (a deadlock victim) needs no second message.
-    if wrap && !session.in_transaction() && stats.first_failed.is_none() {
-        return Err(Failure::new(
-            Exit::SqlError,
-            "read-only guard: the wrapper transaction was gone after the last batch (something \
-             rolled it back without an error); the run is not reported as a success",
-        ));
+    if let Some(failure) =
+        wrapper_lost_unreported(wrap, session.in_transaction(), stats.first_failed.is_some())
+    {
+        return Err(failure);
     }
 
     if opts.check {
@@ -1126,6 +1142,26 @@ fn output_failure(error: io::Error) -> Failure {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // R14: a read-only run whose wrapper is gone after the last batch, with no batch having
+    // failed, is a failure (exit 1); every other combination is left alone.
+    #[test]
+    fn a_wrapper_lost_without_a_failed_batch_is_a_failure() {
+        let failure = wrapper_lost_unreported(true, false, false).expect("a failure");
+        assert_eq!(failure.exit, Exit::SqlError);
+        assert!(
+            failure.message.starts_with(
+                "read-only guard: the wrapper transaction was gone after the last batch"
+            ),
+            "{}",
+            failure.message
+        );
+        // The wrapper is there; a batch failed and said so; the run has no wrapper.
+        assert!(wrapper_lost_unreported(true, true, false).is_none());
+        assert!(wrapper_lost_unreported(true, false, true).is_none());
+        assert!(wrapper_lost_unreported(false, false, false).is_none());
+        assert!(wrapper_lost_unreported(false, true, false).is_none());
+    }
 
     // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,
     // writes allowed or not; READ UNCOMMITTED only when asked for, before the wrapper

@@ -4819,4 +4819,77 @@ mod live {
             code => panic!("exit {code}: {}{}", r.stdout, r.stderr),
         }
     }
+
+    // R15, through the real loops. In a debug build `SQLH_DEBUG_ROW_WORK_US` makes `count_rows`
+    // and `large_value` do that much work of their own per row and per chunk, after the read,
+    // so the stream is ready at once but the batch takes far longer than `-t`: the case the
+    // driver's clock (waiting time only) never sees. Taking the `pace.tick` calls out of
+    // `count_rows` makes the first test last as long as the work (8 s), where the deadline ends
+    // it within `-t` plus the grace.
+    #[cfg(debug_assertions)]
+    fn timed_with_work(p: &str, db: &str, work_us: &str, flags: &[&str], sql: &str) -> Run {
+        let started = Instant::now();
+        let r = live_with(
+            p,
+            db,
+            &[("SQLH_DEBUG_ROW_WORK_US", work_us)],
+            &[flags, &["-t", "1", "-Q", sql]].concat(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1) + GRACE,
+            "{flags:?}: {elapsed:?}\n{}{}",
+            r.stdout,
+            r.stderr
+        );
+        r
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_row_loop_keeps_the_deadline_when_the_work_is_sqlhs_own() {
+        let (p, _) = target();
+        // 20,000 rows of 400 us is 8 s of work against a 1 s deadline: a run that ignores the
+        // deadline fails the bound in 8 s, where all of `Votes` would take half an hour.
+        let sql = "SELECT TOP (20000) Id FROM dbo.Votes";
+        // Shown rows, and writes allowed: a failure.
+        for flags in [
+            &["--allow-write"][..],
+            &["--max-rows", "0", "--max-output", "0"][..],
+        ] {
+            let r = timed_with_work(&p, SO, "400", flags, sql);
+            assert_eq!(r.code, 4, "{flags:?}: {}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(TIMEOUT_1), "{flags:?}: {}", r.stdout);
+        }
+        // Hidden rows only, counted exactly in a read-only run: the owner's exception.
+        let r = timed_with_work(&p, SO, "400", &["--exact-count"], sql);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("counting stopped"), "{}", r.stdout);
+    }
+
+    // Not mutation-sensitive, as measured: with the `pace.tick` taken out of `large_value` this
+    // still passes, because every 32 KB chunk takes several socket reads and tokio's own budget
+    // for those hands the runtime back often enough for the timer to run. It pins the outcome
+    // (exit 4, the message, within the bound); the tick itself is pinned by the `Pace` unit tests
+    // in `src/db/mod.rs`, and the row loop by the test above (mutation-checked: it fails, with
+    // the run lasting its 8 s of work, when the ticks come out of `count_rows`).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_chunk_loop_keeps_the_deadline_when_the_work_is_sqlhs_own() {
+        let (p, db) = target();
+        // 16 MB, built in two steps on the server (well under a second), read in 32 KB chunks:
+        // 512 chunks of 5 ms of work is 2.5 s against a 1 s deadline.
+        let sql = "DECLARE @v varchar(max) = REPLICATE(CAST('x' AS varchar(max)), 4000000); \
+                   SET @v += @v; SET @v += @v; SELECT @v AS v";
+        for flags in [
+            &["--max-cell", "10"][..],
+            &["--max-cell", "10", "--allow-write"][..],
+        ] {
+            let r = timed_with_work(&p, &db, "5000", flags, sql);
+            assert_eq!(r.code, 4, "{flags:?}: {}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(TIMEOUT_1), "{flags:?}: {}", r.stdout);
+        }
+    }
 }

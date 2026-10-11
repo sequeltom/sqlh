@@ -522,12 +522,29 @@ impl Drop for Drain {
     }
 }
 
+/// Debug builds: the work `SQLH_DEBUG_ROW_WORK_US` asks for, per row and per chunk.
+#[cfg(debug_assertions)]
+fn spin(span: Option<Duration>) {
+    if let Some(span) = span {
+        let until = Instant::now() + span;
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 pub struct Session {
     client: TdsClient,
     /// Debug builds only (`SQLH_DEBUG_STOP_HOLD_MS`): how long to wait after a count stops,
     /// before telling it from a user's cancel, so that a test can cancel in that gap.
     #[cfg(debug_assertions)]
     stop_hold: Option<Duration>,
+    /// Debug builds only (`SQLH_DEBUG_ROW_WORK_US`): work, in microseconds, that the row and
+    /// chunk loops do for every row and chunk after reading it, standing in for formatting or
+    /// a slow consumer: sqlh's own work, which the driver's clock never sees (R15). A test
+    /// can then make a ready stream last longer than `-t` and see the deadline end it.
+    #[cfg(debug_assertions)]
+    row_work: Option<Duration>,
     /// How the login was made (`Auth::method`), for `connection`.
     auth: &'static str,
     /// Buffers for reading large values, made on first use.
@@ -614,6 +631,11 @@ impl Session {
                 .ok()
                 .and_then(|ms| ms.trim().parse().ok())
                 .map(Duration::from_millis),
+            #[cfg(debug_assertions)]
+            row_work: std::env::var("SQLH_DEBUG_ROW_WORK_US")
+                .ok()
+                .and_then(|us| us.trim().parse().ok())
+                .map(Duration::from_micros),
             auth: options.auth.method(),
             scratch: stream::Scratch::default(),
         })
@@ -835,11 +857,15 @@ impl Session {
             match step {
                 Ok(Row::Values(values)) => {
                     sink.row(&values)?;
+                    #[cfg(debug_assertions)]
+                    spin(self.row_work);
                     wait_for_output(gate, cancel, drain.deadline()).await?;
                     drain.pace.tick(SHOWN_ROW_TICKS).await;
                 }
                 Ok(Row::Hidden) => {
                     sink.skipped_row();
+                    #[cfg(debug_assertions)]
+                    spin(self.row_work);
                     drain.counted_row();
                     drain.pace.tick(1).await;
                 }
@@ -976,6 +1002,8 @@ impl Session {
             if piece.reached_end {
                 return Ok(cutter.finish());
             }
+            #[cfg(debug_assertions)]
+            spin(self.row_work);
             // A value of gigabytes arrives in chunks that may all be ready: the deadline and
             // the runtime's other tasks get their turn between them.
             pace.tick(CHUNK_TICKS).await;
