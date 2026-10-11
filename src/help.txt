@@ -18,9 +18,8 @@ CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
   -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
   -d database     (env SQLCMDDBNAME); default: the profile's, else the login's (often master)
-  -E              Windows integrated auth (the default when there is no -U)
+  -E              Windows integrated auth (default without -U)    -C  trust the server certificate
   -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
-  -C              trust the server certificate (self-signed dev servers)
   -Ns | -Nm | -No encryption strict | mandatory (default) | optional
   -K ReadOnly     read-only application intent      -M  multi-subnet failover
   -l seconds      login timeout (default 15; 0 = none); one attempt, no retries
@@ -30,17 +29,18 @@ EXECUTION
   -v n=v ...      values for $(n); environment variables also resolve. -x turns this off
   -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
   -t seconds      per-batch query timeout, also for a stalled reader (default 60; 0 = none)
+  --lock-timeout S      seconds a statement waits for a lock, then error 1222 (default 10; 0 = none)
+  --read-uncommitted    read-only runs only: read without waiting for writers; rows may be dirty
   --allow-write   permit writes. Without it, writes other than to #temp/@table are refused
                   before anything runs, and all batches run in a transaction that is rolled back.
                   This guards against accidents; it is not security. Use a read-only login.
-  --check         compile only (SET NOEXEC ON), executes nothing: catches syntax errors and
-                  unknown columns; missing tables only show up when the query really runs
+  --check         compile only (SET NOEXEC ON): finds syntax errors and unknown columns, not missing tables
   --continue-on-error   run later batches after one fails (default: stop)
 
 OUTPUT
-  --format F      text (default) | json (one document; ordered events per batch; exit
-                  status at the end) | csv (data only on stdout/-o; -- lines on stderr)
-  --max-rows N    rows shown per result set (default 100; 0 = all). The rest are counted
+  --format F      text (default) | json (one document; exit status last) | csv (data; -- lines on stderr)
+  --max-rows N    rows shown per result set (default 100; 0 = all). Read-only runs count the rest for
+                  250 ms, then stop: "≥N" means the rest of that batch did not run (--exact-count counts all)
   --max-cell N    characters per value (default 500)   --max-results N  result sets (default 20)
   --max-output N  total output bytes (default 1000000; 0 = no limit); the run still finishes
   -o file         write output to a file (replaced whole when the run ends; never an input)
@@ -52,9 +52,9 @@ PROFILES  (passwords live in Windows Credential Manager, never in files or argum
   sqlh profile list | test NAME | rm NAME
 
 FORMAT
-  Lines starting with "-- " are metadata. A result set is "-- result N", a header of
-  name:type columns, tab-separated rows, then "-- N rows". NULL is NULL; the string 'NULL'
-  is \NULL; \t \n \r \\ are escapes; a cut value ends with …[+N]. Errors map to input lines.
+  "-- " lines are metadata: "-- result N", a header of name:type columns, tab-separated rows,
+  "-- N rows". NULL is NULL; the string 'NULL' is \NULL. Escapes \t \n \r \\ (one backslash) cover
+  values and the names and paths in -- lines. A cut value ends …[+N]. Errors map to input lines.
   The last line is "-- ok: ..." or "-- failed (exit N): ...", unless exit 7 or 10 cut it off.
 
 EXIT CODES
