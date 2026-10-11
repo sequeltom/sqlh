@@ -1937,6 +1937,39 @@ fn the_help_examples_run_as_written_in_every_shell() {
     }
 }
 
+// PLAN.md 2.13, DESIGN.md §4.1: `-Q "..."` with single quotes inside reaches sqlh as typed in
+// every shell, a space, brackets and a non-ASCII letter included. A blocked statement shows the
+// name it writes to, so the refusal proves what arrived. The same line with a character that
+// belongs to a shell would not: DESIGN.md lists them, and docs/notes/windows-shells.md has the
+// measurements, so they aren't re-run here.
+#[cfg(windows)]
+#[test]
+fn the_documented_q_form_reaches_sqlh_intact_in_every_shell() {
+    let line = "sqlh -Q \"UPDATE [it's a caf\u{e9}] SET x = 'it''s'\"";
+    let base = scratch("q_form");
+    let results: Vec<_> = [Shell::Cmd, Shell::PowerShell51, Shell::PowerShell7]
+        .into_iter()
+        .filter(|shell| shell.installed())
+        .map(|shell| {
+            let dir = base.join(format!("shell-{}", shell as u8));
+            fs::create_dir_all(&dir).unwrap();
+            std::thread::spawn(move || (shell, shell.run(line, &dir, &[])))
+        })
+        .collect();
+    assert!(!results.is_empty());
+    for result in results {
+        let (shell, r) = result.join().unwrap();
+        assert_eq!(r.code, 5, "{}: {}{}", shell.name(), r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("-- blocked: line 1: UPDATE [it's a caf\u{e9}] would write"),
+            "{}: {}",
+            shell.name(),
+            r.stdout
+        );
+    }
+}
+
 // PLAN.md 2.13: sqlh leaves the console's code page as it found it. It used to switch the
 // console to UTF-8 whenever stdout was a console and never switch back, so every program run
 // afterwards in that console (and every later PowerShell 5.1 session) inherited UTF-8. The
