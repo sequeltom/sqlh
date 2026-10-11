@@ -942,7 +942,9 @@ mod live {
             let read = stderr.read_line(&mut line).unwrap();
             assert_ne!(read, 0, "sqlh ended before it connected");
         }
-        std::thread::sleep(Duration::from_millis(500));
+        // Quiet for longer than the 1 s the closing lines get after a cancel: time with
+        // nothing to write must not count as a stalled reader (that was exit 7).
+        std::thread::sleep(Duration::from_millis(1500));
         let started = Instant::now();
         ctrl_break(&child);
         let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
@@ -954,7 +956,9 @@ mod live {
             .unwrap()
             .read_to_string(&mut stdout)
             .unwrap();
-        assert_eq!(status.code(), Some(6), "{stdout}");
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        assert_eq!(status.code(), Some(6), "{stdout}{rest}");
         assert!(
             stdout.contains("-- error: cancelled by Ctrl+Break: the server confirmed the cancel\n"),
             "{stdout}"

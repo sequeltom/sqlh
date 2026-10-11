@@ -297,7 +297,7 @@ Usage errors found while parsing the arguments happen before `--format` is known
 
 **Exit 7, undeliverable output.** sqlh couldn't hand its complete output, including the final status line, to its destination. That happens when:
 - the program reading stdout closed it early (a broken pipe), for example a harness that stopped reading. This covers `--help` and `--version` too;
-- the reader kept stdout open but read nothing for `-t` seconds (a stall). A thread writes the output, so a stalled reader can't block timers or Ctrl+C: the batch waits for room in a bounded queue, then gives up;
+- the reader kept stdout open but read none of the waiting output for `-t` seconds (a stall; time with nothing to write doesn't count). A thread writes the output, so a stalled reader can't block timers or Ctrl+C: the batch waits for room in a bounded queue, then gives up;
 - in csv mode, stderr was closed: it carries the metadata and the status (§5.3);
 - writing or flushing `-o file` failed, for example a full disk or lost permissions;
 - the finished `.partial` file couldn't be renamed over `file`.

@@ -6,8 +6,9 @@
 //! - While the queue holds more than `QUEUE_LIMIT` bytes, the batch loop awaits
 //!   `Gate::room` instead of reading more rows, so the runtime keeps handling timers and
 //!   Ctrl+C, and memory stays bounded.
-//! - When the reader makes no progress for the stall limit (the query timeout, `-t`), the
-//!   output couldn't be delivered: exit 7.
+//! - When the reader makes no progress on waiting output for the stall limit (the query
+//!   timeout, `-t`), the output couldn't be delivered: exit 7. Time with nothing to write
+//!   doesn't count.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -37,9 +38,11 @@ struct State {
     done: bool,
     /// The first write error, kept as kind and text because `io::Error` isn't `Clone`.
     error: Option<(io::ErrorKind, String)>,
-    /// When the thread last finished a write, or started one after being idle: a reader that
-    /// has made no progress since then for the stall limit has stalled.
+    /// When the thread last finished a write, or was handed work while it waited for some: a
+    /// reader that has made no progress since then for the stall limit has stalled. Time with
+    /// nothing to write doesn't count.
     progress: Instant,
+    /// The thread is waiting for work, not for the reader.
     idle: bool,
 }
 
@@ -71,6 +74,16 @@ impl Shared {
             .error
             .as_ref()
             .map(|(kind, text)| io::Error::new(*kind, text.clone()))
+    }
+
+    /// Wakes the thread for new work, a chunk or the close. If it was waiting for work rather
+    /// than for the reader, the stall clock starts now.
+    fn give_work(&self, state: &mut State) {
+        if state.idle {
+            state.idle = false;
+            state.progress = Instant::now();
+        }
+        self.work.notify_one();
     }
 
     /// Records the first error; later ones add nothing.
@@ -168,7 +181,7 @@ impl Delivery {
         };
         let mut state = self.shared.lock();
         state.closed = true;
-        self.shared.work.notify_one();
+        self.shared.give_work(&mut state);
         while !state.done {
             match stall {
                 Some(limit) => {
@@ -228,10 +241,6 @@ fn write_out(
             let mut state = shared.lock();
             loop {
                 if let Some(item) = state.queue.pop_front() {
-                    if state.idle {
-                        state.progress = Instant::now();
-                        state.idle = false;
-                    }
                     break item;
                 }
                 if state.closed {
@@ -298,7 +307,7 @@ impl ChannelWriter {
         }
         self.shared.queued.fetch_add(chunk.len(), Ordering::Relaxed);
         state.queue.push_back((self.dest, chunk));
-        self.shared.work.notify_one();
+        self.shared.give_work(&mut state);
     }
 }
 
@@ -516,6 +525,23 @@ mod tests {
             started.elapsed()
         );
         drop(release);
+    }
+
+    // PLAN.md 2.4: time with nothing to write isn't a stall. A run that was quiet for longer
+    // than the limit, then wrote its last lines to a reader that keeps up, is delivered.
+    #[test]
+    fn quiet_time_is_not_a_stall() {
+        let sink = Sink::default();
+        let limit = Duration::from_millis(100);
+        let mut delivery = Delivery::start(Box::new(sink.clone()), None, Some(limit));
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"first\n").unwrap();
+        out.flush().unwrap();
+        std::thread::sleep(limit * 3);
+        out.write_all(b"last\n").unwrap();
+        drop(out);
+        delivery.finish(Some(limit)).unwrap();
+        assert_eq!(*sink.0.lock().unwrap(), b"first\nlast\n");
     }
 
     // F07: once the reader catches up, waiting for room ends without an error.
