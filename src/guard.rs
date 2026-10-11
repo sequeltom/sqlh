@@ -6,7 +6,11 @@
 //! The tokens are read as a stream and none is kept (PLAN.md 2.14), so the guard's memory
 //! doesn't depend on what the input looks like: see `Guard` and `Lexer`.
 //!
+//! Its work is bounded as well (PLAN.md R18): see `Work`.
+//!
 //! The guard reduces accidents. It is not a security boundary: database permissions are.
+
+use std::cell::Cell;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Blocked {
@@ -232,18 +236,119 @@ const STATEMENT_START: &[&str] = &[
     "WRITETEXT",
 ];
 
+/// The classifier's work budget (DESIGN.md §7, PLAN.md R18), the backstop under the linear
+/// scans below. Every token the classifier reads costs one unit, lookahead included, so
+/// reading the same suffix again is paid for again; a read also costs one unit for each 32
+/// bytes it went over, so a huge string or comment that a lookahead crosses over and over is
+/// not free. Each pass over a batch (the write classifier, and `--check`'s NOEXEC search) gets
+/// `WORK_BASE` plus `WORK_PER_BYTE` for each byte of the text. A plain pass costs at most 1
+/// unit a byte (a token of one byte) and the costliest input found, a 10 MB `DROP TABLE` list,
+/// 1.7, so no ordinary input comes near it: it is there for the shape nobody thought of. For
+/// the largest batch it is 32 million units, which took 0.4 s at the fastest rate measured
+/// (75 million units a second) and 1 s at the slowest (31 million): DESIGN.md §11,
+/// notes/memory.md.
+const WORK_BASE: u64 = 2_000_000;
+const WORK_PER_BYTE: u64 = 3;
+
+/// How many `TOP ( ... )` clauses of INSERT, UPDATE and DELETE may be open at once. The
+/// classifier remembers each one until its `)` shows what the statement writes to, which is
+/// how it reads the input once however deeply they nest. A real statement nests a few.
+const MAX_OPEN_TOP: usize = 16_384;
+
+/// How many parentheses (opening and closing) the arguments of `sp_spaceused`, which takes
+/// none, may have.
+const MAX_ARG_PARENS: usize = 8;
+
+/// How much work a batch's classification has done, shared by every `Lexer` copy made for it.
+struct Work {
+    used: Cell<u64>,
+    limit: u64,
+    /// The line the work ran out on.
+    line: Cell<u32>,
+}
+
+impl Work {
+    /// The budget of one pass over `sql`: `base` plus `per_byte` for each byte.
+    fn new(sql: &str, base: u64, per_byte: u64) -> Self {
+        Work {
+            used: Cell::new(0),
+            limit: base.saturating_add(per_byte.saturating_mul(sql.len() as u64)),
+            line: Cell::new(1),
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.used.get() > self.limit
+    }
+
+    /// Pays `units` for a read that ended on `line`.
+    fn charge(&self, units: u64, line: u32) {
+        let before = self.used.get();
+        self.used.set(before.saturating_add(units));
+        if before <= self.limit && self.exceeded() {
+            self.line.set(line);
+        }
+    }
+
+    /// The refusal for a batch whose classification used more than its budget.
+    fn refusal(&self) -> Blocked {
+        too_complex(
+            self.line.get(),
+            &format!(
+                "it would take more than {} token reads to classify, which is the most one \
+                 batch of this size is given",
+                self.limit
+            ),
+        )
+    }
+}
+
+/// The refusal for input the read-only check can't classify in bounded work. `--allow-write`
+/// skips the classifier, so it lifts this one, as it does the others.
+fn too_complex(line: u32, why: &str) -> Blocked {
+    Blocked {
+        line,
+        reason: format!("this input is too complex for the read-only check: {why}"),
+        advice: "Simplify it or split it into smaller batches with GO, or rerun with \
+                 --allow-write if the write is intended"
+            .into(),
+    }
+}
+
 pub fn check(sql: &str, policy: Policy) -> Result<(), Blocked> {
+    check_within(sql, policy, WORK_BASE, WORK_PER_BYTE)
+}
+
+/// `check` with the work budget of each pass spelled out, so that tests can spend one.
+fn check_within(sql: &str, policy: Policy, base: u64, per_byte: u64) -> Result<(), Blocked> {
     if policy.is_open() {
         return Ok(());
     }
-    let guard = Guard { sql };
     if policy.compile_only {
-        guard.check_compile_only()?;
+        metered(sql, base, per_byte, |guard| guard.check_compile_only())?;
     }
     if !policy.writes {
-        guard.check_writes()?;
+        metered(sql, base, per_byte, |guard| guard.check_writes())?;
     }
     Ok(())
+}
+
+/// Runs one pass of the classifier over `sql` with a budget of its own. Once the budget is
+/// spent every lexer reports the end of the input, so whatever the pass made of that is not an
+/// answer: it is replaced by the refusal. A refusal found before then has not spent the
+/// budget, and stands.
+fn metered(
+    sql: &str,
+    base: u64,
+    per_byte: u64,
+    pass: impl FnOnce(&Guard<'_>) -> Result<(), Blocked>,
+) -> Result<(), Blocked> {
+    let work = Work::new(sql, base, per_byte);
+    let result = pass(&Guard { sql, work: &work });
+    if work.exceeded() {
+        return Err(work.refusal());
+    }
+    result
 }
 
 /// Whether `sql` has the bare word `XACT_ABORT` among its tokens, which is how `SET XACT_ABORT`
@@ -251,7 +356,7 @@ pub fn check(sql: &str, policy: Policy) -> Result<(), Blocked> {
 /// run whose input says it counts rows exactly (DESIGN.md §4.4), because with XACT_ABORT ON an
 /// attention rolls the transaction back, and a counting that stopped early would end with the
 /// wrapper transaction gone. Dynamic SQL in a string is not seen; that run is cut like any
-/// other.
+/// other. One pass over the text, so it needs no budget.
 pub fn mentions_xact_abort(sql: &str) -> bool {
     Lexer::new(sql).any(|t| t.is_word("XACT_ABORT"))
 }
@@ -259,14 +364,42 @@ pub fn mentions_xact_abort(sql: &str) -> bool {
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
 /// therefore doesn't depend on how many tokens the input has (PLAN.md 2.14); only a
-/// refusal's message can be as long as the name it quotes.
+/// refusal's message can be as long as the name it quotes, and the open `TOP ( ... )` clauses
+/// (at most `MAX_OPEN_TOP`, a few bytes each). Every read is paid for out of `work`.
 struct Guard<'a> {
     sql: &'a str,
+    work: &'a Work,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Write {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// An INSERT, UPDATE or DELETE whose `TOP (` clause has not closed yet.
+struct OpenTop {
+    write: Write,
+    /// The line of the write keyword, which is where a refusal points.
+    line: u32,
+    /// Where the keyword ends in the text: the order refusals are put in.
+    at: usize,
+    /// The parenthesis depth inside the clause, which its closing `)` leaves.
+    depth: usize,
+}
+
+/// Keeps `blocked` as the refusal to give if it is the earliest in the text (`at` is where
+/// its keyword ends).
+fn hold(held: &mut Option<(usize, Blocked)>, at: usize, blocked: Blocked) {
+    if held.as_ref().is_none_or(|(first, _)| at < *first) {
+        *held = Some((at, blocked));
+    }
 }
 
 impl<'a> Guard<'a> {
     fn lexer(&self) -> Lexer<'a> {
-        Lexer::new(self.sql)
+        Lexer::metered(self.sql, self.work)
     }
 
     /// Under `--check`, input must not touch NOEXEC: `SET NOEXEC OFF` would let the rest of
@@ -296,138 +429,209 @@ impl<'a> Guard<'a> {
                 _ => false,
             };
             if implicit_call {
-                self.check_proc(&start, "a procedure call", true)?;
+                self.check_proc(first.line, &start, "a procedure call", true)?;
             }
         }
         // `lex` is always just past `token`, which is where every lookahead starts.
         let mut lex = start;
+        // The `TOP (` clauses of INSERT, UPDATE and DELETE that are still open, outermost
+        // first. A write's target follows its clause's `)`, so instead of scanning ahead to it
+        // from every such keyword (quadratic when they nest), the single pass counts
+        // parentheses and finishes each check when its clause closes.
+        let mut open: Vec<OpenTop> = Vec::new();
+        let mut depth = 0usize;
+        // The refusal that comes first in the text. One found while a clause is open is held
+        // until the clauses before it have closed, because one of them may refuse too, and the
+        // refusal is the earliest keyword's, as it is when each target is looked up at once.
+        let mut held: Option<(usize, Blocked)> = None;
         while let Some(token) = lex.next() {
-            if token.kind != Kind::Word {
-                continue;
-            }
-            let mut buf = [0; KEYWORD_MAX];
-            let line = token.line;
-            match keyword(token.name, &mut buf) {
-                "INSERT" => {
-                    let mut target = self.skip_top(&lex);
-                    if target.word_is(0, "INTO") {
-                        target = target.after(1);
-                    }
-                    self.require_scratch(line, &target, "INSERT")?;
-                }
-                "INTO" => self.require_scratch(line, &lex, "INTO")?,
-                "UPDATE" => {
-                    if lex.word_is(0, "STATISTICS") {
-                        return Err(self.blocked(line, "UPDATE STATISTICS"));
-                    }
-                    self.require_scratch(line, &self.skip_top(&lex), "UPDATE")?;
-                }
-                "DELETE" => {
-                    let mut target = self.skip_top(&lex);
-                    if target.word_is(0, "FROM") {
-                        target = target.after(1);
-                    }
-                    self.require_scratch(line, &target, "DELETE")?;
-                }
-                "TRUNCATE" => self.require_table(line, &lex, "TRUNCATE TABLE")?,
-                "ALTER" => self.require_table(line, &lex, "ALTER")?,
-                "CREATE" => {
-                    let mut j = lex.clone();
-                    while j
-                        .word(0)
-                        .is_some_and(|w| in_list(&["UNIQUE", "CLUSTERED", "NONCLUSTERED"], w))
+            match token.kind {
+                Kind::Punct('(') => depth += 1,
+                Kind::Punct(')') => {
+                    if open.last().is_some_and(|top| top.depth == depth)
+                        && let Some(top) = open.pop()
+                        && let Err(blocked) = self.finish_write(top.write, top.line, &lex)
                     {
-                        j = j.after(1);
+                        hold(&mut held, top.at, blocked);
                     }
-                    if j.word_is(0, "TABLE") {
-                        self.require_scratch(line, &j.after(1), "CREATE TABLE")?;
-                    } else if j.word_is(0, "INDEX") && j.word_is(2, "ON") {
-                        // CREATE INDEX name ON #t
-                        self.require_scratch(line, &j.after(3), "CREATE INDEX")?;
-                    } else {
-                        return Err(self.blocked(line, "CREATE"));
-                    }
+                    depth = depth.saturating_sub(1);
                 }
-                "DROP" => {
-                    if !lex.word_is(0, "TABLE") {
-                        return Err(self.blocked(line, "DROP"));
-                    }
-                    let mut j = lex.after(1);
-                    if j.word_is(0, "IF") && j.word_is(1, "EXISTS") {
-                        j = j.after(2);
-                    }
-                    loop {
-                        self.require_scratch(line, &j, "DROP TABLE")?;
-                        if j.kind(1) != Some(Kind::Punct(',')) {
-                            break;
+                // Once something is held, a later keyword can't come first.
+                Kind::Word if held.is_none() => {
+                    if let Err(blocked) = self.classify(&token, &lex, depth, &mut open) {
+                        if open.is_empty() {
+                            return Err(blocked);
                         }
-                        j = j.after(2);
+                        hold(&mut held, lex.pos, blocked);
                     }
-                }
-                "EXEC" | "EXECUTE" => self.check_exec(line, &lex)?,
-                "BEGIN" => {
-                    let kinds = ["TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG"];
-                    if let Some(w) = lex.word(0).and_then(|w| find_entry(&kinds, w)) {
-                        return Err(self.blocked(line, &format!("BEGIN {w}")));
-                    }
-                }
-                "DBCC" => {
-                    let command = lex.word(0).unwrap_or("");
-                    if !in_list(DBCC_READ, command) {
-                        let command = command.to_ascii_uppercase();
-                        return Err(self.blocked(line, &format!("DBCC {command}")));
-                    }
-                }
-                // Sequence allocation survives a rollback, so the wrapper can't undo it.
-                "NEXT" if lex.word_is(0, "VALUE") && lex.word_is(1, "FOR") => {
-                    return Err(Blocked {
-                        line,
-                        reason: format!(
-                            "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
-                            self.name_at(&lex.after(2))
-                        ),
-                        advice: WRITE_ADVICE.into(),
-                    });
-                }
-                word if BLOCKED.contains(&word) => {
-                    return Err(Blocked {
-                        line,
-                        reason: format!(
-                            "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
-                            token.text
-                        ),
-                        advice: WRITE_ADVICE.into(),
-                    });
                 }
                 _ => {}
             }
+            if open.is_empty()
+                && let Some((_, blocked)) = held.take()
+            {
+                return Err(blocked);
+            }
+        }
+        // Clauses never closed read to the end of the input and found no target.
+        while let Some(top) = open.pop() {
+            if let Err(blocked) = self.finish_write(top.write, top.line, &lex) {
+                hold(&mut held, top.at, blocked);
+            }
+        }
+        match held {
+            Some((_, blocked)) => Err(blocked),
+            None => Ok(()),
+        }
+    }
+
+    /// Classifies one word of the batch; `lex` is just past it. A write with a `TOP (` clause
+    /// is checked when the clause closes: it is added to `open` here (`depth` is the
+    /// parenthesis depth before the clause's own).
+    fn classify(
+        &self,
+        token: &Token<'a>,
+        lex: &Lexer<'a>,
+        depth: usize,
+        open: &mut Vec<OpenTop>,
+    ) -> Result<(), Blocked> {
+        let mut buf = [0; KEYWORD_MAX];
+        let line = token.line;
+        match keyword(token.name, &mut buf) {
+            "INSERT" => self.write_after_top(Write::Insert, line, lex, depth, open)?,
+            "INTO" => self.require_scratch(line, lex, "INTO")?,
+            "UPDATE" => {
+                if lex.word_is(0, "STATISTICS") {
+                    return Err(self.blocked(line, "UPDATE STATISTICS"));
+                }
+                self.write_after_top(Write::Update, line, lex, depth, open)?;
+            }
+            "DELETE" => self.write_after_top(Write::Delete, line, lex, depth, open)?,
+            "TRUNCATE" => self.require_table(line, lex, "TRUNCATE TABLE")?,
+            "ALTER" => self.require_table(line, lex, "ALTER")?,
+            "CREATE" => {
+                let mut j = lex.clone();
+                while j
+                    .word(0)
+                    .is_some_and(|w| in_list(&["UNIQUE", "CLUSTERED", "NONCLUSTERED"], w))
+                {
+                    j = j.after(1);
+                }
+                if j.word_is(0, "TABLE") {
+                    self.require_scratch(line, &j.after(1), "CREATE TABLE")?;
+                } else if j.word_is(0, "INDEX") && j.word_is(2, "ON") {
+                    // CREATE INDEX name ON #t
+                    self.require_scratch(line, &j.after(3), "CREATE INDEX")?;
+                } else {
+                    return Err(self.blocked(line, "CREATE"));
+                }
+            }
+            "DROP" => {
+                if !lex.word_is(0, "TABLE") {
+                    return Err(self.blocked(line, "DROP"));
+                }
+                let mut j = lex.after(1);
+                if j.word_is(0, "IF") && j.word_is(1, "EXISTS") {
+                    j = j.after(2);
+                }
+                loop {
+                    self.require_scratch(line, &j, "DROP TABLE")?;
+                    // Past the name just checked, then past a comma if one follows.
+                    let mut next = j.clone();
+                    next.next();
+                    if next.next().is_none_or(|t| t.kind != Kind::Punct(',')) {
+                        break;
+                    }
+                    j = next;
+                }
+            }
+            "EXEC" | "EXECUTE" => self.check_exec(line, lex)?,
+            "BEGIN" => {
+                let kinds = ["TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG"];
+                if let Some(w) = lex.word(0).and_then(|w| find_entry(&kinds, w)) {
+                    return Err(self.blocked(line, &format!("BEGIN {w}")));
+                }
+            }
+            "DBCC" => {
+                let command = lex.word(0).unwrap_or("");
+                if !in_list(DBCC_READ, command) {
+                    let command = command.to_ascii_uppercase();
+                    return Err(self.blocked(line, &format!("DBCC {command}")));
+                }
+            }
+            // Sequence allocation survives a rollback, so the wrapper can't undo it.
+            "NEXT" if lex.word_is(0, "VALUE") && lex.word_is(1, "FOR") => {
+                return Err(Blocked {
+                    line,
+                    reason: format!(
+                        "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
+                        self.name_at(&lex.after(2))
+                    ),
+                    advice: WRITE_ADVICE.into(),
+                });
+            }
+            word if BLOCKED.contains(&word) => {
+                return Err(Blocked {
+                    line,
+                    reason: format!(
+                        "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
+                        token.text
+                    ),
+                    advice: WRITE_ADVICE.into(),
+                });
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    /// The position after `TOP (n)` / `TOP n` if `at` is at one, else `at`.
-    fn skip_top(&self, at: &Lexer<'a>) -> Lexer<'a> {
-        if !at.word_is(0, "TOP") {
-            return at.clone();
+    /// A write keyword (`what`, on `line`) whose target follows `lex`. After a `TOP n` or
+    /// nothing, the target is checked at once. After `TOP (`, the clause is entered in `open`
+    /// and the check is made at its closing parenthesis (see `check_writes`). `depth` is the
+    /// parenthesis depth before the clause's own.
+    fn write_after_top(
+        &self,
+        what: Write,
+        line: u32,
+        lex: &Lexer<'a>,
+        depth: usize,
+        open: &mut Vec<OpenTop>,
+    ) -> Result<(), Blocked> {
+        if !lex.word_is(0, "TOP") {
+            return self.finish_write(what, line, lex);
         }
-        if at.kind(1) != Some(Kind::Punct('(')) {
-            return at.after(2);
+        if lex.kind(1) != Some(Kind::Punct('(')) {
+            return self.finish_write(what, line, &lex.after(2));
         }
-        let mut scan = at.after(1);
-        let mut depth = 0usize;
-        while let Some(t) = scan.next() {
-            match t.kind {
-                Kind::Punct('(') => depth += 1,
-                Kind::Punct(')') => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return scan;
-                    }
-                }
-                _ => {}
-            }
+        if open.len() >= MAX_OPEN_TOP {
+            return Err(too_complex(
+                line,
+                &format!("TOP ( clauses are nested more than {MAX_OPEN_TOP} deep"),
+            ));
         }
-        scan
+        open.push(OpenTop {
+            write: what,
+            line,
+            at: lex.pos,
+            // The depth the main pass has once it has read the clause's own `(`.
+            depth: depth + 1,
+        });
+        Ok(())
+    }
+
+    /// The write `what` on `line` has its target at `after`, past any `TOP` clause.
+    fn finish_write(&self, what: Write, line: u32, after: &Lexer<'a>) -> Result<(), Blocked> {
+        let (name, skipped) = match what {
+            Write::Insert => ("INSERT", "INTO"),
+            Write::Update => ("UPDATE", ""),
+            Write::Delete => ("DELETE", "FROM"),
+        };
+        let target = if !skipped.is_empty() && after.word_is(0, skipped) {
+            after.after(1)
+        } else {
+            after.clone()
+        };
+        self.require_scratch(line, &target, name)
     }
 
     /// The token at `target` must be a session temp table (`#t`) or a table variable (`@t`).
@@ -458,7 +662,8 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// `after` is the position just past the EXEC keyword, which is on `line`.
+    /// `after` is the position just past the EXEC keyword, which is on `line`; a refusal is
+    /// reported there, whatever follows the keyword and wherever it is.
     fn check_exec(&self, line: u32, after: &Lexer<'a>) -> Result<(), Blocked> {
         let mut name = after.clone();
         match after.kind(0) {
@@ -472,13 +677,20 @@ impl<'a> Guard<'a> {
         if name.word_is(0, "AS") {
             return Err(self.blocked(line, "EXECUTE AS"));
         }
-        self.check_proc(&name, "EXEC", false)
+        self.check_proc(line, &name, "EXEC", false)
     }
 
     /// Checks the (possibly multi-part) procedure name starting at `start` against the
-    /// allowlist. `batch_start` is true for the implicit call of a batch that begins with a
-    /// word that is no statement keyword.
-    fn check_proc(&self, start: &Lexer<'a>, what: &str, batch_start: bool) -> Result<(), Blocked> {
+    /// allowlist. `line` is where a refusal is reported: the EXEC keyword's, or the first
+    /// word of a batch. `batch_start` is true for the implicit call of a batch that begins
+    /// with a word that is no statement keyword.
+    fn check_proc(
+        &self,
+        line: u32,
+        start: &Lexer<'a>,
+        what: &str,
+        batch_start: bool,
+    ) -> Result<(), Blocked> {
         let mut parts = Dotted::new(start);
         let mut last = None;
         for part in parts.by_ref() {
@@ -487,7 +699,6 @@ impl<'a> Guard<'a> {
         let end = parts.rest();
         let last = last.filter(|t| matches!(t.kind, Kind::Word | Kind::Quoted));
         let name = last.map_or("", |t| t.name);
-        let line = start.ahead(0).map_or(1, |t| t.line);
         if !in_list(PROCS, name) && batch_start {
             // A batch that starts with an unknown word is run as a procedure call by SQL
             // Server, so a typo like `SELEC 1` lands here too.
@@ -522,15 +733,30 @@ impl<'a> Guard<'a> {
                 ),
             });
         }
-        if name.eq_ignore_ascii_case("SP_SPACEUSED") && self.spaceused_updates_usage(&end) {
-            return Err(Blocked {
-                line,
-                reason: "sp_spaceused with @updateusage (named, or as the second argument) runs \
-                         DBCC UPDATEUSAGE, which writes"
-                    .into(),
-                advice: "Leave @updateusage out to only read sizes, or rerun with --allow-write"
-                    .into(),
-            });
+        if name.eq_ignore_ascii_case("SP_SPACEUSED") {
+            match self.spaceused_updates_usage(&end) {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(Blocked {
+                        line,
+                        reason: "sp_spaceused with @updateusage (named, or as the second \
+                                 argument) runs DBCC UPDATEUSAGE, which writes"
+                            .into(),
+                        advice: "Leave @updateusage out to only read sizes, or rerun with \
+                                 --allow-write"
+                            .into(),
+                    });
+                }
+                None => {
+                    return Err(too_complex(
+                        line,
+                        &format!(
+                            "the arguments of sp_spaceused have more than {MAX_ARG_PARENS} \
+                             parentheses"
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -570,14 +796,29 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// `sp_spaceused`'s second positional parameter is `@updateusage`. `args_start` is the
-    /// position just past the procedure's name.
-    fn spaceused_updates_usage(&self, args_start: &Lexer<'a>) -> bool {
+    /// Whether `sp_spaceused`'s arguments pass `@updateusage`, named or as the second
+    /// positional parameter, or `None` if they have more than `MAX_ARG_PARENS` parentheses.
+    /// `args_start` is the position just past the procedure's name.
+    ///
+    /// The scan ends at a `;` or a statement keyword outside parentheses, so the next call's
+    /// own scan starts where this one stops. A scan can only read on to a later call (an
+    /// `EXEC` is a statement keyword) with a parenthesis open, so each scan that reaches the
+    /// `k`-th call after it has read a parenthesis from each of those calls' arguments, the
+    /// ones in between included. With at most `MAX_ARG_PARENS` of them in a scan, no token is
+    /// read by more than that many scans, and the work stays linear.
+    fn spaceused_updates_usage(&self, args_start: &Lexer<'a>) -> Option<bool> {
         let mut positional = 0;
         let mut depth = 0usize;
+        let mut parens = 0usize;
         let mut arg_start = true;
         let mut scan = args_start.clone();
         while let Some(t) = scan.next() {
+            if matches!(t.kind, Kind::Punct('(' | ')')) {
+                parens += 1;
+                if parens > MAX_ARG_PARENS {
+                    return None;
+                }
+            }
             match t.kind {
                 Kind::Punct(';') if depth == 0 => break,
                 Kind::Word if depth == 0 && in_list(STATEMENT_START, t.name) => break,
@@ -593,14 +834,18 @@ impl<'a> Guard<'a> {
                 arg_start = false;
                 let named = t.kind == Kind::Var && scan.kind(0) == Some(Kind::Punct('='));
                 if named && t.name.eq_ignore_ascii_case("@UPDATEUSAGE") {
-                    return true;
+                    return Some(true);
                 }
                 if !named {
                     positional += 1;
+                    if positional >= 2 {
+                        // The answer can't change now; the rest is not read.
+                        return Some(true);
+                    }
                 }
             }
         }
-        positional >= 2
+        Some(false)
     }
 
     /// The dotted name starting at `at`, as written, for messages.
@@ -671,14 +916,27 @@ struct Lexer<'a> {
     pos: usize,
     /// 1-based line at `pos`.
     line: u32,
+    /// What every read is charged to, if anything: once it is spent, the lexer and all its
+    /// copies report the end of the input.
+    work: Option<&'a Work>,
 }
 
 impl<'a> Lexer<'a> {
+    /// A lexer that is not charged for its reads: for a single pass over the text.
     fn new(sql: &'a str) -> Self {
         Lexer {
             sql,
             pos: 0,
             line: 1,
+            work: None,
+        }
+    }
+
+    /// A lexer whose reads, and its copies', are charged to `work`.
+    fn metered(sql: &'a str, work: &'a Work) -> Self {
+        Lexer {
+            work: Some(work),
+            ..Lexer::new(sql)
         }
     }
 
@@ -722,6 +980,24 @@ impl<'a> Iterator for Lexer<'a> {
     type Item = Token<'a>;
 
     fn next(&mut self) -> Option<Token<'a>> {
+        let Some(work) = self.work else {
+            return self.read();
+        };
+        if work.exceeded() {
+            return None;
+        }
+        let from = self.pos;
+        let token = self.read();
+        // One unit a read, and one for each 32 bytes it went over (a read that ends the input
+        // counts too).
+        work.charge(1 + ((self.pos - from) >> 5) as u64, self.line);
+        token
+    }
+}
+
+impl<'a> Lexer<'a> {
+    /// The next token, uncharged.
+    fn read(&mut self) -> Option<Token<'a>> {
         let sql = self.sql;
         let bytes = sql.as_bytes();
         let mut line = self.line;
@@ -1521,9 +1797,289 @@ mod tests {
         )
         .expect_err("refused");
         assert_eq!(b.line, 3);
-        // Kept as it was: an EXEC with nothing after it is reported on line 1, because the
-        // refusal looks the line up on the token that should follow the keyword.
-        assert_eq!(blocked("SELECT 1\nEXEC").line, 1);
+        // An EXEC is reported on its own line (R18): not on line 1 when nothing follows it,
+        // and not on the line of its name when that is further down.
+        assert_eq!(blocked("SELECT 1\nEXEC").line, 2);
+        assert_eq!(blocked("SELECT 1\n\n-- c\nEXECUTE").line, 4);
+        assert_eq!(blocked("SELECT 1\nEXEC\n  dbo.sp_who").line, 2);
+        assert_eq!(blocked("SELECT 1\nEXEC\n\n  sp_spaceused N'a', 1").line, 2);
+        assert_eq!(
+            blocked("SELECT 1\n\nEXECUTE\n\nsp_who2 ; EXEC\nsp_spaceused N'a', 1").line,
+            5
+        );
+        assert_eq!(blocked("SELECT 1\nEXEC\n(\n'x')").line, 2);
+    }
+
+    // The refusal for a TOP clause that is not closed yet when a later keyword refuses, and the
+    // nested clauses among themselves, come out as when each clause's target was looked up at
+    // its keyword: the earliest keyword's. (The expected values are what the guard of `6ad9c14`,
+    // which scanned ahead from every keyword, gave for these inputs.)
+    #[test]
+    fn open_top_clauses_refuse_in_the_order_of_their_keywords() {
+        for (sql, line, reason) in [
+            (
+                "SELECT 1\nUPDATE TOP (\nDELETE FROM dbo.Z) dbo.T SET x = 1",
+                2,
+                "UPDATE dbo.T would write",
+            ),
+            (
+                "SELECT 1\nUPDATE TOP (\nDELETE FROM dbo.Z) @t SET x = 1",
+                3,
+                "DELETE dbo.Z would write",
+            ),
+            (
+                "UPDATE TOP (DELETE TOP (INSERT INTO dbo.A) dbo.B) dbo.C SET x = 1",
+                1,
+                "UPDATE dbo.C would write",
+            ),
+            (
+                "UPDATE TOP (DELETE TOP (INSERT INTO dbo.A) dbo.B) @t SET x = 1",
+                1,
+                "DELETE dbo.B would write",
+            ),
+            (
+                "UPDATE TOP (DELETE TOP (INSERT INTO #a) dbo.B) @t SET x = 1",
+                1,
+                "DELETE dbo.B would write",
+            ),
+            (
+                "UPDATE TOP (DELETE TOP (INSERT INTO #a) @b) dbo.C SET x = 1",
+                1,
+                "UPDATE dbo.C would write",
+            ),
+            (
+                "UPDATE TOP (1) @t SET x = 1;\nDELETE TOP (2) dbo.Q",
+                2,
+                "DELETE dbo.Q would write",
+            ),
+            (
+                "UPDATE TOP (1) dbo.T SET x = 1;\nDELETE TOP (2) dbo.Q",
+                1,
+                "UPDATE dbo.T would write",
+            ),
+            (
+                "INSERT TOP (1) INTO #t SELECT 1;\nINSERT TOP (SELECT 1) dbo.Q SELECT 1",
+                2,
+                "INSERT dbo.Q would write",
+            ),
+            (
+                "DELETE TOP (1) FROM @t; DELETE TOP (1) FROM dbo.U",
+                1,
+                "DELETE dbo.U would write",
+            ),
+            (
+                "DELETE TOP ((1) + (2)) FROM ##g",
+                1,
+                "DELETE ##g would write to a global temp table, which other sessions share",
+            ),
+            // Never closed, or closed once too often: no target.
+            ("UPDATE TOP (1", 1, "UPDATE ? would write"),
+            ("UPDATE TOP (UPDATE TOP (1) @t", 1, "UPDATE ? would write"),
+            ("UPDATE TOP (1) ) @t", 1, "UPDATE ? would write"),
+            (
+                "UPDATE TOP (UPDATE TOP (1) @t) @t SET x = 1 )))) DELETE dbo.Q",
+                1,
+                "DELETE dbo.Q would write",
+            ),
+        ] {
+            let b = blocked(sql);
+            assert_eq!((b.line, b.reason.as_str()), (line, reason), "{sql:?}");
+        }
+        allowed("UPDATE TOP (UPDATE TOP (1) @t) @t SET x = 1");
+        allowed("INSERT TOP (5) INTO #t SELECT 1");
+        allowed("DELETE TOP (SELECT TOP (1) 1) FROM @t");
+    }
+
+    /// The work a write-classifier pass over `sql` takes, in the units of `Work`.
+    fn work_of(sql: &str) -> u64 {
+        let work = Work::new(sql, WORK_BASE, WORK_PER_BYTE);
+        let _ = Guard { sql, work: &work }.check_writes();
+        work.used.get()
+    }
+
+    // R18: the shapes whose lookahead used to read the same suffix from every keyword now take
+    // one look at each token, however deep they nest, and an input they can't be read in one
+    // look from is refused.
+    #[test]
+    fn nested_top_clauses_are_read_in_one_pass() {
+        // The reviewer's input, at the depths of its measurements.
+        for n in [2_000, 4_000, 8_000, 16_000, MAX_OPEN_TOP] {
+            let sql = format!("{}@t{}", "UPDATE TOP (".repeat(n), ") @t ".repeat(n));
+            allowed(&sql);
+            // About 10 reads a level; the old scan read n^2 of them.
+            assert!(work_of(&sql) < 12 * n as u64, "{n}: {}", work_of(&sql));
+            // A refusal at the end of it is found and named with its own line.
+            let b = blocked(&format!("{sql}\nDELETE FROM dbo.T"));
+            assert_eq!((b.line, b.reason.as_str()), (2, "DELETE dbo.T would write"));
+        }
+        // One level deeper than the classifier remembers is refused, whatever follows.
+        let n = MAX_OPEN_TOP + 1;
+        let sql = format!("{}@t{}", "UPDATE TOP (".repeat(n), ") @t ".repeat(n));
+        let b = blocked(&sql);
+        assert_eq!(b.line, 1);
+        assert_eq!(
+            b.reason,
+            format!(
+                "this input is too complex for the read-only check: TOP ( clauses are nested \
+                 more than {MAX_OPEN_TOP} deep"
+            )
+        );
+        assert!(b.advice.contains("split it into smaller batches"));
+        assert!(b.advice.contains("--allow-write"));
+        // The writes the clauses before it make are still checked first.
+        let b = blocked(&format!("UPDATE TOP (1) dbo.T SET x = 1\n{sql}"));
+        assert_eq!((b.line, b.reason.as_str()), (1, "UPDATE dbo.T would write"));
+        // Deep parentheses inside one clause are not clauses.
+        allowed(&format!(
+            "UPDATE TOP ({}1{}) #t SET x = 1",
+            "(".repeat(50_000),
+            ")".repeat(50_000)
+        ));
+        // A clause that is never closed reads to the end once, however many follow.
+        let b = blocked(&"DELETE TOP (".repeat(10_000));
+        assert_eq!(b.reason, "DELETE ? would write");
+        // --allow-write skips the classifier, so no limit of it applies.
+        let writes = Policy {
+            writes: true,
+            compile_only: false,
+        };
+        assert_eq!(check(&sql, writes), Ok(()));
+    }
+
+    #[test]
+    fn sp_spaceused_arguments_are_scanned_a_bounded_number_of_times() {
+        // Parentheses in the arguments of a call that takes none: a few are read, many are not.
+        allowed("EXEC sp_spaceused (N'a')");
+        let half = MAX_ARG_PARENS / 2;
+        let (open, close) = ("(".repeat(half), ")".repeat(half));
+        allowed(&format!("EXEC sp_spaceused {open}{close}; SELECT 1"));
+        let parens = "(".repeat(MAX_ARG_PARENS);
+        let b = blocked(&format!("SELECT 1\nEXEC sp_spaceused {parens}("));
+        assert_eq!(b.line, 2);
+        assert_eq!(
+            b.reason,
+            format!(
+                "this input is too complex for the read-only check: the arguments of \
+                 sp_spaceused have more than {MAX_ARG_PARENS} parentheses"
+            )
+        );
+        assert!(b.advice.contains("--allow-write"));
+        // What the arguments say before the limit still counts.
+        assert!(
+            blocked(&format!("EXEC sp_spaceused N'a', 1 {parens}("))
+                .reason
+                .contains("UPDATEUSAGE")
+        );
+        // A call after a stray `)` is the shape that kept every scan going: `) (` before each
+        // call holds one parenthesis open at all of them. Each scan stops at its ninth.
+        for unit in [
+            "EXEC sp_spaceused ) (",
+            "EXEC sp_spaceused (",
+            "EXEC sp_spaceused ( ) (",
+        ] {
+            let sql = unit.repeat(50_000);
+            let b = blocked(&sql);
+            assert!(b.reason.contains("too complex"), "{unit}: {}", b.reason);
+            assert!(work_of(&sql) < 1_000, "{unit}: {}", work_of(&sql));
+        }
+        // Calls that do nest a few parentheses are read about as often as they nest.
+        for k in 1..=MAX_ARG_PARENS / 2 {
+            let unit = format!("{}{}", "EXEC sp_spaceused (".repeat(k), ")".repeat(k));
+            let sql = unit.repeat(5_000);
+            allowed(&sql);
+            assert!(
+                work_of(&sql) < 3 * sql.len() as u64 / 2,
+                "{k}: {}",
+                work_of(&sql)
+            );
+        }
+    }
+
+    // R18: the work budget, the backstop under all of the above. The real one is too large to
+    // reach with any input this size, so these use a small one.
+    #[test]
+    fn input_over_its_work_budget_is_refused() {
+        let policy = READ_ONLY;
+        let sql = "SELECT 1\n".repeat(1_000);
+        // 1,000 lines of 2 tokens: a pass reads about 2,300 units' worth.
+        assert_eq!(check_within(&sql, policy, 10_000, 0), Ok(()));
+        let b = check_within(&sql, policy, 1_000, 0).expect_err("over the budget");
+        assert!(
+            b.reason.starts_with(
+                "this input is too complex for the read-only check: it would take more than 1000 \
+                 token reads"
+            ),
+            "{}",
+            b.reason
+        );
+        assert!(b.advice.contains("split it into smaller batches with GO"));
+        assert!(b.advice.contains("--allow-write"));
+        // It names the line it ran out on: about half way.
+        assert!((400..=600).contains(&b.line), "{}", b.line);
+        // The budget grows with the text.
+        assert_eq!(check_within(&sql, policy, 0, 1), Ok(()));
+        assert!(check_within(&sql, policy, 0, 0).is_err());
+        // A refusal found within the budget stands.
+        let sql = format!("DELETE FROM dbo.T\n{}", "SELECT 1\n".repeat(100_000));
+        let b = check_within(&sql, policy, 100, 0).expect_err("refused");
+        assert_eq!((b.line, b.reason.as_str()), (1, "DELETE dbo.T would write"));
+        // Spent before the refusal it would have found: the answer is the budget's, not a
+        // verdict on the truncated text.
+        let sql = format!("{}\nDELETE FROM dbo.T", "SELECT 1\n".repeat(100_000));
+        let b = check_within(&sql, policy, 100, 0).expect_err("refused");
+        assert!(b.reason.contains("too complex"), "{}", b.reason);
+        // Nothing is read when no check applies.
+        let open = Policy {
+            writes: true,
+            compile_only: false,
+        };
+        assert_eq!(check_within(&sql, open, 0, 0), Ok(()));
+        // --check's NOEXEC search has a budget of its own, and the write classifier another.
+        let both = Policy {
+            writes: false,
+            compile_only: true,
+        };
+        let sql = "SELECT 1\n".repeat(1_000);
+        assert_eq!(check_within(&sql, both, 3_000, 0), Ok(()));
+        let b = check_within(&sql, both, 1_000, 0).expect_err("over the budget");
+        assert!(b.reason.contains("too complex"), "{}", b.reason);
+    }
+
+    #[test]
+    fn a_repeated_lookahead_is_charged_each_time() {
+        // Charged by what is read, lookahead included: the same text read twice costs twice.
+        let work = Work::new("a b c d", 100, 0);
+        let lex = Lexer::metered("a b c d", &work);
+        assert_eq!(work.used.get(), 0);
+        assert!(lex.ahead(2).is_some());
+        assert_eq!(work.used.get(), 3);
+        assert!(lex.ahead(2).is_some());
+        assert_eq!(work.used.get(), 6);
+        assert!(lex.after(4).ahead(0).is_none());
+        assert_eq!(work.used.get(), 6 + 4 + 1);
+        // Big tokens cost one more unit for each 32 bytes they, and what precedes them, take.
+        let text = format!("x '{}' /* {} */ y", "s".repeat(100), "c".repeat(100));
+        let work = Work::new(&text, 1_000, 0);
+        let all: Vec<_> = Lexer::metered(&text, &work).collect();
+        assert_eq!(all.len(), 3);
+        assert!(
+            work.used.get() >= 4 + 100 / 32 + 100 / 32,
+            "{}",
+            work.used.get()
+        );
+        assert!(!work.exceeded());
+        // Once the limit is passed the lexer, and its copies, report the end of the input,
+        // and the line it passed it on is kept.
+        let text = "a\nb\nc\nd\ne\nf\n";
+        let work = Work::new(text, 3, 0);
+        let mut lex = Lexer::metered(text, &work);
+        let copy = lex.clone();
+        assert_eq!(lex.by_ref().count(), 4);
+        assert!(work.exceeded());
+        assert_eq!(work.line.get(), 4);
+        assert!(copy.ahead(0).is_none());
+        // An unmetered lexer is never cut off.
+        assert_eq!(Lexer::new(text).count(), 6);
     }
 
     // A refusal never depends on how much comes after it, and a pass takes one look at each
