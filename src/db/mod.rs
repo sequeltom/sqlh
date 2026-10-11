@@ -227,8 +227,12 @@ impl Session {
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
         let connecting = provider.create_client(context, &source, Some(&cancel.handle));
-        // The driver checks its cancel only between attempts; dropping the attempt closes
-        // the socket, and a login that never finished leaves nothing to clean up.
+        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 wraps
+        // the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
+        // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
+        // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
+        // a login that never finished leaves nothing to clean up. Only a blocking call, such as
+        // opening a pipe, outlasts a cancel.
         let mut client = tokio::select! {
             client = connecting => client.map_err(|e| connect_error(e, options))?,
             () = cancel.cancelled() => {
@@ -442,21 +446,134 @@ fn runtime_error(error: TdsError) -> DbError {
 }
 
 /// What the driver gets for `-S`. Without a protocol, the driver tries TCP and then Named
-/// Pipes, and it opens the pipe synchronously: for an unreachable remote host that blocks the
-/// whole runtime for about 21 s while SMB gives up, and neither -l nor Ctrl+C can end it. sqlh
-/// connects over TCP (DESIGN.md §4.2), so a remote name gets `tcp:`. Local names keep the
-/// driver's order (shared memory, TCP, a local pipe), which never reaches SMB. A protocol, a
-/// colon (IPv6, which takes no prefix), a pipe path or LocalDB passes through as written.
+/// Pipes. Its first pipe open is a synchronous `CreateFileW` on the runtime thread (the wait
+/// after a busy pipe, `WaitNamedPipeW`, runs on `spawn_blocking`, but the open does not), so
+/// for an unreachable remote host the whole runtime is blocked for about 21 s while SMB gives
+/// up, and neither -l nor Ctrl+C can end it. sqlh connects over TCP (DESIGN.md §4.2), so a
+/// remote name gets `tcp:`, and `check_server` has already refused an explicit remote pipe.
+///
+/// Local names keep the driver's order (shared memory, TCP, a local pipe), which never reaches
+/// SMB. A protocol, a pipe path or LocalDB passes through as written. An IPv6 address can't
+/// take `tcp:`, because the driver reads its colons as part of the name; without a port it
+/// would get the pipe fallback too (an unreachable address held a run for 23 s), so it gets the
+/// default port, 1433, and a port makes the driver use TCP only. Other text with a colon, such
+/// as `db01:1433`, is no name a host answers to, and the driver fails on it at once.
 fn data_source(server: &str) -> Cow<'_, str> {
     let server = server.trim();
     let host = server.split(['\\', '/', ',']).next().unwrap_or_default();
-    let local = [".", "(local)", "(localdb)", "localhost", "127.0.0.1"]
+    let local = [".", "(local)", "(localdb)", "localhost", "127.0.0.1", "::1"]
         .iter()
         .any(|name| host.eq_ignore_ascii_case(name));
-    if local || host.is_empty() || server.contains(':') {
+    if local || host.is_empty() {
         Cow::Borrowed(server)
-    } else {
+    } else if !server.contains(':') {
         Cow::Owned(format!("tcp:{server}"))
+    } else if looks_like_ipv6(server) && !server.contains([',', '\\']) {
+        Cow::Owned(format!("{server},1433"))
+    } else {
+        Cow::Borrowed(server)
+    }
+}
+
+/// The protocols a data source can name, as the driver's parser accepts them.
+const PROTOCOLS: [&str; 4] = ["tcp", "np", "lpc", "admin"];
+
+/// The driver's test for an IPv6 address: `::`, or more than one colon.
+fn looks_like_ipv6(server: &str) -> bool {
+    server.contains("::") || server.matches(':').count() > 1
+}
+
+/// Splits a protocol prefix from the rest, the way the driver does
+/// (`datasource_parser.rs`, `parse_protocol`): at the first colon, unless the text looks like
+/// an IPv6 address, and only for `tcp`, `np`, `lpc` or `admin`, in any case. Anything else,
+/// such as `http:db01`, stays part of the name. The protocol comes back in lowercase.
+fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
+    if let Some(colon) = server.find(':')
+        && !looks_like_ipv6(server)
+    {
+        let name = server[..colon].trim();
+        if let Some(protocol) = PROTOCOLS.iter().find(|p| name.eq_ignore_ascii_case(p)) {
+            return (Some(protocol), server[colon + 1..].trim_start());
+        }
+    }
+    (None, server)
+}
+
+/// Refuses a Named Pipes request to another machine, with a message for a usage error
+/// (DESIGN.md §4.2). The driver opens a pipe with a synchronous `CreateFileW` on its runtime
+/// thread, so for an unreachable host a run is stuck for about 21 s while SMB gives up, past
+/// `-l` and Ctrl+C. TCP can be timed out and cancelled; the open of a pipe cannot. So a remote
+/// pipe is refused before anything connects, whether the server came from `-S`, `SQLCMDSERVER`
+/// or a profile, and whether it is `np:host`, `np:host\instance`, or a UNC pipe path
+/// (`\\host\pipe\sql\query`) with any prefix: the driver reads a UNC path as a pipe even after
+/// `tcp:`.
+///
+/// Local pipes stay: `np:` with `.`, `(local)`, `localhost`, `127.0.0.1`, `::1` or this
+/// computer's name (`COMPUTERNAME`), a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared
+/// memory, which the driver only allows locally), `admin:` (a TCP connection) and LocalDB. Text
+/// the driver would reject before opening anything, such as `np:` with no host, is left to it.
+///
+/// The message starts with the server text, so a caller can say where it came from:
+/// `-S np:db01: Named Pipes ...`.
+pub fn check_server(server: &str) -> Result<(), String> {
+    check(server, std::env::var("COMPUTERNAME").ok().as_deref())
+}
+
+fn check(server: &str, computer: Option<&str>) -> Result<(), String> {
+    let server = server.trim();
+    // The driver looks for LocalDB before it looks for a protocol.
+    let localdb = server
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("(localdb)"))
+        && matches!(server.as_bytes().get(9), Some(b'\\' | b'/'));
+    if localdb {
+        return Ok(());
+    }
+    let local = |name: &str| {
+        [".", "(local)", "localhost", "127.0.0.1", "::1"]
+            .iter()
+            .any(|own| name.eq_ignore_ascii_case(own))
+            || computer.is_some_and(|own| name.eq_ignore_ascii_case(own))
+    };
+    let (protocol, rest) = split_protocol(server);
+    let over_tcp = if let Some(path) = rest.strip_prefix(r"\\") {
+        let name = path.split('\\').next().unwrap_or_default();
+        (!name.is_empty() && !local(name)).then(|| tcp_form(path))
+    } else if protocol == Some("np") {
+        let name = rest.split(['\\', ',']).next().unwrap_or_default().trim();
+        (!name.is_empty() && !local(name)).then(|| rest.to_owned())
+    } else {
+        None
+    };
+    match over_tcp {
+        Some(tcp) => Err(format!(
+            "{server}: Named Pipes to a remote server aren't supported, because their open \
+             can't be timed out or cancelled; connect over TCP: -S {tcp}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The TCP spelling of a pipe path given without its leading `\\`: the server, and the instance
+/// when the pipe is `\pipe\MSSQL$instance\sql\query`. Any other pipe name gives the server alone.
+fn tcp_form(unc: &str) -> String {
+    const PIPE: &str = "pipe\\mssql$";
+    const QUERY: &str = "\\sql\\query";
+    let (server, pipe) = unc.split_once('\\').unwrap_or((unc, ""));
+    let lower = pipe.to_ascii_lowercase();
+    match lower
+        .strip_prefix(PIPE)
+        .and_then(|name| name.strip_suffix(QUERY))
+    {
+        Some(instance) if !instance.is_empty() => {
+            // The slice of the original, to keep the instance's case. ASCII lowercasing
+            // doesn't change lengths, so the offsets are the same.
+            format!(
+                "{server}\\{}",
+                &pipe[PIPE.len()..PIPE.len() + instance.len()]
+            )
+        }
+        _ => server.to_owned(),
     }
 }
 
@@ -557,7 +674,7 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_source, tls_hint};
+    use super::{check, data_source, split_protocol, tcp_form, tls_hint};
 
     #[test]
     fn remote_names_connect_over_tcp_only() {
@@ -567,7 +684,7 @@ mod tests {
             (r"db01\SALES", r"tcp:db01\SALES"),
             ("db01,14330", "tcp:db01,14330"),
             ("10.1.2.3", "tcp:10.1.2.3"),
-            // A protocol is the user's choice.
+            // A protocol is the user's choice (`check_server` has refused remote pipes).
             ("tcp:db01", "tcp:db01"),
             ("TCP:db01,1433", "TCP:db01,1433"),
             ("np:db01", "np:db01"),
@@ -579,13 +696,156 @@ mod tests {
             ("LocalHost", "LocalHost"),
             ("localhost,1433", "localhost,1433"),
             ("127.0.0.1", "127.0.0.1"),
-            (r"(localdb)\MSSQLLocalDB", r"(localdb)\MSSQLLocalDB"),
-            // IPv6 takes no prefix, and a pipe path names its protocol.
             ("::1", "::1"),
+            (r"(localdb)\MSSQLLocalDB", r"(localdb)\MSSQLLocalDB"),
+            // IPv6 takes no `tcp:` prefix, but without a port it gets one: otherwise the
+            // driver would go on to open a pipe to the address.
+            ("2001:db8::5", "2001:db8::5,1433"),
+            (" fe80::1%12 ", "fe80::1%12,1433"),
             ("2001:db8::5,1433", "2001:db8::5,1433"),
+            (r"2001:db8::5\SQLEXPRESS", r"2001:db8::5\SQLEXPRESS"),
+            // A pipe path names its protocol; other text with a colon is left to the driver.
             (r"\\db01\pipe\sql\query", r"\\db01\pipe\sql\query"),
+            ("db01:1433", "db01:1433"),
         ] {
             assert_eq!(data_source(server), expected, "{server}");
+        }
+    }
+
+    // The driver's own parse_protocol examples, plus the spellings sqlh has to agree with.
+    #[test]
+    fn protocol_prefixes_are_split_like_the_driver_does() {
+        for (server, protocol, rest) in [
+            ("tcp:myserver,1433", Some("tcp"), "myserver,1433"),
+            ("NP:db01", Some("np"), "db01"),
+            ("Lpc: .", Some("lpc"), "."),
+            ("admin:db01", Some("admin"), "db01"),
+            ("np :db01", Some("np"), "db01"),
+            (
+                r"np:\\db01\pipe\sql\query",
+                Some("np"),
+                r"\\db01\pipe\sql\query",
+            ),
+            // No protocol, or not one of the four.
+            ("db01", None, "db01"),
+            (r"myserver\instance", None, r"myserver\instance"),
+            ("http:myserver", None, "http:myserver"),
+            (":db01", None, ":db01"),
+            (r"\\db01\pipe\sql\query", None, r"\\db01\pipe\sql\query"),
+            // An IPv6 address has colons of its own, so nothing is split off, even after what
+            // looks like a protocol.
+            ("::1", None, "::1"),
+            ("2001:db8::1,1433", None, "2001:db8::1,1433"),
+            ("np:::1", None, "np:::1"),
+            ("tcp:2001:db8:0:0:0:0:0:5", None, "tcp:2001:db8:0:0:0:0:0:5"),
+        ] {
+            assert_eq!(split_protocol(server), (protocol, rest), "{server}");
+        }
+    }
+
+    // DESIGN.md §4.2: a Named Pipes request to another machine is refused, with the TCP form
+    // of the same server in the message.
+    #[test]
+    fn remote_named_pipes_are_refused() {
+        for (server, tcp) in [
+            ("np:db01", "db01"),
+            (" NP:db01 ", "db01"),
+            ("np: db01.corp.example", "db01.corp.example"),
+            ("np:192.0.2.1", "192.0.2.1"),
+            (r"np:db01\SALES", r"db01\SALES"),
+            ("np:db01,1433", "db01,1433"),
+            // This computer's name only counts when it is the computer's own.
+            ("np:buildbox2", "buildbox2"),
+            // A UNC pipe path, with or without a prefix. The driver reads it as a pipe even
+            // after `tcp:`.
+            (r"\\db01\pipe\sql\query", "db01"),
+            (r"np:\\db01\pipe\sql\query", "db01"),
+            (r"tcp:\\db01\pipe\sql\query", "db01"),
+            (r"lpc:\\db01\pipe\sql\query", "db01"),
+            (r"\\192.0.2.1\pipe\sql\query", "192.0.2.1"),
+            (r"\\db01\pipe\MSSQL$SALES\sql\query", r"db01\SALES"),
+            (r"\\DB01\PIPE\mssql$Sales\SQL\QUERY", r"DB01\Sales"),
+            (r"\\db01\pipe\custom\app", "db01"),
+            (r"\\db01", "db01"),
+        ] {
+            let message = check(server, Some("BUILDBOX")).unwrap_err();
+            assert!(
+                message.starts_with(&format!(
+                    "{}: Named Pipes to a remote server",
+                    server.trim()
+                )) && message.ends_with(&format!("connect over TCP: -S {tcp}")),
+                "{server}: {message}"
+            );
+        }
+        // Without a computer name nothing counts as the computer's own.
+        assert!(check("np:buildbox", None).is_err());
+        assert_eq!(
+            check("np:db01", Some("BUILDBOX")).unwrap_err(),
+            "np:db01: Named Pipes to a remote server aren't supported, because their open \
+             can't be timed out or cancelled; connect over TCP: -S db01"
+        );
+    }
+
+    #[test]
+    fn local_pipes_and_other_servers_are_accepted() {
+        for server in [
+            // Names with no pipe in them.
+            "db01",
+            r"db01\SALES",
+            "db01,1433",
+            "tcp:db01",
+            "TCP:db01,1433",
+            "admin:db01",
+            "2001:db8::5",
+            "2001:db8::5,1433",
+            "db01:1433",
+            // Local pipes, by every name for this computer.
+            "np:.",
+            r"np:.\SQLEXPRESS",
+            "np:(local)",
+            "NP:LocalHost",
+            "np:127.0.0.1",
+            "np:::1",
+            "np:buildbox",
+            r"np:BUILDBOX\SQLEXPRESS",
+            r"\\.\pipe\sql\query",
+            r"\\.\pipe\MSSQL$SQLEXPRESS\sql\query",
+            r"\\localhost\pipe\sql\query",
+            r"\\127.0.0.1\pipe\sql\query",
+            r"\\::1\pipe\sql\query",
+            r"\\BUILDBOX\pipe\sql\query",
+            r"np:\\.\pipe\sql\query",
+            r"tcp:\\.\pipe\sql\query",
+            // Shared memory is local-only (the driver refuses a remote name itself), and
+            // LocalDB resolves to a local pipe.
+            "lpc:.",
+            "lpc:db01",
+            r"(localdb)\MSSQLLocalDB",
+            "(LocalDB)/MSSQLLocalDB",
+            // Nothing remote in it: the driver fails on these before it opens anything.
+            "np:",
+            r"np:\SALES",
+            "np:,1433",
+            r"\\",
+            r"\\\pipe\sql\query",
+            "",
+        ] {
+            assert_eq!(check(server, Some("BUILDBOX")), Ok(()), "{server:?}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_path_has_a_tcp_spelling() {
+        for (unc, expected) in [
+            (r"db01\pipe\sql\query", "db01"),
+            (r"db01\pipe\MSSQL$SALES\sql\query", r"db01\SALES"),
+            (r"db01\pipe\mssql$sales\sql\query", r"db01\sales"),
+            // Not the standard pipe of an instance: the instance isn't known.
+            (r"db01\pipe\MSSQL$\sql\query", "db01"),
+            (r"db01\pipe\MSSQL$SALES\other", "db01"),
+            ("db01", "db01"),
+        ] {
+            assert_eq!(tcp_form(unc), expected, "{unc}");
         }
     }
 
