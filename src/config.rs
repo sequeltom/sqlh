@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::cli::Opts;
 use crate::credman;
-use crate::db::{Auth, ConnectOptions, Encrypt};
+use crate::db::{Auth, ConnectOptions, Encrypt, check_server};
 use crate::error::Failure;
 use crate::output::Limits;
 
@@ -219,12 +219,19 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
         None => None,
     };
     let p = profile.clone().unwrap_or_default();
-    let server = opts
-        .server
-        .clone()
-        .or(p.server.clone())
-        .or_else(|| env("SQLCMDSERVER"))
-        .unwrap_or_else(|| ".".into());
+    // Where the server came from, for the message when it is refused.
+    let (server, origin) = if let Some(server) = &opts.server {
+        (server.clone(), "-S".to_owned())
+    } else if let Some(server) = &p.server {
+        (server.clone(), format!("profile {} server", p.name))
+    } else if let Some(server) = env("SQLCMDSERVER") {
+        (server, "SQLCMDSERVER".to_owned())
+    } else {
+        (".".to_owned(), "-S".to_owned())
+    };
+    // A Named Pipes request to another machine can't be timed out or cancelled, so it is
+    // refused here, whichever way the server was given (DESIGN.md §4.2).
+    check_server(&server).map_err(|reason| Failure::usage(format!("{origin} {reason}")))?;
 
     // Decide the auth method first, with the same precedence as everything else, then the
     // login. A Windows-auth profile stays Windows auth whatever SQLCMDUSER says.
@@ -797,6 +804,53 @@ mod tests {
                 login(&resolve_in(&opts, FILE, &env).unwrap()).as_deref(),
                 Some("environment_login")
             );
+        }
+
+        // DESIGN.md §4.2: a Named Pipes request to another machine is refused whichever way
+        // the server is given, and the message says which. Only the server that would be
+        // used counts: a flag replaces a profile's.
+        #[test]
+        fn a_remote_named_pipe_is_refused_from_every_source() {
+            use crate::error::Exit;
+            let file = "[profiles.old]\nserver = \"np:db01\"\nauth = \"windows\"\n";
+            let refused = |opts: &Opts, env: &[(&str, &str)]| {
+                let failure = resolve_in(opts, file, env).err().expect("refused");
+                assert_eq!(failure.exit, Exit::Usage);
+                failure.message
+            };
+            let flag = Opts {
+                server: Some(r"\\db01\pipe\sql\query".into()),
+                ..Opts::default()
+            };
+            assert!(
+                refused(&flag, &[])
+                    .starts_with(r"-S \\db01\pipe\sql\query: Named Pipes to a remote"),
+            );
+            let message = refused(&with_profile("old"), &[]);
+            assert!(
+                message.starts_with("profile old server np:db01: Named Pipes to a remote"),
+                "{message}"
+            );
+            assert!(message.ends_with("connect over TCP: -S db01"), "{message}");
+            let message = refused(&Opts::default(), &[("SQLCMDSERVER", "np:db01")]);
+            assert!(
+                message.starts_with("SQLCMDSERVER np:db01: Named Pipes to a remote"),
+                "{message}"
+            );
+
+            let replaced = Opts {
+                server: Some("db01".into()),
+                ..with_profile("old")
+            };
+            let settings = resolve_in(&replaced, file, &[]).unwrap();
+            assert_eq!(settings.connect.server, "db01");
+            for local in ["np:.", r"\\.\pipe\sql\query", "lpc:.", "tcp:db01"] {
+                let opts = Opts {
+                    server: Some(local.into()),
+                    ..Opts::default()
+                };
+                assert!(resolve_in(&opts, file, &[]).is_ok(), "{local}");
+            }
         }
 
         #[test]

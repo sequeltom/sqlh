@@ -360,6 +360,181 @@ fn ctrl_break_cancels_a_connect() {
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
 
+// Phase 2 review, answer 1: a Named Pipes request to another machine is refused before
+// anything connects, however the server is named. The driver's pipe open can't be timed out or
+// cancelled: it held a run for 21 s, past -l and Ctrl+C. With -l 30, a run that tried would
+// still be going; exit 3 within moments shows that nothing was tried.
+#[test]
+fn remote_named_pipes_are_refused_before_anything_connects() {
+    // The text format escapes a backslash as two.
+    let escaped = |text: &str| text.replace('\\', r"\\");
+    let started = Instant::now();
+    for (server, tcp) in [
+        ("np:192.0.2.1", "192.0.2.1"),
+        (r"NP:db01\SALES", r"db01\SALES"),
+        (r"\\192.0.2.1\pipe\sql\query", "192.0.2.1"),
+        (r"tcp:\\db01\pipe\MSSQL$SALES\sql\query", r"db01\SALES"),
+    ] {
+        let r = sqlh_args(&["-S", server, "-l", "30", "-Q", "SELECT 1"]);
+        assert_eq!(r.code, 3, "{server}: {}", r.stdout);
+        let expected = format!(
+            "-- error: -S {}: Named Pipes to a remote server aren't supported, because their \
+             open can't be timed out or cancelled; connect over TCP: -S {}\n\
+             -- failed (exit 3): usage error (see sqlh --help), ",
+            escaped(server),
+            escaped(tcp)
+        );
+        assert!(r.stdout.starts_with(&expected), "{server}: {}", r.stdout);
+    }
+
+    // The server can come from SQLCMDSERVER or a profile, and the message says which.
+    let r = run(sqlh()
+        .env("SQLCMDSERVER", "np:db01")
+        .args(["-l", "30", "-Q", "SELECT 1"]));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .starts_with("-- error: SQLCMDSERVER np:db01: Named Pipes to a remote server"),
+        "{}",
+        r.stdout
+    );
+    let dir = scratch("remote_pipe_profile");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.old]\nserver = \"np:db01\"\nauth = \"windows\"\nlogin_timeout = 30\n",
+    )
+    .unwrap();
+    let r = run(sqlh()
+        .env("SQLH_CONFIG", &config)
+        .args(["--profile", "old", "-Q", "SELECT 1"]));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .starts_with("-- error: profile old server np:db01: Named Pipes to a remote server"),
+        "{}",
+        r.stdout
+    );
+    // A flag replaces the profile's server, so the profile's pipe no longer matters.
+    let r = run(sqlh().env("SQLH_CONFIG", &config).args([
+        "--profile",
+        "old",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+        "-Q",
+        "SELECT 1",
+    ]));
+    assert_reached_connect(&r, "a flag replaces the profile's server");
+
+    // `profile add` refuses it too, before it asks for a password or saves anything.
+    let saved = dir.join("saved.toml");
+    let r = run(sqlh()
+        .env("SQLH_CONFIG", &saved)
+        .args(["profile", "add", "dev", "-S", "np:db01", "-U", "reader"]));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .starts_with("-- error: -S np:db01: Named Pipes to a remote server"),
+        "{}",
+        r.stdout
+    );
+    assert!(!saved.exists(), "no profile was saved");
+
+    // Local pipes aren't refused: they get as far as the driver, and whatever it says.
+    for server in [
+        "np:.",
+        "NP:localhost",
+        r"\\.\pipe\sql\query",
+        "lpc:.",
+        "tcp:127.0.0.1,1",
+    ] {
+        let r = sqlh_args(&["-S", server, "-l", "1", "-Q", "SELECT 1"]);
+        assert_ne!(r.code, 3, "{server}: {}", r.stdout);
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+// Phase 2 review, answer 2: a name can have several addresses, and they are tried in turn. On
+// a dual-stack machine `localhost` has two, ::1 and 127.0.0.1, and a refused attempt at each takes
+// about 2 s. Each TCP attempt gets -l seconds and the whole login one more. If every attempt
+// fails before that deadline the run is exit 2 (4 s here); if the deadline expires first, even
+// during a later address's attempt, it is exit 4. The four runs go at once, as they don't share
+// anything: the name with the default -l, the name with -l 2, and each address alone with -l 2.
+#[test]
+fn a_name_with_several_addresses_is_tried_in_turn_until_the_login_deadline() {
+    use std::net::ToSocketAddrs;
+    let addresses = ("localhost", 1)
+        .to_socket_addrs()
+        .map_or(0, Iterator::count);
+    if addresses < 2 {
+        eprintln!("skipped: localhost has {addresses} address(es) here, and the test needs two");
+        return;
+    }
+    let timed = |args: &[&str]| {
+        let started = Instant::now();
+        let r = sqlh_args(args);
+        (r, started.elapsed())
+    };
+    let ((both, both_time), (cut, cut_time), (v4, v4_time), (v6, v6_time)) =
+        std::thread::scope(|scope| {
+            let both = scope.spawn(|| timed(&["-S", "localhost,1", "-Q", "SELECT 1"]));
+            let cut = scope.spawn(|| timed(&["-S", "localhost,1", "-l", "2", "-Q", "SELECT 1"]));
+            let v4 = scope.spawn(|| timed(&["-S", "127.0.0.1,1", "-l", "2", "-Q", "SELECT 1"]));
+            let v6 = scope.spawn(|| timed(&["-S", "::1,1", "-l", "2", "-Q", "SELECT 1"]));
+            (
+                both.join().unwrap(),
+                cut.join().unwrap(),
+                v4.join().unwrap(),
+                v6.join().unwrap(),
+            )
+        });
+
+    // Each address alone with -l 2 is exit 2, whatever it takes, as the deadline (3 s) is past
+    // its attempt (2 s). The test relies on a refusal taking about that long at both of them;
+    // where it doesn't, there is nothing to show.
+    for (run, time, name) in [(&v4, v4_time, "127.0.0.1"), (&v6, v6_time, "::1")] {
+        assert_eq!(run.code, 2, "{name}: {}", run.stdout);
+        if time < Duration::from_millis(1500) {
+            eprintln!("skipped: a refused connect to {name} took only {time:?} here");
+            return;
+        }
+    }
+
+    // Both addresses refused, within the default deadline of 16 s: exit 2, after two attempts.
+    assert_eq!(both.code, 2, "{}", both.stdout);
+    assert!(
+        both.stdout
+            .starts_with("-- error: cannot connect to localhost,1 "),
+        "{}",
+        both.stdout
+    );
+    assert!(
+        (Duration::from_secs(3)..Duration::from_secs(10)).contains(&both_time),
+        "{both_time:?}"
+    );
+    // With -l 2 the first address ends at 2 s, a second starts, and the deadline expires one
+    // second into it: exit 4.
+    assert_eq!(cut.code, 4, "{}", cut.stdout);
+    assert!(
+        cut.stdout.starts_with(
+            "-- error: login timeout: localhost,1 (Windows auth, encrypt mandatory) didn't \
+             complete the login within 3 s;"
+        ),
+        "{}",
+        cut.stdout
+    );
+    assert!(
+        (Duration::from_millis(2500)..Duration::from_secs(8)).contains(&cut_time),
+        "{cut_time:?}"
+    );
+}
+
 // R01: an existing file that can't be replaced is refused before anything runs, or, if it
 // only becomes clear at the end, the run is exit 7 and the file is left exactly as it was.
 #[cfg(windows)]
@@ -919,7 +1094,9 @@ mod live {
         }
     }
 
-    // PLAN.md 2.4: Ctrl+Break cancels a running statement, and the server confirms it.
+    // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the
+    // connection stayed usable, and not that the server confirmed the cancel: the driver gives
+    // no receipt for its attention (see `Session::failure`).
     #[cfg(windows)]
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -960,9 +1137,13 @@ mod live {
         stderr.read_to_string(&mut rest).unwrap();
         assert_eq!(status.code(), Some(6), "{stdout}{rest}");
         assert!(
-            stdout.contains("-- error: cancelled by Ctrl+Break: the server confirmed the cancel\n"),
+            stdout.contains(
+                "-- error: cancelled by Ctrl+Break: the statement was cancelled; the connection \
+                 stayed usable\n"
+            ),
             "{stdout}"
         );
+        assert!(!stdout.contains("confirmed"), "{stdout}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 

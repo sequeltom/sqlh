@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::cli::{Opts, ProfileCommand};
 use crate::config::{self, AuthKind, Profile};
-use crate::db::{Column, Value};
+use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
 use crate::{Out, console, credman, finish, finish_ok, run_command, stdout_sink};
@@ -110,6 +110,9 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         .server
         .clone()
         .ok_or_else(|| Failure::usage("profile add needs -S server"))?;
+    // Before the password is asked for or anything is saved: a run with this server would be
+    // refused anyway (DESIGN.md §4.2).
+    check_server(&server).map_err(|reason| Failure::usage(format!("-S {reason}")))?;
 
     let stored = user.is_some() && matches!(credman::exists(name), Ok(true));
     let mut kept_password = false;

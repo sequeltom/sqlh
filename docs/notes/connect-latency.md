@@ -4,7 +4,7 @@ Measured 2026-10-10, on a working tree based on `a133ede`. This was a time-boxed
 
 ## Summary
 
-A one-shot `sqlh` call against the dev/test server spends about 195 ms connecting, and about 150 ms of that is the server checking the SQL login's password. SQL Server 2025 hashes SQL-authentication passwords with PBKDF2, which makes each login deliberately slow. sqlh and the driver add about 5 ms. The 40 ms target is out of reach for one-shot calls with SQL authentication on SQL Server 2025, so fast repeated turns need connection reuse (Phase 5).
+A one-shot `sqlh` call against the dev/test server spends about 195 ms connecting, and about 150 ms of that is the login step: the wait between sending the login packet and the server's reply. The likely cause is SQL Server 2025 hashing SQL-authentication passwords with PBKDF2, which makes each login deliberately slow, but **that is an inference** from the interval and Microsoft's documentation, not an isolated measurement. sqlh and the driver add about 5 ms. On this server the 40 ms target is out of reach for one-shot calls with SQL authentication, so fast repeated turns need connection reuse (Phase 5). One server on one LAN was measured: this supports prioritizing reuse, and is not a universal lower bound.
 
 ## Setup
 
@@ -31,7 +31,7 @@ Ten runs:
 | TCP connect | 5 ms | 5–7 ms | one round trip |
 | Prelogin | 6 ms | 3–9 ms | one round trip |
 | TLS | 26 ms | 14–88 ms | two round trips plus Schannel work, including about 2 ms to acquire credentials. The spikes are Wi-Fi. |
-| Login | 150 ms | 122–159 ms | the server checking the login |
+| Login | 150 ms | 122–159 ms | from sending the login packet to the server's reply |
 | Total connect | 195 ms | 145–260 ms | |
 | Session setup | 2–3 ms | 2–4 ms | the `SET` options and `BEGIN TRANSACTION`, one round trip |
 
@@ -39,23 +39,25 @@ Before connecting, sqlh spends about 3 ms on startup, settings and the Credentia
 
 ## Findings
 
-1. **The login is about 77% of the connect time, and it is server-side.** The client sends the login packet as soon as TLS completes, then waits 120 to 160 ms for the reply.
-   - Starting with SQL Server 2025, SQL-authentication passwords are hashed with PBKDF2 (RFC 2898): 100,000 iterations of SHA-512.
+1. **The login is about 77% of the connect time, and it is server-side.** The client sends the login packet as soon as TLS completes, then waits 120 to 160 ms for the reply. *(Measured.)*
+   - Starting with SQL Server 2025, SQL-authentication passwords are hashed with PBKDF2 (RFC 2898): 100,000 iterations of SHA-512. *(Documented by Microsoft.)*
    - Microsoft notes that this can lengthen SQL-authentication logins, mostly where connections aren't pooled. sqlh opens a new connection on every call, so every call pays it. See [Create a login: Background](https://learn.microsoft.com/sql/relational-databases/security/authentication-access/create-a-login).
-   - The measured time fits 100,000 HMAC-SHA-512 iterations on a server CPU.
+   - **Inference, not measurement:** the interval is consistent with 100,000 HMAC-SHA-512 iterations on a server CPU, so hashing is the likely main cause. Nothing here separates it from the server's other login work, so 150 ms is the whole interval, not the hashing alone.
 2. **TLS is the second cost, and the most variable one.** It takes two round trips over Wi-Fi, plus Schannel's work. The driver caches Schannel credentials per process, so a one-shot CLI always misses that cache; acquiring them costs about 2 ms.
 3. **TCP and prelogin take about one round trip each.**
 4. **sqlh and the driver add almost nothing:** about 3 ms before connecting, 2 ms for Schannel credentials, and under 1 ms between the driver's steps.
 
 ## Conclusions
 
-- **The 40 ms target can't be met for one-shot calls** with SQL authentication on SQL Server 2025. The login alone takes about 150 ms on this server, by the server's design. Over this Wi-Fi link, TCP, prelogin and TLS add about 35 ms more.
+- **The 40 ms target can't be met for one-shot calls** with SQL authentication on this server. The login step alone took about 150 ms, which fits the server's documented password hashing. Over this Wi-Fi link, TCP, prelogin and TLS add about 35 ms more.
 - **Nothing to fix upstream for speed.** No client-side change saves more than a few milliseconds.
 - **Phase 5 is needed:** an agent turn pays about 200 ms of connecting here before its query runs. Reusing a connection (MCP, or a local daemon) pays the login once.
 
 Not measured:
-- Windows authentication, which skips the password hash but isn't available on this setup.
-- Strict encryption (TDS 8.0), a wired network, and a second login within one process.
+- Windows authentication, which skips the password hash but isn't available on this setup. It would also test the inference: a much shorter login step on the same server would point at the hashing.
+- Other servers and networks: older SQL Server versions, other hardware, a wired or remote link.
+- The split of the login interval (a server-side trace would show it).
+- Strict encryption (TDS 8.0), and a second login within one process.
 - The release target, SQL Server 2025 Standard over a real network (checklist in PLAN.md §7).
 
 ## The driver logs packets in clear text at debug level
