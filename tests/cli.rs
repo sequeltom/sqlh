@@ -585,6 +585,140 @@ fn output_to_a_device_is_written_directly() {
     assert_eq!(r.stderr, "");
 }
 
+/// What `run_read_slowly` saw.
+struct SlowRun {
+    code: Option<i32>,
+    /// The stream that was read slowly, and the other one, read at full speed.
+    slow: String,
+    fast: String,
+    elapsed: Duration,
+}
+
+/// Runs sqlh on a refused statement far bigger than a pipe, with `-t 1`, and reads stdout (or
+/// stderr) slowly: 1,024 bytes every 50 ms. Delivering that takes several times `-t`, but the
+/// reader never pauses for anywhere near it.
+fn run_read_slowly(test: &str, extra: &[&str], slow_stderr: bool) -> SlowRun {
+    let input = scratch(test).join("big.sql");
+    fs::write(&input, format!("UPDATE [{}] SET x = 1", "a".repeat(96_000))).unwrap();
+    let input_arg = input.display().to_string();
+    let mut child = sqlh()
+        .args(["-i", &input_arg, "-t", "1", "--max-output", "0"])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let (mut slow, mut fast): (Box<dyn Read + Send>, Box<dyn Read + Send>) = if slow_stderr {
+        (Box::new(stderr), Box::new(stdout))
+    } else {
+        (Box::new(stdout), Box::new(stderr))
+    };
+    let started = Instant::now();
+    let slow = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = slow.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        received
+    });
+    let fast = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let _ = fast.read_to_end(&mut received);
+        received
+    });
+    let status = wait_within(&mut child, Duration::from_secs(60), test);
+    let elapsed = started.elapsed();
+    let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+    SlowRun {
+        code: status.code(),
+        slow: text(slow.join().unwrap()),
+        fast: text(fast.join().unwrap()),
+        elapsed,
+    }
+}
+
+// R11: the stall limit (-t) is about a reader that stops reading, not one that is slow. This
+// refusal is far bigger than a pipe, and the reader takes 1,024 bytes every 50 ms, so
+// delivering it outlasts -t several times over. The reader never pauses for anywhere near -t,
+// so the output is delivered whole, and the exit code is the guard's own (5), not 7.
+#[test]
+fn a_slow_reader_that_keeps_reading_is_not_a_stall() {
+    let r = run_read_slowly("r11_slow_reader", &[], false);
+    assert_eq!(r.code, Some(5), "{}", r.fast);
+    assert_eq!(r.fast, "");
+    assert!(
+        r.slow.contains(&"a".repeat(96_000))
+            && last_line(&r.slow).starts_with("-- failed (exit 5)"),
+        "the refusal wasn't delivered whole ({} bytes)",
+        r.slow.len()
+    );
+    assert!(
+        r.elapsed > Duration::from_secs(1),
+        "delivery was meant to outlast -t 1: {:?}",
+        r.elapsed
+    );
+}
+
+// R11: the same for csv, which writes its metadata and the refusal to stderr, a second stream
+// that the one delivery thread writes in order with stdout.
+#[test]
+fn a_slow_reader_of_csv_metadata_is_not_a_stall() {
+    let r = run_read_slowly("r11_slow_csv_reader", &["--format", "csv"], true);
+    assert_eq!(r.code, Some(5), "{}", last_line(&r.slow));
+    assert_eq!(r.fast, "");
+    assert!(
+        r.slow.contains(&"a".repeat(96_000))
+            && last_line(&r.slow).starts_with("-- failed (exit 5)"),
+        "the refusal wasn't delivered whole ({} bytes)",
+        r.slow.len()
+    );
+    assert!(
+        r.elapsed > Duration::from_secs(1),
+        "delivery was meant to outlast -t 1: {:?}",
+        r.elapsed
+    );
+}
+
+// R11 keeps the other side of the line: a reader that holds stdout open and takes nothing
+// beyond what the pipe holds is still a stall, exit 7 after -t. (The live suite checks the
+// same with a result that fills sqlh's queue.)
+#[test]
+fn a_reader_that_reads_nothing_is_still_a_stall() {
+    let input = scratch("r11_unread").join("big.sql");
+    fs::write(&input, format!("UPDATE [{}] SET x = 1", "a".repeat(96_000))).unwrap();
+    let input_arg = input.display().to_string();
+    let mut child = sqlh()
+        .args(["-i", &input_arg, "-t", "1", "--max-output", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let _held_open = child.stdout.take();
+    let started = Instant::now();
+    let status = wait_within(&mut child, Duration::from_secs(30), "an unread stdout");
+    let elapsed = started.elapsed();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(7), "{stderr}");
+    assert!(
+        stderr.contains("the reader stopped reading for 1 s (-t)")
+            && stderr.contains("the run itself ended with exit 5"),
+        "{stderr}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+}
+
 // F02: if the reader goes away, the output wasn't delivered: exit 7, never 0.
 #[test]
 fn undelivered_output_is_exit_7() {
