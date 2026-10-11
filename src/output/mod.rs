@@ -7,7 +7,10 @@
 //! the cap and is withheld whole past it. Everything else is text of unbounded length that
 //! must still be written: notes, a guard refusal, the closing error, `--verbose` lines.
 //! `Layout` shortens such text to what is left, ending it with `…[+N]`, and keeps the
-//! status line (JSON: the outcome fields) out of reach of all of it.
+//! status line (JSON: the outcome fields) out of reach of all of it. In text and csv the
+//! status line ends with a tail that says where the run went; its length depends on the names
+//! in it, so the budget holds exactly that much back on top of the two reserves
+//! (`Tally::reserve_ending`).
 
 pub mod csv;
 pub mod delivery;
@@ -79,7 +82,20 @@ pub const OUTPUT_RESERVE: u64 = 1024;
 /// shortened to stop this many bytes short of the cap, so that the status line (JSON: the
 /// outcome fields) and the closers of the result or batch still open always fit. The worst
 /// case for those, with every number at its widest, is well under it (tested per format).
+///
+/// In text and csv the status line also ends with where the run went (`Tally::reserve_ending`).
+/// That tail is as long as the names in it, so it isn't part of this constant: both reserves
+/// grow by exactly its length once the sink has it.
 pub const STATUS_RESERVE: u64 = 512;
+
+/// The most characters of a name from the server (the server, the database, the version) that
+/// the output carries: the `connection` object of JSON and the tail of the status line in
+/// text and csv (DESIGN.md §5). SQL Server names stop at 128, so a longer one isn't from a SQL
+/// Server; it is cut like a long value. That bounds both: at six bytes for a character that has
+/// to be escaped, the status line's tail takes at most 1,609 bytes (`text::WIDEST_ENDING` in
+/// the tests) and JSON's object under 2,000, which fit the smallest `--max-output` with room
+/// to spare.
+pub const NAME_CHARS: usize = 128;
 
 /// The smallest `--max-output` other than 0: room for some output plus the reserve.
 pub const MIN_MAX_OUTPUT: u64 = 4096;
@@ -162,10 +178,14 @@ pub trait Output: BatchSink {
     /// The connection is up, after `connect_ms` milliseconds. The facts come from the login
     /// itself, so there is no extra round trip. Called once, before the first batch, and not
     /// at all when nothing connected (a usage error, a guard refusal, a failed connect). A
-    /// sink that carries them refuses a call that comes too late.
+    /// sink refuses a call that comes too late, or a second one (`OutOfOrder`).
     ///
-    /// Only the JSON format carries them for now (DESIGN.md §5.2). Text and csv would add
-    /// tokens to every call; what, if anything, they say is owner decision 10 (PLAN.md §6).
+    /// JSON carries the server, the database the run started in and the connect time as
+    /// `connection` and `connect_ms` (DESIGN.md §5.2). Text and csv carry the server, the
+    /// database and the connect time as the tail of the status line, `; db01/master, connect
+    /// 195 ms` (§5.1; owner decision 10, PLAN.md §6). They do not carry the auth method or
+    /// whether the traffic is encrypted. The default does nothing, for a sink that carries
+    /// none of it.
     fn connected(&mut self, connection: &Connection, connect_ms: u128) -> io::Result<()> {
         let _ = (connection, connect_ms);
         Ok(())
@@ -449,7 +469,8 @@ struct Withheld {
     batches: u64,
     /// Notes and diagnostics that didn't fit, not even shortened.
     notes: u64,
-    /// The description of the connection (JSON), when the budget was already used up.
+    /// The description of the connection, when the budget was already used up: JSON's head, or
+    /// the tail of the status line in text and csv.
     connection: u64,
 }
 
@@ -478,6 +499,13 @@ pub struct Tally {
     messages_seen: usize,
     errors: u32,
     batch_max_severity: i32,
+    /// Bytes the end of the run needs on top of the two reserves: the tail of the status line
+    /// that names the connection (`reserve_ending`). Zero in JSON, which has no such tail.
+    ending: u64,
+    /// `reserve_ending` has been called: the connection is described once.
+    connection_told: bool,
+    /// A batch has begun, so the connection can no longer be described.
+    batch_begun: bool,
 }
 
 impl Tally {
@@ -501,19 +529,22 @@ impl Tally {
             messages_seen: 0,
             errors: 0,
             batch_max_severity: 0,
+            ending: 0,
+            connection_told: false,
+            batch_begun: false,
         }
     }
 
     /// Whether `bytes` more of the body fit in the output budget, given the `used` bytes
     /// written so far (both streams, and anything promised to the end). The budget keeps
-    /// `OUTPUT_RESERVE` for the end of the run. Once something doesn't fit, nothing more
-    /// does, so output never resumes after a gap.
+    /// `OUTPUT_RESERVE` for the end of the run, and the status line's tail on top of it.
+    /// Once something doesn't fit, nothing more does, so output never resumes after a gap.
     pub fn admit(&mut self, used: u64, bytes: usize) -> bool {
         if self.exhausted {
             return false;
         }
         let max = self.limits.max_output;
-        if max == 0 || used + bytes as u64 <= max.saturating_sub(OUTPUT_RESERVE) {
+        if max == 0 || used + bytes as u64 <= max.saturating_sub(OUTPUT_RESERVE + self.ending) {
             return true;
         }
         self.exhausted = true;
@@ -521,10 +552,41 @@ impl Tally {
     }
 
     /// Bytes a note, a guard refusal or a diagnostic may take, given the `used` bytes
-    /// written so far: what the budget has left, less `STATUS_RESERVE` (`usize::MAX`: no
-    /// limit).
+    /// written so far: what the budget has left, less `STATUS_RESERVE` and the status line's
+    /// tail (`usize::MAX`: no limit).
     pub fn note_room(&self, used: u64) -> usize {
-        self.room(used, STATUS_RESERVE)
+        self.room(used, STATUS_RESERVE + self.ending)
+    }
+
+    /// Text and csv, when the connection is described (`Output::connected`): the status line
+    /// will end with `bytes` more than the reserves were sized for, the tail that says where
+    /// the run went. Its length depends on the names in it, so it is held back from the
+    /// budget exactly, on top of both reserves, instead of being added to a constant that
+    /// every run would pay for at its widest. The status line is never shortened (DESIGN.md
+    /// §4.4), so the room is promised here and `admit` and `note_room` keep it.
+    ///
+    /// Returns whether the tail has room. When notes written before the connection (the one
+    /// about ignored sqlcmd flags) have left less than `bytes` before the status reserve, the
+    /// tail is left out and counted among what wasn't shown, the way JSON's head is, and the
+    /// body stops: the cap is the thing that gives way, and the status line stays whole.
+    ///
+    /// A second call, or one after a batch has begun, is the caller's bug: `OutOfOrder`.
+    pub fn reserve_ending(&mut self, used: u64, bytes: usize) -> io::Result<bool> {
+        if self.connection_told || self.batch_begun {
+            return Err(OutOfOrder::error(
+                "the connection was described twice, or after the first batch had begun; it \
+                 is described once, before the first batch (Output order, DESIGN.md §5.1)"
+                    .into(),
+            ));
+        }
+        self.connection_told = true;
+        if self.note_room(used) >= bytes {
+            self.ending = bytes as u64;
+            return Ok(true);
+        }
+        self.exhausted = true;
+        self.withhold_connection();
+        Ok(false)
     }
 
     /// Bytes the closing lines may take: what the budget has left (`usize::MAX`: no limit).
@@ -573,7 +635,8 @@ impl Tally {
         self.withheld.batches += 1;
     }
 
-    /// The description of the connection didn't fit the budget.
+    /// The description of the connection didn't fit the budget (JSON's head; text and csv go
+    /// through `reserve_ending`).
     pub fn withhold_connection(&mut self) {
         self.withheld.connection += 1;
     }
@@ -600,6 +663,7 @@ impl Tally {
     }
 
     pub fn begin_batch(&mut self, batch: &BatchInfo) {
+        self.batch_begun = true;
         self.source.clear();
         self.source.push_str(batch.source);
         self.multi_source = batch.multi_source;
@@ -1311,7 +1375,9 @@ mod tests {
 
     // R08: the reserve is sized for the widest footer plus the longest status line main.rs
     // builds (the JSON equivalent is tested in json.rs). If a status line grows, this is the
-    // test that says the reserve must too.
+    // test that says the reserve must too. The tail that says where the run went (PLAN.md
+    // 2.11) is not in it: its length depends on the names, so it is reserved exactly, on top
+    // (`Tally::reserve_ending`, tested below).
     #[test]
     fn the_worst_case_footer_and_status_fit_the_status_reserve() {
         let mut tally = Tally::new(Limits {
@@ -1323,16 +1389,135 @@ mod tests {
         tally.rows_shown = u64::MAX - 1;
         tally.cells_cut = u64::MAX;
         let footer = format!("-- {}\n", tally.footer());
-        let status = format!(
-            "-- failed (exit 1): {} errors, first in batch {}; {} later batches not run \
-             (--continue-on-error runs them), {} ms\n",
+        let status = format!("-- {}\n", text::tests::FILLING_STATUS);
+        // The status the sweeps use is the longest main.rs builds: every count at its widest.
+        let widest = format!(
+            "failed (exit 1): {} errors, first in batch {}; {} later batches not run \
+             (--continue-on-error runs them), {} ms",
             u32::MAX,
             usize::MAX,
             usize::MAX,
             u128::MAX
         );
+        assert_eq!(status, format!("-- {widest}\n"));
         let worst = footer.len() + status.len();
         assert!(worst <= STATUS_RESERVE as usize, "{worst} bytes");
+    }
+
+    // PLAN.md 2.11, DESIGN.md §4.4: the status line's tail (`; db01/master, connect 195 ms`)
+    // is held back from the budget by its own length, on top of both reserves, so the status
+    // line, which is never shortened, fits whatever the names hold, and a short tail costs the
+    // body a few bytes rather than the widest one's worth.
+    #[test]
+    fn the_status_tail_is_reserved_on_top_of_both_reserves() {
+        let tally = |max_output| {
+            Tally::new(Limits {
+                max_output,
+                ..Limits::default()
+            })
+        };
+        let mut t = tally(5000);
+        assert!(t.reserve_ending(0, 100).unwrap());
+        // The body stops 100 bytes sooner, notes 100 bytes sooner, and the closing lines keep
+        // everything the cap has left, the tail's room included: they hold the status line.
+        assert_eq!(
+            t.note_room(1000),
+            5000 - 1000 - STATUS_RESERVE as usize - 100
+        );
+        assert_eq!(t.closing_room(1000), 4000);
+        let body = 5000 - OUTPUT_RESERVE as usize - 100;
+        assert!(t.admit(0, body));
+        assert!(!t.admit(body as u64, 1));
+        let mut without = tally(5000);
+        assert!(without.admit(0, body + 100));
+        // No cap, no reserve.
+        let mut unlimited = tally(0);
+        assert!(
+            unlimited
+                .reserve_ending(u64::MAX / 2, usize::MAX / 2)
+                .unwrap()
+        );
+        assert_eq!(unlimited.note_room(7), usize::MAX);
+        assert!(unlimited.admit(u64::MAX / 2, usize::MAX / 2));
+    }
+
+    // The tail fits when the cap has that much left before the status reserve, exactly; when it
+    // doesn't, it is left out, the budget is spent, and the closing note counts it, as it
+    // counts JSON's head (`1 connection description`). The reserves stay as they were.
+    #[test]
+    fn a_status_tail_that_does_not_fit_is_left_out_and_counted() {
+        let tally = || {
+            Tally::new(Limits {
+                max_output: 5000,
+                ..Limits::default()
+            })
+        };
+        let room = 5000 - 4000 - STATUS_RESERVE;
+        let mut fits = tally();
+        assert!(fits.reserve_ending(4000, room as usize).unwrap());
+        assert_eq!(fits.note_room(4000), 0);
+        let mut tight = tally();
+        assert!(!tight.reserve_ending(4000, room as usize + 1).unwrap());
+        assert_eq!(tight.note_room(4000), room as usize);
+        assert!(!tight.admit(0, 1), "the budget is spent");
+        assert_eq!(
+            tight.limit_notes(),
+            [
+                "output stopped at the --max-output limit of 5000 bytes; the run continued, and \
+                 these weren't shown: 1 connection description"
+            ]
+        );
+    }
+
+    // The connection is described once, and before the first batch: a second call, or one
+    // after a batch began, is a bug of the caller's and changes nothing.
+    #[test]
+    fn a_status_tail_is_reserved_once_and_before_the_first_batch() {
+        let mut t = Tally::new(Limits::default());
+        assert!(t.reserve_ending(0, 10).unwrap());
+        let error = t.reserve_ending(0, 10).unwrap_err();
+        assert!(OutOfOrder::is(&error), "{error}");
+        assert_eq!(t.note_room(0), 1_000_000 - STATUS_RESERVE as usize - 10);
+
+        let mut t = Tally::new(Limits::default());
+        t.begin_batch(&BatchInfo {
+            number: 1,
+            total: 1,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+        });
+        assert!(OutOfOrder::is(&t.reserve_ending(0, 10).unwrap_err()));
+        assert_eq!(t.note_room(0), 1_000_000 - STATUS_RESERVE as usize);
+    }
+
+    // The widest tail, two names of 255 characters that are all six-byte escapes (cut to 128
+    // each) and a connect time of 39 digits, is 1,609 bytes. With the widest status line
+    // (above) it is the widest ending there can be, and the smallest cap the CLI accepts still
+    // leaves the body more than a thousand bytes after both: the tail costs a short tail's
+    // few bytes in a normal run and this only for names no SQL Server hands out.
+    #[test]
+    fn the_widest_status_tail_leaves_the_smallest_cap_a_body() {
+        use text::tests::{WIDEST_ENDING, widest_names};
+        let mut tally = Tally::new(Limits::default());
+        let ending = text::status_ending(&mut tally, 0, &widest_names(), u128::MAX).unwrap();
+        assert_eq!(ending.len(), WIDEST_ENDING);
+        assert_eq!(WIDEST_ENDING, 1609);
+        let body = MIN_MAX_OUTPUT - OUTPUT_RESERVE - WIDEST_ENDING as u64;
+        assert!(body > 1000, "{body} bytes");
+        // A normal tail costs the body about thirty bytes.
+        let usual = text::status_ending(
+            &mut Tally::new(Limits::default()),
+            0,
+            &text::tests::connection_to("db01", "master"),
+            195,
+        )
+        .unwrap();
+        assert_eq!(usual, "; db01/master, connect 195 ms");
     }
 
     /// What the delivery thread wrote, readable from the test (the thread needs `Send`).

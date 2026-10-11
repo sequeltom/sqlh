@@ -1327,6 +1327,124 @@ fn early_errors_stay_within_max_output_in_every_format() {
     }
 }
 
+// PLAN.md 2.11, owner decision 10: the status line says where a run went only when it got
+// there. A usage error, a guard refusal and a failed connect end as they always did, in text
+// and in csv (where the status line is on stderr), with no server, database or connect time.
+#[test]
+fn a_run_that_never_connected_has_no_connection_tail() {
+    let cases = [
+        ("usage error", 3, vec!["-Q", "SELECT $(nosuchvariable)"]),
+        ("guard refusal", 5, vec!["-Q", "UPDATE dbo.T SET x = 1"]),
+        ("failed connect", 2, [DEAD, &["-Q", "SELECT 1"]].concat()),
+    ];
+    for (what, code, args) in &cases {
+        for format in ["text", "csv"] {
+            let mut all = args.clone();
+            all.extend(["--format", format]);
+            let r = sqlh_args(&all);
+            assert_eq!(r.code, *code, "{what}, {format}: {}", r.stdout);
+            let status = last_line(status_stream(format, &r));
+            assert!(
+                status.starts_with(&format!("-- failed (exit {code})")) && status.ends_with(" ms"),
+                "{what}, {format}: {status}"
+            );
+            // Neither the tail's `; server/database, connect N ms` nor anything like it.
+            assert!(
+                !status.contains("; ") && !status.contains("connect "),
+                "{what}, {format}: {status}"
+            );
+        }
+    }
+}
+
+// PLAN.md 2.13, owner decision 11, DESIGN.md §5.1: paths in `-- ` lines follow the escape
+// rule, and input is never escaped. A path as Explorer's "Copy as path" writes it, in double
+// quotes with single backslashes and spaces in the folder and file names, is taken exactly as
+// typed after -i and -o in cmd.exe and in PowerShell. The folders are named so that a backslash
+// is followed by an escape letter (`\new reports\tab files`, and `\tmp` is in the scratch
+// path): a path that went through the output format's decoder would hold a line feed and a
+// tab, and the file wouldn't be found. A blocked statement ends the run at the guard without
+// connecting, so exit 5 means the input was read and the output file got the refusal. With two
+// inputs the refusal names the second by the path as typed, and in the `-- ` line each
+// backslash is written `\\`, which a reader decodes like any other field.
+#[cfg(windows)]
+#[test]
+fn a_path_from_copy_as_path_works_after_i_and_o_in_every_shell() {
+    let blocked = "UPDATE dbo.T SET x = 1";
+    let base = scratch("copy as path");
+    let shells: Vec<Shell> = [Shell::Cmd, Shell::PowerShell51, Shell::PowerShell7]
+        .into_iter()
+        .filter(|shell| {
+            let installed = shell.installed();
+            if !installed {
+                eprintln!("skipped: {} isn't installed here", shell.name());
+            }
+            installed
+        })
+        .collect();
+    assert!(!shells.is_empty());
+    // Each shell in a thread of its own and a folder of its own: starting Windows PowerShell
+    // takes a moment.
+    let results: Vec<_> = shells
+        .iter()
+        .map(|&shell| {
+            let dir = base.join(format!("shell-{}", shell as u8));
+            let folder = dir.join("new reports").join("tab files");
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(folder.join("in file.sql"), blocked).unwrap();
+            fs::write(folder.join("read file.sql"), "SELECT 1").unwrap();
+            std::thread::spawn(move || {
+                // What Explorer puts on the clipboard: the full path in double quotes.
+                let copied = |name: &str| {
+                    let path = folder.join(name).display().to_string().replace('/', "\\");
+                    (format!("\"{path}\""), path)
+                };
+                let (input, _) = copied("in file.sql");
+                let (output, _) = copied("out file.txt");
+                let single = shell.run(&format!("sqlh -i {input} -o {output}"), &dir, &[]);
+                let written = fs::read_to_string(folder.join("out file.txt"));
+                let left = names(&folder);
+
+                let (read, _) = copied("read file.sql");
+                let (_, second) = copied("in file.sql");
+                let pair = shell.run(&format!("sqlh -i {read} -i {input}"), &dir, &[]);
+                (shell, single, written, left, pair, second)
+            })
+        })
+        .collect();
+    for result in results {
+        let (shell, single, written, left, pair, second) = result.join().unwrap();
+        let name = shell.name();
+        // -i and -o: the input was found and read, and the output file got the refusal.
+        assert_eq!(single.code, 5, "{name}: {}{}", single.stdout, single.stderr);
+        let written = written.unwrap_or_else(|e| panic!("{name}: no output file: {e}"));
+        assert!(
+            written.starts_with("-- blocked: line 1: UPDATE dbo.T would write"),
+            "{name}: {written}"
+        );
+        assert_eq!(single.stdout, "", "{name}");
+        assert_eq!(
+            left,
+            ["in file.sql", "out file.txt", "read file.sql"],
+            "{name}: a .partial file or another file was left"
+        );
+
+        // Two inputs: the refusal names the second by its path, written with the escape rule.
+        assert_eq!(pair.code, 5, "{name}: {}{}", pair.stdout, pair.stderr);
+        let line = pair.stdout.lines().next().unwrap_or("");
+        let field = format!(
+            "-- blocked: {}:1: UPDATE dbo.T would write",
+            text_escaped(&second)
+        );
+        assert!(line.starts_with(&field), "{name}: {line}\nwanted {field}");
+        // The bytes of the input are not the bytes of the output: the path as typed is nowhere
+        // in it. A reader decodes the field (`\\` is one backslash) and gets the path back.
+        assert!(!pair.stdout.contains(&second), "{name}: {line}");
+        let shown = &line["-- blocked: ".len()..line.find(":1: ").unwrap()];
+        assert_eq!(shown.replace(r"\\", r"\"), second, "{name}");
+    }
+}
+
 // R08: --verbose lines go through the output and count against --max-output. Offline the
 // connection never succeeds, so no line is produced, but the budget, the exit code and the
 // status line must be the same with the flag as without.
@@ -3145,6 +3263,95 @@ mod live {
             }
             assert!(elapsed < Duration::from_secs(10), "{format}: {elapsed:?}");
         }
+    }
+
+    /// `(what comes before the tail, server, database, connect_ms)` of a status line that ends
+    /// `; server/database, connect N ms`. The status of the runs below holds no other `; `.
+    fn split_tail(status: &str) -> (String, String, String, u64) {
+        let (head, tail) = status
+            .rsplit_once("; ")
+            .unwrap_or_else(|| panic!("no tail on the status line: {status}"));
+        let (names, ms) = tail
+            .strip_suffix(" ms")
+            .and_then(|tail| tail.rsplit_once(", connect "))
+            .unwrap_or_else(|| panic!("not a tail: {tail}"));
+        let (server, database) = names
+            .split_once('/')
+            .unwrap_or_else(|| panic!("no server/database in {names}"));
+        let ms = ms.parse().unwrap_or_else(|_| panic!("not a time: {ms}"));
+        (head.to_owned(), server.into(), database.into(), ms)
+    }
+
+    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.1 and §5.3: in text and csv the status line
+    // ends with the server, the database the run started in and the connect time, so the first
+    // response shows where it ran (agent trial 1 spent a call finding out it was in master).
+    // The database is the profile's own, not the one a later USE moved the session to; csv has
+    // the same tail on stderr and nothing of it on stdout; json agrees on the server and the
+    // database and doesn't repeat the tail in its `summary`; a run that fails after connecting
+    // has it too.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_status_line_names_the_profiles_database() {
+        let (p, db) = target();
+        let sql = "SELECT 1 AS a\nGO\nUSE master\nGO\nSELECT DB_NAME() AS db";
+
+        let r = live(&p, &db, &["-Q", sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        // The session ended in master, and the status line still says where the run began.
+        assert!(r.stdout.contains("\nmaster\n"), "{}", r.stdout);
+        let (head, server, database, connect_ms) = split_tail(last_line(&r.stdout));
+        assert!(head.starts_with("-- ok: 3 batches, "), "{head}");
+        assert_eq!(database, db);
+        assert!(!server.is_empty() && server != "?", "{server}");
+        // The run's own time is the one before the tail, and it includes the connect.
+        let elapsed: u64 = head
+            .strip_suffix(" ms")
+            .and_then(|head| head.rsplit(", ").next())
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_else(|| panic!("no elapsed time in {head}"));
+        assert!(connect_ms <= elapsed, "{connect_ms} > {elapsed}");
+
+        // csv: the metadata stream, and only it.
+        let csv = live(&p, &db, &["--format", "csv", "-Q", sql]);
+        assert_eq!(csv.code, 0, "{}", csv.stderr);
+        let (csv_head, csv_server, csv_database, _) = split_tail(last_line(&csv.stderr));
+        assert!(csv_head.starts_with("-- ok: 3 batches, "), "{csv_head}");
+        assert_eq!(
+            (csv_server.as_str(), csv_database.as_str()),
+            (server.as_str(), db.as_str())
+        );
+        assert!(!csv.stdout.contains("connect "), "{}", csv.stdout);
+
+        // json: the same server and database in `connection`; the summary is the status
+        // without the tail.
+        let json = live(&p, &db, &["--format", "json", "-Q", sql]);
+        assert_eq!(json.code, 0, "{}", json.stdout);
+        let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("valid JSON");
+        let json_server = doc["connection"]["server"].as_str().expect("a server");
+        assert_eq!(text_escaped(json_server), server);
+        assert_eq!(doc["connection"]["database"], db);
+        let summary = doc["summary"].as_str().expect("a summary");
+        assert!(summary.starts_with("ok: 3 batches, ") && !summary.contains("connect "));
+
+        // A failure after connecting is told where it happened too.
+        let r = live(&p, &db, &["-Q", "SELECT * FROM dbo.sqlh_no_such_table"]);
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        let (head, _, database, _) = split_tail(last_line(&r.stdout));
+        assert!(head.starts_with("-- failed (exit 1): 1 error"), "{head}");
+        assert_eq!(database, db);
+
+        // With no -d the run starts in the profile's database, whatever that is: the one the
+        // same session reports for itself.
+        let r = run(Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            .stdin(Stdio::null())
+            .args(["--profile", &p, "-Q", "SELECT DB_NAME() AS db"]));
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let (_, _, database, _) = split_tail(last_line(&r.stdout));
+        assert!(
+            r.stdout.contains(&format!("\n{database}\n")),
+            "the status line says {database}\n{}",
+            r.stdout
+        );
     }
 
     // R10: Ctrl+Break during the last wait of a run that completed. `SELECT 1` has run and

@@ -912,8 +912,9 @@ async fn run_session(
     };
     let mut session = connected.map_err(db_failure)?;
     let connect_ms = connect_started.elapsed().as_millis();
-    // The output says where the run is going (JSON does; text and csv wait for owner decision
-    // 10), from what the login already told us.
+    // The output says where the run went, from what the login already told us: JSON in its
+    // head, text and csv at the end of the status line (owner decision 10). Not said when
+    // nothing connected, which is every path that returns before this point.
     out.connected(&session.connection(), connect_ms)
         .map_err(output_failure)?;
     // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.

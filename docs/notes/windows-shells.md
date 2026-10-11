@@ -11,6 +11,7 @@ Measured 2026-10-11 on the dev machine: Windows 11 Pro 10.0.26200 (en-US, OEM co
 | Piped non-ASCII text in Windows PowerShell 5.1 | Arrives as `?`, silently. `--help` and DESIGN.md §4.1 say to set `$OutputEncoding` or use `-Q`/`-i`. Verified live. | `src/help.txt`, DESIGN.md §4.1 |
 | Piped text in another encoding (cmd.exe at an OEM page, PowerShell with the console's encoding) | Refused as not valid UTF-8 (it already was), now with the fix named. | `decode_source` in `main.rs` |
 | Forward slashes, UNC, relative paths, spaces for `-i`, `-o`, `SQLH_CONFIG` | All worked already. Now pinned by a test. | test `path_forms_work_for_input_output_and_config` |
+| A path from Explorer's "Copy as path" (double-quoted, single backslashes, spaces) after `-i` and `-o` | Works as is in cmd.exe, Windows PowerShell 5.1, PowerShell 7 and Git Bash. Input is never escaped; the same path in a `-- ` line has its backslashes doubled (owner decision 11). | test `a_path_from_copy_as_path_works_after_i_and_o_in_every_shell`; DESIGN.md §5.1 |
 | `-Q` quoting | Works in every shell for one line without `"`, `$`, `%` or a backtick, with single quotes inside. Table below. | DESIGN.md §4.1; test `the_documented_q_form_reaches_sqlh_intact_in_every_shell` |
 | PowerShell capturing output (`$r = sqlh ...`) at a non-UTF-8 console | Garbled in 5.1 and 7 alike. Documented, with the two fixes. | DESIGN.md §4.1 |
 | The console code page that `console::use_utf8` set and never restored | **Removed, not restored.** The switch was never needed, so there is nothing to put back on any exit path. | `console.rs`; DESIGN.md §11; test `sqlh_leaves_the_console_code_page_alone` |
@@ -75,7 +76,7 @@ Now, when the path isn't found and has the form `/<letter>` followed by `/` or t
 -- error: -i /c/code/x.sql: The system cannot find the path specified. (os error 3); that is a Git Bash path, which only Git Bash converts; in cmd.exe and PowerShell write C:\\code\\x.sql or C:/code/x.sql
 ```
 
-The backslashes are doubled by the text format (DESIGN.md §5.1; owner decision 11 is open), which is why the forward-slash spelling is offered too: it reads the same in text, json and csv, and every Windows API and sqlh accept it. A path that is found is used as written. `//server/share` (a UNC path), `/tmp/x` and `/cygdrive/c/...` get no hint. For `SQLH_CONFIG` the check is on the folder, because a missing file is normal: `SQLH_CONFIG /c/Users/me/profiles.toml: the folder wasn't found; that is a Git Bash path, ...`.
+The backslashes are doubled by the text format (DESIGN.md §5.1; owner decision 11, settled 2026-10-11: a path in a `-- ` line keeps the escape rule, see "Copy as path" below), which is why the forward-slash spelling is offered too: it reads the same in text, json and csv, and every Windows API and sqlh accept it. A path that is found is used as written. `//server/share` (a UNC path), `/tmp/x` and `/cygdrive/c/...` get no hint. For `SQLH_CONFIG` the check is on the folder, because a missing file is normal: `SQLH_CONFIG /c/Users/me/profiles.toml: the folder wasn't found; that is a Git Bash path, ...`.
 
 ## Paths
 
@@ -95,6 +96,15 @@ Every form below worked for `-i` and for `-o` (the file is created as a `.partia
 - **Spaces** need quotes in every shell (`-i "C:\my dir\a b.sql"`). Single quotes work in PowerShell and Git Bash, not in cmd.exe, which passes them through. A directory with a trailing backslash inside quotes (`"C:\out dir\"`) swallows the rest of the line in cmd.exe and Windows PowerShell 5.1 (the `\"` is an escaped quote); nothing in sqlh takes a directory.
 - **`~`** is expanded to a native program only by PowerShell 7; cmd.exe and Windows PowerShell 5.1 pass `~\a.sql` as is, and sqlh reports it as not found.
 - **`%TEMP%`, `$env:TEMP`** are expanded by the shell, as expected.
+
+### Copy as path (owner decision 11, 2026-10-11)
+
+Explorer's "Copy as path" puts the full path on the clipboard in double quotes with single backslashes: `"C:\code\new reports\tab files\in file.sql"`. Pasted after `-i` or `-o` it is the argument as it stands. **Input is never escaped**: the escape rule (a backslash is `\\`, `\n` is a line feed) is for what sqlh writes, and a path is taken exactly as typed. The folders in the test are named so that a decoder would show: `\new reports` and `\tab files` (and `\tmp` in the scratch path) would be read as a line feed and a tab.
+
+- **By test**, `a_path_from_copy_as_path_works_after_i_and_o_in_every_shell`, in cmd.exe, Windows PowerShell 5.1 and PowerShell 7: `sqlh -i "<path>" -o "<path>"` with a blocked statement, so the run ends at the guard without connecting. Exit 5, the refusal in the output file, no `.partial` file left; and with two inputs, `sqlh -i "<a>" -i "<b>"`, exit 5 and the refusal names the second path.
+- **By hand, in Git Bash**, against the release build, the same paths. Double quotes and single quotes both give exit 5 (the input was read, the output file got the refusal). **Unquoted** backslashes are removed by bash: `-i C:\code\sqlharness\x.sql` reaches sqlh as `C:codesqlharnessx.sql`, which is not found (`-- error: -i C:codesqlharnessx.sql: The system cannot find the file specified. (os error 2)`). That is the shell's rule, not sqlh's, and the quotes Explorer puts around the path avoid it.
+- **In a `-- ` line the path has its backslashes doubled.** With two inputs the refusal reads `-- blocked: C:\\code\\...\\new reports\\tab files\\in file.sql:1: UPDATE dbo.T would write; ...`. A reader decodes the field like any other (`\\` is `\`) and gets the path back. Copied back as it is, a local path still works (Windows folds `\\`), a UNC path does not (`\\\\server\\share`).
+- **Rejected** (decision 11): writing forward slashes in `-- ` lines (it rewrites what was typed, and some cmd built-ins refuse forward slashes), and escaping a backslash only before an escape letter (a second reader rule, and `C:\new` would still be doubled).
 
 ## `-S`
 
