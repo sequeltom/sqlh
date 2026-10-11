@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
-use crate::db::{BatchSink, ServerMessage};
+use crate::db::{BatchSink, Connection, ServerMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -84,6 +84,35 @@ pub const STATUS_RESERVE: u64 = 512;
 /// The smallest `--max-output` other than 0: room for some output plus the reserve.
 pub const MIN_MAX_OUTPUT: u64 = 4096;
 
+/// The error a sink returns for an event that came out of order (`Tally::outside_rows`, and
+/// `Output::connected` of the JSON sink). It is an `io::Error` of kind `InvalidInput` that
+/// carries this, so the caller can tell it from a failure to write: the order is a promise of
+/// sqlh and its driver, a broken one is a bug, and the run ends as an internal error (exit 10)
+/// rather than as undeliverable output (exit 7; DESIGN.md §5.1 and §6).
+#[derive(Debug)]
+pub struct OutOfOrder(String);
+
+impl OutOfOrder {
+    pub fn error(message: String) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, OutOfOrder(message))
+    }
+
+    /// Whether `error` is a sink's refusal of an event out of order.
+    pub fn is(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<OutOfOrder>())
+    }
+}
+
+impl std::fmt::Display for OutOfOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OutOfOrder {}
+
 /// Where a batch comes from, for markers and error line mapping.
 pub struct BatchInfo<'a> {
     /// 1-based position in the run, counting `GO n` repeats.
@@ -98,6 +127,10 @@ pub struct BatchInfo<'a> {
     pub line_map: &'a [u32],
     pub run: u32,
     pub runs: u32,
+    /// The run clock when the batch started, in milliseconds: the clock that
+    /// `Summary::elapsed_ms` and `Output::end_batch` read, so a batch's duration is a
+    /// difference of two readings and no sink has to look at the time itself.
+    pub started_ms: u128,
 }
 
 impl BatchInfo<'_> {
@@ -126,8 +159,20 @@ pub struct Summary<'a> {
 }
 
 pub trait Output: BatchSink {
+    /// The connection is up, after `connect_ms` milliseconds. The facts come from the login
+    /// itself, so there is no extra round trip. Called once, before the first batch, and not
+    /// at all when nothing connected (a usage error, a guard refusal, a failed connect). A
+    /// sink that carries them refuses a call that comes too late.
+    ///
+    /// Only the JSON format carries them for now (DESIGN.md §5.2). Text and csv would add
+    /// tokens to every call; what, if anything, they say is owner decision 10 (PLAN.md §6).
+    fn connected(&mut self, connection: &Connection, connect_ms: u128) -> io::Result<()> {
+        let _ = (connection, connect_ms);
+        Ok(())
+    }
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()>;
-    fn end_batch(&mut self) -> io::Result<()>;
+    /// The batch is over. `ended_ms` is the run clock (see `BatchInfo::started_ms`).
+    fn end_batch(&mut self, ended_ms: u128) -> io::Result<()>;
     /// A note about the run. Shortened (`…[+N]`) to fit what is left of `--max-output`, or
     /// counted as withheld when not even that fits.
     fn note(&mut self, text: &str) -> io::Result<()>;
@@ -140,7 +185,8 @@ pub trait Output: BatchSink {
     /// take the line just drops it; in csv, stderr is the metadata stream (DESIGN.md §5.3).
     fn diagnostic(&mut self, text: &str) -> io::Result<()>;
     /// Writes the end of the output: limit notes, any error, the status. Always called last,
-    /// also after a failure mid-result, and must leave well-formed output. The status is
+    /// also after a failure mid-result, and must leave well-formed output. A batch still
+    /// open ended when the run did: at `summary.elapsed_ms` on the run clock. The status is
     /// never shortened; the error and notes are, to fit the budget.
     fn finish(&mut self, summary: &Summary) -> io::Result<()>;
     fn tally(&self) -> &Tally;
@@ -403,6 +449,8 @@ struct Withheld {
     batches: u64,
     /// Notes and diagnostics that didn't fit, not even shortened.
     notes: u64,
+    /// The description of the connection (JSON), when the budget was already used up.
+    connection: u64,
 }
 
 /// Limits and counts shared by all formats.
@@ -414,6 +462,9 @@ pub struct Tally {
     line_map: Vec<u32>,
     results_seen: usize,
     hidden: bool,
+    /// A result set's rows are streaming: `columns` has been called and `end_rows` has not.
+    /// True for a hidden result set too, because the order is the caller's, not the display's.
+    rows_open: bool,
     /// The output budget ran out: nothing more of the body is written.
     exhausted: bool,
     /// The budget ran out while the current result set was being shown.
@@ -439,6 +490,7 @@ impl Tally {
             line_map: Vec::new(),
             results_seen: 0,
             hidden: false,
+            rows_open: false,
             exhausted: false,
             cut: false,
             withheld: Withheld::default(),
@@ -521,6 +573,11 @@ impl Tally {
         self.withheld.batches += 1;
     }
 
+    /// The description of the connection didn't fit the budget.
+    pub fn withhold_connection(&mut self) {
+        self.withheld.connection += 1;
+    }
+
     /// Row counts of `statements` statements didn't fit the budget.
     pub fn withhold_row_counts(&mut self, statements: u64) {
         self.withheld.row_counts += statements;
@@ -550,10 +607,14 @@ impl Tally {
         self.line_map.clear();
         self.line_map.extend_from_slice(batch.line_map);
         self.batch_max_severity = 0;
+        // A batch starts with no result open. One that a failure cut short is closed by the
+        // sink (json marks it interrupted), and must not leave every event refused.
+        self.rows_open = false;
     }
 
     /// Starts a result set. Returns its number, or `None` when `--max-results` hides it.
     pub fn start_result(&mut self) -> Option<usize> {
+        self.rows_open = true;
         self.results_seen += 1;
         self.rows_total = 0;
         self.rows_shown = 0;
@@ -562,6 +623,31 @@ impl Tally {
         let max = self.limits.max_results;
         self.hidden = max > 0 && self.results_seen > max;
         (!self.hidden).then_some(self.results_seen)
+    }
+
+    /// The rows of the current result set are over (`end_rows`), shown or hidden.
+    pub fn end_rows(&mut self) {
+        self.rows_open = false;
+    }
+
+    /// The order of a batch's events (DESIGN.md §5.1, and `BatchSink` in `db`): between a
+    /// result set's `columns` and its `end_rows` the sink gets rows and nothing else. A
+    /// message, an error or a row count arrives before the result set or after it, so the
+    /// open result is never interrupted. `what` names the call for the error, which says so
+    /// and changes nothing: a sink asks this first and returns the error.
+    ///
+    /// It is an error in every build rather than a debug assertion: the events come from the
+    /// server, and a release build must neither panic on them nor write a document that
+    /// isn't valid. The run then ends as an internal error (exit 10, DESIGN.md §6): the
+    /// order is a promise of sqlh and its driver, so a broken one is a bug.
+    pub fn outside_rows(&self, what: &str) -> io::Result<()> {
+        if self.rows_open {
+            return Err(OutOfOrder::error(format!(
+                "{what} arrived while a result set's rows were streaming; the sink takes it \
+                 before the result set or after its end (BatchSink order, DESIGN.md §5.1)"
+            )));
+        }
+        Ok(())
     }
 
     pub fn result_hidden(&self) -> bool {
@@ -694,6 +780,11 @@ impl Tally {
                 ),
                 (w.batches, "batch", "batches"),
                 (w.notes, "note", "notes"),
+                (
+                    w.connection,
+                    "connection description",
+                    "connection descriptions",
+                ),
             ]
             .iter()
             .filter(|(n, _, _)| *n > 0)
@@ -999,6 +1090,82 @@ mod tests {
         );
     }
 
+    // PLAN.md 2.11: the description of the connection is a piece of the body, counted when
+    // the budget has no room for it.
+    #[test]
+    fn a_withheld_connection_description_is_counted() {
+        let mut tally = Tally::new(Limits {
+            max_output: 5000,
+            ..Limits::default()
+        });
+        assert!(!tally.admit(4000, 1));
+        tally.withhold_connection();
+        assert_eq!(
+            tally.limit_notes(),
+            [
+                "output stopped at the --max-output limit of 5000 bytes; the run continued, and \
+                 these weren't shown: 1 connection description"
+            ]
+        );
+    }
+
+    // PLAN.md 2.12: a result set is open from `columns` to `end_rows`, whether it is shown
+    // or hidden, and while it is open nothing but rows is taken. Refusing changes nothing.
+    #[test]
+    fn events_are_refused_while_a_result_set_is_open() {
+        let mut tally = Tally::new(Limits {
+            max_results: 1,
+            ..Limits::default()
+        });
+        assert!(tally.outside_rows("a message").is_ok());
+        for shown in [true, false] {
+            assert_eq!(tally.start_result().is_some(), shown);
+            for what in ["a message", "an error", "a row count"] {
+                let error = tally.outside_rows(what).unwrap_err();
+                assert!(OutOfOrder::is(&error), "{error}");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with(&format!("{what} arrived while a result set's rows were")),
+                    "{error}"
+                );
+            }
+            tally.end_rows();
+            assert!(tally.outside_rows("a message").is_ok());
+        }
+        // A result set that a failure cut short doesn't carry over into the next batch.
+        tally.start_result();
+        assert!(tally.outside_rows("a message").is_err());
+        tally.begin_batch(&BatchInfo {
+            number: 2,
+            total: 2,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+        });
+        assert!(tally.outside_rows("a message").is_ok());
+    }
+
+    // Only a sink's refusal is an `OutOfOrder`: an `InvalidInput` from a writer is not, so it
+    // stays a failure to write.
+    #[test]
+    fn only_a_refusal_is_out_of_order() {
+        assert!(OutOfOrder::is(&OutOfOrder::error("x".into())));
+        assert!(!OutOfOrder::is(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
+        assert!(!OutOfOrder::is(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "x"
+        )));
+        assert_eq!(OutOfOrder::error("why".into()).to_string(), "why");
+    }
+
     // R08: the reserve is sized for the widest footer plus the longest status line main.rs
     // builds (the JSON equivalent is tested in json.rs). If a status line grows, this is the
     // test that says the reserve must too.
@@ -1157,6 +1324,7 @@ mod tests {
             line_map: &[],
             run: 1,
             runs: 1,
+            started_ms: 0,
         };
         assert_eq!(batch.location(), "line 14");
         batch.multi_source = true;

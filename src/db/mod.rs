@@ -35,6 +35,16 @@ pub enum Auth {
     Sql { user: String, password: String },
 }
 
+impl Auth {
+    /// The method's name, as the output states it: `windows` or `sql`. Never the login.
+    pub fn method(&self) -> &'static str {
+        match self {
+            Auth::Integrated => "windows",
+            Auth::Sql { .. } => "sql",
+        }
+    }
+}
+
 pub struct ConnectOptions {
     pub server: String,
     pub database: Option<String>,
@@ -63,7 +73,30 @@ pub struct ServerMessage {
     pub text: String,
 }
 
-/// Receives a batch's results in wire order.
+/// Receives a batch's results, messages and errors in the order `Session::run` delivers them
+/// (DESIGN.md §5.1 and §5.2; the sinks refuse a call out of this order, PLAN.md 2.12):
+///
+/// - **A result set** is `columns`, then its rows (`row`, or `skipped_row` while
+///   `wants_values` is false), then `end_rows`. Between `columns` and `end_rows` the sink
+///   gets nothing else: no `message`, no `error`, no `rows_affected`. A sink answers such a
+///   call with an `OutOfOrder` error and changes nothing (`Tally::outside_rows`), and the run
+///   ends as an internal error (exit 10), so that a driver upgrade or a new caller can't put a
+///   message into the middle of a result and break the output without anyone noticing. When a
+///   run fails mid-result `end_rows` never comes; `Output::finish` closes what is open.
+/// - **A message** (an INFO token: `PRINT`, `RAISERROR` at severity 10 or below, a warning)
+///   lands at a statement boundary, not where the server sent it. The driver keeps the
+///   messages it reads while it moves through the response, and `Session::run` hands them
+///   over in the order they arrived, at each boundary before the statement's own outcome
+///   (its result set, its row count, its errors), and once more after the last statement.
+///   So a message the server sends while a result set's rows are streaming comes after that
+///   result set's `end_rows`, never between its rows. When the rows end in an error, the
+///   order is `end_rows`, the messages held, then the errors.
+/// - **A row count** (`rows_affected`) and **an error** are outside any result set too.
+///
+/// Messages keep their order among themselves. Their order against results, row counts and
+/// errors is the one above, which is not always the wire order. A statement's errors are
+/// reported once the driver has read the statement to its end, so a message the server sent
+/// after an error, but before that end, comes before the error.
 pub trait BatchSink {
     fn columns(&mut self, columns: &[Column]) -> io::Result<()>;
     /// False once the row limit is reached; remaining rows are then only counted.
@@ -74,6 +107,25 @@ pub trait BatchSink {
     fn rows_affected(&mut self, count: u64) -> io::Result<()>;
     fn message(&mut self, message: &ServerMessage) -> io::Result<()>;
     fn error(&mut self, error: &ServerMessage) -> io::Result<()>;
+}
+
+/// What the login says about the connection, for the output (JSON's `connection`, DESIGN.md
+/// §5.2). It is read from the session, so it costs no round trip, and it holds nothing from a
+/// credential: not the login name, never a connection string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Connection {
+    /// The server's own name for itself (`@@SERVERNAME`), which need not be the name that was
+    /// dialled. `None` when the server didn't report one.
+    pub server: Option<String>,
+    /// The server version, `major.minor.build`, from the login acknowledgement.
+    pub version: Option<String>,
+    /// The database in effect. The driver follows a `USE` (it applies the server's
+    /// environment-change token), so this is the current database whenever it is read.
+    pub database: String,
+    /// `windows` or `sql`.
+    pub auth: &'static str,
+    /// Whether the traffic after the login is encrypted.
+    pub encrypted: bool,
 }
 
 #[derive(Debug)]
@@ -177,6 +229,8 @@ async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(),
 
 pub struct Session {
     client: TdsClient,
+    /// How the login was made (`Auth::method`), for `connection`.
+    auth: &'static str,
 }
 
 impl Session {
@@ -241,21 +295,38 @@ impl Session {
         };
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
         client.take_info_messages();
-        Ok(Session { client })
+        Ok(Session {
+            client,
+            auth: options.auth.method(),
+        })
+    }
+
+    /// What the login says about the connection. Nothing is sent to the server; the driver
+    /// already holds all of it. The database is the current one, since the driver applies the
+    /// server's environment-change token for a `USE` (PLAN.md 2.11); read it right after the
+    /// connect and it is the database the first batch starts in.
+    pub fn connection(&self) -> Connection {
+        Connection {
+            server: self.client.server_reported_name().map(str::to_owned),
+            version: self
+                .client
+                .server_version()
+                .map(|v| format!("{}.{}.{}", v.major, v.minor, v.build)),
+            database: self.client.database().to_owned(),
+            auth: self.auth,
+            encrypted: self.client.is_encrypted(),
+        }
     }
 
     /// One line of connection facts for --verbose.
     pub fn describe(&self) -> String {
-        let version = self
-            .client
-            .server_version()
-            .map(|v| format!("{}.{}.{}", v.major, v.minor, v.build))
-            .unwrap_or_else(|| "?".into());
+        let connection = self.connection();
         format!(
-            "server {} version {version}, database {}, encrypted {}",
-            self.client.server_reported_name().unwrap_or("?"),
-            self.client.database(),
-            self.client.is_encrypted()
+            "server {} version {}, database {}, encrypted {}",
+            connection.server.as_deref().unwrap_or("?"),
+            connection.version.as_deref().unwrap_or("?"),
+            connection.database,
+            connection.encrypted
         )
     }
 
@@ -263,8 +334,11 @@ impl Session {
         self.client.has_active_transaction()
     }
 
-    /// Runs one batch, streaming results, messages and errors to `sink` in order. SQL errors
-    /// go to the sink and don't fail the call; only transport, timeout and output problems do.
+    /// Runs one batch, streaming results, messages and errors to `sink` in the order that
+    /// `BatchSink` describes. In particular, the messages the driver has buffered go out at the
+    /// top of each step, before that step's result set, row count or errors, and none is
+    /// handed over while a result set's rows are being read. SQL errors go to the sink and
+    /// don't fail the call; only transport, timeout and output problems do.
     pub async fn run(
         &mut self,
         sql: String,

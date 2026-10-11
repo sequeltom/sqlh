@@ -68,10 +68,21 @@ fn main() -> ExitCode {
         Ok(Command::Run(opts)) => run_command(*opts, started),
         Ok(Command::Profile(command)) => profile::run(command, started),
         Ok(Command::Help) => print_plain(HELP),
-        Ok(Command::Version) => print_plain(&format!("sqlh {}\n", env!("CARGO_PKG_VERSION"))),
+        Ok(Command::Version) => print_plain(&version_line()),
         Err(message) => fail(Failure::usage(message), Format::Text, started),
     };
     exit.into()
+}
+
+/// What `--version` prints: the program's version, and the version of the JSON document it
+/// writes (DESIGN.md §5.2), which the document itself starts with. Text and csv carry no
+/// version of their own, so a tool that wants to know what to expect asks here.
+fn version_line() -> String {
+    format!(
+        "sqlh {} (json contract {})\n",
+        env!("CARGO_PKG_VERSION"),
+        output::json::CONTRACT_VERSION
+    )
 }
 
 /// A panic is a bug, but it must still end with the documented exit code 10 rather than an
@@ -193,7 +204,7 @@ async fn run_and_deliver(
         .map_err(output_failure)
     };
     let (result, late) = match noted {
-        Ok(()) => execute(opts, settings, prepared, &mut out, &mut signals).await,
+        Ok(()) => execute(opts, settings, prepared, &mut out, &mut signals, started).await,
         Err(failure) => (Err(failure), None),
     };
     let exit = finish_async(&mut out, result, late, started, signals.as_mut().ok()).await;
@@ -673,12 +684,14 @@ fn prepare(opts: &Opts, settings: &Settings) -> Result<Prepared, Failure> {
 
 /// Runs the input, or reports why it won't run. The signal, if any, is one that arrived
 /// while the last batches finished, too late to change the outcome (`run_cancellable`).
+/// `started` is the run clock: the batches are timed on it, as the closing lines are.
 async fn execute(
     opts: &Opts,
     settings: &Settings,
     prepared: &Prepared,
     out: &mut Out,
     signals: &mut Result<Signals, String>,
+    started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     if let Some((location, blocked)) = &prepared.blocked {
         if let Err(e) = out.blocked(location, &blocked.reason, &blocked.advice) {
@@ -706,6 +719,7 @@ async fn execute(
         &prepared.batches,
         out,
         signals,
+        started,
     )
     .await
 }
@@ -795,10 +809,11 @@ async fn run_cancellable(
     batches: &[Batch],
     out: &mut Out,
     signals: &mut Signals,
+    started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     let root = Cancel::new();
     let cancel = root.child();
-    let work = run_session(opts, settings, sources, batches, out, &cancel);
+    let work = run_session(opts, settings, sources, batches, out, &cancel, started);
     tokio::pin!(work);
     tokio::select! {
         result = &mut work => (result, None),
@@ -834,6 +849,7 @@ async fn run_session(
     batches: &[Batch],
     out: &mut Out,
     cancel: &Cancel,
+    started: Instant,
 ) -> Result<Stats, Failure> {
     let timeout = settings.query_timeout;
     // --verbose and `profile test` say where the time to the first batch went (PLAN.md 2.1).
@@ -850,6 +866,10 @@ async fn run_session(
     };
     let mut session = connected.map_err(db_failure)?;
     let connect_ms = connect_started.elapsed().as_millis();
+    // The output says where the run is going (JSON does; text and csv wait for owner decision
+    // 10), from what the login already told us.
+    out.connected(&session.connection(), connect_ms)
+        .map_err(output_failure)?;
     // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
     // `--check` always gets it too, as a second line of defense behind NOEXEC.
     let wrap = !settings.allow_write || opts.check;
@@ -914,6 +934,7 @@ async fn run_session(
                 line_map: &batch.line_map,
                 run,
                 runs: batch.repeat,
+                started_ms: started.elapsed().as_millis(),
             })
             .map_err(output_failure)?;
             session
@@ -929,7 +950,8 @@ async fn run_session(
                     e => db_failure(e),
                 })?;
             stats.batches_run += 1;
-            out.end_batch().map_err(output_failure)?;
+            out.end_batch(started.elapsed().as_millis())
+                .map_err(output_failure)?;
             out.flush().map_err(output_failure)?;
             if out.tally().batch_max_severity() >= 11 {
                 stats.first_failed.get_or_insert(number);
@@ -975,7 +997,12 @@ fn db_failure(error: DbError) -> Failure {
 }
 
 /// Writing output failed mid-run: the reader went away, or the `-o` file couldn't be written.
+/// A sink that refused an event out of order (DESIGN.md §5.1) is not that: nothing is wrong
+/// with the reader, and the order is a promise of sqlh and its driver, so it is a bug.
 fn output_failure(error: io::Error) -> Failure {
+    if output::OutOfOrder::is(&error) {
+        return Failure::new(Exit::Internal, format!("internal error: {error}"));
+    }
     Failure::new(Exit::Undelivered, format!("writing output failed: {error}"))
 }
 
@@ -1099,6 +1126,30 @@ mod tests {
         let mut broken = out(0, false);
         let (delivered, _) = deliver_ok(&mut broken, Exit::Ok, None);
         assert_eq!(delivered, Exit::Undelivered);
+    }
+
+    // PLAN.md 2.12: a sink that refuses an event out of order has found a bug in sqlh or its
+    // driver, so the run is an internal error (exit 10), not undeliverable output (exit 7);
+    // a failure to write stays exit 7.
+    #[test]
+    fn an_event_out_of_order_is_an_internal_error_and_a_broken_pipe_is_not() {
+        let mut tally = output::Tally::new(Limits::default());
+        tally.start_result();
+        let refused = tally.outside_rows("a message").unwrap_err();
+        let failure = output_failure(refused);
+        assert_eq!(failure.exit, Exit::Internal);
+        assert!(
+            failure
+                .message
+                .starts_with("internal error: a message arrived while a result set's rows were"),
+            "{}",
+            failure.message
+        );
+        let broken = output_failure(io::Error::from(io::ErrorKind::InvalidInput));
+        assert_eq!(broken.exit, Exit::Undelivered);
+        let broken = output_failure(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert_eq!(broken.exit, Exit::Undelivered);
+        assert!(broken.message.starts_with("writing output failed: "));
     }
 
     // R09: a job that never finishes is abandoned at the deadline; one that does, isn't.

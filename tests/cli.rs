@@ -1361,6 +1361,76 @@ fn verbose_runs_stay_within_max_output() {
     }
 }
 
+/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 1.0)`.
+fn contract_version() -> String {
+    let r = sqlh_args(&["--version"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let line = r.stdout.trim_end();
+    let contract = line
+        .strip_prefix(&format!(
+            "sqlh {} (json contract ",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("unexpected --version output: {line:?}"));
+    let digits = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+    assert!(
+        contract
+            .split_once('.')
+            .is_some_and(|(major, minor)| digits(major) && digits(minor)),
+        "the contract version is major.minor: {contract:?}"
+    );
+    contract.to_owned()
+}
+
+// PLAN.md 2.11: the JSON document starts with its contract version, which `--version`
+// reports, and a run that never connected (a failed connect, a guard refusal, an error in the
+// input, nothing to run) has no description of a connection and no connect time.
+#[test]
+fn json_documents_start_with_the_contract_version() {
+    let contract = contract_version();
+    let head = format!("{{\"contract_version\":\"{contract}\",\"batches\":[]");
+    let dead = |sql: &'static str| {
+        let mut args = DEAD.to_vec();
+        args.extend(["-Q", sql]);
+        args
+    };
+    let cases = [
+        ("failed connect", dead("SELECT 1"), 2),
+        ("guard refusal", dead("UPDATE dbo.T SET x = 1"), 5),
+        ("input error", vec!["-Q", "SELECT $(no_such_variable)"], 3),
+        ("nothing to run", vec!["-Q", ""], 0),
+    ];
+    for (what, mut args, code) in cases {
+        args.extend(["--format", "json"]);
+        let r = sqlh_args(&args);
+        assert_eq!(r.code, code, "{what}: {}", r.stdout);
+        assert!(r.stdout.starts_with(&head), "{what}: {}", r.stdout);
+        let doc: serde_json::Value =
+            serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            doc.get("connection").is_none() && doc.get("connect_ms").is_none(),
+            "{what}: {doc}"
+        );
+        assert_eq!(doc["exit_code"], code, "{what}");
+    }
+}
+
+// PLAN.md 2.11: `--version` names the JSON contract version after the program's own, in
+// `sqlh 0.1.0 (json contract 1.0)` form, and nothing else. The contract is pinned here: a
+// new version is an updated DESIGN.md §5.2 and an updated test.
+#[test]
+fn version_reports_the_json_contract() {
+    let r = sqlh_args(&["--version"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stderr, "");
+    assert_eq!(
+        r.stdout,
+        format!("sqlh {} (json contract 1.0)\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(contract_version(), "1.0");
+}
+
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
 // break (U+0085, U+2028, U+2029) either. The run is refused before it connects, so no server
 // is needed. json is left out: its strings may hold these characters, and it has no
@@ -1930,5 +2000,157 @@ mod live {
         } else {
             assert!(!line.contains("(tcp "), "{line}");
         }
+    }
+
+    // PLAN.md 2.12 / DESIGN.md §5.1 and §5.2: where a message lands. No query was found that
+    // makes SQL Server send a message between two rows of a result: warnings raised per row
+    // (an aggregate that drops a NULL, an arithmetic warning) are held until the end of the
+    // statement, even in results of 50,000 and of 1.2 million rows (a parallel plan), and
+    // PRINT and RAISERROR can't run inside a query. The nearest cases are what this pins: a
+    // warning the server sends after the last row but before the statement is over, and an
+    // error that ends the rows. Each lands after the result, never among its rows, in every
+    // format.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_message_sent_during_a_result_lands_after_it() {
+        use serde_json::Value;
+        let (p, db) = target();
+        // Dropping a NULL in an aggregate warns once. Rows 4 to 6 have one.
+        let warning = "SELECT x.n, (SELECT SUM(t.v) FROM (SELECT CASE WHEN x.n >= 4 THEN NULL \
+                       ELSE 1 END AS v UNION ALL SELECT 1) AS t) AS s \
+                       FROM (VALUES (1), (2), (3), (4), (5), (6)) AS x(n)";
+        // The division fails on the third row, ending the statement and its rows.
+        let failing = "SELECT n, 10 / (n - 3) AS q FROM (VALUES (1), (2), (3), (4), (5)) AS x(n)";
+        for (what, sql, code, then) in [
+            ("a warning", warning, 0, "-- msg: "),
+            ("an error", failing, 1, "-- error 8134 "),
+        ] {
+            for format in ["text", "csv"] {
+                let r = live(&p, &db, &["--format", format, "-Q", sql]);
+                assert_eq!(r.code, code, "{what}, {format}: {}{}", r.stdout, r.stderr);
+                // text keeps everything on stdout; csv has the rows there and the rest on stderr.
+                let lines: Vec<&str> = if format == "csv" {
+                    &r.stderr
+                } else {
+                    &r.stdout
+                }
+                .lines()
+                .collect();
+                let footer = lines
+                    .iter()
+                    .position(|l| l.starts_with("-- ") && l.ends_with(" rows"))
+                    .unwrap_or_else(|| panic!("{what}, {format}: no footer: {lines:?}"));
+                assert!(
+                    lines[footer + 1].starts_with(then),
+                    "{what}, {format}: {lines:?}"
+                );
+                assert!(
+                    !lines[..footer]
+                        .iter()
+                        .any(|l| l.starts_with("-- msg:") || l.starts_with("-- error")),
+                    "{what}, {format}: {lines:?}"
+                );
+            }
+            let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+            assert_eq!(r.code, code, "{what}, json: {}", r.stdout);
+            let doc: Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+            let events = doc["batches"][0]["events"].as_array().expect("events");
+            assert_eq!(events.len(), 2, "{what}, json: {doc}");
+            assert_eq!(events[0]["type"], "result", "{what}, json: {doc}");
+            assert!(
+                events[0].get("interrupted").is_none(),
+                "{what}, json: {doc}"
+            );
+            assert_eq!(
+                events[0]["rows"].as_array().map(Vec::len),
+                events[0]["row_count"].as_u64().map(|n| n as usize),
+                "{what}, json: {doc}"
+            );
+            let kind = if code == 0 { "msg" } else { "error" };
+            assert_eq!(events[1]["type"], kind, "{what}, json: {doc}");
+        }
+    }
+
+    // PLAN.md 2.11: a JSON document starts with the contract version and says where the run
+    // went: the connection, taken from the login so the first response shows the database;
+    // how long connecting took; and how long each batch took. The database is the one the run
+    // started in, not the one a later USE moved the session to.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn json_says_where_the_run_went_and_how_long_it_took() {
+        let (p, db) = target();
+        let contract = contract_version();
+        let sql = "SELECT 1 AS a\nGO\nUSE master\nGO\nSELECT DB_NAME() AS db";
+        let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with(&format!(
+                "{{\"contract_version\":\"{contract}\",\"connection\":{{\"server\":"
+            )),
+            "{}",
+            r.stdout
+        );
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let connection = doc["connection"].as_object().expect("a connection");
+        let mut keys: Vec<&str> = connection.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["auth", "database", "encrypted", "server", "server_version"]
+        );
+        assert_eq!(connection["database"], db);
+        assert!(connection["server"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(matches!(
+            connection["auth"].as_str(),
+            Some("windows" | "sql")
+        ));
+        assert!(connection["encrypted"].is_boolean());
+        let version = connection["server_version"].as_str().expect("a version");
+        assert!(
+            version.split('.').count() == 3 && version.split('.').all(|n| n.parse::<u16>().is_ok()),
+            "{version}"
+        );
+        // The session ended in master, and the connection still says where it started.
+        assert_eq!(
+            doc["batches"][2]["events"][0]["rows"],
+            serde_json::json!([["master"]])
+        );
+        // Connecting, then three batches, all inside the run.
+        let connect_ms = doc["connect_ms"].as_u64().expect("connect_ms");
+        let batches = doc["batches"].as_array().unwrap();
+        assert_eq!(batches.len(), 3);
+        let in_batches: u64 = batches
+            .iter()
+            .map(|b| b["elapsed_ms"].as_u64().expect("elapsed_ms per batch"))
+            .sum();
+        let run = doc["elapsed_ms"].as_u64().unwrap();
+        assert!(
+            connect_ms + in_batches <= run,
+            "{connect_ms} + {in_batches} > {run}"
+        );
+    }
+
+    // PLAN.md 2.11: a run cut short by --max-output still has its connection, its times and
+    // its outcome, and is valid JSON no longer than the cap.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_cut_json_run_keeps_its_connection_and_times() {
+        let (p, db) = target();
+        let sql = "SELECT TOP (500) o.name, o.object_id, o.type_desc FROM sys.all_objects AS o \
+                   ORDER BY o.object_id; PRINT 'after';";
+        let r = live(
+            &p,
+            &db,
+            &["--max-output", "4096", "--format", "json", "-Q", sql],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.len() <= 4096, "{} bytes", r.stdout.len());
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        assert_eq!(doc["contract_version"], contract_version());
+        assert_eq!(doc["connection"]["database"], db);
+        assert!(doc["connect_ms"].is_u64());
+        assert_eq!(doc["batches"][0]["events"][0]["truncated"], true);
+        assert!(doc["batches"][0]["elapsed_ms"].is_u64(), "{doc}");
+        assert_eq!(doc["ok"], true);
     }
 }

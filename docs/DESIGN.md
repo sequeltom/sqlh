@@ -159,7 +159,7 @@ These keep a careless query from flooding an agent's context:
 - **Result sets and messages.** Past their caps (for example, a `WHILE` loop that selects or prints), output is counted, not printed.
 - **Row counts.** Consecutive row counts within a batch become one line, `-- 300 statements, 300 rows affected`, so a loop of inserts prints one line rather than 300. A result set, message or error in between starts a new line.
 - **Total output.** `--max-output` (default 1,000,000 bytes; 0 = no limit, otherwise at least 4096) caps the whole response in every format: the bytes sqlh writes to stdout (or `-o`) and stderr together never exceed it. They are counted as encoded UTF-8 after escaping, so a `\x01` costs 4 bytes and a `\u2028` 6. Everything counts: data, metadata, result footers, csv's `-- result` markers, JSON's brackets and closers, notes, a guard refusal, the closing error, the status line and `--verbose` lines. The exceptions are `--help` and `--version`; the last-resort messages on stderr when delivery itself has failed (exit 7) or sqlh has crashed (exit 10); and a usage error in the options themselves, found before `--max-output` is known, which keeps to the default cap. An error found after that, in a profile, in the input or at `-o`, keeps to the cap like any other output.
-  - **The body** (result sets, rows, messages, errors, row counts, batch markers) is written piece by piece while each piece fits in what the cap has left after a reserve of 1,024 bytes. Once one doesn't fit, nothing more of the body is written, even a small piece. The result set being shown still ends with its footer, `-- 80 of 500 rows shown (--max-output)`. JSON stays a valid document, with the cut result marked `"truncated":true`.
+  - **The body** (result sets, rows, messages, errors, row counts, batch markers, and json's description of the connection) is written piece by piece while each piece fits in what the cap has left after a reserve of 1,024 bytes. Once one doesn't fit, nothing more of the body is written, even a small piece. The result set being shown still ends with its footer, `-- 80 of 500 rows shown (--max-output)`. JSON stays a valid document, with the cut result marked `"truncated":true`.
   - **Text of any length** is shortened to fit, as a cut cell is: it ends with `…[+N]`, N being the number of characters left out (counted before escaping; a cut never splits an escape sequence or a character). That covers notes, a guard refusal, the closing error, the limit notes below, and `--verbose` lines.
     - A note, a refusal or a `--verbose` line is shortened when it is written, to what the cap has left less 512 bytes. JSON counts a note from the moment it arrives, although the document gets it last.
     - A guard refusal is cut in its variable parts only: the location, the reason (which can quote a huge identifier) and the advice. The words between them stay, so the agent still reads that nothing was run and what to do: `-- blocked: line 1: UPDATE [aaaa…[+16537]; nothing was run. Rerun with --allow-write if the write is intended`.
@@ -167,7 +167,7 @@ These keep a careless query from flooding an agent's context:
     - Text that cannot fit even as a bare marker is dropped and counted, and the closing note says so: `...these weren't shown: 1 note`. That stops the body too, like any piece that didn't fit.
   - **The end is never cut.** The status line (JSON: `ok`, `exit_code`, `summary`, `elapsed_ms`) is always written whole, and in text and csv the result being shown gets its footer, in JSON the open result and batch their closers. Two reserves make room for them:
     - The body stops 1,024 bytes short of the cap (the reserve above). The rest of the run's end uses that room: the footer or closers, the closing error, the note that the output stopped and what wasn't shown (counts of result sets, messages, errors, row counts, batches and notes), and the status. At the minimum cap of 4096 bytes the body has 3,072.
-    - Notes, refusals and `--verbose` lines stop 512 bytes short of the cap, however full it is. The widest ending that has to fit those 512 bytes (a footer or JSON's closers, and the status line, with every number at its widest and the longest status line sqlh builds) takes about 420, and the tests pin that. sqlh builds the status line from bounded parts and never shortens it; if a status line ever grows, the 512 must grow with it.
+    - Notes, refusals and `--verbose` lines stop 512 bytes short of the cap, however full it is. The widest ending that has to fit those 512 bytes (a footer or JSON's closers, which include the batch's `elapsed_ms`, and the status line, with every number at its widest and the longest status line sqlh builds) takes about 470, and the tests pin that. sqlh builds the status line from bounded parts and never shortens it; if a status line ever grows, the 512 must grow with it.
   - **Shortening changes no outcome.** A refusal is still exit 5 and a SQL error exit 1; the exit code, the status line and the JSON outcome fields say what happened whether or not the text around them was cut.
 - **Limits never change what runs.** Like the row limit, the output limit only stops printing: the run continues to the end, and the counts (rows, errors, the status line) stay exact. Whether to stop early instead is the open drain question (PLAN.md 2.6).
 - **Input.** At most 10 MB of SQL per run, across `-Q`, `-i` files and stdin, and again after `$(var)` substitution; `GO n` runs a batch at most 1000 times. Past either, the run is refused with exit 3 before anything connects.
@@ -202,11 +202,21 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 - **Batch marker:** `-- batch N (line L)` appears only when the input has more than one batch.
 - **Footer** after each result set: `-- N rows`, plus any truncation notes.
 - **Statement summaries:** `-- N rows affected` for DML. Consecutive ones become one line, `-- 300 statements, 300 rows affected` (§4.4).
-- **Messages:** `-- msg: text` for PRINT and messages of severity 10 or lower.
+- **Messages:** `-- msg: text` for PRINT and messages of severity 10 or lower. Where one lands is under "Order of events" below.
 - **Errors:** `-- error <num> (severity S, state T, line L[, proc P]): message`.
 - **Notes, refusals and the run's error:** `-- note: text`; `-- blocked: line L: reason; nothing was run. advice` for a guard refusal (exit 5); `-- error: text` for why the run stopped early (the closing lines come in this order: the error, the notes about limits that hid output, the status). With a short `--max-output` their variable text ends in `…[+N]`, N the characters left out (§4.4). The reason can quote an identifier of any length, so it is the part that gets cut; `; nothing was run.` and the advice are not.
 - **Final summary:** the last line of complete output, either `-- ok: ...` or `-- failed (exit N): ...`. It is never shortened, not even by `--max-output` (§4.4). Output is cut short only when it couldn't be delivered (exit 7) or sqlh crashed (exit 10, where the line is best effort). Then the exit code is what counts (§4.3, §6).
 - **Diagnostics:** `--verbose` writes `sqlh: <text>` lines to stderr, the one thing text and json put there. They are escaped like a note, counted in `--max-output` and shortened like a note; if stderr is closed they are lost and nothing else changes (§6).
+
+**Order of events**
+
+The output is not in the order of the server's bytes ("wire order"). It is in the order below, which holds for json (§5.2) and csv (§5.3) too. A result set is its `-- result N` line, its header, its rows and its footer, and **nothing else is ever written between them**: no message, no error, no row count. Those come before the result set or after its footer.
+
+- **Where a message lands.** A message (PRINT, RAISERROR at severity 10 or below, a server warning) is written at a statement boundary, not where the server sent it. The driver keeps the messages it reads while it moves through the response, and sqlh writes them in the order they arrived, at each boundary before the next statement's own output, and once more after the last statement. So a message the server sends while a result set's rows are streaming comes after that result set's footer, never between its rows. `PRINT 'a'; SELECT 1; PRINT 'b'` writes `a`, the result set, then `b`.
+- **Messages come before the output of the statement they precede.** At a boundary the held messages are written first, then the statement's result set, its row count or its errors. When a result set's rows end in an error, the order is the rows, the footer, the messages held, then the error.
+- **Messages and errors.** A statement's errors are reported once the driver has read the statement to its end, so a message the server sent after an error, within that statement, comes before the error. A constraint violation therefore writes `-- msg: The statement has been terminated.` before the `-- error 2627 ...` line it follows on the wire. The driver doesn't say which came first.
+- **Nothing was found that sends a message between two rows.** SQL Server 2025 sent every warning a query raised at the end of the statement, after its last row: a NULL dropped by an aggregate (in results of 50,000 rows, and of 1.2 million rows under a parallel plan) and a division by zero with `ANSI_WARNINGS` off. PRINT and RAISERROR can't run inside a query. The rule is for a server or a driver that does. The nearest real case is that warning, which the driver reads between the last row and the end of the statement, and an error that ends the rows; both land after the result.
+- **A sink refuses a call out of this order.** A message, an error or a row count that arrives between a result set's header and its footer is answered with an error and writes nothing, in every build: the run ends as an internal error (exit 10, §6) with `-- error: internal error: a message arrived while a result set's rows were streaming...`. That means a bug in sqlh, or a driver that changed, not a problem with the query or the reader. Without the refusal a json document would hold an event among a result's rows, and could be invalid.
 
 **Escaping (values, names, and every variable field in metadata lines)**
 
@@ -239,10 +249,13 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 
 ### 5.2 json
 
-`--format json` writes one JSON document. It is streamed, so memory stays flat, and the outcome fields come last because they are only known at the end.
+`--format json` writes one JSON document. It is streamed, so memory stays flat. The head (the contract version, and once sqlh has connected, the connection and how long that took) comes first because it is known before anything runs, and the outcome fields come last because they are only known at the end.
 
 ```json
-{"batches":[
+{"contract_version":"1.0",
+ "connection":{"server":"SQL01","database":"AppDb","auth":"sql","encrypted":true,"server_version":"17.0.1000"},
+ "connect_ms":31,
+ "batches":[
   {"batch":1,"source":"-Q","line":1,"events":[
     {"type":"msg","text":"starting"},
     {"type":"result",
@@ -250,15 +263,33 @@ id:int	name:nvarchar(50)	created:datetime2(7)
      "rows":[[1,"12.50"],[2,null]],
      "row_count":48213,"truncated":true,"cells_cut":0},
     {"type":"rows_affected","count":5},
-    {"type":"error","number":208,"severity":16,"state":1,"line":14,"text":"Invalid object name 'dbo.Nope'."}]}],
+    {"type":"error","number":208,"severity":16,"state":1,"line":14,"text":"Invalid object name 'dbo.Nope'."}],
+   "elapsed_ms":12}],
  "notes":["ignored sqlcmd flags -W (sqlh output is always compact)"],
  "error":"query timeout after 60 s in batch 2; ...",
  "ok":false,"exit_code":1,"summary":"failed (exit 1): 1 error, first in batch 1, 48 ms","elapsed_ms":48}
 ```
 
+**Contract version**
+- `contract_version` is the document's first field: `major.minor`, `"1.0"` here. `sqlh --version` reports it too, as `sqlh 0.1.0 (json contract 1.0)`, so a tool can see what to expect before it runs anything. Text and csv carry no version, because it would cost tokens on every call.
+- The major version changes only for an incompatible change: a field or an event type removed or renamed, or its type or meaning changed. A minor version may add optional fields, event types and enum values (the `type` of an event, the `auth` words). So a reader written for 1.x ignores fields and event types it doesn't know, and doesn't treat the values of an enumeration as a closed list.
+- 1.0 is the document described here: `contract_version`, `connection` and `connect_ms` in the head, and `elapsed_ms` on every batch.
+
+**Connection**
+- `connection` and `connect_ms` follow the version once sqlh has connected. They are written as soon as the login is done, before the first batch, from facts the login already gave, so they cost no round trip. When nothing connected (a usage error, a guard refusal, a failed connect, an input with no SQL) both are left out.
+- `connection` has five fields:
+  - `server`: the server's own name for itself (`@@SERVERNAME`), which need not be the name that was dialled; `null` if it reported none.
+  - `database`: the database in effect when the run starts, which is where the first batch runs: `-d`, else the profile's database, else the login's default (often `master`). A `USE` in the input moves the session on, and this field does not follow it. (The driver does track a `USE`, because it applies the server's environment-change token, so `Session::connection` would return the new database if it were read later. The head is written before the first batch, so it states where the run began.)
+  - `auth`: `"windows"` or `"sql"`. Never the login name.
+  - `encrypted`: whether the traffic after the login is encrypted.
+  - `server_version`: `major.minor.build`; `null` if the server reported none.
+- Never a connection string, and nothing from a credential. The names that come from the server are escaped like every string and cut after 128 characters with `…[+N]`. SQL Server's own names stop at 128, so the cut changes nothing real, and it bounds the object (under 2,000 bytes whatever the server sends), which is what keeps it inside the smallest `--max-output`.
+- `connect_ms` is the time to connect and log in, in milliseconds: the connect time `--verbose` reports. It tells a slow connect from a slow batch. Once connections are reused (PLAN.md Phase 5) it will be about 0.
+
 **Batches and events**
 - Each batch carries `batch`, `source` (a file name, `-Q` or `stdin`), `line` (where it starts), and `run`/`runs` when repeated by `GO n`.
-- Its `events` array keeps wire order, so messages and errors stay where they happened relative to results.
+- Its `events` array is in the order of §5.1's "Order of events", which is not the wire order: a message lands at a statement boundary, between results, and never among a result's `rows`. A message the server sends while a result's rows are streaming is an event after that result.
+- After its events, each batch carries `elapsed_ms`: how long it took, from when sqlh sent it until its last result was read (waits for a slow reader included). A batch cut short by a timeout, a cancel or a lost connection lasts until the run ends.
 - **result:**
   - `rows` holds only the shown rows (`--max-rows`), and `row_count` counts all of them.
   - `truncated` means rows were hidden; `cells_cut` counts values cut by `--max-cell` (they end in `…[+N]`).
@@ -276,9 +307,10 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 
 **Outcome**
 - `notes` (when present), `error` (when the run stopped early, including a guard block), `ok`, `exit_code`, `summary` (the text format's status line) and `elapsed_ms`.
-- Failures before any batch, such as a bad profile or a refused connection, still produce a well-formed document with `"batches":[]`.
+- Failures before any batch, such as a bad profile or a refused connection, still produce a well-formed document with `"batches":[]`. It has the `contract_version`; it has no `connection` or `connect_ms` when nothing connected.
 - A run that dies mid-result closes the open result with `"interrupted":true`.
-- **Within `--max-output` (§4.4)** the whole document is: valid, no longer than the cap, and with `ok`, `exit_code`, `summary` and `elapsed_ms` intact. What gives way is text. A note is shortened when it is recorded, and a note that can't fit even as a marker is left out and counted (`"...these weren't shown: 1 note"`). `error` is shortened when the document ends, in its variable parts if it is a guard refusal; a cut string ends in `…[+N]`, N the characters left out. The closers of the open result and batch (`],"row_count":...}]}`) and the outcome fields are never cut: the reserves in §4.4 leave room for them. `--verbose` lines are not in the document; they go to stderr, counted in the same cap.
+- **Within `--max-output` (§4.4)** the whole document is: valid, no longer than the cap, and with `ok`, `exit_code`, `summary` and `elapsed_ms` intact. What gives way is text. A note is shortened when it is recorded, and a note that can't fit even as a marker is left out and counted (`"...these weren't shown: 1 note"`). `error` is shortened when the document ends, in its variable parts if it is a guard refusal; a cut string ends in `…[+N]`, N the characters left out. The closers of the open result and batch (`],"row_count":...}],"elapsed_ms":N}`) and the outcome fields are never cut: the reserves in §4.4 leave room for them, with every number at its widest. `--verbose` lines are not in the document; they go to stderr, counted in the same cap.
+- The head with the `connection` is the first piece of the body and is admitted like one, so it counts against the cap and can't push the ending out of it. If notes and `--verbose` lines have already used up the room (only with a cap near the minimum), it is left out, and the closing note counts it among what wasn't shown (`1 connection description`).
 
 ### 5.3 csv and md
 
@@ -306,7 +338,7 @@ Usage errors found while parsing the arguments happen before `--format` is known
 | 5 | Blocked by the read-only guard. Nothing was executed. |
 | 6 | Cancelled: Ctrl+C, Ctrl+Break, the console closing, logoff or shutdown (§4.3). |
 | 7 | Output could not be delivered (see below). |
-| 10 | Internal error (a bug), including any panic. Details go to stderr, best effort (§4.3). |
+| 10 | Internal error (a bug), including any panic. Details go to stderr, best effort (§4.3). Also a sink's refusal of an event that came out of order (§5.1, "Order of events"): the run stops there, and the status line and `-- error:` say so as for any other failure. |
 
 **Exit 7, undeliverable output.** sqlh couldn't hand its complete output, including the final status line, to its destination. That happens when:
 - the program reading stdout closed it early (a broken pipe), for example a harness that stopped reading. This covers `--help` and `--version` too;
@@ -324,7 +356,7 @@ Diagnostics on stderr are best effort and bounded: one that can't be delivered n
 
 Text in a diagnostic that comes from elsewhere, such as the run's own error message or a path, is cut after 1,000 characters with a `…[+N]` marker and escaped like metadata, so a file name holding U+2028 or U+2029 shows them as `\u2028` and `\u2029`, and a backslash is doubled.
 
-In the text, json and md formats, everything goes to stdout in order: results, messages, SQL errors, connection and usage errors, and the summary. That gives agents one stream to read. stderr carries only `--verbose` diagnostics, delivery failures (exit 7) and internal errors (exit 10), except in csv mode (§5.3).
+In the text, json and md formats, everything goes to stdout in order: results, messages, SQL errors, connection and usage errors, and the summary. That gives agents one stream to read. stderr carries only `--verbose` diagnostics, delivery failures (exit 7) and internal errors (exit 10), except in csv mode (§5.3). The order is the one in §5.1, "Order of events". `--help` and `--version` print to stdout, with no status line. `--version` prints the program's version and the version of the JSON contract (§5.2): `sqlh 0.1.0 (json contract 1.0)`.
 
 Connection errors must be actionable. They name the server, port, auth method and encryption mode, give the underlying error, and add a hint where one applies, such as:
 - a named instance with SQL Browser unreachable: try `host,port`

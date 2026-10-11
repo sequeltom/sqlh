@@ -1,22 +1,39 @@
-//! `--format json` (DESIGN.md §5.2): one JSON document, streamed. Each batch has an ordered
-//! `events` array (result, msg, rows_affected, error); the run's outcome comes last because
-//! it is only known at the end. `finish` closes whatever is open, so a run that fails
-//! mid-result still yields valid JSON.
+//! `--format json` (DESIGN.md §5.2): one JSON document, streamed. It starts with the contract
+//! version and, once connected, a description of the connection and how long that took; each
+//! batch has an ordered `events` array (result, msg, rows_affected, error) and its duration;
+//! the run's outcome comes last because it is only known at the end. `finish` closes whatever
+//! is open, so a run that fails mid-result still yields valid JSON.
 //!
 //! The output budget (`--max-output`) covers the whole document, which the sink counts
-//! piece by piece: events are admitted or taken back whole; a note is shortened when it is
-//! recorded and its bytes count from then on, though it is written last; the closers of
-//! the result and batch still open and the outcome fields come out of the reserve.
+//! piece by piece: the head with the connection, and events, are admitted or taken back
+//! whole; a note is shortened when it is recorded and its bytes count from then on, though
+//! it is written last; the closers of the result and batch still open and the outcome fields
+//! come out of the reserve.
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::text::write_diagnostic;
 use super::{
-    BatchInfo, Layout, Limits, Output, Summary, Tally, cut, cut_marker, hex, push_blocked,
-    push_within,
+    BatchInfo, Layout, Limits, OutOfOrder, Output, Summary, Tally, cut, cut_marker, hex,
+    push_blocked, push_within,
 };
-use crate::db::{BatchSink, Column, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
+
+/// The version of the JSON document (DESIGN.md §5.2): `major.minor`, the document's first
+/// field, and what `sqlh --version` reports. The major changes only for an incompatible
+/// change, such as a field or event removed or renamed, or its type or meaning changed. A
+/// minor may add optional fields, event types or enum values, so a reader written for a
+/// version has to ignore what it doesn't know. 1.0 is the document with `contract_version`,
+/// `connection`, `connect_ms` and the batches' `elapsed_ms`.
+pub const CONTRACT_VERSION: &str = "1.0";
+
+/// The most characters of a name from the server (the server, the database, the version) that
+/// the `connection` object carries. SQL Server names stop at 128, so a longer one isn't from
+/// a SQL Server; it is cut like a long value. That also bounds the object: at six bytes for a
+/// character that has to be escaped, it takes under 2,000 bytes, which fits the smallest
+/// `--max-output` with room to spare.
+const NAME_CHARS: usize = 128;
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;
@@ -37,6 +54,9 @@ pub struct JsonSink<W: Write> {
     opened: bool,
     batches: usize,
     in_batch: bool,
+    /// The run clock when the open batch started, for its `elapsed_ms`; none for a batch
+    /// opened without `begin_batch`, which has no duration to report.
+    batch_started: Option<u128>,
     events: usize,
     in_result: bool,
     /// The notes, already shortened to fit and written as JSON string content (escaped,
@@ -75,6 +95,7 @@ impl<W: Write> JsonSink<W> {
             opened: false,
             batches: 0,
             in_batch: false,
+            batch_started: None,
             events: 0,
             in_result: false,
             notes: Vec::new(),
@@ -131,12 +152,26 @@ impl<W: Write> JsonSink<W> {
         self.drain(false)
     }
 
-    /// Writes the document head once: `{"batches":[`.
+    /// Writes the document head once, if nothing has: `{"contract_version":"1.0","batches":[`.
     fn open(&mut self) {
         if !self.opened {
-            self.buf.push_str("{\"batches\":[");
-            self.opened = true;
+            self.push_head(None);
         }
+    }
+
+    /// The document head, with the description of the connection and the time it took in
+    /// front of the batches when they are known.
+    fn push_head(&mut self, connection: Option<(&Connection, u128)>) {
+        self.buf.push_str("{\"contract_version\":\"");
+        self.buf.push_str(CONTRACT_VERSION);
+        self.buf.push('"');
+        if let Some((connection, connect_ms)) = connection {
+            self.buf.push_str(",\"connection\":");
+            push_connection(&mut self.buf, connection);
+            let _ = write!(self.buf, ",\"connect_ms\":{connect_ms}");
+        }
+        self.buf.push_str(",\"batches\":[");
+        self.opened = true;
     }
 
     /// Starts an event in the current batch, opening an anonymous batch if none is open.
@@ -175,10 +210,20 @@ impl<W: Write> JsonSink<W> {
         self.in_result = false;
     }
 
-    fn close_batch(&mut self) {
+    /// Closes the open result, which was cut short, and the open batch, which ended at
+    /// `ended_ms` on the run clock.
+    fn close_batch(&mut self, ended_ms: u128) {
         self.end_result(true);
         if self.in_batch {
-            self.buf.push_str("]}");
+            self.buf.push(']');
+            if let Some(started_ms) = self.batch_started.take() {
+                let _ = write!(
+                    self.buf,
+                    ",\"elapsed_ms\":{}",
+                    ended_ms.saturating_sub(started_ms)
+                );
+            }
+            self.buf.push('}');
             self.in_batch = false;
         }
     }
@@ -260,6 +305,45 @@ fn push_char(out: &mut String, c: char) {
     }
 }
 
+/// Appends a name from the server as a JSON string, cut after `NAME_CHARS` characters (the
+/// cut ends in `…[+N]`, like a cut value).
+fn push_name(out: &mut String, name: &str) {
+    let (kept, cut_count) = cut(name, NAME_CHARS);
+    out.push('"');
+    push_escaped(out, kept);
+    if cut_count > 0 {
+        out.push_str(&cut_marker(cut_count, false));
+    }
+    out.push('"');
+}
+
+/// `push_name`, or `null` for a name the server didn't give.
+fn push_name_or_null(out: &mut String, name: Option<&str>) {
+    match name {
+        Some(name) => push_name(out, name),
+        None => out.push_str("null"),
+    }
+}
+
+/// The `connection` object (DESIGN.md §5.2). Every field that comes from the server goes
+/// through `push_name`; `auth` is one of two fixed words, and there is no login name here, no
+/// connection string, nothing from a credential.
+fn push_connection(out: &mut String, connection: &Connection) {
+    out.push_str("{\"server\":");
+    push_name_or_null(out, connection.server.as_deref());
+    out.push_str(",\"database\":");
+    push_name(out, &connection.database);
+    out.push_str(",\"auth\":");
+    push_str(out, connection.auth);
+    let _ = write!(
+        out,
+        ",\"encrypted\":{},\"server_version\":",
+        connection.encrypted
+    );
+    push_name_or_null(out, connection.version.as_deref());
+    out.push('}');
+}
+
 /// The document's last fields: `,"ok":...,"elapsed_ms":N}` and a newline. The status is
 /// never shortened.
 fn outcome(summary: &Summary) -> String {
@@ -337,16 +421,19 @@ impl<W: Write> BatchSink for JsonSink<W> {
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
         self.end_result(false);
         self.drain(false)
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
+        self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
         Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("a message")?;
         self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
@@ -363,6 +450,7 @@ impl<W: Write> BatchSink for JsonSink<W> {
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("an error")?;
         self.flush_affected()?;
         self.tally.error(error.severity);
         let mark = self.mark();
@@ -408,12 +496,32 @@ impl<W: Write> BatchSink for JsonSink<W> {
 }
 
 impl<W: Write> Output for JsonSink<W> {
+    /// Writes the head of the document with the connection in it, as a piece of the body: the
+    /// budget can refuse it (when notes and diagnostics have used it up), and it is then
+    /// counted as withheld, and the head comes later without it. It has to come before
+    /// anything else in the document; a call after that is refused.
+    fn connected(&mut self, connection: &Connection, connect_ms: u128) -> io::Result<()> {
+        if self.opened {
+            return Err(OutOfOrder::error(
+                "the connection was described after the document had started; it comes before \
+                 the first batch (Output order, DESIGN.md §5.2)"
+                    .into(),
+            ));
+        }
+        let mark = self.mark();
+        self.push_head(Some((connection, connect_ms)));
+        if !self.admit_since(mark) {
+            self.tally.withhold_connection();
+        }
+        self.drain(false)
+    }
+
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.flush_affected()?;
         self.tally.begin_batch(batch);
         // The previous batch's closers are not up for admission. The document head is: it
         // comes back out with the batch if the budget refuses both.
-        self.close_batch();
+        self.close_batch(batch.started_ms);
         let mark = self.mark();
         self.open();
         if self.batches > 0 {
@@ -429,15 +537,17 @@ impl<W: Write> Output for JsonSink<W> {
         self.batches += 1;
         self.in_batch = true;
         self.events = 0;
-        if !self.admit_since(mark) {
+        if self.admit_since(mark) {
+            self.batch_started = Some(batch.started_ms);
+        } else {
             self.tally.withhold_batch();
         }
         self.drain(false)
     }
 
-    fn end_batch(&mut self) -> io::Result<()> {
+    fn end_batch(&mut self, ended_ms: u128) -> io::Result<()> {
         self.flush_affected()?;
-        self.close_batch();
+        self.close_batch(ended_ms);
         self.drain(false)
     }
 
@@ -482,7 +592,8 @@ impl<W: Write> Output for JsonSink<W> {
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
         self.flush_affected()?;
         self.open();
-        self.close_batch();
+        // A batch still open ended with the run.
+        self.close_batch(summary.elapsed_ms);
         self.buf.push(']');
         let limit_notes = self.tally.limit_notes();
         let notes = std::mem::take(&mut self.notes);
@@ -549,7 +660,7 @@ impl<W: Write> Output for JsonSink<W> {
 mod tests {
     use super::super::text::tests::{
         ADVICE, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, batch, capped, col, cut_by, error,
-        interrupted_run, limits, msg, quoting, ragged_run, summary,
+        interrupted_run, limits, mid_result_events_are_refused, msg, quoting, ragged_run, summary,
     };
     use super::*;
     use serde_json::{Value as Json, json};
@@ -562,7 +673,11 @@ mod tests {
     #[test]
     fn document_shape() {
         let mut s = JsonSink::new(Vec::new(), limits());
-        s.begin_batch(&batch("q.sql", false, 1)).unwrap();
+        s.begin_batch(&BatchInfo {
+            started_ms: 4,
+            ..batch("q.sql", false, 1)
+        })
+        .unwrap();
         s.message(&msg("hello \"world\"")).unwrap();
         s.columns(&[
             col("id", "bigint"),
@@ -582,7 +697,7 @@ mod tests {
         s.end_rows().unwrap();
         s.rows_affected(3).unwrap();
         s.error(&error(2)).unwrap();
-        s.end_batch().unwrap();
+        s.end_batch(9).unwrap();
         s.note("ignored sqlcmd flags -W").unwrap();
         s.finish(&Summary {
             exit: 1,
@@ -594,6 +709,7 @@ mod tests {
         assert_eq!(
             parse(s),
             json!({
+                "contract_version": "1.0",
                 "batches": [{
                     "batch": 1, "source": "q.sql", "line": 1,
                     "events": [
@@ -609,7 +725,8 @@ mod tests {
                         {"type": "rows_affected", "count": 3},
                         {"type": "error", "number": 208, "severity": 16, "state": 1,
                          "line": 2, "text": "Invalid object name 'dbo.Nope'."}
-                    ]
+                    ],
+                    "elapsed_ms": 5
                 }],
                 "notes": ["ignored sqlcmd flags -W"],
                 "ok": false, "exit_code": 1, "summary": "failed (exit 1): 1 error, 9 ms",
@@ -628,7 +745,7 @@ mod tests {
         }
         s.message(&msg("done")).unwrap();
         s.rows_affected(5).unwrap();
-        s.end_batch().unwrap();
+        s.end_batch(0).unwrap();
         s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
         assert_eq!(
             parse(s)["batches"][0]["events"],
@@ -670,7 +787,7 @@ mod tests {
         s.end_rows().unwrap();
         s.message(&msg("later")).unwrap();
         s.error(&error(1)).unwrap();
-        s.end_batch().unwrap();
+        s.end_batch(0).unwrap();
         s.begin_batch(&BatchInfo {
             number: 2,
             total: 2,
@@ -678,7 +795,7 @@ mod tests {
         })
         .unwrap();
         s.rows_affected(1).unwrap();
-        s.end_batch().unwrap();
+        s.end_batch(0).unwrap();
         s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
             .unwrap();
         let length = s.out.len() as u64;
@@ -775,6 +892,484 @@ mod tests {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
     }
 
+    // PLAN.md 2.11: the contract version, the description of the connection and the times.
+
+    fn connection() -> Connection {
+        Connection {
+            server: Some("SQL01".into()),
+            version: Some("17.0.1000".into()),
+            database: "master".into(),
+            auth: "sql",
+            encrypted: true,
+        }
+    }
+
+    /// A connection whose server and database names are `name` and `name`, both hostile.
+    fn named(name: &str) -> Connection {
+        Connection {
+            server: Some(name.into()),
+            database: name.into(),
+            ..connection()
+        }
+    }
+
+    // The version is `major.minor`, and it is the document's first field.
+    #[test]
+    fn the_contract_version_is_major_dot_minor_and_comes_first() {
+        let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        let (major, minor) = CONTRACT_VERSION.split_once('.').expect("major.minor");
+        assert!(digits(major) && digits(minor), "{CONTRACT_VERSION}");
+        for connected in [false, true] {
+            let (mut s, main, _) = sink(capped(0));
+            if connected {
+                s.connected(&connection(), 5).unwrap();
+            }
+            s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+            assert!(
+                main.text()
+                    .starts_with(&format!("{{\"contract_version\":\"{CONTRACT_VERSION}\",")),
+                "{}",
+                main.text()
+            );
+        }
+    }
+
+    // Exact output, with a connection: the description and its time come right after the
+    // version, in front of the batches, and each batch ends with how long it took.
+    #[test]
+    fn a_document_starts_with_the_connection_and_each_batch_ends_with_its_time() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection(), 195).unwrap();
+        s.begin_batch(&BatchInfo {
+            started_ms: 200,
+            ..batch("-Q", false, 1)
+        })
+        .unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(212).unwrap();
+        s.finish(&Summary {
+            elapsed_ms: 215,
+            ..summary("ok: 1 batch, 215 ms")
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            concat!(
+                r#"{"contract_version":"1.0","#,
+                r#""connection":{"server":"SQL01","database":"master","auth":"sql","#,
+                r#""encrypted":true,"server_version":"17.0.1000"},"connect_ms":195,"#,
+                r#""batches":[{"batch":1,"source":"-Q","line":1,"events":["#,
+                r#"{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
+                r#""rows":[[1]],"row_count":1,"truncated":false,"cells_cut":0}],"#,
+                r#""elapsed_ms":12}],"#,
+                r#""ok":true,"exit_code":0,"summary":"ok: 1 batch, 215 ms","elapsed_ms":215}"#,
+                "\n"
+            )
+        );
+    }
+
+    // Exact output, without one: a run that never connected (a usage error, a guard refusal,
+    // a failed connect) has the version and nothing about a connection or its time.
+    #[test]
+    fn without_a_connection_there_is_neither_connection_nor_connect_ms() {
+        let (mut s, main, _) = sink(capped(0));
+        s.finish(&refused(3, "failed (exit 3): usage error, 0 ms"))
+            .unwrap();
+        assert_eq!(
+            main.text(),
+            concat!(
+                r#"{"contract_version":"1.0","batches":[],"ok":false,"exit_code":3,"#,
+                r#""summary":"failed (exit 3): usage error, 0 ms","elapsed_ms":0}"#,
+                "\n"
+            )
+        );
+        let (mut s, main, _) = sink(capped(0));
+        s.blocked("line 2", "INSERT ##t would write", "Use a #temp table")
+            .unwrap();
+        s.finish(&refused(5, "failed (exit 5): blocked, 0 ms"))
+            .unwrap();
+        let doc = document(&main);
+        assert!(doc.get("connection").is_none() && doc.get("connect_ms").is_none());
+        assert_eq!(doc["batches"], json!([]));
+        assert_eq!(doc["exit_code"], 5);
+    }
+
+    // A server that gave no name or version has `null`s, not placeholders.
+    #[test]
+    fn a_server_that_reports_no_name_or_version_gives_nulls() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(
+            &Connection {
+                server: None,
+                version: None,
+                auth: "windows",
+                encrypted: false,
+                ..connection()
+            },
+            0,
+        )
+        .unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            document(&main)["connection"],
+            json!({"server": null, "database": "master", "auth": "windows",
+                   "encrypted": false, "server_version": null})
+        );
+        assert_eq!(document(&main)["connect_ms"], 0);
+    }
+
+    // Every field that comes from the server is escaped, whatever it holds: quotes, backslashes,
+    // control characters, line breaks, and characters that JSON allows raw (U+007F, U+0085,
+    // U+2028 and U+2029, as in every json string; DESIGN.md §5.1). The document stays valid,
+    // the names read back unchanged, and the only raw line break is the final newline.
+    #[test]
+    fn hostile_server_and_database_names_are_escaped() {
+        let name = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h\u{85}i\u{2028}j\u{2029}k]}{,\"x\":1";
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&named(name), 1).unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        let text = main.text();
+        let doc: Json = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(doc["connection"]["server"], name);
+        assert_eq!(doc["connection"]["database"], name);
+        assert_eq!(doc["connection"].as_object().unwrap().len(), 5, "{doc}");
+        // Only the final newline is a raw one.
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
+        assert!(!text.contains(['\r', '\t', '\u{1}']), "{text:?}");
+    }
+
+    // A name longer than SQL Server's own limit is cut like a long value, with the number of
+    // characters left out; one of exactly 128 characters is not.
+    #[test]
+    fn a_name_beyond_128_characters_is_cut() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(
+            &Connection {
+                server: Some("s".repeat(128)),
+                database: "d".repeat(300),
+                ..connection()
+            },
+            1,
+        )
+        .unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        let doc = document(&main);
+        assert_eq!(doc["connection"]["server"], "s".repeat(128));
+        assert_eq!(
+            doc["connection"]["database"],
+            format!("{}…[+172]", "d".repeat(128))
+        );
+    }
+
+    // The widest description there can be, every character of two cut names a six-byte
+    // escape, is under 2,000 bytes: it fits the smallest cap with most of the body to spare,
+    // and the whole document still ends within the cap with its outcome.
+    #[test]
+    fn the_widest_connection_fits_the_smallest_cap() {
+        let (mut s, main, _) = sink(capped(4096));
+        s.connected(&named(&"\u{1}".repeat(255)), u128::MAX)
+            .unwrap();
+        let head = main.bytes() + s.buf.len();
+        assert!(head < 2000, "{head} bytes");
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        assert!(main.bytes() <= 4096, "{} bytes", main.bytes());
+        let doc = document(&main);
+        let server = doc["connection"]["server"].as_str().unwrap();
+        assert_eq!(server.matches('\u{1}').count(), 128);
+        assert!(server.ends_with("…[+127]"), "{server}");
+        // The head is in the document, not withheld.
+        assert!(doc["connect_ms"].is_number() && doc.get("notes").is_none());
+    }
+
+    // The description is a piece of the body. When notes and diagnostics have used the room
+    // it would need, the budget refuses it: it is left out, counted in the closing note, and
+    // the document stays valid and within the cap, with no connection in it.
+    #[test]
+    fn a_connection_the_budget_has_no_room_for_is_left_out_and_counted() {
+        let (mut s, main, meta) = sink(capped(4096));
+        s.diagnostic(&"d".repeat(3_000)).unwrap();
+        s.connected(&connection(), 7).unwrap();
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&refused(0, "ok: 1 batch, 3 ms")).unwrap();
+        assert!(main.bytes() + meta.bytes() <= 4096);
+        let doc = document(&main);
+        assert!(doc.get("connection").is_none() && doc.get("connect_ms").is_none());
+        assert_eq!(doc["batches"], json!([]));
+        assert_eq!(doc["exit_code"], 0);
+        assert_eq!(
+            doc["notes"][0],
+            "output stopped at the --max-output limit of 4096 bytes; the run continued, and \
+             these weren't shown: 1 batch, 1 connection description"
+        );
+    }
+
+    // The description comes first or not at all: after the document has started, or a
+    // second time, the sink refuses it and changes nothing.
+    #[test]
+    fn the_connection_is_described_once_before_anything_else() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection(), 1).unwrap();
+        for _ in 0..2 {
+            let error = s.connected(&named("other"), 2).unwrap_err();
+            assert!(OutOfOrder::is(&error), "{error}");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("before the first batch"),
+                "{error}"
+            );
+        }
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(main.text().matches("\"connection\"").count(), 1);
+        let doc = document(&main);
+        assert_eq!(doc["connect_ms"], 1);
+        assert_eq!(doc["connection"]["server"], "SQL01");
+
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.connected(&connection(), 1).unwrap_err();
+        s.finish(&refused(0, "ok: 1 batch, 3 ms")).unwrap();
+        assert!(document(&main).get("connection").is_none());
+    }
+
+    // A batch lasts from its start to its end on the run clock; one that ends with the run
+    // (a timeout, a cancel) ends at the run's own elapsed time; one opened without
+    // `begin_batch` has no start to measure from, so it reports no time.
+    #[test]
+    fn a_batch_reports_the_time_between_its_start_and_its_end() {
+        let (mut s, main, _) = sink(capped(0));
+        let at = |number, started_ms| BatchInfo {
+            number,
+            total: 3,
+            started_ms,
+            ..batch("-Q", false, 1)
+        };
+        s.begin_batch(&at(1, 10)).unwrap();
+        s.end_batch(25).unwrap();
+        s.begin_batch(&at(2, 30)).unwrap();
+        s.end_batch(31).unwrap();
+        s.begin_batch(&at(3, 40)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.finish(&Summary {
+            exit: 4,
+            status: "failed (exit 4): timeout, 100 ms",
+            error: Some("query timeout after 1 s in batch 3"),
+            elapsed_ms: 100,
+        })
+        .unwrap();
+        let doc = document(&main);
+        let times: Vec<u64> = doc["batches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["elapsed_ms"].as_u64().expect("a time"))
+            .collect();
+        assert_eq!(times, [15, 1, 60]);
+        assert_eq!(doc["batches"][2]["events"][0]["interrupted"], true);
+
+        let (mut s, main, _) = sink(capped(0));
+        s.message(&msg("outside any batch")).unwrap();
+        s.end_batch(99).unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        let batch = &document(&main)["batches"][0];
+        assert!(batch.get("batch").is_none() && batch.get("elapsed_ms").is_none());
+    }
+
+    // A clock that ran backwards (it can't, but a time is only a difference) is 0, not a wrap.
+    #[test]
+    fn a_batch_never_lasts_a_negative_time() {
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&BatchInfo {
+            started_ms: 50,
+            ..batch("-Q", false, 1)
+        })
+        .unwrap();
+        s.end_batch(40).unwrap();
+        s.finish(&refused(0, "ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(document(&main)["batches"][0]["elapsed_ms"], 0);
+    }
+
+    // A run cut by --max-output keeps what the head promised: the connection and its time come
+    // first and are counted in the cap, the cut result closes with exact counts, the batch
+    // still says how long it took, and the outcome is whole.
+    #[test]
+    fn a_run_cut_by_the_cap_keeps_its_connection_and_times() {
+        let max = crate::output::OUTPUT_RESERVE + 600;
+        let (mut s, main, _) = sink(capped(max));
+        s.connected(&connection(), 31).unwrap();
+        s.begin_batch(&BatchInfo {
+            started_ms: 40,
+            ..batch("-Q", false, 1)
+        })
+        .unwrap();
+        s.columns(&[col("v", "varchar(20)")]).unwrap();
+        for i in 0..100 {
+            if s.wants_values() {
+                s.row(&[Value::Text(format!("row {i}"))]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        s.message(&msg("too late for the cap")).unwrap();
+        s.end_batch(95).unwrap();
+        s.finish(&Summary {
+            elapsed_ms: 99,
+            ..summary("ok: 1 batch, 99 ms")
+        })
+        .unwrap();
+        assert!(main.bytes() as u64 <= max, "{} bytes", main.bytes());
+        let doc = document(&main);
+        assert_eq!(doc["connection"]["database"], "master");
+        assert_eq!(doc["connect_ms"], 31);
+        let batch = &doc["batches"][0];
+        assert_eq!(batch["elapsed_ms"], 55);
+        let result = &batch["events"][0];
+        assert_eq!(result["row_count"], 100);
+        assert_eq!(result["truncated"], true);
+        let shown = result["rows"].as_array().unwrap().len();
+        assert!((1..100).contains(&shown), "{shown} rows");
+        assert_eq!(batch["events"].as_array().unwrap().len(), 1);
+        assert!(
+            doc["notes"][0]
+                .as_str()
+                .is_some_and(|n| n.ends_with("these weren't shown: 1 message")),
+            "{doc}"
+        );
+        assert_eq!(doc["summary"], "ok: 1 batch, 99 ms");
+        assert_eq!(doc["elapsed_ms"], 99);
+    }
+
+    // A result that a failure cut short is closed as interrupted when the next batch begins,
+    // ending that batch there, and the next batch takes its events. (A failed run goes no
+    // further today; the sink doesn't depend on that.)
+    #[test]
+    fn a_cut_short_result_does_not_refuse_the_next_batch() {
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.begin_batch(&BatchInfo {
+            number: 2,
+            total: 2,
+            started_ms: 8,
+            ..batch("-Q", false, 2)
+        })
+        .unwrap();
+        s.message(&msg("second batch")).unwrap();
+        s.end_batch(9).unwrap();
+        s.finish(&refused(0, "ok: 2 batches, 3 ms")).unwrap();
+        let doc = document(&main);
+        assert_eq!(doc["batches"][0]["events"][0]["interrupted"], true);
+        assert_eq!(doc["batches"][0]["elapsed_ms"], 8);
+        assert_eq!(doc["batches"][1]["events"][0]["text"], "second batch");
+        assert_eq!(doc["batches"][1]["elapsed_ms"], 1);
+    }
+
+    // The sweep of `the_cap_holds_wherever_the_body_ends`, with the description of the
+    // connection written first: at every cap from the reserve up, the document is valid, no
+    // longer than the cap, and has its outcome; the description is there or counted as withheld.
+    #[test]
+    fn the_cap_holds_with_the_connection_in_the_document() {
+        use crate::output::OUTPUT_RESERVE;
+        for max in OUTPUT_RESERVE..OUTPUT_RESERVE + 1800 {
+            for (run, exit) in [(ragged_run as fn(&mut dyn Output), 1), (interrupted_run, 4)] {
+                let (mut s, main, meta) = sink(capped(max));
+                s.connected(&named("N"), 12).unwrap();
+                run(&mut s);
+                let total = (main.bytes() + meta.bytes()) as u64;
+                assert!(total <= max, "cap {max}: {total} bytes\n{}", main.text());
+                let doc = document(&main);
+                assert_eq!(doc["exit_code"], exit, "cap {max}");
+                // Either the description is there, or the closing note says the output
+                // stopped first (its start is never cut; its counts may be).
+                let stopped = doc["notes"].as_array().is_some_and(|notes| {
+                    notes
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .any(|note| note.starts_with("output stopped at the --max-output limit"))
+                });
+                assert!(
+                    doc.get("connection").is_some() || stopped,
+                    "cap {max}: {doc}"
+                );
+                assert_eq!(
+                    doc.get("connection").is_some(),
+                    doc.get("connect_ms").is_some(),
+                    "cap {max}"
+                );
+            }
+        }
+    }
+
+    // PLAN.md 2.12, DESIGN.md §5.2: nothing but rows arrives inside a result set. What did is
+    // refused and changes nothing, and a message the server sent during the result is an
+    // event after it in the batch's events, never one of its rows.
+    #[test]
+    fn nothing_but_rows_arrives_inside_a_result_set() {
+        let (mut s, main, meta) = sink(limits());
+        mid_result_events_are_refused(&mut s);
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        assert_eq!(meta.bytes(), 0);
+        assert_eq!(
+            document(&main),
+            json!({
+                "contract_version": "1.0",
+                "batches": [{"events": [
+                    {"type": "result",
+                     "columns": [{"name": "v", "type": "int", "nullable": true}],
+                     "rows": [[1], [2]], "row_count": 2, "truncated": false, "cells_cut": 0},
+                    {"type": "msg", "text": "kept"},
+                    {"type": "rows_affected", "count": 3},
+                    {"type": "error", "number": 208, "severity": 16, "state": 1, "line": 2,
+                     "text": "Invalid object name 'dbo.Nope'."}
+                ]}],
+                "notes": ["1 more result sets not shown (--max-results 1)"],
+                "ok": true, "exit_code": 0,
+                "summary": "failed (exit 1): 1 error, 3 ms", "elapsed_ms": 3
+            })
+        );
+    }
+
+    // A refused call writes nothing: the result it came in is still there, and the run that
+    // ends there closes it as interrupted and leaves a valid document, with none of the
+    // refused events in it.
+    #[test]
+    fn a_refused_event_leaves_a_valid_document() {
+        type Call = fn(&mut JsonSink<Shared>) -> io::Result<()>;
+        let calls: [(&str, Call); 3] = [
+            ("message", |s| s.message(&msg("too early"))),
+            ("error", |s| s.error(&error(1))),
+            ("row count", |s| s.rows_affected(4)),
+        ];
+        for (what, call) in calls {
+            let (mut s, main, _) = sink(capped(0));
+            s.begin_batch(&batch("-Q", false, 1)).unwrap();
+            s.columns(&[col("x", "int")]).unwrap();
+            s.row(&[Value::Int(1)]).unwrap();
+            let written = main.bytes() + s.buf.len();
+            call(&mut s).unwrap_err();
+            assert_eq!(main.bytes() + s.buf.len(), written, "{what}");
+            s.row(&[Value::Int(2)]).unwrap();
+            s.finish(&Summary {
+                exit: 10,
+                status: "failed (exit 10): internal error, 3 ms",
+                error: Some("internal error: the sink refused it"),
+                elapsed_ms: 3,
+            })
+            .unwrap();
+            let doc = document(&main);
+            let events = doc["batches"][0]["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "{what}: {doc}");
+            assert_eq!(events[0]["rows"], json!([[1], [2]]), "{what}");
+            assert_eq!(events[0]["interrupted"], true, "{what}");
+            assert_eq!(doc["exit_code"], 10);
+        }
+    }
+
     fn refused(exit: u8, status: &str) -> Summary<'_> {
         Summary {
             exit,
@@ -818,9 +1413,10 @@ mod tests {
 
     // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
     // the 512-byte status reserve, 600 - 512 = 88 bytes, 13 of them for the array and quotes
-    // around the first note: 66 characters and "…[+134]". The document head and `]` take 13,
-    // and what the notes array, the error's wrapper and the outcome leave of the other 587
-    // goes to the error: 404 characters and "…[+596]".
+    // around the first note: 66 characters and "…[+134]". The document head
+    // (`{"contract_version":"1.0","batches":[`) and `]` take 38, and what the notes array,
+    // the error's wrapper and the outcome leave of the other 562 goes to the error: 379
+    // characters and "…[+621]".
     #[test]
     fn a_tight_cap_shortens_exactly() {
         let (mut s, main, _) = sink(capped(600));
@@ -836,13 +1432,15 @@ mod tests {
         assert_eq!(
             main.text(),
             format!(
-                "{{\"batches\":[],\"notes\":[\"{}…[+134]\"],\"error\":\"{}…[+596]\",\
-                 \"ok\":false,\"exit_code\":1,\"summary\":\"ok: 0 batches, 3 ms\",\
-                 \"elapsed_ms\":3}}\n",
+                "{{\"contract_version\":\"1.0\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
+                 \"error\":\"{}…[+621]\",\"ok\":false,\"exit_code\":1,\
+                 \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":3}}\n",
                 "x".repeat(66),
-                "e".repeat(404)
+                "e".repeat(379)
             )
         );
+        // One byte of the cap is left over: the marker is sized for the widest count.
+        assert_eq!(main.bytes(), 599);
     }
 
     // A huge closing error is shortened; the outcome fields are not.
@@ -1013,29 +1611,39 @@ mod tests {
         s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
         assert_eq!(
             main.text(),
-            "{\"batches\":[],\"ok\":true,\"exit_code\":0,\"summary\":\"ok: 0 batches, 3 ms\",\
-             \"elapsed_ms\":0}\n"
+            "{\"contract_version\":\"1.0\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
+             \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":0}\n"
         );
     }
 
-    // The reserve is sized for this: the closers of an open result and batch, the end of the
-    // batches, and the notes and error wrappers, with every number at its widest and the
-    // longest status main.rs builds. The closers' template is checked against a real run.
+    // The reserve is sized for this: the closers of an open result and batch (the batch's
+    // `elapsed_ms` among them), the end of the batches, and the notes and error wrappers, with
+    // every number at its widest and the longest status main.rs builds. The closers' template
+    // is checked against a real run. The head with the connection is not in it: it is a piece
+    // of the body, admitted when it is written.
     #[test]
     fn the_worst_case_ending_fits_the_status_reserve() {
-        let closers = |rows: u64, cut: u64, truncated: bool| {
+        let closers = |rows: u64, cut: u64, truncated: bool, elapsed: u128| {
             format!(
                 "],\"row_count\":{rows},\"truncated\":{truncated},\"cells_cut\":{cut},\
-                 \"interrupted\":true}}]}}"
+                 \"interrupted\":true}}],\"elapsed_ms\":{elapsed}}}"
             )
         };
         let (mut s, main, _) = sink(capped(0));
-        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.begin_batch(&BatchInfo {
+            started_ms: 3,
+            ..batch("-Q", false, 1)
+        })
+        .unwrap();
         s.columns(&[col("v", "int")]).unwrap();
         s.row(&[Value::Int(7)]).unwrap();
-        s.finish(&refused(1, "x")).unwrap();
+        s.finish(&Summary {
+            elapsed_ms: 10,
+            ..refused(1, "x")
+        })
+        .unwrap();
         assert!(
-            main.text().contains(&closers(1, 0, false)),
+            main.text().contains(&closers(1, 0, false, 7)),
             "{}",
             main.text()
         );
@@ -1054,7 +1662,7 @@ mod tests {
             error: None,
             elapsed_ms: u128::MAX,
         });
-        let worst = closers(u64::MAX, u64::MAX, false).len()
+        let worst = closers(u64::MAX, u64::MAX, false, u128::MAX).len()
             + "]".len()
             + ",\"notes\":[\"\"]".len()
             + ",\"error\":\"\"".len()

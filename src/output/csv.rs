@@ -200,6 +200,7 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -208,11 +209,13 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
+        self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
         Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("a message")?;
         self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
@@ -224,6 +227,7 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("an error")?;
         self.flush_affected()?;
         self.tally.error(error.severity);
         let line = error_line(&self.tally, error);
@@ -244,7 +248,7 @@ impl<W: Write> Output for CsvSink<W> {
         Ok(())
     }
 
-    fn end_batch(&mut self) -> io::Result<()> {
+    fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
         self.flush_affected()
     }
 
@@ -285,9 +289,29 @@ impl<W: Write> Output for CsvSink<W> {
 mod tests {
     use super::super::text::tests::{
         ADVICE, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, capped, col, cut_by, error,
-        interrupted_run, limits, msg, quoting, ragged_run, summary,
+        interrupted_run, limits, mid_result_events_are_refused, msg, quoting, ragged_run, summary,
     };
     use super::*;
+
+    // PLAN.md 2.12, DESIGN.md §5.1 and §5.3: nothing but rows arrives inside a result set.
+    // The data stream holds the rows only; a message the server sent during the result is on
+    // the metadata stream after its footer.
+    #[test]
+    fn nothing_but_rows_arrives_inside_a_result_set() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), limits());
+        mid_result_events_are_refused(&mut s);
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        assert_eq!(data.text(), "v\n1\n2\n");
+        assert_eq!(
+            meta.text(),
+            "-- result 1: v:int\n-- 2 rows\n-- msg: kept\n-- 3 rows affected\n\
+             -- error 208 (severity 16, state 1, line 2): Invalid object name 'dbo.Nope'.\n\
+             -- note: 1 more result sets not shown (--max-results 1)\n\
+             -- failed (exit 1): 1 error, 3 ms\n"
+        );
+    }
 
     #[test]
     fn data_and_meta_streams() {
