@@ -136,6 +136,8 @@ These long flags are our own:
 | `--max-results N` | Result sets shown per run. Default 20. The rest are counted, not printed. Messages are capped at 100. |
 | `--max-output N` | Bytes of output per run, across stdout and stderr. Default 1000000; 0 means no limit, and otherwise it must be at least 4096. See §4.4. |
 | `--allow-write` | Turn off the read-only guard, if the profile's write policy allows it (§7). |
+| `--lock-timeout SECONDS` | How long a statement waits for a lock before it fails with error 1222, `Lock request time out period exceeded.` Default 10; 0 means no limit, as `-t 0` does (the server's `LOCK_TIMEOUT -1`); at most 2147483 (about 24.8 days), because the server takes milliseconds in an `int`, and a larger value is a usage error. Same in read-only and `--allow-write` runs. Profile key `lock_timeout`, saved by `profile add`. There is no environment variable, as for the other limits. A lock wait is not a query timeout: it ends with exit 1 at this limit, normally well before `-t` (§4.3, §6). |
+| `--read-uncommitted[=true\|false]` | Read without shared locks (`SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED`), so a read neither waits behind other sessions' writes nor blocks them. **Off unless asked for:** the isolation level is otherwise the database's default, READ COMMITTED, which honors `READ_COMMITTED_SNAPSHOT` where the DBA turned it on. **Read-only runs only** (§4.3). With `--allow-write`, or with a profile whose `write_policy` is `allow` (so the run can write), the flag is a usage error (exit 3) that says why: a write could be based on rows that were never committed. A profile's `read_uncommitted = true` is ignored in a run that can write, silently: the run reads committed data. `--read-uncommitted=false` turns off a profile's setting for one run. When it is in effect the run says so once, as a note written after the session is set up and before the first batch, so it comes ahead of the results: `-- note: reads were uncommitted (--read-uncommitted): rows may include uncommitted, duplicated or missing data` (in json it is an entry of the `notes` array, in csv a line on stderr). The note counts against `--max-output` like any note (§4.4). It is the same text whether the flag or a profile asked for it. `--check` reads nothing, so it neither sets the level nor adds the note. Profile key `read_uncommitted`, saved by `profile add`. |
 | `--check` | Compile only: `SET NOEXEC ON`, executes nothing. Catches syntax errors and unknown columns of existing tables. Missing tables are only reported when a query runs, because SQL Server defers their resolution. Input that mentions `NOEXEC` is refused (exit 5; §7 lists the false positives), NOEXEC is re-armed before every batch, and the rolled-back wrapper transaction always applies. With `--allow-write`, write statements may be compiled; they still don't run. A later version could add `sp_describe_first_result_set` per statement. |
 | `--continue-on-error` | Keep running later batches after a failed one. |
 | `--stats` | Turn on `SET STATISTICS IO, TIME` and print a summary instead of the raw messages (M3). |
@@ -149,6 +151,15 @@ These long flags are our own:
 - **Fail fast.** The whole input is read, split and guard-checked (§7) before anything runs.
 - **Execution.** Batches run in order on one connection. Every error a batch raises is reported. After a batch with an error of severity 11 or higher, later batches are skipped unless `--continue-on-error` is set.
 - **Session SET options** match SSMS: `ANSI_NULLS`, `ANSI_PADDING`, `ANSI_WARNINGS`, `ARITHABORT`, `CONCAT_NULL_YIELDS_NULL` and `QUOTED_IDENTIFIER` ON, and `NUMERIC_ROUNDABORT` OFF. That way filtered and computed-column indexes behave as people expect. (§14 covers the ARITHABORT question.)
+- **Agent session defaults** (owner decision 7, PLAN.md 2.8). Every connection, in read-only and `--allow-write` runs alike, gets `SET DEADLOCK_PRIORITY LOW` and `SET LOCK_TIMEOUT 10000` in the same first batch as the options above, ahead of the read-only wrapper's `BEGIN TRANSACTION`. An agent's queries give way to production work instead of waiting behind it:
+  - **A lock wait ends at `--lock-timeout`** (default 10 s; 0 sends `SET LOCK_TIMEOUT -1`, no limit). The statement fails with error 1222 (severity 16, `Lock request time out period exceeded.`), long before the 60 s default of `-t`. The server ends only the statement: the batch's later statements still run (unless `XACT_ABORT` is ON), and so do later batches with `--continue-on-error`, because the transaction and the session carry on. The timeout covers waits for locks only: a query that is merely slow runs until `-t`, and a lock wait longer than `-t` (`--lock-timeout 0`, or a value above `-t`) is cut by `-t` as a query timeout (exit 4).
+  - **A deadlock is lost by sqlh.** At priority LOW (-5), sqlh's session is chosen as the victim against any session at a higher priority, such as the default NORMAL (0); between sessions of equal priority the server picks the one whose rollback is cheaper. The statement fails with error 1205 (severity 13, `Transaction (Process ID n) was deadlocked ... chosen as the deadlock victim. Rerun the transaction.`) and the server rolls the transaction back, so a read-only run (whose wrapper transaction is gone, §7) stops there, and an `--allow-write` run has nothing from that transaction left. Retrying is the agent's decision.
+  - **Both are ordinary SQL errors:** exit 1, the normal error line with `line` mapped to the input like any other (`-- error 1222 (severity 16, state 45, line 4): Lock request time out period exceeded.`, where line 4 is the statement in the file), and the later batches skipped unless `--continue-on-error`. A result set that was waiting for its first row when the lock wait ended is written as its header and `-- 0 rows`, then the error line (§5.1, "Order of events"). Neither is exit 4: that is `-t`.
+  - **They are defaults, not enforcement.** The input may `SET LOCK_TIMEOUT` or `SET DEADLOCK_PRIORITY` itself (the guard allows these `SET` statements), and the new value holds for the rest of the run.
+- **Isolation level.** The default is the database's: READ COMMITTED, which honors `READ_COMMITTED_SNAPSHOT` where the DBA turned it on, so a read then doesn't wait for writers at all. sqlh doesn't change it. **READ UNCOMMITTED is opt-in only,** by `--read-uncommitted` or a profile's `read_uncommitted = true` (§4.2), and for read-only runs only, because a write based on a dirty read could store rows that never existed. Under `--allow-write`, or a profile that allows writes, the flag is a usage error and a profile's setting does nothing.
+  - **What it does:** the setup batch adds `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` after `SET LOCK_TIMEOUT` and before the wrapper transaction begins, so every statement reads without shared locks: it doesn't wait behind writers and doesn't block them. Dirty reads can silently return rows that are later rolled back, the same row twice or not at all (when pages split or move during a scan), so the run says so once, as a note (§4.2), and the docs and the note both say "may".
+  - **What it doesn't do:** it doesn't help against schema-modification locks (`ALTER TABLE`, an index build), which readers under any isolation level wait for, so the lock timeout stays. It isn't reported when the input itself runs `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED`; that is the input's choice, and the guard allows it. And `--check` runs nothing, so it neither sets the level nor adds the note.
+  - **Checked live** (`tests/cli.rs`, `a_blocked_read_fails_after_the_lock_timeout_unless_it_reads_uncommitted`): a `SELECT COUNT(*)` of a table with another session's open insert waits and fails with 1222 after `--lock-timeout 2`, and with `--read-uncommitted` returns 1, the uncommitted row, at once. The scratch database has row versioning off, which the test relies on: with `READ_COMMITTED_SNAPSHOT` on, the plain read would not wait.
 - **Error line numbers** are mapped back to the original input: a file and line, not just a line within the batch.
 - **Query timeout** sends a TDS attention, reports `-- error: query timeout after 60 s (batch 2)` and exits 4.
 - **Cancellation.** Ctrl+C, Ctrl+Break, the console closing, logoff and shutdown cancel the run wherever it is: connecting, setting up the session, running a batch, waiting for a slow reader, or delivering the last of its output.
@@ -346,10 +357,10 @@ Usage errors found while parsing the arguments happen before `--format` is known
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | One or more SQL errors were reported. |
+| 1 | One or more SQL errors were reported. A lock timeout (error 1222) and a lost deadlock (error 1205) are SQL errors like any other (§4.3). |
 | 2 | Couldn't connect, or login failed. |
-| 3 | Usage or config error: bad flag, missing profile, unknown `$(var)`, `-P`. |
-| 4 | Timeout (login or query). |
+| 3 | Usage or config error: bad flag, missing profile, unknown `$(var)`, `-P`, `--read-uncommitted` in a run that can write. |
+| 4 | Timeout (login or query: `-l`, `-t`). Not a lock timeout, which is exit 1. |
 | 5 | Blocked by the read-only guard. Nothing was executed. |
 | 6 | Cancelled: Ctrl+C, Ctrl+Break, the console closing, logoff or shutdown (§4.3). |
 | 7 | Output could not be delivered (see below). |
@@ -438,6 +449,8 @@ It is read by a small, strict parser of our own, which avoids pulling in the `to
 
 Unknown keys, repeated keys and contradictions are errors that name the line, so a typo can't fail silently. `sqlh profile add` rewrites the file, which drops any comments.
 
+**Profile settings that mirror flags** take the usual precedence: the flag, then the profile, then the default. `login_timeout`, `query_timeout`, `max_rows` and `max_cell` are whole numbers like their flags. `lock_timeout` is whole seconds (0 means no limit, at most 2147483) and `read_uncommitted` is `true` or `false`; an out-of-range or mistyped value is an error that names the line (exit 3). A profile's `read_uncommitted = true` has no effect in a run that can write (`--allow-write`, or `write_policy = "allow"`), and is not an error (§4.3). A flag given as `--read-uncommitted=false` turns it off for one run.
+
 `auth` decides the auth method: `"windows"` or `"sql"`, and `user` must be set exactly when it's `"sql"`. Files without `auth` fall back to "SQL auth when `user` is set". The method is resolved before the login, with the usual precedence (flags, profile, environment), so a Windows-auth profile stays Windows auth even when `SQLCMDUSER` is set; `-U` or `-E` override it for one run.
 
 ```toml
@@ -452,6 +465,8 @@ trust_server_certificate = false
 write_policy = "flag"        # deny | flag | allow
 max_rows = 100
 query_timeout = 60
+lock_timeout = 10            # seconds a statement waits for a lock; 0 = no limit (§4.2)
+read_uncommitted = false     # true: read-only runs read without shared locks (§4.3)
 
 [profiles.reporting]
 server = "tcp:myserver.database.windows.net"
@@ -470,13 +485,13 @@ write_policy = "deny"
 - In-memory copies are not yet reliably wiped: only the buffer handed to `CredWriteW` is zeroed. Wiping the prompt, the copy read back and the copy given to the driver is planned (PLAN.md, F14).
 
 **Profile commands**
-- `sqlh profile add NAME -S server [-d db] [-U login] [-C] [-N..] [--write-policy ..]`
+- `sqlh profile add NAME -S server [-d db] [-U login] [-C] [-N..] [--write-policy ..] [--lock-timeout S] [--read-uncommitted[=false]]`
   - It asks for the password with echo off. This is the tool's only prompt, and it refuses to run if stdin isn't a console, if echo can't actually be turned off (Git Bash's mintty: use PowerShell, cmd or `winpty`), or if the handler that puts echo back on Ctrl+C or a close can't be registered. Echo comes back on every return path, errors included, and after a crash. Ctrl+C, Ctrl+Break or closing the console at the prompt restores it before the process ends; only a process killed outright can leave echo off in that console.
   - It saves the profile and runs `profile test`.
-  - Options you leave out keep their saved values, so rerunning `sqlh profile add NAME` just replaces the password.
+  - Options you leave out keep their saved values, so rerunning `sqlh profile add NAME` just replaces the password. A given `--lock-timeout 0` or `--read-uncommitted=false` is a value that replaces the saved one, not "unset".
   - The first profile you add becomes the default.
 - `sqlh profile test NAME` connects and reports server, version, edition, database, login, user, encryption and auth scheme, with a note on how long connecting took (the `--verbose` line). Encryption and auth scheme come from `CONNECTIONPROPERTY`, which needs no extra permission. This is the first thing to run when a connection misbehaves.
-- `sqlh profile list` shows every profile and whether its password is stored, without revealing it.
+- `sqlh profile list` shows every profile and whether its password is stored, without revealing it. Its columns are `name`, `default`, `server`, `database`, `auth`, `user`, `password` (`stored`, `missing`, `unreadable` or `-` for Windows auth), `write_policy`, `lock_timeout` (`int`, seconds) and `read_uncommitted` (`bit`). The last three show what a run with the profile gets, so a key that isn't saved shows its default: `flag`, `10` and `0`.
 - `sqlh profile rm NAME` removes the profile and its credential.
 
 ## 9. Agent subcommands (M2)

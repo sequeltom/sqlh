@@ -47,6 +47,32 @@ const SESSION_SETUP: &str = "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WA
     SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; \
     SET NUMERIC_ROUNDABORT OFF;";
 
+/// Agent defaults on every connection, writes allowed or not (PLAN.md 2.8, owner decision
+/// 7): sqlh's session is the one that loses a deadlock (error 1205) and gives up on a lock
+/// after `--lock-timeout` (error 1222), so it gives way to production work.
+const AGENT_DEFAULTS: &str = "SET DEADLOCK_PRIORITY LOW;";
+
+/// Said once, as a note, in a run whose reads were uncommitted (DESIGN.md §4.3).
+const READ_UNCOMMITTED_NOTE: &str = "reads were uncommitted (--read-uncommitted): rows may include uncommitted, duplicated or missing data";
+
+/// The batch sent first on every connection: the SSMS options, the agent defaults, the lock
+/// timeout, READ UNCOMMITTED if this run reads that way, and last the wrapper transaction of
+/// a read-only run. The isolation level is set before the transaction begins, so it is the
+/// transaction's from its first statement.
+fn session_setup(lock_timeout: u32, read_uncommitted: bool, wrap: bool) -> String {
+    let mut setup = format!(
+        "{SESSION_SETUP} {AGENT_DEFAULTS} SET LOCK_TIMEOUT {};",
+        config::lock_timeout_ms(lock_timeout)
+    );
+    if read_uncommitted {
+        setup.push_str(" SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;");
+    }
+    if wrap {
+        setup.push_str(" BEGIN TRANSACTION;");
+    }
+    setup
+}
+
 type Out = output::Stream;
 
 /// Whether stdout carries the text format, so the panic hook may append a status line.
@@ -893,15 +919,18 @@ async fn run_session(
     // Layer 2 of the read-only guard: everything runs in a transaction that is rolled back.
     // `--check` always gets it too, as a second line of defense behind NOEXEC.
     let wrap = !settings.allow_write || opts.check;
-    let mut setup = String::from(SESSION_SETUP);
-    if wrap {
-        setup.push_str(" BEGIN TRANSACTION;");
-    }
+    // `--check` reads nothing, so there is no read to make uncommitted and none to report.
+    let read_uncommitted = settings.read_uncommitted && !opts.check;
+    let setup = session_setup(settings.lock_timeout, read_uncommitted, wrap);
     let setup_started = Instant::now();
     session
         .exec_internal(&setup, timeout, cancel)
         .await
         .map_err(db_failure)?;
+    if read_uncommitted {
+        // Said once, up front, where an output cut short by --max-output still has it.
+        out.note(READ_UNCOMMITTED_NOTE).map_err(output_failure)?;
+    }
     if report {
         let profile = settings.profile.as_deref().unwrap_or("(none)");
         let line = format!(
@@ -1030,6 +1059,39 @@ fn output_failure(error: io::Error) -> Failure {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,
+    // writes allowed or not; READ UNCOMMITTED only when asked for, before the wrapper
+    // transaction begins.
+    #[test]
+    fn the_session_setup_carries_the_agent_defaults() {
+        let ssms = SESSION_SETUP;
+        assert_eq!(
+            session_setup(10, false, true),
+            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; BEGIN TRANSACTION;")
+        );
+        // --allow-write: no wrapper transaction, same defaults.
+        assert_eq!(
+            session_setup(10, false, false),
+            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000;")
+        );
+        // A changed timeout, and 0 = no limit, which is -1 on the server.
+        assert!(session_setup(3, false, true).contains(" SET LOCK_TIMEOUT 3000; "));
+        assert!(session_setup(0, false, false).ends_with(" SET LOCK_TIMEOUT -1;"));
+        assert_eq!(
+            session_setup(2_147_483, false, false),
+            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 2147483000;")
+        );
+        // Dirty reads: after the lock timeout, before the transaction is opened.
+        assert_eq!(
+            session_setup(10, true, true),
+            format!(
+                "{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; \
+                 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; BEGIN TRANSACTION;"
+            )
+        );
+        assert!(!session_setup(10, false, true).contains("ISOLATION"));
+    }
 
     /// A writer that fails after accepting `ok` bytes, or only at flush.
     struct Failing {

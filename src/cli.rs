@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::config::{WritePolicy, valid_name};
+use crate::config::{MAX_LOCK_TIMEOUT, WritePolicy, valid_name};
 use crate::db::Encrypt;
 use crate::output::{Format, MIN_MAX_OUTPUT};
 
@@ -48,6 +48,12 @@ pub struct Opts {
     pub max_results: Option<usize>,
     pub max_output: Option<u64>,
     pub allow_write: bool,
+    /// `--lock-timeout SECONDS`: how long a statement waits for a lock before it fails with
+    /// error 1222; 0 means no limit (DESIGN.md §4.2). Unset defers to the profile.
+    pub lock_timeout: Option<u32>,
+    /// `--read-uncommitted[=true|false]`: read without shared locks, in read-only runs
+    /// (DESIGN.md §4.3). Unset defers to the profile.
+    pub read_uncommitted: Option<bool>,
     pub check: bool,
     pub continue_on_error: bool,
     pub verbose: bool,
@@ -167,18 +173,10 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Short('c') => o.terminator = Some(string(p.value())?),
             Short('C') => o.trust_server_certificate = Some(true),
             Long("trust-server-certificate") => {
-                o.trust_server_certificate = Some(match p.optional_value() {
-                    None => true,
-                    Some(v) => match string(Ok(v))?.to_ascii_lowercase().as_str() {
-                        "true" | "yes" => true,
-                        "false" | "no" => false,
-                        other => {
-                            return Err(format!(
-                                "--trust-server-certificate={other}: expected true or false"
-                            ));
-                        }
-                    },
-                })
+                o.trust_server_certificate = Some(switch(&mut p, "--trust-server-certificate")?)
+            }
+            Long("read-uncommitted") => {
+                o.read_uncommitted = Some(switch(&mut p, "--read-uncommitted")?)
             }
             Short('N') => {
                 o.encrypt = Some(match p.optional_value() {
@@ -209,6 +207,15 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
                 o.max_output = Some(bytes);
             }
             Long("allow-write") => o.allow_write = true,
+            Long("lock-timeout") => {
+                let seconds: u32 = number(p.value(), "--lock-timeout")?;
+                if seconds > MAX_LOCK_TIMEOUT {
+                    return Err(format!(
+                        "--lock-timeout {seconds}: at most {MAX_LOCK_TIMEOUT} seconds; use 0 for no limit"
+                    ));
+                }
+                o.lock_timeout = Some(seconds);
+            }
             Long("check") => o.check = true,
             Long("continue-on-error") => o.continue_on_error = true,
             Long("verbose") => o.verbose = true,
@@ -248,6 +255,20 @@ fn string(value: Result<OsString, lexopt::Error>) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .into_string()
         .map_err(|v| format!("argument is not valid Unicode: {v:?}"))
+}
+
+/// A long flag that is on when given bare and can be set either way with `=`:
+/// `--flag`, `--flag=true`, `--flag=false`. The `=false` form turns off, for one run, what a
+/// profile saved.
+fn switch(p: &mut lexopt::Parser, flag: &str) -> Result<bool, String> {
+    match p.optional_value() {
+        None => Ok(true),
+        Some(v) => match string(Ok(v))?.to_ascii_lowercase().as_str() {
+            "true" | "yes" => Ok(true),
+            "false" | "no" => Ok(false),
+            other => Err(format!("{flag}={other}: expected true or false")),
+        },
+    }
 }
 
 fn number<T: std::str::FromStr>(
@@ -349,6 +370,89 @@ mod tests {
         let err = parse_args(&["--max-output", "100", "x"]).err().unwrap();
         assert!(err.contains("at least 4096"), "{err}");
         assert!(parse_args(&["--max-output", "1MB", "x"]).is_err());
+    }
+
+    #[test]
+    fn lock_timeout_is_seconds_and_zero_means_no_limit() {
+        assert_eq!(opts(&["x"]).lock_timeout, None);
+        assert_eq!(opts(&["--lock-timeout", "5", "x"]).lock_timeout, Some(5));
+        assert_eq!(opts(&["--lock-timeout", "0", "x"]).lock_timeout, Some(0));
+        assert_eq!(opts(&["--lock-timeout=30", "x"]).lock_timeout, Some(30));
+        assert_eq!(
+            opts(&["--lock-timeout", "2147483", "x"]).lock_timeout,
+            Some(2_147_483)
+        );
+        let err = |args: &[&str]| parse_args(args).err().expect("an error");
+        assert_eq!(
+            err(&["--lock-timeout", "2147484", "x"]),
+            "--lock-timeout 2147484: at most 2147483 seconds; use 0 for no limit"
+        );
+        for bad in ["abc", "-1", "1.5", "10s", ""] {
+            assert_eq!(
+                err(&["--lock-timeout", bad, "x"]),
+                format!("--lock-timeout {bad}: expected a non-negative whole number"),
+                "{bad:?}"
+            );
+        }
+        assert!(err(&["--lock-timeout"]).contains("lock-timeout"));
+    }
+
+    #[test]
+    fn read_uncommitted_is_a_switch() {
+        assert_eq!(opts(&["x"]).read_uncommitted, None);
+        assert_eq!(
+            opts(&["--read-uncommitted", "x"]).read_uncommitted,
+            Some(true)
+        );
+        for on in ["true", "TRUE", "yes"] {
+            let flag = format!("--read-uncommitted={on}");
+            assert_eq!(opts(&[&flag, "x"]).read_uncommitted, Some(true), "{on}");
+        }
+        for off in ["false", "No"] {
+            let flag = format!("--read-uncommitted={off}");
+            assert_eq!(opts(&[&flag, "x"]).read_uncommitted, Some(false), "{off}");
+        }
+        // The word after a bare flag is not its value.
+        let o = opts(&["--read-uncommitted", "SELECT 1"]);
+        assert_eq!(o.read_uncommitted, Some(true));
+        assert_eq!(o.query.as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            parse_args(&["--read-uncommitted=maybe", "x"])
+                .err()
+                .unwrap(),
+            "--read-uncommitted=maybe: expected true or false"
+        );
+        // The older switch keeps its message.
+        assert_eq!(
+            parse_args(&["--trust-server-certificate=maybe", "x"])
+                .err()
+                .unwrap(),
+            "--trust-server-certificate=maybe: expected true or false"
+        );
+        assert_eq!(
+            opts(&["--trust-server-certificate=false", "x"]).trust_server_certificate,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn profile_add_takes_the_lock_settings() {
+        match parse_args(&[
+            "profile",
+            "add",
+            "dev",
+            "-S",
+            "srv",
+            "--lock-timeout",
+            "0",
+            "--read-uncommitted=false",
+        ]) {
+            Ok(Command::Profile(ProfileCommand::Add { opts, .. })) => {
+                assert_eq!(opts.lock_timeout, Some(0));
+                assert_eq!(opts.read_uncommitted, Some(false));
+            }
+            _ => panic!("expected profile add"),
+        }
     }
 
     #[test]
