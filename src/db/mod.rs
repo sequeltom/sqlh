@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -232,16 +232,30 @@ pub trait Backpressure {
     fn room(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 }
 
-/// Waits while the output is backed up, unless the run is cancelled first.
-async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(), DbError> {
+/// Waits while the output is backed up, unless the run is cancelled first, or the batch's
+/// deadline (`-t`) passes: a reader that is slow, and not stalled, can't hold a batch past it.
+/// The connection is closed then, as for a cancel, which stops the server's work too.
+async fn wait_for_output(
+    gate: &dyn Backpressure,
+    cancel: &Cancel,
+    deadline: Option<Instant>,
+) -> Result<(), DbError> {
     if !gate.is_full() {
         return Ok(());
     }
+    let expiry = async {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
-        room = gate.room() => room.map_err(DbError::Output),
+        biased;
         () = cancel.cancelled() => Err(DbError::Cancelled(
             "cancelled while waiting for the reader; the connection was closed".into(),
         )),
+        room = gate.room() => room.map_err(DbError::Output),
+        () = expiry => Err(DbError::Timeout("query timeout".into())),
     }
 }
 
@@ -296,57 +310,178 @@ impl Counting {
     };
 }
 
-/// One batch's counting: the budget, the cancel handles that end the batch when it runs out,
-/// and the clock. The driver gets `handle`, a child of `root`, which is a child of the run's
-/// handle. Cancelling `root` therefore cancels the batch's statement without cancelling the
-/// run, and the run's own cancel (Ctrl+C) still reaches the statement. The driver then does what
-/// it does for any cancel of a read in progress: it sends an attention, reads on to the server's
-/// acknowledgement (DONE with the ATTN flag) and settles its state.
+/// How much work, in ticks, a loop does between looks at the clock (`Pace`). A hidden row is
+/// 1 tick, a row that is shown 4 and a chunk of a large value 16, so a look comes every few
+/// hundred narrow rows, a few dozen rows that are formatted, or a few big chunks, and a look
+/// costs well under a percent of that work.
+const PACE_TICKS: u32 = 256;
+const SHOWN_ROW_TICKS: u32 = 4;
+const CHUNK_TICKS: u32 = 16;
+
+/// The longest the batch's loops run before they hand the runtime back (`tokio::task::
+/// yield_now`). The runtime has one thread. A timer (the count budget, the deadline), the
+/// console events and the writer thread's completions run only when this task gives it up,
+/// and a result that is already in the read buffer never makes it wait.
+const YIELD_EVERY: Duration = Duration::from_millis(10);
+
+/// Who cancelled the batch's statement, other than the user: the first of them to fire.
+const CAUSE_NONE: u8 = 0;
+const CAUSE_BUDGET: u8 = 1;
+const CAUSE_DEADLINE: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    /// The count's own time budget (`Counting::budget`).
+    Budget,
+    /// `-t`: the batch's deadline.
+    Deadline,
+}
+
+/// A handle that cancels once, and the cause it is recorded under.
+type Root = Arc<Mutex<Option<CancelHandle>>>;
+
+/// Cancels the batch's statement through `root`, once, recording `cause` if no other cause
+/// came first. A user's cancel does not go through here, so it leaves the cause alone.
+fn fire(root: &Mutex<Option<CancelHandle>>, cause: &AtomicU8, which: u8) {
+    if let Ok(mut cell) = root.lock()
+        && let Some(handle) = cell.take()
+    {
+        let _ = cause.compare_exchange(CAUSE_NONE, which, Ordering::SeqCst, Ordering::SeqCst);
+        handle.cancel();
+    }
+}
+
+/// sqlh's own `-t` for one batch (R15): a monotonic deadline from the moment the batch is
+/// sent, enforced here and not by the driver, whose `timeout_secs` adds up only the time its
+/// transport reads wait and so never expires for data that is already in the buffer, or for
+/// work sqlh does between reads (DESIGN.md §4.4).
+///
+/// It is enforced three ways, because each covers what the others cannot: a timer task fires
+/// the cancel while the batch waits for the server or for the reader; `tick` and `slice` look
+/// at the clock as rows and chunks go by, which catches a loop that never waits; and both only
+/// run when the loop hands the runtime back, which `slice` does every `YIELD_EVERY`.
+struct Pace {
+    deadline: Option<Instant>,
+    root: Root,
+    cause: Arc<AtomicU8>,
+    ticks: u32,
+    yielded: Instant,
+}
+
+impl Pace {
+    /// `weight` ticks of work were done: look at the clock when enough have been.
+    async fn tick(&mut self, weight: u32) {
+        self.ticks += weight;
+        if self.ticks >= PACE_TICKS {
+            self.slice().await;
+        }
+    }
+
+    /// Looks at the clock now: fires the deadline if it has passed, and gives the runtime a
+    /// turn if the loop has held it for `YIELD_EVERY`.
+    async fn slice(&mut self) {
+        self.ticks = 0;
+        let now = Instant::now();
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            fire(&self.root, &self.cause, CAUSE_DEADLINE);
+        }
+        if now.duration_since(self.yielded) >= YIELD_EVERY {
+            tokio::task::yield_now().await;
+            self.yielded = Instant::now();
+        }
+    }
+}
+
+/// One batch's stops: the deadline (`-t`), and the budget of a count of hidden rows. Both
+/// cancel the batch's statement without cancelling the run: the driver gets `handle`, which
+/// is a child of the budget's root, which is a child of the deadline's root, which is a child
+/// of the run's handle. Firing the budget's root cancels the statement; firing the deadline's
+/// cancels it and, through it, the budget's; and the run's own cancel (Ctrl+C) still reaches
+/// the statement through all of them, without leaving a cause behind. The driver then does
+/// what it does for any cancel of a read in progress: it sends an attention, reads on to the
+/// server's acknowledgement (DONE with the ATTN flag, at most 5 s) and settles its state.
 struct Drain {
     budget: Option<Duration>,
-    /// What the driver gets for the batch; `None` without a budget, and then the run's own
-    /// handle is used as it always was.
-    handle: Option<CancelHandle>,
-    /// Holds `root` until the budget fires or the result ends. Taken by whichever comes first.
-    root: Arc<Mutex<Option<CancelHandle>>>,
-    /// Set just before `root` is cancelled: it tells the budget's cancel from a user's.
-    fired: Arc<AtomicBool>,
+    /// What the driver gets for the batch.
+    handle: CancelHandle,
+    /// Holds the budget's root until it fires or the result ends. Empty without a budget.
+    root: Root,
+    /// Which stop fired first (`CAUSE_*`); 0 while none has.
+    cause: Arc<AtomicU8>,
     /// When the first hidden row of the current result was counted.
     began: Option<Instant>,
     timer: Option<tokio::task::JoinHandle<()>>,
+    pace: Pace,
+    deadline_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drain {
-    fn new(budget: Option<Duration>, run: &CancelHandle) -> Drain {
-        let (handle, root) = match budget {
-            Some(_) => {
-                let root = run.child_handle();
-                (Some(root.child_handle()), Some(root))
-            }
-            None => (None, None),
-        };
+    /// `deadline` is `None` for `-t 0`.
+    fn new(budget: Option<Duration>, deadline: Option<Instant>, run: &CancelHandle) -> Drain {
+        let deadline_root = run.child_handle();
+        let budget_root = budget.map(|_| deadline_root.child_handle());
+        let handle = budget_root
+            .as_ref()
+            .unwrap_or(&deadline_root)
+            .child_handle();
+        let cause: Arc<AtomicU8> = Arc::default();
+        let deadline_root: Root = Arc::new(Mutex::new(Some(deadline_root)));
+        let deadline_timer = deadline.map(|at| {
+            let (root, cause) = (Arc::clone(&deadline_root), Arc::clone(&cause));
+            tokio::spawn(async move {
+                tokio::time::sleep_until(at.into()).await;
+                fire(&root, &cause, CAUSE_DEADLINE);
+            })
+        });
         Drain {
             budget,
             handle,
-            root: Arc::new(Mutex::new(root)),
-            fired: Arc::default(),
+            root: Arc::new(Mutex::new(budget_root)),
+            cause: Arc::clone(&cause),
             began: None,
             timer: None,
+            pace: Pace {
+                deadline,
+                root: deadline_root,
+                cause,
+                ticks: 0,
+                yielded: Instant::now(),
+            },
+            deadline_timer,
         }
     }
 
     /// The handle for the driver's `execute`.
-    fn handle<'a>(&'a self, run: &'a CancelHandle) -> &'a CancelHandle {
-        self.handle.as_ref().unwrap_or(run)
+    fn handle(&self) -> &CancelHandle {
+        &self.handle
     }
 
-    /// Whether the budget ended the work, as opposed to the user.
+    /// The batch's deadline; `None` without one.
+    fn deadline(&self) -> Option<Instant> {
+        self.pace.deadline
+    }
+
+    /// Which of sqlh's own stops cancelled the statement first, if one did.
+    fn cause(&self) -> Option<Cause> {
+        match self.cause.load(Ordering::SeqCst) {
+            CAUSE_BUDGET => Some(Cause::Budget),
+            CAUSE_DEADLINE => Some(Cause::Deadline),
+            _ => None,
+        }
+    }
+
+    /// Whether the budget ended the work, as opposed to the user or `-t`.
     fn fired(&self) -> bool {
-        self.fired.load(Ordering::SeqCst)
+        self.cause() == Some(Cause::Budget)
     }
 
-    /// A result begins, or ends however it ends. The timer stops, so that it can't cancel the
-    /// statements that follow.
+    /// Whether `-t` ended the work, as opposed to the user or the budget.
+    fn deadline_fired(&self) -> bool {
+        self.cause() == Some(Cause::Deadline)
+    }
+
+    /// A result begins, or ends however it ends. The budget's timer stops, so that it can't
+    /// cancel the statements that follow. (The deadline's runs to the end of the batch.)
     fn reset(&mut self) {
         self.began = None;
         if let Some(timer) = self.timer.take() {
@@ -364,13 +499,15 @@ impl Drain {
         match self.began {
             None => {
                 self.began = Some(Instant::now());
-                let (root, fired) = (Arc::clone(&self.root), Arc::clone(&self.fired));
+                let (root, cause) = (Arc::clone(&self.root), Arc::clone(&self.cause));
                 self.timer = Some(tokio::spawn(async move {
                     tokio::time::sleep(budget).await;
-                    fire(&root, &fired);
+                    fire(&root, &cause, CAUSE_BUDGET);
                 }));
             }
-            Some(began) if began.elapsed() >= budget => fire(&self.root, &self.fired),
+            Some(began) if began.elapsed() >= budget => {
+                fire(&self.root, &self.cause, CAUSE_BUDGET);
+            }
             Some(_) => {}
         }
     }
@@ -379,16 +516,9 @@ impl Drain {
 impl Drop for Drain {
     fn drop(&mut self) {
         self.reset();
-    }
-}
-
-/// Cancels the batch's statement, once.
-fn fire(root: &Mutex<Option<CancelHandle>>, fired: &AtomicBool) {
-    if let Ok(mut cell) = root.lock()
-        && let Some(handle) = cell.take()
-    {
-        fired.store(true, Ordering::SeqCst);
-        handle.cancel();
+        if let Some(timer) = self.deadline_timer.take() {
+            timer.abort();
+        }
     }
 }
 
@@ -528,6 +658,10 @@ impl Session {
     /// handed over while a result set's rows are being read. SQL errors go to the sink and
     /// don't fail the call; only transport, timeout and output problems do.
     ///
+    /// `timeout_secs` is `-t`, kept here as a deadline from the call to the end of the batch
+    /// (`Pace`, DESIGN.md §4.4); 0 is none. It ends the batch with `DbError::Timeout`, except
+    /// where only hidden rows are being counted and `Counting::timeout_stops` allows a stop.
+    ///
     /// With a bounded `counting`, a result whose hidden rows outrun the budget (or `-t`, when
     /// `Counting::timeout_stops`) ends the batch instead: the rest of it is cancelled, so the
     /// statements after that result do not run, and the sink is told (`counting_stopped`).
@@ -540,15 +674,23 @@ impl Session {
         sink: &mut dyn BatchSink,
         gate: &dyn Backpressure,
     ) -> Result<(), DbError> {
-        let mut drain = Drain::new(counting.budget, &cancel.handle);
+        // `-t` is sqlh's own deadline from here (R15); the driver's `timeout_secs` stays 0 (none),
+        // because it adds up only the time spent waiting for the server and so can neither
+        // bound a batch nor agree with this one.
+        let deadline = (timeout_secs > 0)
+            .then(|| Instant::now().checked_add(Duration::from_secs(u64::from(timeout_secs))))
+            .flatten();
+        let mut drain = Drain::new(counting.budget, deadline, &cancel.handle);
         let options = ExecuteOptions::new()
-            .timeout_secs(timeout_secs)
-            .cancel(drain.handle(&cancel.handle))
+            .timeout_secs(0)
+            .cancel(drain.handle())
             .on_error(BatchErrorMode::Continue);
         let mut step = self.client.execute(sql, options).await;
         loop {
             self.flush_messages(sink)?;
-            wait_for_output(gate, cancel).await?;
+            wait_for_output(gate, cancel, drain.deadline()).await?;
+            // A batch of many small statements and results never waits for a read.
+            drain.pace.slice().await;
             match step {
                 Ok(StatementResult::Rows) => {
                     if self
@@ -610,8 +752,15 @@ impl Session {
     /// `failure` for an error met in a batch that has a count of hidden rows (`Drain`). When the
     /// budget's own cancel went unacknowledged (it fired, the user did not cancel, and the driver
     /// marked the connection dead), the message says that it was sqlh's count that ended the
-    /// run, not a cancel from outside (DESIGN.md §6, exit 6).
+    /// run, not a cancel from outside (DESIGN.md §6, exit 6). A cancel that is sqlh's own `-t`
+    /// (and not the user's) is a timeout, exit 4, whether or not the server acknowledged it.
     fn counting_failure(&self, error: TdsError, drain: &Drain, cancel: &Cancel) -> DbError {
+        if matches!(error, TdsError::OperationCancelledError(_))
+            && drain.deadline_fired()
+            && !cancel.is_cancelled()
+        {
+            return DbError::Timeout("query timeout".into());
+        }
         let own_stop = drain.fired() && !cancel.is_cancelled();
         classify(error, self.client.is_connection_dead(), own_stop)
     }
@@ -663,7 +812,8 @@ impl Session {
             let step = match &plan {
                 Some(plan) => {
                     let cap = sink.cell_limit();
-                    self.streamed_row(plan, shown.then_some(cap)).await
+                    self.streamed_row(plan, shown.then_some(cap), &mut drain.pace)
+                        .await
                 }
                 None => self.plain_row(shown).await,
             };
@@ -685,11 +835,13 @@ impl Session {
             match step {
                 Ok(Row::Values(values)) => {
                     sink.row(&values)?;
-                    wait_for_output(gate, cancel).await?;
+                    wait_for_output(gate, cancel, drain.deadline()).await?;
+                    drain.pace.tick(SHOWN_ROW_TICKS).await;
                 }
                 Ok(Row::Hidden) => {
                     sink.skipped_row();
                     drain.counted_row();
+                    drain.pace.tick(1).await;
                 }
                 Ok(Row::End) => break,
                 Err(TdsError::SqlServerError { diagnostics }) => {
@@ -710,8 +862,9 @@ impl Session {
                     sink.end_rows()?;
                     return Ok(true);
                 }
-                Err(TdsError::TimeoutError(_))
-                    if !shown
+                Err(TdsError::OperationCancelledError(_))
+                    if drain.deadline_fired()
+                        && !shown
                         && counting.timeout_stops
                         && !cancel.is_cancelled()
                         && !self.client.is_connection_dead() =>
@@ -745,7 +898,12 @@ impl Session {
     /// `cap` is `Some(limit)` for a row to show (see `BatchSink::cell_limit`), and `None` for
     /// one to count only: the cursor stays on that row, and the next call skips its columns
     /// without decoding them, a large value chunk by chunk.
-    async fn streamed_row(&mut self, plan: &[stream::Cell], cap: Option<usize>) -> TdsResult<Row> {
+    async fn streamed_row(
+        &mut self,
+        plan: &[stream::Cell],
+        cap: Option<usize>,
+        pace: &mut Pace,
+    ) -> TdsResult<Row> {
         let positioned = match self.client.try_next_row_cursor()? {
             CursorPoll::Ready(positioned) => positioned,
             CursorPoll::Pending => self.client.next_row_cursor().await?,
@@ -769,7 +927,7 @@ impl Session {
                         _ => return Err(unreadable(index)),
                     }
                 }
-                cell => self.large_value(index, *cell, cap).await?,
+                cell => self.large_value(index, *cell, cap, pace).await?,
             });
         }
         Ok(Row::Values(values))
@@ -785,6 +943,7 @@ impl Session {
         index: usize,
         cell: stream::Cell,
         cap: usize,
+        pace: &mut Pace,
     ) -> TdsResult<Value> {
         let (chunk, room) = self.scratch.buffers();
         match self.client.try_read_row_plp_complete(index, chunk)? {
@@ -817,6 +976,9 @@ impl Session {
             if piece.reached_end {
                 return Ok(cutter.finish());
             }
+            // A value of gigabytes arrives in chunks that may all be ready: the deadline and
+            // the runtime's other tasks get their turn between them.
+            pace.tick(CHUNK_TICKS).await;
             if piece.read == 0 {
                 return Err(TdsError::ProtocolError(
                     "a large value's stream made no progress".into(),
@@ -1169,11 +1331,13 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COUNT_STOP_UNCONFIRMED, Counting, DbError, Drain, TdsError, check, classify, data_source,
-        filled, split_protocol, tcp_form, tls_hint,
+        Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, PACE_TICKS,
+        TdsError, check, classify, data_source, filled, split_protocol, tcp_form, tls_hint,
+        wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
-    use std::time::Duration;
+    use std::future::Future;
+    use std::time::{Duration, Instant};
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1188,7 +1352,7 @@ mod tests {
     fn the_count_budget_fires_from_the_first_hidden_row() {
         let run = CancelHandle::new();
         runtime().block_on(async {
-            let mut drain = Drain::new(Some(Duration::from_millis(20)), &run);
+            let mut drain = Drain::new(Some(Duration::from_millis(20)), None, &run);
             tokio::time::sleep(Duration::from_millis(40)).await;
             assert!(!drain.fired(), "the clock starts at the first hidden row");
             drain.counted_row();
@@ -1203,7 +1367,7 @@ mod tests {
     fn a_result_that_ends_in_time_cancels_nothing() {
         let run = CancelHandle::new();
         runtime().block_on(async {
-            let mut drain = Drain::new(Some(Duration::from_millis(20)), &run);
+            let mut drain = Drain::new(Some(Duration::from_millis(20)), None, &run);
             drain.counted_row();
             drain.reset();
             tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1219,7 +1383,7 @@ mod tests {
     fn rows_that_keep_coming_stop_on_time_too() {
         let run = CancelHandle::new();
         runtime().block_on(async {
-            let mut drain = Drain::new(Some(Duration::from_millis(10)), &run);
+            let mut drain = Drain::new(Some(Duration::from_millis(10)), None, &run);
             drain.counted_row();
             // No await, so the timer task never runs: the check in the row does the work.
             std::thread::sleep(Duration::from_millis(30));
@@ -1233,13 +1397,183 @@ mod tests {
     fn exact_counting_has_no_budget_and_no_handle_of_its_own() {
         let run = CancelHandle::new();
         runtime().block_on(async {
-            let mut drain = Drain::new(Counting::EXACT.budget, &run);
+            let mut drain = Drain::new(Counting::EXACT.budget, None, &run);
             drain.counted_row();
-            assert!(drain.handle.is_none() && !drain.fired() && drain.timer.is_none());
+            assert!(drain.cause().is_none() && drain.timer.is_none() && drain.deadline().is_none());
         });
         let (bounded, exact) = (Counting::BOUNDED, Counting::EXACT);
         assert!(bounded.timeout_stops && bounded.budget.is_some());
         assert!(!exact.timeout_stops);
+    }
+
+    /// Work of sqlh's own that waits for nothing: what a loop over rows already in the read
+    /// buffer does between the driver's reads.
+    fn busy(span: Duration) {
+        let until = Instant::now() + span;
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    // R15, the deterministic regression: every "row" is ready at once and costs work of our
+    // own, so nothing in the loop ever waits for the server, and the driver's own clock (which
+    // adds up waiting only) would never run out. The batch's deadline still fires, from the
+    // loop, and the loop stops soon after, not after all its rows. 200,000 rows of 100 µs is
+    // 20 s of work against a 100 ms deadline.
+    #[test]
+    fn the_deadline_fires_in_a_loop_that_never_waits() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let mut drain = Drain::new(None, Some(deadline), &run);
+            let started = Instant::now();
+            let mut rows = 0u32;
+            while rows < 200_000 && drain.cause().is_none() {
+                busy(Duration::from_micros(100));
+                rows += 1;
+                drain.pace.tick(1).await;
+            }
+            let late = started.elapsed().saturating_sub(Duration::from_millis(100));
+            assert!(drain.deadline_fired() && !drain.fired());
+            assert!(rows < 200_000, "the loop ran to the end");
+            // One look comes every PACE_TICKS rows (25.6 ms of work here), or every slice.
+            assert!(late < Duration::from_millis(250), "{late:?} late");
+        });
+    }
+
+    // The clock check alone, with no chance for the timer to run (no await between the work
+    // and the check): the deadline has passed, so the next look fires it.
+    #[test]
+    fn the_clock_check_fires_the_deadline_without_the_timer() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let deadline = Instant::now() + Duration::from_millis(10);
+            let mut drain = Drain::new(None, Some(deadline), &run);
+            busy(Duration::from_millis(30));
+            assert!(drain.cause().is_none(), "the timer can't have run yet");
+            // Less than a slice's worth of work does not look.
+            drain.pace.tick(PACE_TICKS - 1).await;
+            assert!(drain.cause().is_none());
+            drain.pace.tick(1).await;
+            assert!(drain.deadline_fired());
+        });
+    }
+
+    // The loop hands the runtime back, so that a timer and the console listeners (other tasks
+    // on the one thread) run while rows keep arriving. Here a task that would set a flag after
+    // 5 ms can only do so if the loop yields.
+    #[test]
+    fn a_busy_loop_lets_other_tasks_run() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = std::sync::Arc::clone(&flag);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let mut drain = Drain::new(None, None, &run);
+            let started = Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                busy(Duration::from_micros(50));
+                drain.pace.tick(1).await;
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "the loop starved the runtime"
+                );
+            }
+            // Not at every row: the first yield waits for a slice of YIELD_EVERY.
+            assert!(started.elapsed() < Duration::from_millis(200));
+        });
+    }
+
+    // `-t 0` is no deadline at all, and the first stop to fire is the one on record.
+    #[test]
+    fn no_timeout_means_no_deadline_and_the_first_stop_wins() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let mut drain = Drain::new(None, None, &run);
+            for _ in 0..10 {
+                busy(Duration::from_millis(2));
+                drain.pace.tick(PACE_TICKS).await;
+            }
+            assert!(drain.deadline().is_none() && drain.cause().is_none());
+        });
+        runtime().block_on(async {
+            // The budget fires first; the deadline after it does not take its place.
+            let soon = Instant::now() + Duration::from_millis(20);
+            let mut drain = Drain::new(Some(Duration::from_millis(5)), Some(soon), &run);
+            drain.counted_row();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(drain.cause(), Some(Cause::Budget));
+            assert!(drain.fired() && !drain.deadline_fired());
+        });
+        runtime().block_on(async {
+            // The deadline fires first, and a count stopped by it later keeps that cause.
+            let soon = Instant::now() + Duration::from_millis(5);
+            let mut drain = Drain::new(Some(Duration::from_millis(30)), Some(soon), &run);
+            drain.counted_row();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(drain.cause(), Some(Cause::Deadline));
+            assert!(drain.deadline_fired() && !drain.fired());
+        });
+    }
+
+    // What the pacing costs a loop of hidden rows, which does nothing else: nanoseconds per
+    // row, to compare with the 100 to 500 ns that reading a narrow row takes (the numbers are
+    // in docs/notes/drain-experiment.md). Run it with
+    // `cargo test --release pacing_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn pacing_costs_next_to_nothing() {
+        let run = CancelHandle::new();
+        runtime().block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(3600);
+            let mut drain = Drain::new(None, Some(deadline), &run);
+            let rows = 200_000_000u64;
+            let started = Instant::now();
+            for _ in 0..rows {
+                drain.pace.tick(1).await;
+            }
+            let each = started.elapsed().as_nanos() as f64 / rows as f64;
+            eprintln!("pacing: {each:.2} ns per hidden row ({rows} rows)");
+            assert!(each < 20.0, "{each} ns per row");
+        });
+    }
+
+    /// A reader that never takes what is queued.
+    struct Stuck;
+
+    impl Backpressure for Stuck {
+        fn is_full(&self) -> bool {
+            true
+        }
+        fn room(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    // R15: the wait for a reader is inside the deadline, and the user's cancel still comes
+    // first.
+    #[test]
+    fn a_wait_for_the_reader_ends_at_the_deadline_and_a_cancel_wins() {
+        runtime().block_on(async {
+            let cancel = Cancel::new();
+            let started = Instant::now();
+            let deadline = Some(started + Duration::from_millis(40));
+            let outcome = wait_for_output(&Stuck, &cancel, deadline).await;
+            assert!(matches!(outcome, Err(DbError::Timeout(_))), "{outcome:?}");
+            assert!(started.elapsed() >= Duration::from_millis(40));
+            assert!(started.elapsed() < Duration::from_millis(500));
+
+            // Both at once: the deadline has passed and the run is cancelled.
+            let root = Cancel::new();
+            let child = root.child();
+            root.cancel();
+            let past = Some(Instant::now());
+            let outcome = wait_for_output(&Stuck, &child, past).await;
+            assert!(matches!(outcome, Err(DbError::Cancelled(_))), "{outcome:?}");
+        });
     }
 
     // PLAN.md 2.15: what a cancel is called depends only on what sqlh observed. A count that

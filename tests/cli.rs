@@ -4274,8 +4274,8 @@ mod live {
 
     /// The server answers with 20,000 rows at once and then searches 15 billion combinations
     /// for a match that does not exist: a wait with no row coming, for the count to end or for
-    /// `-t` to. (`-t` is the time the driver spends waiting for the server, summed over reads,
-    /// not the time a slow client spends reading, so a stall is what makes it expire.)
+    /// `-t` to. (`-t` is sqlh's own deadline for the batch since R15, so it would also expire
+    /// for a result that is read without any wait; a stall is what makes the wait certain.)
     const STALL_AFTER_20000_ROWS: &str = "SELECT TOP (20000) 1 AS n FROM sys.all_objects AS x \
         CROSS JOIN sys.all_objects AS y UNION ALL SELECT 2 FROM sys.all_objects AS a \
         CROSS JOIN sys.all_objects AS b CROSS JOIN sys.all_objects AS c \
@@ -4553,5 +4553,270 @@ mod live {
         );
         // The hold had a second left, and the closing lines get another.
         assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    // R14. A session that starts with XACT_ABORT ON, as a server's `user options` setting
+    // would make every session, without the word in the user's SQL and without touching the
+    // server: a debug build sends `SQLH_DEBUG_SESSION_PREFIX` ahead of the session setup, in
+    // the same batch. The setup's `SET XACT_ABORT OFF` has to undo it before the wrapper
+    // transaction begins; otherwise the attention that stops a bounded count rolls the wrapper
+    // back, the next batch fails sqlh's invariant, and a last batch ends in a success with the
+    // wrapper gone. (Checked to fail with the OFF taken out of the setup: exit 1, `read-only
+    // guard: an error rolled back the wrapper transaction`, for the first run below.)
+
+    /// Like `live`, with environment variables set for the run.
+    fn live_with(profile: &str, database: &str, env: &[(&str, &str)], args: &[&str]) -> Run {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command
+            .stdin(Stdio::null())
+            .args(["--profile", profile, "-d", database])
+            .args(args);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        run(&mut command)
+    }
+
+    #[cfg(debug_assertions)]
+    const XACT_ABORT_ON: [(&str, &str); 1] = [("SQLH_DEBUG_SESSION_PREFIX", "SET XACT_ABORT ON;")];
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_session_setup_turns_xact_abort_off() {
+        let (p, db) = target();
+        let probe = "SELECT CASE WHEN (@@OPTIONS & 16384) = 16384 THEN 1 ELSE 0 END AS xact_abort";
+        // The prefix alone would leave it ON; the setup after it decides, in both kinds of run.
+        for flags in [&[][..], &["--allow-write"][..]] {
+            let r = live_with(&p, &db, &XACT_ABORT_ON, &[flags, &["-Q", probe]].concat());
+            assert_eq!(r.code, 0, "{flags:?}: {}{}", r.stdout, r.stderr);
+            assert!(
+                r.stdout.contains("xact_abort:int\n0\n"),
+                "{flags:?}: {}",
+                r.stdout
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_stopped_count_keeps_the_wrapper_in_a_session_that_started_with_xact_abort_on() {
+        let (p, _) = target();
+        // A bounded stop (5 million rows are more than 250 ms reads), then a batch that runs.
+        let sql = format!("{}\nGO\nSELECT @@TRANCOUNT AS open_trans", votes(5_000_000));
+        let r = live_with(&p, SO, &XACT_ABORT_ON, &["-Q", &sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("counting stopped)\n"), "{}", r.stdout);
+        assert!(r.stdout.contains("open_trans:int\n1\n"), "{}", r.stdout);
+        assert!(
+            last_line(&r.stdout).starts_with("-- ok: 2 batches, counting stopped in 1, "),
+            "{}",
+            r.stdout
+        );
+        // The stopped count is the last batch: the wrapper is intact at the end, and the run is
+        // a success because of it, not in spite of its absence.
+        let r = live_with(&p, SO, &XACT_ABORT_ON, &["-Q", &votes(5_000_000)]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("counting stopped)\n"), "{}", r.stdout);
+        assert!(!r.stdout.contains("read-only guard"), "{}", r.stdout);
+        // The same in JSON, which says the batch stopped and the run is ok.
+        let json = ["--format", "json", "-Q", &votes(5_000_000)];
+        let r = live_with(&p, SO, &XACT_ABORT_ON, &json);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        assert_eq!(doc["ok"], true, "{doc}");
+        assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
+    }
+
+    // The explicit-input cases are unchanged: XACT_ABORT in the SQL still counts exactly (and
+    // `-t` over it is still exit 4: `a_timeout_that_is_not_in_hidden_rows_is_still_exit_4`),
+    // also in a session that started with it ON.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn xact_abort_in_the_input_still_counts_exactly_in_such_a_session() {
+        let (p, _) = target();
+        let sql = format!("SET XACT_ABORT ON\nGO\n{}; PRINT 'after'", votes(3_000_000));
+        let r = live_with(&p, SO, &XACT_ABORT_ON, &["-Q", &sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("-- 100 of 3000000 rows shown (--max-rows 100)\n-- msg: after\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+    }
+
+    // R15: `-t` is sqlh's own elapsed deadline for a batch, from when it is sent to when its
+    // last result is read, whatever the batch is doing: reading rows that are already there,
+    // formatting them, waiting for the reader. The driver's own `-t` adds up only the time it
+    // waits for the server, so a result that the client read as fast as the server sent it ran
+    // to the end (`--allow-write -t 1` on 10 million narrow rows: 7.4 s, in
+    // docs/notes/drain-experiment.md). After the deadline the statement is cancelled with an
+    // attention, which the server acknowledges after the data in flight: tens of milliseconds
+    // in a release build, up to 2 s measured in a debug build that can't keep up with the
+    // stream. The driver waits for it 5 s at most (DESIGN.md §4.4). These tests allow `-t`
+    // plus 4 s, which a run that reads to the end (7.4 s and up) does not meet.
+    const GRACE: Duration = Duration::from_secs(4);
+
+    /// A run with `-t 1` that has to be over within `-t` plus the grace.
+    fn timed(p: &str, db: &str, flags: &[&str], sql: &str) -> (Run, Duration) {
+        let started = Instant::now();
+        let r = live(p, db, &[flags, &["-t", "1", "-Q", sql]].concat());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1) + GRACE,
+            "{flags:?}: {elapsed:?}\n{}{}",
+            r.stdout,
+            r.stderr
+        );
+        (r, elapsed)
+    }
+
+    const TIMEOUT_1: &str =
+        "-- error: query timeout after 1 s in batch 1; raise -t or narrow the query\n";
+
+    // A fast, narrow result: 10 million rows of one int. Each mode ends within the deadline
+    // plus the grace, with the exit code and the output its rule gives.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_fast_narrow_result_is_bounded_by_t_in_every_mode() {
+        let (p, _) = target();
+        let sql = "SELECT Id FROM dbo.Votes";
+        // Writes allowed: exact, and a failure when the time is up (a stop could skip a COMMIT).
+        let (r, _) = timed(&p, SO, &["--allow-write"], sql);
+        assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains(TIMEOUT_1), "{}", r.stdout);
+        assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+        assert!(
+            last_line(&r.stdout).starts_with("-- failed (exit 4): timeout, "),
+            "{}",
+            r.stdout
+        );
+        // --exact-count in a read-only run: only hidden rows were being read, the rows shown
+        // are complete, so the count stops with the run's own exit code (owner decision 6).
+        let (r, _) = timed(&p, SO, &["--exact-count"], sql);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let n = bound(&r.stdout);
+        assert!(n >= 101, "{n}\n{}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!(
+                "-- 100 of ≥{n} rows shown (--max-rows 100; counting stopped)\n"
+            )),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout
+                .contains("so its later statements did not run; raise -t to count longer\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            last_line(&r.stdout).starts_with("-- ok: 1 batch, counting stopped in 1, "),
+            "{}",
+            r.stdout
+        );
+        // Every row shown, no output limit: the rows being produced are rows to show, so it is
+        // a failure. (The default read-only mode, with its 250 ms count, has nothing hidden.)
+        let (r, _) = timed(&p, SO, &["--max-rows", "0", "--max-output", "0"], sql);
+        assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains(TIMEOUT_1), "{}", r.stdout);
+        assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+        assert!(
+            last_line(&r.stdout).starts_with("-- failed (exit 4): timeout, "),
+            "{}",
+            r.stdout
+        );
+        // The same in JSON: the result that was cut is not exact, and says so.
+        let json = ["--format", "json", "--max-rows", "0", "--max-output", "0"];
+        let (r, _) = timed(&p, SO, &json, sql);
+        assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["interrupted"], true, "{doc}");
+        assert_eq!(result["row_count_exact"], false, "{doc}");
+        // --max-rows 0 with the default output budget: the rows past the budget are hidden,
+        // and the 250 ms count ends the run long before -t.
+        let (r, elapsed) = timed(&p, SO, &["--max-rows", "0"], sql);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("rows shown (--max-output; counting stopped)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+        // The ordinary bounded mode: the budget, not -t, ends it.
+        let (r, elapsed) = timed(&p, SO, &[], sql);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("so its later statements did not run; --exact-count counts every row\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    // A single large value that is shown (cut to --max-cell as it arrives), 256 MB built on
+    // the server. The value is a row to show, so the deadline is a failure, in a read-only run
+    // and with writes allowed alike, and the value is not read to its end.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_large_visible_value_is_bounded_by_t() {
+        let (p, db) = target();
+        // Doubled in steps, not one REPLICATE: a step ends in well under a second, where one
+        // call for 300 MB cannot be interrupted, and then the server would take its time to
+        // answer the attention (the driver waits for it 5 s) however quickly sqlh gives it.
+        let sql = "DECLARE @v varchar(max) = REPLICATE(CAST('x' AS varchar(max)), 4000000); \
+                   SET @v += @v; SET @v += @v; SET @v += @v; SET @v += @v; SET @v += @v; \
+                   SET @v += @v; SELECT @v AS v";
+        for flags in [
+            &["--max-cell", "10"][..],
+            &["--max-cell", "10", "--allow-write"][..],
+            &["--max-cell", "10", "--exact-count"][..],
+        ] {
+            let (r, _) = timed(&p, &db, flags, sql);
+            assert_eq!(r.code, 4, "{flags:?}: {}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(TIMEOUT_1), "{flags:?}: {}", r.stdout);
+            assert!(
+                last_line(&r.stdout).starts_with("-- failed (exit 4): timeout, "),
+                "{flags:?}: {}",
+                r.stdout
+            );
+        }
+    }
+
+    // Many small result sets: a loop that selects a row per iteration. The count budget starts
+    // again with each result, so no result is long, and `--max-results` stops showing them
+    // after the first few; only the deadline bounds the batch. With writes allowed it is exit
+    // 4. In a read-only run the deadline can land while one of the hidden rows is being read,
+    // which is the owner's exception (exit 0, a stopped count), or between results, which is a
+    // failure (exit 4): either ends the run inside the bound.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn many_small_results_are_bounded_by_t() {
+        let (p, db) = target();
+        let sql = "DECLARE @i int = 0; WHILE @i < 20000000 BEGIN SELECT @i AS i; SET @i += 1; END";
+        let (r, _) = timed(&p, &db, &["--allow-write"], sql);
+        assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains(TIMEOUT_1), "{}", r.stdout);
+        assert!(
+            last_line(&r.stdout).starts_with("-- failed (exit 4): timeout, "),
+            "{}",
+            r.stdout
+        );
+        let (r, _) = timed(&p, &db, &[], sql);
+        match r.code {
+            4 => assert!(r.stdout.contains(TIMEOUT_1), "{}", r.stdout),
+            0 => assert!(
+                last_line(&r.stdout).starts_with("-- ok: 1 batch, counting stopped in 1, "),
+                "{}",
+                r.stdout
+            ),
+            code => panic!("exit {code}: {}{}", r.stdout, r.stderr),
+        }
     }
 }

@@ -42,10 +42,14 @@ const DIAG_WAIT: Duration = Duration::from_millis(500);
 const DIAG_FIELD_CHARS: usize = 1000;
 
 /// Session options matching SSMS, so plans and filtered/computed-column indexes behave as
-/// people expect (DESIGN.md §4.3).
+/// people expect (DESIGN.md §4.3). `XACT_ABORT` is set OFF explicitly, as SSMS has it: a
+/// server whose `user options` setting turns it on for every session would otherwise hand sqlh
+/// an ON session, and then the attention that stops a count (or `-t`) rolls the read-only
+/// wrapper back (R14; DESIGN.md §4.4 and §7). It is in the same batch as the wrapper's
+/// `BEGIN TRANSACTION` and ahead of it, so it costs no round trip.
 const SESSION_SETUP: &str = "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; \
     SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; \
-    SET NUMERIC_ROUNDABORT OFF;";
+    SET NUMERIC_ROUNDABORT OFF; SET XACT_ABORT OFF;";
 
 /// Agent defaults on every connection, writes allowed or not (PLAN.md 2.8, owner decision
 /// 7): sqlh's session is the one that loses a deadlock (error 1205) and gives up on a lock
@@ -954,6 +958,14 @@ async fn run_session(
     // `--check` reads nothing, so there is no read to make uncommitted and none to report.
     let read_uncommitted = settings.read_uncommitted && !opts.check;
     let setup = session_setup(settings.lock_timeout, read_uncommitted, wrap);
+    // Debug builds only: SQL sent ahead of the setup in the same batch, so that a test can
+    // start from a session whose `XACT_ABORT` is ON (as a server's `user options` would make
+    // it) without touching the server's configuration. The setup's OFF has to undo it (R14).
+    #[cfg(debug_assertions)]
+    let setup = match std::env::var("SQLH_DEBUG_SESSION_PREFIX") {
+        Ok(prefix) => format!("{prefix} {setup}"),
+        Err(_) => setup,
+    };
     let setup_started = Instant::now();
     session
         .exec_internal(&setup, timeout, cancel)
@@ -1055,6 +1067,18 @@ async fn run_session(
         }
     }
 
+    // The wrapper has to be there after the last batch too. It is checked before each batch
+    // (above), which leaves the last one: a run whose wrapper was rolled back without an error
+    // (an attention under XACT_ABORT ON) must not end as a success (R14). A batch that failed
+    // already says so, and its rollback (a deadlock victim) needs no second message.
+    if wrap && !session.in_transaction() && stats.first_failed.is_none() {
+        return Err(Failure::new(
+            Exit::SqlError,
+            "read-only guard: the wrapper transaction was gone after the last batch (something \
+             rolled it back without an error); the run is not reported as a success",
+        ));
+    }
+
     if opts.check {
         out.note(
             "--check compiled each batch without running it. Missing tables are only reported \
@@ -1109,6 +1133,26 @@ mod tests {
     #[test]
     fn the_session_setup_carries_the_agent_defaults() {
         let ssms = SESSION_SETUP;
+        // R14, spelled out: the whole first batch of a read-only run, with XACT_ABORT OFF
+        // before the wrapper transaction begins (and in an --allow-write run, which has no
+        // wrapper, all the same).
+        assert_eq!(
+            session_setup(10, false, true),
+            "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; SET ARITHABORT ON; \
+             SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; SET NUMERIC_ROUNDABORT OFF; \
+             SET XACT_ABORT OFF; SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; \
+             BEGIN TRANSACTION;"
+        );
+        for read_uncommitted in [false, true] {
+            let setup = session_setup(10, read_uncommitted, true);
+            let off = setup
+                .find("SET XACT_ABORT OFF;")
+                .expect("XACT_ABORT is set");
+            let begin = setup.find("BEGIN TRANSACTION;").expect("the wrapper");
+            assert!(off < begin, "{setup}");
+            assert!(!setup.contains("XACT_ABORT ON"), "{setup}");
+        }
+        assert!(session_setup(10, false, false).contains(" SET XACT_ABORT OFF; "));
         assert_eq!(
             session_setup(10, false, true),
             format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; BEGIN TRANSACTION;")
