@@ -3,6 +3,7 @@
 //! Batches are split first and substituted after (DESIGN.md §4.3), so a variable can't
 //! create a batch separator: a value of `GO` stays inside its batch.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// The most SQL a run takes, before and after `$(var)` substitution (DESIGN.md §4.4).
@@ -95,21 +96,28 @@ pub fn prepare(
                 ));
             }
             let (sql, line_map) = match vars {
-                Some(vars) => substitute(&raw.text, vars).map_err(|(name, offset)| {
-                    let line = raw.line + raw.text[..offset].matches('\n').count() as u32;
-                    format!(
-                        "{}:{line}: undefined variable $({name}); pass -v {name}=value, or -x to turn substitution off",
-                        source.name
-                    )
-                })?,
+                // Told how much of the limit is left, so that a value repeated a million times
+                // is refused when it reaches the limit, not after it has been built.
+                Some(vars) => {
+                    substitute(&raw.text, vars, MAX_INPUT_BYTES.saturating_sub(total)).map_err(
+                        |stop| match stop {
+                            Stop::TooLarge => too_large(),
+                            Stop::Undefined(name, offset) => {
+                                let line =
+                                    raw.line + raw.text[..offset].matches('\n').count() as u32;
+                                format!(
+                                    "{}:{line}: undefined variable $({name}); pass -v {name}=value, or -x to turn substitution off",
+                                    source.name
+                                )
+                            }
+                        },
+                    )?
+                }
                 None => (raw.text, Vec::new()),
             };
             total += sql.len();
             if total > MAX_INPUT_BYTES {
-                return Err(format!(
-                    "after $(var) substitution the SQL is over the {} MB limit; run it in parts",
-                    MAX_INPUT_BYTES / 1_000_000
-                ));
+                return Err(too_large());
             }
             batches.push(Batch {
                 sql,
@@ -121,6 +129,13 @@ pub fn prepare(
         }
     }
     Ok(batches)
+}
+
+fn too_large() -> String {
+    format!(
+        "after $(var) substitution the SQL is over the {} MB limit; run it in parts",
+        MAX_INPUT_BYTES / 1_000_000
+    )
 }
 
 struct RawBatch {
@@ -249,63 +264,130 @@ impl Lexer {
     }
 }
 
+/// Why `substitute` stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Stop {
+    /// A name without a value, with its byte offset in the text.
+    Undefined(String, usize),
+    /// The text would pass the room it was given.
+    TooLarge,
+}
+
 /// Replaces `$(name)` with values from `-v`, then environment variables (as sqlcmd does).
 /// Names are case-insensitive. A `$(` that isn't a well-formed reference stays literal.
-/// Returns the text and its line map (see `Batch::line_map`). On an undefined name,
-/// returns the name with its byte offset.
+/// Returns the text and its line map (see `Batch::line_map`).
+///
+/// `room` is how many bytes of SQL the run may still take (`MAX_INPUT_BYTES` less the earlier
+/// batches). The text is checked against it before every piece is appended, so a reference
+/// repeated a million times stops at the limit instead of being built first: peak allocation is
+/// bounded by the room, not by what the input would expand to. The text never gets capacity
+/// beyond the room, and the line map, made only when a value adds lines, takes at most 8 bytes
+/// a line of the result (4 bytes of entry and room to double).
 fn substitute(
     text: &str,
     vars: &[(String, String)],
-) -> Result<(String, Vec<u32>), (String, usize)> {
+    room: usize,
+) -> Result<(String, Vec<u32>), Stop> {
     if !text.contains("$(") {
-        return Ok((text.to_owned(), Vec::new()));
+        return if text.len() > room {
+            Err(Stop::TooLarge)
+        } else {
+            Ok((text.to_owned(), Vec::new()))
+        };
     }
-    let mut out = String::with_capacity(text.len());
-    let mut map = vec![0u32];
-    let mut original_line = 0u32;
-    let mut multi_line = false;
+    let mut result = Builder {
+        out: String::with_capacity(text.len().min(room)),
+        room,
+        original_line: 0,
+        map: None,
+    };
     let mut rest = text;
     let mut offset = 0;
     while let Some(pos) = rest.find("$(") {
-        copy_original(&mut out, &mut map, &mut original_line, &rest[..pos]);
+        result.original(&rest[..pos])?;
         let after = &rest[pos + 2..];
         let len = after
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
             .unwrap_or(after.len());
         let consumed = if len > 0 && after[len..].starts_with(')') {
             let name = &after[..len];
-            let value = vars
+            let value = match vars
                 .iter()
                 .rev()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.clone())
-                .or_else(|| std::env::var(name).ok())
-                .ok_or_else(|| (name.to_owned(), offset + pos))?;
-            // Lines a value adds all come from the line the reference is on.
-            for _ in value.matches('\n') {
-                map.push(original_line);
-                multi_line = true;
-            }
-            out.push_str(&value);
+            {
+                Some((_, value)) => Cow::Borrowed(value.as_str()),
+                None => Cow::Owned(
+                    std::env::var(name)
+                        .map_err(|_| Stop::Undefined(name.to_owned(), offset + pos))?,
+                ),
+            };
+            result.value(&value)?;
             pos + 2 + len + 1
         } else {
-            out.push_str("$(");
+            result.original("$(")?;
             pos + 2
         };
         rest = &rest[consumed..];
         offset += consumed;
     }
-    copy_original(&mut out, &mut map, &mut original_line, rest);
-    Ok((out, if multi_line { map } else { Vec::new() }))
+    result.original(rest)?;
+    Ok((result.out, result.map.unwrap_or_default()))
 }
 
-/// Appends original text, recording which original line each new output line starts on.
-fn copy_original(out: &mut String, map: &mut Vec<u32>, original_line: &mut u32, segment: &str) {
-    for _ in segment.matches('\n') {
-        *original_line += 1;
-        map.push(*original_line);
+/// The text of a substitution so far, within the room it may take.
+struct Builder {
+    out: String,
+    room: usize,
+    /// The line of the input the output has reached (0-based).
+    original_line: u32,
+    /// For each line of the output, the input line it came from. Made when a value first adds
+    /// a line: until then every line is its own, and nothing is stored.
+    map: Option<Vec<u32>>,
+}
+
+impl Builder {
+    /// Appends input text, recording which input line each new output line starts on.
+    fn original(&mut self, segment: &str) -> Result<(), Stop> {
+        self.reserve(segment.len())?;
+        for _ in segment.matches('\n') {
+            self.original_line += 1;
+            if let Some(map) = &mut self.map {
+                map.push(self.original_line);
+            }
+        }
+        self.out.push_str(segment);
+        Ok(())
     }
-    out.push_str(segment);
+
+    /// Appends a value. The lines it adds all come from the line the reference is on.
+    fn value(&mut self, value: &str) -> Result<(), Stop> {
+        self.reserve(value.len())?;
+        let lines = value.matches('\n').count();
+        if lines > 0 {
+            let line = self.original_line;
+            let map = self.map.get_or_insert_with(|| (0..=line).collect());
+            map.extend(std::iter::repeat_n(line, lines));
+        }
+        self.out.push_str(value);
+        Ok(())
+    }
+
+    /// Makes sure `more` bytes fit in the room, and in the string: it grows by doubling, but
+    /// never past the room.
+    fn reserve(&mut self, more: usize) -> Result<(), Stop> {
+        let needed = self.out.len().saturating_add(more);
+        if needed > self.room {
+            return Err(Stop::TooLarge);
+        }
+        if needed > self.out.capacity() {
+            let target = needed
+                .max(self.out.capacity().saturating_mul(2))
+                .min(self.room);
+            self.out.reserve_exact(target - self.out.len());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -377,12 +459,12 @@ mod tests {
     fn substitutes_variables() {
         let vars = vec![("db".to_string(), "AppDb".to_string())];
         assert_eq!(
-            substitute("USE $(DB); SELECT '$(' ", &vars).unwrap(),
+            substitute("USE $(DB); SELECT '$(' ", &vars, MAX_INPUT_BYTES).unwrap(),
             ("USE AppDb; SELECT '$(' ".to_owned(), Vec::new())
         );
         assert_eq!(
-            substitute("$(nope_sqlh_test)", &vars).unwrap_err(),
-            ("nope_sqlh_test".into(), 0)
+            substitute("$(nope_sqlh_test)", &vars, MAX_INPUT_BYTES).unwrap_err(),
+            Stop::Undefined("nope_sqlh_test".into(), 0)
         );
     }
 
@@ -454,6 +536,212 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("over the 10 MB limit"), "{err}");
+    }
+
+    // PLAN.md 2.7: the limit is checked as the text is built, not after. This input would
+    // expand to 32 GB ("$(v)" a million times, 32 KB each); it is refused when it reaches the
+    // limit, which is the only reason this test finishes at all, and the message is the
+    // existing one.
+    #[test]
+    fn a_runaway_expansion_is_refused_at_the_limit() {
+        let vars = [("v".to_owned(), "x".repeat(32 * 1024))];
+        let text = "$(v)".repeat(1_000_000);
+        assert_eq!(
+            substitute(&text, &vars, MAX_INPUT_BYTES).unwrap_err(),
+            Stop::TooLarge
+        );
+        let err = prepare(&[source("a.sql", &text)], "GO", Some(&vars))
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            "after $(var) substitution the SQL is over the 10 MB limit; run it in parts"
+        );
+    }
+
+    // PLAN.md 2.7: the room is exact. Original text before and after a reference, a value, a
+    // `$(` kept literal and text without any reference all count, byte for byte.
+    #[test]
+    fn the_room_is_exact() {
+        let vars = [
+            ("v".to_owned(), "12345".to_owned()),
+            ("e".to_owned(), String::new()),
+        ];
+        for (text, size) in [
+            ("a$(v)b", 7),
+            ("aaa$(v)", 8),
+            ("$(v)aaa", 8),
+            ("$(v)$(", 7),
+            ("$(v)$(v)", 10),
+            ("$(e)", 0),
+            ("x$(e)y$(e)", 2),
+            ("abcdef$(", 8),
+            ("abcdef", 6),
+        ] {
+            let (sql, _) = substitute(text, &vars, size).unwrap();
+            assert_eq!(sql.len(), size, "{text}");
+            assert!(
+                sql.capacity() <= size,
+                "{text}: capacity {}",
+                sql.capacity()
+            );
+            if size > 0 {
+                assert_eq!(
+                    substitute(text, &vars, size - 1).unwrap_err(),
+                    Stop::TooLarge,
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    // PLAN.md 2.7: the limit is shared by a run's batches, so each gets what the earlier ones
+    // left.
+    #[test]
+    fn the_room_shrinks_across_batches() {
+        // `SELECT '$(v)'` twice (14 and 13 bytes, 4 of them the reference), then a comment of
+        // 3 bytes and `comment` more.
+        let run = |value: usize, comment: usize| {
+            let sources = [
+                source("a.sql", "SELECT '$(v)'\nGO\nSELECT '$(v)'"),
+                source("b.sql", &format!("-- {}", "x".repeat(comment))),
+            ];
+            prepare(&sources, "GO", Some(&[("v".to_owned(), "y".repeat(value))]))
+        };
+        let limit = |batches: Vec<Batch>| batches.iter().map(|b| b.sql.len()).sum::<usize>();
+        // 10 + 4,000,000, 9 + 4,000,000 and 3 + 1,999,978 bytes: exactly the limit.
+        assert_eq!(limit(run(4_000_000, 1_999_978).unwrap()), MAX_INPUT_BYTES);
+        for (value, comment) in [
+            // One byte over, found in the comment (text without a reference).
+            (4_000_000, 1_999_979),
+            // Two bytes over, found there too.
+            (4_999_990, 0),
+            // The second batch alone passes what the first left, and is refused as it is built.
+            (5_000_000, 0),
+        ] {
+            let err = run(value, comment).err().unwrap();
+            assert!(
+                err.contains("over the 10 MB limit"),
+                "{value} {comment}: {err}"
+            );
+        }
+        assert_eq!(limit(run(4_999_989, 0).unwrap()), MAX_INPUT_BYTES);
+    }
+
+    /// `substitute` as it was before PLAN.md 2.7: no room, and the line map made eagerly.
+    fn reference(
+        text: &str,
+        vars: &[(String, String)],
+    ) -> Result<(String, Vec<u32>), (String, usize)> {
+        if !text.contains("$(") {
+            return Ok((text.to_owned(), Vec::new()));
+        }
+        let mut out = String::new();
+        let mut map = vec![0u32];
+        let mut original_line = 0u32;
+        let mut multi_line = false;
+        let mut rest = text;
+        let mut offset = 0;
+        let copy = |out: &mut String, map: &mut Vec<u32>, line: &mut u32, segment: &str| {
+            for _ in segment.matches('\n') {
+                *line += 1;
+                map.push(*line);
+            }
+            out.push_str(segment);
+        };
+        while let Some(pos) = rest.find("$(") {
+            copy(&mut out, &mut map, &mut original_line, &rest[..pos]);
+            let after = &rest[pos + 2..];
+            let len = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(after.len());
+            let consumed = if len > 0 && after[len..].starts_with(')') {
+                let name = &after[..len];
+                let value = vars
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(name).ok())
+                    .ok_or_else(|| (name.to_owned(), offset + pos))?;
+                for _ in value.matches('\n') {
+                    map.push(original_line);
+                    multi_line = true;
+                }
+                out.push_str(&value);
+                pos + 2 + len + 1
+            } else {
+                out.push_str("$(");
+                pos + 2
+            };
+            rest = &rest[consumed..];
+            offset += consumed;
+        }
+        copy(&mut out, &mut map, &mut original_line, rest);
+        Ok((out, if multi_line { map } else { Vec::new() }))
+    }
+
+    // PLAN.md 2.7: building within a room, and making the line map only when a value adds
+    // lines, change nothing about the result. Against the old algorithm, for any room: the
+    // same text and line map when it fits, TooLarge when it doesn't, and for an undefined name
+    // the same error unless the room ran out before the name was reached.
+    #[test]
+    fn substitution_within_a_room_matches_the_unbounded_algorithm() {
+        const PIECES: &[&str] = &[
+            "SELECT",
+            " ",
+            "\n",
+            "\r\n",
+            "$(a)",
+            "$(b)",
+            "$(c)",
+            "$(none_sqlh_test)",
+            "$(",
+            ")",
+            "é",
+            "😀",
+            "GO",
+            "'",
+        ];
+        let vars = [
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "x\ny\nz".to_string()),
+            ("C".to_string(), String::new()),
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 12) as usize;
+            let text: String = (0..len)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect();
+            let wanted = reference(&text, &vars);
+            for room in [0, 1, 5, 12, 30, 1000, MAX_INPUT_BYTES] {
+                let got = substitute(&text, &vars, room);
+                match (&wanted, &got) {
+                    (Ok((sql, _)), Ok(_)) if sql.len() <= room => {
+                        assert_eq!(wanted.as_ref().ok(), got.as_ref().ok(), "{text:?} {room}");
+                        assert!(
+                            got.as_ref().unwrap().0.capacity() <= room,
+                            "{text:?} {room}"
+                        );
+                    }
+                    (Ok((sql, _)), Err(Stop::TooLarge)) => {
+                        assert!(sql.len() > room, "{text:?} {room}");
+                    }
+                    (Err((name, offset)), Err(Stop::Undefined(n, o))) => {
+                        assert_eq!((name, offset), (n, o), "{text:?} {room}");
+                    }
+                    (Err(_), Err(Stop::TooLarge)) => {}
+                    _ => panic!("{text:?} in {room}: wanted {wanted:?}, got {got:?}"),
+                }
+            }
+        }
     }
 
     #[test]

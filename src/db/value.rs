@@ -17,6 +17,12 @@ pub enum Value {
     /// Text that needs escaping and may be truncated.
     Text(String),
     Bin(Vec<u8>),
+    /// Text the read cut (`BatchSink::cell_limit`): the characters kept, and how many more
+    /// followed, which were counted and dropped as they arrived. A sink writes the kept
+    /// characters and the cut marker, exactly as for a `Text` it cut itself.
+    TextCut(String, usize),
+    /// Binary the read cut: the bytes kept, and how many more followed.
+    BinCut(Vec<u8>, usize),
 }
 
 /// Days from 0001-01-01 and from 1900-01-01 to the Unix epoch.

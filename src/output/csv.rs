@@ -144,6 +144,10 @@ impl<W: Write> BatchSink for CsvSink<W> {
         self.tally.wants_values()
     }
 
+    fn cell_limit(&self) -> usize {
+        self.tally.cell_limit()
+    }
+
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
         let max = self.tally.limits().max_cell;
         let mut line = std::mem::take(&mut self.line);
@@ -176,6 +180,16 @@ impl<W: Write> BatchSink for CsvSink<W> {
                         text.push_str(&cut_marker(cut_count, true));
                     }
                     line.push_str(&text);
+                }
+                // Cut by the read, to the sink's own limit: the marker is all that's left to add.
+                Value::TextCut(s, more) => {
+                    cells_cut += 1;
+                    push_field(&mut line, &format!("{s}{}", cut_marker(*more, false)));
+                }
+                Value::BinCut(bytes, more) => {
+                    cells_cut += 1;
+                    line.push_str(&hex(bytes, 0).0);
+                    line.push_str(&cut_marker(*more, true));
                 }
             }
         }

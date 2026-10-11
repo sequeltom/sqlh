@@ -1502,6 +1502,98 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
+/// Runs `command` to its end and also returns the child's peak working set in bytes. Windows
+/// keeps that with the process handle, which `Child` holds until it is dropped, so it can be
+/// read after the child has exited. The pipes are drained in the order a run writes them: a
+/// run of sqlh writes little to stderr.
+#[cfg(windows)]
+fn run_measured(command: &mut Command) -> (Run, usize) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    /// PROCESS_MEMORY_COUNTERS.
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        size: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        peak_paged_pool: usize,
+        paged_pool: usize,
+        peak_non_paged_pool: usize,
+        non_paged_pool: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+
+    // kernel32 exports GetProcessMemoryInfo under this name since Windows 7.
+    unsafe extern "system" {
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut MemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().expect("sqlh ends");
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let mut counters = MemoryCounters {
+        size: std::mem::size_of::<MemoryCounters>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the handle is the child's own process handle, which `child` keeps open; the
+    // counters are a correctly sized, writable struct, and `size` says how big it is.
+    let read =
+        unsafe { K32GetProcessMemoryInfo(child.as_raw_handle(), &mut counters, counters.size) };
+    assert_ne!(read, 0, "peak memory: {}", std::io::Error::last_os_error());
+    let run = Run {
+        code: status.code().expect("an exit code, not a signal"),
+        stdout,
+        stderr,
+    };
+    (run, counters.peak_working_set)
+}
+
+// PLAN.md 2.7: $(var) substitution is checked against the 10 MB limit while the text is built,
+// so a reference repeated 200,000 times to a 3,000-byte value is refused when it reaches the
+// limit, not after it has been expanded: that would be 600 MB, and the whole run now takes a
+// few megabytes more than the file it reads.
+#[cfg(windows)]
+#[test]
+fn a_runaway_substitution_is_refused_without_being_built() {
+    let dir = scratch("f06_expansion");
+    let file = dir.join("expand.sql");
+    fs::write(&file, "$(big)".repeat(200_000)).unwrap();
+    let value = format!("big={}", "x".repeat(3_000));
+    let (r, peak) = run_measured(sqlh().args(DEAD).args(["-v", &value, "-i"]).arg(&file));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("after $(var) substitution the SQL is over the 10 MB limit; run it in parts"),
+        "{}",
+        r.stdout
+    );
+    assert!(peak < 100 << 20, "peak working set {} MB", peak >> 20);
+}
+
 // F10: a truncated UTF-16 file is an error, not a silent loss of the last byte.
 #[test]
 fn odd_length_utf16_is_rejected() {
@@ -2365,6 +2457,148 @@ mod live {
             );
             assert!(elapsed < Duration::from_secs(15), "{limits:?}: {elapsed:?}");
         }
+    }
+
+    // PLAN.md 2.7: a large value shown with --max-cell is cut as it arrives, so memory stays
+    // flat. The values are built on the server, 60 MB each; before the change a run held two
+    // copies of one (about 120 MB at the peak, and 2 GB for a value of 1 GB), and now it holds
+    // the 500 characters it shows, plus the few buffers it reads through. The count of what was
+    // cut stays exact: the text has a surrogate pair that chunk boundaries fall in, and a
+    // double-byte code page.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_large_value_is_cut_as_it_arrives() {
+        let (p, db) = target();
+        let cases = [
+            // varchar(max): 60,000,000 characters, one byte each.
+            (
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big",
+                format!("{}…[+59999500]", "x".repeat(500)),
+            ),
+            // nvarchar(max): 20,000,000 characters, 60,000,000 bytes, half of them in pairs.
+            (
+                "SELECT REPLICATE(CAST(N'é😀' AS nvarchar(max)), 10000000) AS big",
+                format!("{}…[+19999500]", "é😀".repeat(250)),
+            ),
+            // varchar(max) in Japanese code page 932: 20,000,000 characters of two bytes.
+            // Built from code points, so that nothing on the way to the server can turn the
+            // text into question marks.
+            (
+                "SELECT REPLICATE(CAST((NCHAR(26085) + NCHAR(26412)) COLLATE Japanese_CI_AS \
+                 AS varchar(max)), 10000000) AS big",
+                format!("{}…[+19999500]", "日本".repeat(250)),
+            ),
+            // varbinary(max): 60,000,000 bytes; 500 hex digits are 250 bytes. (REPLICATE
+            // turns binary into varchar, so the bytes are made from text.)
+            (
+                "SELECT CAST(REPLICATE(CAST('ab' AS varchar(max)), 30000000) AS varbinary(max)) \
+                 AS big",
+                format!("0x{}…[+59999750 bytes]", "6162".repeat(125)),
+            ),
+        ];
+        for (sql, shown) in cases {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command.stdin(Stdio::null()).args([
+                "--profile",
+                &p,
+                "-d",
+                &db,
+                "--max-cell",
+                "500",
+                "-Q",
+                sql,
+            ]);
+            let (r, peak) = run_measured(&mut command);
+            assert_eq!(r.code, 0, "{sql}: {}{}", r.stdout, r.stderr);
+            let lines: Vec<&str> = r.stdout.lines().collect();
+            assert_eq!(lines[2], shown, "{sql}");
+            assert_eq!(lines[3], "-- 1 row; 1 value cut (--max-cell 500)", "{sql}");
+            assert!(
+                peak < 40 << 20,
+                "{sql}: peak working set {} MB for a value of 60 MB",
+                peak >> 20
+            );
+        }
+        // With no --max-cell, the output budget is the limit: a value of 40,000,000 characters
+        // can't fit in 1,000,000 bytes, so the row is withheld as it was before, and what the
+        // run held is still a few megabytes, not 80 MB of text and the same again to write it.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-cell",
+            "0",
+            "-Q",
+            "SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 40000000) AS big",
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains("\n-- 0 of 1 rows shown (--max-output)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
+        // The same in json, which builds its rows in a buffer of its own.
+        let sql = "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big";
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-cell",
+            "500",
+            "--format",
+            "json",
+            "-Q",
+            sql,
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(
+            result["rows"][0][0],
+            format!("{}…[+59999500]", "x".repeat(500))
+        );
+        assert_eq!(result["cells_cut"], 1);
+        assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
+    }
+
+    // PLAN.md 2.7: rows past --max-rows are counted without decoding their values. The first
+    // row is small and shown; the five after it hold 40 MB each, and are skipped chunk by
+    // chunk. Reading each into memory first took 40 MB or more at the peak.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn hidden_rows_are_not_materialized() {
+        let (p, db) = target();
+        let sql = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), CASE WHEN n = 1 THEN 10 \
+                   ELSE 40000000 END) AS v FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n)";
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-rows",
+            "1",
+            "-Q",
+            sql,
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("\n1\txxxxxxxxxx\n-- 1 of 6 rows shown (--max-rows 1)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(peak < 25 << 20, "peak working set {} MB", peak >> 20);
     }
 
     // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the

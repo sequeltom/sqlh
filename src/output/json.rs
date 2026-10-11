@@ -271,6 +271,21 @@ impl<W: Write> JsonSink<W> {
                 self.buf.push('"');
                 return cut_count > 0;
             }
+            // Cut by the read, to the sink's own limit: the marker is all that's left to add.
+            Value::TextCut(s, more) => {
+                self.buf.push('"');
+                push_escaped(&mut self.buf, s);
+                self.buf.push_str(&cut_marker(*more, false));
+                self.buf.push('"');
+                return true;
+            }
+            Value::BinCut(bytes, more) => {
+                self.buf.push('"');
+                self.buf.push_str(&hex(bytes, 0).0);
+                self.buf.push_str(&cut_marker(*more, true));
+                self.buf.push('"');
+                return true;
+            }
         }
         false
     }
@@ -387,6 +402,10 @@ impl<W: Write> BatchSink for JsonSink<W> {
 
     fn wants_values(&self) -> bool {
         self.tally.wants_values()
+    }
+
+    fn cell_limit(&self) -> usize {
+        self.tally.cell_limit()
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
