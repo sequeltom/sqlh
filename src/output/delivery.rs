@@ -10,8 +10,9 @@
 //!   rows, not a hard ceiling.
 //! - The thread writes a chunk in units of at most `WRITE_UNIT` bytes. Each write that takes
 //!   bytes is progress: the bytes stop counting as queued, so room opens as the reader
-//!   drains, and the stall clock restarts. A reader that keeps taking output isn't stalled,
-//!   however slowly.
+//!   drains, and the stall clock restarts. A reader that takes each write within the stall
+//!   limit isn't stalled, however slow it is overall: it must take `WRITE_UNIT` bytes per
+//!   stall limit (review R11; about 68 bytes/s at the default 60 s).
 //! - When the reader makes no progress on waiting output for the stall limit (the query
 //!   timeout, `-t`), the output couldn't be delivered: exit 7. Time with nothing to write
 //!   doesn't count.
@@ -379,8 +380,9 @@ fn write_out(
 /// on after a partial write, retries an interrupted one, and fails on a write that takes
 /// nothing. After every write that took `n` bytes, those bytes stop counting as queued, the
 /// stall clock restarts and the waiters are woken. Progress is therefore what the reader
-/// actually takes, not whole chunks: a reader that keeps reading is never a stall, however
-/// slowly, and one that blocks a single write for the stall limit is.
+/// actually takes, not whole chunks: a reader that takes each write within the stall limit is
+/// not a stall, and one that blocks a single write for the stall limit is, however much it
+/// keeps reading byte by byte.
 fn write_units(shared: &Shared, out: &mut dyn Write, chunk: &[u8]) -> io::Result<()> {
     let mut rest = chunk;
     while !rest.is_empty() {
@@ -522,6 +524,109 @@ impl crate::db::Backpressure for Gate {
 
     fn room(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + '_>> {
         Box::pin(Gate::room(self))
+    }
+}
+
+/// How long the end of a run waits for `Side` to write what it was given.
+pub const SIDE_WAIT: Duration = Duration::from_millis(500);
+
+enum SideMessage {
+    Bytes(Vec<u8>),
+    /// Answered once everything before it has been written (or dropped).
+    Sync(std::sync::mpsc::Sender<()>),
+}
+
+/// A best-effort stream with a thread of its own: text and json's stderr, which carries only
+/// diagnostics (`--verbose`). Nothing written here can hold up the main output, whose thread
+/// never touches this stream (review R12): a reader that leaves stderr unread blocks only this
+/// thread. A write error ends the stream's writes and fails nothing. At the end, `finish`
+/// gives the thread `SIDE_WAIT` to catch up; what it hasn't written by then is lost, and the
+/// thread is left behind when the process ends.
+pub struct Side {
+    sender: std::sync::mpsc::Sender<SideMessage>,
+    /// Set when a wait ran out, so later waits (`Drop`) don't wait again.
+    abandoned: bool,
+}
+
+impl Side {
+    pub fn start(mut out: Box<dyn Write + Send>) -> Side {
+        let (sender, messages) = std::sync::mpsc::channel();
+        // If the thread can't start, `messages` is dropped with the closure: every send then
+        // fails, and diagnostics are dropped, as they would be on a broken stderr.
+        let _ = std::thread::Builder::new()
+            .name("sqlh-stderr".into())
+            .spawn(move || {
+                let mut failed = false;
+                for message in messages {
+                    match message {
+                        SideMessage::Bytes(bytes) if !failed => {
+                            failed = out.write_all(&bytes).and_then(|()| out.flush()).is_err();
+                        }
+                        SideMessage::Bytes(_) => {}
+                        SideMessage::Sync(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            });
+        Side {
+            sender,
+            abandoned: false,
+        }
+    }
+
+    pub fn writer(&self) -> SideWriter {
+        SideWriter {
+            sender: self.sender.clone(),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Waits until everything sent so far is written, for at most `SIDE_WAIT` in all.
+    pub fn finish(&mut self) {
+        if self.abandoned {
+            return;
+        }
+        let (done, written) = std::sync::mpsc::channel();
+        if self.sender.send(SideMessage::Sync(done)).is_ok()
+            && written.recv_timeout(SIDE_WAIT).is_err()
+        {
+            self.abandoned = true;
+        }
+    }
+}
+
+impl Drop for Side {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// A sink's end of `Side`: collects bytes and hands them over on `flush`. It never blocks
+/// and never fails.
+pub struct SideWriter {
+    sender: std::sync::mpsc::Sender<SideMessage>,
+    buf: Vec<u8>,
+}
+
+impl Write for SideWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let bytes = std::mem::take(&mut self.buf);
+            let _ = self.sender.send(SideMessage::Bytes(bytes));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SideWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -1101,5 +1206,47 @@ mod tests {
             out.write_all(b"two\n").unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    // R12: the diagnostics' own thread writes in order, and the end waits for it only as
+    // long as it takes, which on a healthy stream is no time at all.
+    #[test]
+    fn side_writes_in_order_and_finishes_promptly() {
+        let sink = Sink::default();
+        let mut side = Side::start(Box::new(sink.clone()));
+        let mut out = side.writer();
+        out.write_all(b"one\n").unwrap();
+        out.flush().unwrap();
+        out.write_all(b"two\n").unwrap();
+        drop(out);
+        let started = Instant::now();
+        side.finish();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(*sink.0.lock().unwrap(), b"one\ntwo\n");
+    }
+
+    // R12: a stream that fails loses what follows and fails nothing; it isn't tried again.
+    #[test]
+    fn side_stops_writing_after_an_error() {
+        #[derive(Clone, Default)]
+        struct Failing(Arc<AtomicUsize>);
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let tries = Failing::default();
+        let mut side = Side::start(Box::new(tries.clone()));
+        let mut out = side.writer();
+        for line in [&b"one\n"[..], b"two\n", b"three\n"] {
+            out.write_all(line).unwrap();
+            out.flush().unwrap();
+        }
+        side.finish();
+        assert_eq!(tries.0.load(Ordering::SeqCst), 1);
     }
 }

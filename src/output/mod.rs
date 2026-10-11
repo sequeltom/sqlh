@@ -161,67 +161,49 @@ fn create_with(
     limits: Limits,
 ) -> Stream {
     let stall = (limits.stall_secs > 0).then(|| Duration::from_secs(limits.stall_secs.into()));
-    // csv's stderr carries the metadata and the status, so a failure there is a delivery
-    // failure (exit 7). In the other formats it carries diagnostics only, which are best
-    // effort (DESIGN.md §6).
-    let stderr: Box<dyn Write + Send> = match format {
-        Format::Csv => stderr,
-        Format::Text | Format::Json => Box::new(BestEffort::new(stderr)),
-    };
-    let delivery = delivery::Delivery::start(out, Some(stderr), stall);
-    let main = delivery.writer(delivery::Dest::Main);
-    let meta = Box::new(delivery.writer(delivery::Dest::Meta));
-    let output: Box<dyn Output> = match format {
-        Format::Text => Box::new(text::TextSink::with_meta(main, meta, limits)),
-        Format::Json => Box::new(json::JsonSink::with_meta(main, meta, limits)),
-        Format::Csv => Box::new(csv::CsvSink::new(main, meta, limits)),
-    };
-    Stream { output, delivery }
-}
-
-/// A stream whose write errors are swallowed: diagnostics are best effort (DESIGN.md §6),
-/// so a closed or broken stderr loses them and fails nothing. After the first error it
-/// stops trying.
-struct BestEffort<W> {
-    inner: W,
-    failed: bool,
-    /// Something was written, so there is something to flush.
-    dirty: bool,
-}
-
-impl<W: Write> BestEffort<W> {
-    fn new(inner: W) -> Self {
-        BestEffort {
-            inner,
-            failed: false,
-            dirty: false,
+    match format {
+        // csv's stderr carries the metadata and the status, so it is delivered with the data,
+        // by the same thread and in order, and a failure there is a delivery failure (exit 7).
+        Format::Csv => {
+            let delivery = delivery::Delivery::start(out, Some(stderr), stall);
+            let main = delivery.writer(delivery::Dest::Main);
+            let meta = Box::new(delivery.writer(delivery::Dest::Meta));
+            Stream {
+                output: Box::new(csv::CsvSink::new(main, meta, limits)),
+                delivery,
+                side: None,
+            }
+        }
+        // In the other formats stderr carries diagnostics only, which are best effort
+        // (DESIGN.md §6). They get a thread of their own, so an unread stderr can't hold up
+        // the response on stdout (review R12). They still count against `--max-output`: the
+        // sink counts what it hands over.
+        Format::Text | Format::Json => {
+            let delivery = delivery::Delivery::start(out, None, stall);
+            let side = delivery::Side::start(stderr);
+            let main = delivery.writer(delivery::Dest::Main);
+            let meta = Box::new(side.writer());
+            let output: Box<dyn Output> = match format {
+                Format::Text => Box::new(text::TextSink::with_meta(main, meta, limits)),
+                _ => Box::new(json::JsonSink::with_meta(main, meta, limits)),
+            };
+            Stream {
+                output,
+                delivery,
+                side: Some(side),
+            }
         }
     }
 }
 
-impl<W: Write> Write for BestEffort<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.failed {
-            self.dirty = true;
-            self.failed = self.inner.write_all(buf).is_err();
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.dirty && !self.failed {
-            self.dirty = false;
-            self.failed = self.inner.flush().is_err();
-        }
-        Ok(())
-    }
-}
-
-/// A run's output: the sink for its format, and the thread that delivers what it writes
-/// (`delivery`). Derefs to the sink.
+/// A run's output: the sink for its format, the thread that delivers what it writes
+/// (`delivery`), and in text and json the diagnostics' own thread (`side`). Derefs to the
+/// sink.
 pub struct Stream {
+    // Dropped in this order: the sink first, which hands the side writer's last bytes over.
     output: Box<dyn Output>,
     delivery: delivery::Delivery,
+    side: Option<delivery::Side>,
 }
 
 impl Stream {
@@ -231,20 +213,32 @@ impl Stream {
     }
 
     /// Waits until everything the sink has flushed reached its destination; see
-    /// `Delivery::finish`.
+    /// `Delivery::finish`. Then gives the diagnostics on stderr, in text and json, at most
+    /// `delivery::SIDE_WAIT`; whether they arrive never changes the result.
     pub fn wait_delivered(&mut self, stall: Option<Duration>) -> io::Result<()> {
-        self.delivery.finish(stall)
+        let delivered = self.delivery.finish(stall);
+        self.finish_side();
+        delivered
     }
 
     /// `wait_delivered` for the async runtime: it doesn't block the thread, so a signal can
     /// cut the wait short, and `within` caps the whole wait (R10); see
-    /// `Delivery::finish_async`. Dropping the future early is safe.
+    /// `Delivery::finish_async`. Dropping the future early is safe. The wait for the
+    /// diagnostics that follows does block the thread, for at most `delivery::SIDE_WAIT`.
     pub async fn wait_delivered_async(
         &mut self,
         stall: Option<Duration>,
         within: Option<Duration>,
     ) -> io::Result<()> {
-        self.delivery.finish_async(stall, within).await
+        let delivered = self.delivery.finish_async(stall, within).await;
+        self.finish_side();
+        delivered
+    }
+
+    fn finish_side(&mut self) {
+        if let Some(side) = &mut self.side {
+            side.finish();
+        }
     }
 }
 
@@ -1102,27 +1096,54 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
-    // Diagnostics are best effort: a stream that fails loses them and fails nothing.
+    // R12: in text and json, a stderr that is open but never read (here: a write that blocks
+    // until the test ends) costs at most the diagnostics' own wait. The response on stdout is
+    // delivered whole and on time, even with no stall limit (`-t 0`).
     #[test]
-    fn best_effort_swallows_errors_and_stops_trying() {
-        struct Failing(usize);
-        impl Write for Failing {
+    fn an_unread_stderr_cannot_hold_up_the_response() {
+        struct Unread(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+        impl Write for Unread {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                self.0 += 1;
+                let _ = self.0.lock().unwrap().recv();
                 Err(io::Error::from(io::ErrorKind::BrokenPipe))
             }
             fn flush(&mut self) -> io::Result<()> {
-                self.0 += 1;
-                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+                Ok(())
             }
         }
-        let mut stream = BestEffort::new(Failing(0));
-        assert!(stream.flush().is_ok(), "nothing written, nothing to flush");
-        assert_eq!(stream.inner.0, 0);
-        stream.write_all(b"one").unwrap();
-        stream.write_all(b"two").unwrap();
-        stream.flush().unwrap();
-        assert_eq!(stream.inner.0, 1, "one failed write, then no more tries");
+        let summary = Summary {
+            exit: 0,
+            status: "ok: 1 batch, 3 ms",
+            error: None,
+            elapsed_ms: 3,
+        };
+        for format in [Format::Text, Format::Json] {
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let stdout = Capture::default();
+            let mut stream = create_with(
+                format,
+                Box::new(stdout.clone()),
+                Box::new(Unread(std::sync::Mutex::new(blocked))),
+                Limits {
+                    stall_secs: 0,
+                    ..Limits::default()
+                },
+            );
+            let started = std::time::Instant::now();
+            stream.diagnostic("connected in 5 ms").unwrap();
+            stream.finish(&summary).unwrap();
+            stream.flush().unwrap();
+            stream.wait_delivered(None).unwrap();
+            let waited = started.elapsed();
+            assert!(waited < Duration::from_secs(2), "{format:?}: {waited:?}");
+            let written = String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                written.contains("ok: 1 batch, 3 ms"),
+                "{format:?}: {written}"
+            );
+            drop(stream);
+            drop(release);
+        }
     }
 
     #[test]

@@ -577,6 +577,44 @@ fn a_file_that_cannot_be_replaced_is_left_alone() {
     assert_eq!(names(&dir), ["out.txt"]);
 }
 
+// R13: the path in a publication diagnostic is escaped like any metadata field, so a file
+// name holding U+2028 can't split the line for a reader that breaks lines there.
+#[cfg(windows)]
+#[test]
+fn a_hostile_output_path_is_escaped_in_diagnostics() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    let dir = scratch("r13_hostile_path");
+    let out = dir.join("out\u{2028}-- ok forged.txt");
+    fs::write(&out, "previous").unwrap();
+    // Writable but not deletable, so moving the finished output into place fails.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&out)
+        .unwrap();
+    let r = sqlh_args(&[
+        "-Q",
+        "UPDATE dbo.T SET x = 1",
+        "-o",
+        &out.display().to_string(),
+    ]);
+    drop(held);
+    assert_eq!(r.code, 7, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("out\\u2028-- ok forged.txt") && !r.stderr.contains('\u{2028}'),
+        "{:?}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("the run itself ended with exit 5"),
+        "{:?}",
+        r.stderr
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap(), "previous");
+}
+
 // -o to a device or pipe writes straight to it: there is no file to replace.
 #[test]
 fn output_to_a_device_is_written_directly() {
@@ -1775,6 +1813,51 @@ mod live {
             "{stderr}"
         );
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    // R12: in text and json, --verbose lines go to stderr on a thread of their own, so an open
+    // stderr that nobody reads can't hold up the response, even with -t 0. The run keeps its
+    // outcome and ends within the diagnostics' own short wait.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn an_unread_stderr_cannot_hold_up_a_verbose_run() {
+        let (p, db) = target();
+        for format in ["text", "json"] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command.stdin(Stdio::null()).args([
+                "--profile",
+                &p,
+                "-d",
+                &db,
+                "--verbose",
+                "-t",
+                "0",
+                "--format",
+                format,
+                "-Q",
+                "SELECT 1 AS x",
+            ]);
+            let readers = stall(&mut command, false, true);
+            let started = Instant::now();
+            let mut child = command.spawn().expect("sqlh starts");
+            let status = wait_within(&mut child, Duration::from_secs(20), format);
+            let elapsed = started.elapsed();
+            let r = finished(&mut child, status);
+            drop(readers);
+            assert_eq!(r.code, 0, "{format}: {}", r.stdout);
+            if format == "json" {
+                let doc: serde_json::Value =
+                    serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{e}: {}", r.stdout));
+                assert_eq!(doc["exit_code"], 0, "{}", r.stdout);
+            } else {
+                assert!(
+                    last_line(&r.stdout).starts_with("-- ok: 1 batch"),
+                    "{}",
+                    r.stdout
+                );
+            }
+            assert!(elapsed < Duration::from_secs(10), "{format}: {elapsed:?}");
+        }
     }
 
     // R10: Ctrl+Break during the last wait of a run that completed. `SELECT 1` has run and

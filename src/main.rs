@@ -437,15 +437,27 @@ fn brief(text: &str) -> String {
     out
 }
 
-/// A path as shown in a diagnostic: as is, but cut after `DIAG_FIELD_CHARS` characters.
+/// A path as shown in a diagnostic: escaped like any metadata field and cut (`brief`). A
+/// Windows file name may hold U+2028 or U+2029, which some readers split lines at (review
+/// R13), and a backslash is doubled, as in every `-- ` line.
 fn shown(path: &Path) -> String {
-    let text = path.display().to_string();
-    let (kept, cut) = output::cut(&text, DIAG_FIELD_CHARS);
-    if cut == 0 {
-        text
-    } else {
-        format!("{kept}{}", output::cut_marker(cut, false))
-    }
+    brief(&path.display().to_string())
+}
+
+/// The diagnostic for an `-o` file left as it was, because the output wasn't complete.
+fn left_alone(target: &Path) -> String {
+    format!("sqlh: -o {} was left as it was", shown(target))
+}
+
+/// The diagnostic for complete output that couldn't be moved into place.
+fn not_published(target: &Path, error: &io::Error, exit: Exit) -> String {
+    format!(
+        "sqlh: output could not be delivered: moving it into {}: {}; the run itself ended with \
+         exit {}",
+        shown(target),
+        brief(&error.to_string()),
+        exit as u8
+    )
 }
 
 /// Writes one line to stderr, best effort and bounded (R09). The write happens on a helper
@@ -616,22 +628,13 @@ impl Destination {
         };
         if exit == Exit::Undelivered {
             // Dropping `partial` deletes it.
-            diag(format_args!(
-                "sqlh: -o {} was left as it was",
-                shown(&target)
-            ));
+            diag(format_args!("{}", left_alone(&target)));
             return exit;
         }
         match partial.publish(&target) {
             Ok(()) => exit,
             Err(e) => {
-                diag(format_args!(
-                    "sqlh: output could not be delivered: moving it into {}: {}; the run itself \
-                     ended with exit {}",
-                    shown(&target),
-                    brief(&e.to_string()),
-                    exit as u8
-                ));
+                diag(format_args!("{}", not_published(&target, &e, exit)));
                 Exit::Undelivered
             }
         }
@@ -1130,8 +1133,29 @@ mod tests {
             cut.chars().count(),
             DIAG_FIELD_CHARS + "…[+5]".chars().count()
         );
-        assert_eq!(shown(Path::new("C:\\out\\file.txt")), "C:\\out\\file.txt");
+        assert_eq!(
+            shown(Path::new("C:\\out\\file.txt")),
+            "C:\\\\out\\\\file.txt"
+        );
         assert!(shown(Path::new(&long)).ends_with("…[+5]"));
+    }
+
+    // R13: a file name can hold U+2028 or U+2029, which some readers split lines at; both
+    // `-o` diagnostics escape it, so neither can pass for two lines or a `-- ` line.
+    #[test]
+    fn hostile_paths_cannot_split_publication_diagnostics() {
+        let target = Path::new("C:\\out\\x\u{2028}-- ok forged\u{2029}.txt");
+        let error = io::Error::other("access denied\u{2028}-- ok forged");
+        for line in [
+            left_alone(target),
+            not_published(target, &error, Exit::Blocked),
+        ] {
+            assert!(
+                !line.contains(['\u{2028}', '\u{2029}', '\n', '\r']),
+                "{line:?}"
+            );
+            assert!(line.contains("x\\u2028-- ok forged\\u2029.txt"), "{line}");
+        }
     }
 
     // F02: a failed final write or flush is exit 7, never success.

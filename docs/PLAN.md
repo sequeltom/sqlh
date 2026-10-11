@@ -155,6 +155,13 @@ Also from the review:
 - **Corrected on the way:** mssql-tds 0.2.0 does drop a pending connect attempt when its handle is cancelled (`run_until_cancelled`), so that upstream issue was withdrawn; its first pipe open is synchronous, but the wait for a busy pipe runs on `spawn_blocking`. The attribution of the login time to password hashing is now labeled an inference ([notes/connect-latency.md](notes/connect-latency.md)).
 - **Design debt, as planned:** the queue and memory bounds and the substitution cap, which is checked after the text is built (2.7); a single owner for the run's lifecycle (3.1). R10's `run_and_deliver` is a first step.
 
+Second round: the reviewer's verification of `afdefad` closed R08–R11, R11 with its documented granularity (a reader must take each 4 KB write within `-t`; a slower trickle is a stall, about 68 bytes/s at the default 60 s, so the feature is never described as "however slowly"). It found two P2 follow-ups, both fixed:
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| R12 (P2) | In text and json, `--verbose` lines went to stderr through the same thread as stdout, so an open, unread stderr held up the whole response: exit 7 after `-t`, or no end with `-t 0`. R09's 0.5 s bound covered only the last-resort messages. | In text and json, stderr gets a thread of its own (`delivery::Side`) that stdout's thread never waits on. At the end sqlh waits at most 0.5 s for it, then drops what is left. The lines still count against `--max-output`. csv is unchanged: its stderr is the required metadata stream. | unit: a stderr that never returns, with no stall limit, in text and json; `Side` order, prompt finish and errors; live: `--verbose -t 0` with an unread stderr ends with exit 0 and the full response |
+| R13 (P2) | The two `-o` publication messages printed the path without escaping, so a file name holding U+2028 split the line. | Paths in diagnostics go through the same escaping and cut as other fields (`shown` uses `brief`), so U+2028 shows as ` `, and a backslash is doubled, as in metadata (decision 11 may change that for both). | unit: both messages with a hostile path; CLI: a failed publication to a hostile file name |
+
 ### Phase 3: execution core, CI and fixtures (the enabler for Phases 4 and 5)
 
 | # | Task | Acceptance | Size |
