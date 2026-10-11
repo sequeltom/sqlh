@@ -70,7 +70,8 @@ struct Shared {
     work: Condvar,
     /// Wakes `Delivery::finish` when the thread makes progress or stops.
     progress: Condvar,
-    /// Wakes `Gate::room` when the thread makes progress or stops.
+    /// Wakes `Gate::room` and `Delivery::finish_async` (never both at once: the first waits
+    /// during the run, the second after it) when the thread makes progress or stops.
     room: tokio::sync::Notify,
 }
 
@@ -231,6 +232,83 @@ impl Delivery {
             None => Ok(()),
         }
     }
+
+    /// `finish` for the async runtime (R10): the same conditions and the same stall rule, but
+    /// the wait doesn't block the thread, so a signal can cut it short. `within` also caps the
+    /// whole wait, whatever the reader is doing (`None`: no cap beyond `stall`). Giving up
+    /// detaches the thread for good, as in `finish`.
+    ///
+    /// Cancel-safe: dropping the future leaves the delivery closed but unfinished, and a
+    /// later `finish` or `finish_async` carries on from there.
+    pub async fn finish_async(
+        &mut self,
+        stall: Option<Duration>,
+        within: Option<Duration>,
+    ) -> io::Result<()> {
+        let (stall, why) = match stall {
+            Some(limit) => (Some(limit), ""),
+            None => (self.stall, " (-t)"),
+        };
+        let cap = within.map(|within| (Instant::now() + within, within));
+        {
+            let mut state = self.shared.lock();
+            state.closed = true;
+            self.shared.give_work(&mut state);
+        }
+        loop {
+            // Registered before looking at the state, so a wakeup in between isn't lost.
+            let notified = self.shared.room.notified();
+            let wait: Option<Duration> = {
+                let state = self.shared.lock();
+                if state.done {
+                    break;
+                }
+                let mut wait = None;
+                if let Some(limit) = stall {
+                    let waited = state.progress.elapsed();
+                    if waited >= limit {
+                        self.thread = None;
+                        return Err(stalled(limit, why));
+                    }
+                    wait = Some(limit - waited);
+                }
+                if let Some((deadline, within)) = cap {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        self.thread = None;
+                        return Err(unfinished(within));
+                    }
+                    wait = Some(wait.map_or(left, |w: Duration| w.min(left)));
+                }
+                wait
+            };
+            match wait {
+                Some(left) => {
+                    let _ = tokio::time::timeout(left, notified).await;
+                }
+                None => notified.await,
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        match self.shared.error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The cap on a wait (`finish_async`'s `within`) ran out while the reader was still taking
+/// output, too slowly to finish in time.
+fn unfinished(within: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "the reader didn't take the rest of the output within {} s",
+            within.as_secs().max(1)
+        ),
+    )
 }
 
 impl Drop for Delivery {
@@ -575,6 +653,156 @@ mod tests {
             started.elapsed()
         );
         drop(release);
+    }
+
+    // R10: the async wait ends when everything is written, like `finish`.
+    #[test]
+    fn finish_async_waits_for_delivery() {
+        let sink = Sink::default();
+        let mut delivery = Delivery::start(Box::new(sink.clone()), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"one\n").unwrap();
+        drop(out);
+        runtime()
+            .block_on(delivery.finish_async(None, None))
+            .unwrap();
+        assert_eq!(*sink.0.lock().unwrap(), b"one\n");
+    }
+
+    // R10: a write error comes out of the async wait too.
+    #[test]
+    fn finish_async_reports_a_write_error() {
+        let mut delivery = Delivery::start(Box::new(Broken), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"one\n").unwrap();
+        drop(out);
+        let error = runtime()
+            .block_on(delivery.finish_async(None, None))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // R10: the same stall rule as `finish`, and the same detaching: dropping the delivery
+    // afterwards doesn't wait again, however long the stall limit is.
+    #[test]
+    fn finish_async_gives_up_on_a_stalled_reader_for_good() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(
+            Box::new(Stalled(Mutex::new(blocked))),
+            None,
+            Some(Duration::from_secs(60)),
+        );
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(&[b'x'; CHUNK]).unwrap();
+        drop(out);
+        let started = Instant::now();
+        let error = runtime()
+            .block_on(delivery.finish_async(Some(Duration::from_millis(200)), None))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "the reader stopped reading for 1 s");
+        drop(delivery);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(release);
+    }
+
+    // R10: with no stall limit (-t 0) and no cap the wait has no end of its own; the signal
+    // that cuts it short is the caller's `select!`. A shorter wait asked for afterwards
+    // still works, and the stalled thread is detached when it gives up.
+    #[test]
+    fn finish_async_without_limits_waits_until_it_is_dropped() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(Box::new(Stalled(Mutex::new(blocked))), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(&[b'x'; CHUNK]).unwrap();
+        drop(out);
+        runtime().block_on(async {
+            let waited = tokio::time::timeout(
+                Duration::from_millis(300),
+                delivery.finish_async(None, None),
+            )
+            .await;
+            assert!(waited.is_err(), "no limit: still waiting");
+            let started = Instant::now();
+            let error = delivery
+                .finish_async(
+                    Some(Duration::from_millis(200)),
+                    Some(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+        drop(delivery);
+        drop(release);
+    }
+
+    // R10: the cap ends the wait even for a reader that keeps making progress.
+    #[test]
+    fn finish_async_stops_at_its_cap() {
+        /// Takes every chunk, but slowly: 100 ms each.
+        struct Slow;
+
+        impl Write for Slow {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut delivery = Delivery::start(Box::new(Slow), None, Some(Duration::from_secs(1)));
+        let mut out = delivery.writer(Dest::Main);
+        for _ in 0..20 {
+            out.write_all(&[b'x'; CHUNK]).unwrap();
+        }
+        drop(out);
+        let started = Instant::now();
+        let error = runtime()
+            .block_on(delivery.finish_async(None, Some(Duration::from_millis(400))))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "the reader didn't take the rest of the output within 1 s"
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        // Detached: dropping the delivery doesn't wait for the other chunks.
+        drop(delivery);
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    // R10: a wait whose future was dropped (a signal won the `select!`) can be resumed, and
+    // delivers what is left once the reader reads again.
+    #[test]
+    fn a_dropped_async_wait_can_be_resumed() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(Box::new(Stalled(Mutex::new(blocked))), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"late\n").unwrap();
+        drop(out);
+        runtime().block_on(async {
+            let cut = tokio::time::timeout(
+                Duration::from_millis(100),
+                delivery.finish_async(None, None),
+            )
+            .await;
+            assert!(cut.is_err(), "the reader is stalled, so the wait is open");
+            release.send(()).unwrap();
+            delivery.finish_async(None, None).await.unwrap();
+        });
     }
 
     // PLAN.md 2.4: time with nothing to write isn't a stall. A run that was quiet for longer

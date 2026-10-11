@@ -35,6 +35,12 @@ impl Signal {
 }
 
 /// Listens for all of them. Needs a runtime with signals enabled.
+///
+/// While one is alive Windows' default handling is off: an event is handled (and, if nobody
+/// is waiting in `recv` yet, remembered for the next `recv`) instead of ending the process
+/// with 0xC000013A. So it must live as long as sqlh can still be cancelled: through the
+/// run, the delivery of its output and the publication of `-o` (R10; DESIGN.md §4.3). It
+/// must not exist while sqlh blocks reading stdin, when it would swallow Ctrl+C.
 #[cfg(windows)]
 pub struct Signals {
     c: tokio::signal::windows::CtrlC,

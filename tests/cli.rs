@@ -767,6 +767,265 @@ fn closed_streams_give_exact_exit_codes() {
     }
 }
 
+/// How many bytes a pipe takes before the next write blocks, measured once: a thread writes
+/// one byte at a time into a scratch pipe until it blocks.
+fn pipe_capacity() -> usize {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        std::thread::spawn(move || {
+            while writer.write_all(b".").is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let mut last = usize::MAX;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = count.load(Ordering::SeqCst);
+            if now == last && now > 0 {
+                break;
+            }
+            last = now;
+        }
+        // Ends the blocked write, and with it the thread.
+        drop(reader);
+        last
+    })
+}
+
+/// A pipe that is open, full and never read: a reader that stopped reading without closing
+/// the pipe. (`closed()` is the other failure, which a write sees at once.) Filled to the
+/// byte, with no write left waiting: a blocked writer would hold the pipe's file object, and
+/// block the child's own queries of its stdout (`is_terminal`) at startup. Keep the reader
+/// until the test is over.
+fn stalled_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    for _ in 0..pipe_capacity() {
+        writer.write_all(b".").expect("room in a new pipe");
+    }
+    (reader, writer)
+}
+
+/// Points `command`'s stdout and/or stderr at a stalled pipe, and captures the other one
+/// (so it must stay small). Returns the readers: keep them until the test is over.
+fn stall(
+    command: &mut Command,
+    stdout_stalled: bool,
+    stderr_stalled: bool,
+) -> Vec<std::io::PipeReader> {
+    let mut readers = Vec::new();
+    let mut stream = |stalled: bool| {
+        if stalled {
+            let (reader, writer) = stalled_pipe();
+            readers.push(reader);
+            Stdio::from(writer)
+        } else {
+            Stdio::piped()
+        }
+    };
+    command.stdout(stream(stdout_stalled));
+    command.stderr(stream(stderr_stalled));
+    readers
+}
+
+/// The exit code of a finished `child`, and what it left on the streams that were captured.
+fn finished(child: &mut std::process::Child, status: std::process::ExitStatus) -> Run {
+    let read = |pipe: Option<&mut dyn Read>| {
+        let mut text = String::new();
+        if let Some(pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    };
+    let stdout = read(child.stdout.as_mut().map(|p| p as &mut dyn Read));
+    let stderr = read(child.stderr.as_mut().map(|p| p as &mut dyn Read));
+    Run {
+        code: status.code().expect("an exit code, not a signal"),
+        stdout,
+        stderr,
+    }
+}
+
+/// Runs `command` with stdout and/or stderr stalled (see `stall`), failing the test if it is
+/// still running after `limit`. Returns what it left on the other streams, and how long it
+/// ran.
+fn run_with_stalled(
+    command: &mut Command,
+    stdout_stalled: bool,
+    stderr_stalled: bool,
+    limit: Duration,
+) -> (Run, Duration) {
+    let readers = stall(command, stdout_stalled, stderr_stalled);
+    let started = Instant::now();
+    let mut child = command.spawn().expect("sqlh starts");
+    let status = wait_within(&mut child, limit, "a stalled pipe");
+    let elapsed = started.elapsed();
+    let run = finished(&mut child, status);
+    drop(readers);
+    (run, elapsed)
+}
+
+// R09: csv sends the refusal and the status to stderr. With stderr full and never read, the
+// output thread blocks in its write holding Rust's stderr lock. Reporting the stall used to
+// wait for that same lock, so sqlh never got to exit 7. The diagnostic is now abandoned
+// after half a second.
+#[test]
+fn a_stalled_stderr_in_csv_still_exits_7() {
+    let (r, elapsed) = run_with_stalled(
+        sqlh().args(["-Q", "DELETE FROM dbo.T", "--format", "csv", "-t", "1"]),
+        false,
+        true,
+        Duration::from_secs(20),
+    );
+    assert_eq!(r.code, 7, "{}", r.stdout);
+    assert_eq!(r.stdout, "", "csv's data stream carries no refusal");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+// R09: both streams stalled at once, in every format: nothing can be reported anywhere, and
+// sqlh still ends on time with exit 7.
+#[test]
+fn stalled_stdout_and_stderr_together_still_exit_7() {
+    for format in ["text", "json", "csv"] {
+        let (r, elapsed) = run_with_stalled(
+            sqlh().args(["-Q", "DELETE FROM dbo.T", "--format", format, "-t", "1"]),
+            true,
+            true,
+            Duration::from_secs(20),
+        );
+        assert_eq!(r.code, 7, "--format {format}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "--format {format}: {elapsed:?}"
+        );
+    }
+}
+
+// R09: with a healthy stderr the diagnostic is still delivered, and says what the run
+// itself ended with (the guard's refusal, exit 5) and why the output was given up on.
+#[test]
+fn a_stalled_stdout_is_reported_on_stderr() {
+    let (r, elapsed) = run_with_stalled(
+        sqlh().args(["-Q", "DELETE FROM dbo.T", "-t", "1"]),
+        true,
+        false,
+        Duration::from_secs(20),
+    );
+    assert_eq!(r.code, 7, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("the reader stopped reading for 1 s (-t)")
+            && r.stderr.contains("the run itself ended with exit 5: "),
+        "{}",
+        r.stderr
+    );
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+// R09: the panic net holds when the streams it reports to are stalled, not only when they
+// are closed. Debug builds only, like every panic injection.
+#[cfg(debug_assertions)]
+#[test]
+fn a_panic_with_stalled_streams_still_exits_10() {
+    let mut args = DEAD.to_vec();
+    args.extend(["-Q", "SELECT 1"]);
+    let (r, elapsed) = run_with_stalled(
+        sqlh().args(&args).env("SQLH_DEBUG_PANIC", "1"),
+        true,
+        true,
+        Duration::from_secs(20),
+    );
+    assert_eq!(r.code, 10);
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+/// R10: runs sqlh against a server that takes the connection and never answers, so the run
+/// ends with its login timeout (exit 4) 2 s in (`-l 1` plus the second the deadline adds).
+/// Its few closing lines then wait for a reader that stopped reading. Presses Ctrl+Break at
+/// that point, and checks what the wait did with it: exit 7 and not Windows' 0xC000013A,
+/// soon, and with `-t 0` too. Where stderr can be read, it must say what the run itself
+/// ended with and that the signal cut the delivery short.
+#[cfg(windows)]
+fn ctrl_break_while_delivering(format: &str, timeout: &str) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    let mut command = sqlh();
+    command.args(["-S", &server, "-E", "-l", "1", "-t", timeout]);
+    command.args(["--format", format, "-Q", "SELECT 1"]);
+    // The closing lines go to stdout, except in csv, which keeps stdout for data and
+    // sends them to stderr.
+    let csv = format == "csv";
+    let readers = stall(&mut command, !csv, csv);
+    let mut child = spawn_in_group(&mut command);
+    let (_held, _) = listener.accept().expect("sqlh connects");
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "--format {format}, -t {timeout}: sqlh should be waiting for its reader"
+    );
+    let started = Instant::now();
+    ctrl_break(&child);
+    let status = wait_within(&mut child, Duration::from_secs(20), "Ctrl+Break");
+    let elapsed = started.elapsed();
+    let r = finished(&mut child, status);
+    drop(readers);
+    assert_eq!(
+        r.code, 7,
+        "--format {format}, -t {timeout}: exit {:#x}\n{}",
+        r.code, r.stderr
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "--format {format}, -t {timeout}: {elapsed:?}"
+    );
+    if !csv {
+        assert!(
+            r.stderr.contains("output could not be delivered (")
+                && r.stderr
+                    .contains("; cancelled by Ctrl+Break while delivering); ")
+                && r.stderr
+                    .contains("the run itself ended with exit 4: failed (exit 4): timeout, "),
+            "--format {format}, -t {timeout}: {}",
+            r.stderr
+        );
+    }
+}
+
+// R10: the console event listeners used to end with the run, before its closing lines were
+// delivered. Ctrl+Break during that last wait then reached Windows' default handler (exit
+// 0xC000013A, nothing on stderr), and with -t 0 the wait itself had no end. The runtime and
+// the listeners now live through delivery, and a signal gives the rest one second.
+#[cfg(windows)]
+#[test]
+fn ctrl_break_during_final_delivery_in_text() {
+    for timeout in ["0", "60"] {
+        ctrl_break_while_delivering("text", timeout);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn ctrl_break_during_final_delivery_in_json() {
+    for timeout in ["0", "60"] {
+        ctrl_break_while_delivering("json", timeout);
+    }
+}
+
+// csv's closing lines are on stderr, so that is the stream that stalls, and the diagnostic
+// has nowhere to go: the exit is still 7, on time.
+#[cfg(windows)]
+#[test]
+fn ctrl_break_during_final_delivery_in_csv() {
+    for timeout in ["0", "60"] {
+        ctrl_break_while_delivering("csv", timeout);
+    }
+}
+
 // F05: malformed input never crashes sqlh.
 #[test]
 fn malformed_input_does_not_crash() {
@@ -1472,6 +1731,52 @@ mod live {
                      connection was closed)"
                 ),
             "{stderr}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    // R10: Ctrl+Break during the last wait of a run that completed. `SELECT 1` has run and
+    // its few bytes wait for a reader that stopped reading; -t 0 puts no limit on that. The
+    // signal ends the wait: exit 7 (not Windows' 0xC000013A), promptly, and stderr says the
+    // run itself ended with exit 0.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn ctrl_break_cancels_the_final_delivery_of_a_completed_run() {
+        let (p, db) = target();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "-t",
+            "0",
+            "-Q",
+            "SELECT 1 AS x",
+        ]);
+        let readers = stall(&mut command, true, false);
+        let mut child = spawn_in_group(&mut command);
+        // Time to connect, run, and block on delivering the result.
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "sqlh should be waiting for its reader"
+        );
+        let started = Instant::now();
+        ctrl_break(&child);
+        let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+        let elapsed = started.elapsed();
+        let r = finished(&mut child, status);
+        drop(readers);
+        assert_eq!(r.code, 7, "exit {:#x}\n{}", r.code, r.stderr);
+        assert!(
+            r.stderr
+                .contains("; cancelled by Ctrl+Break while delivering); ")
+                && r.stderr
+                    .contains("the run itself ended with exit 0: ok: 1 batch, "),
+            "{}",
+            r.stderr
         );
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
