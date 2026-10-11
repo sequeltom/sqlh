@@ -159,6 +159,17 @@ impl Stream {
     pub fn wait_delivered(&mut self, stall: Option<Duration>) -> io::Result<()> {
         self.delivery.finish(stall)
     }
+
+    /// `wait_delivered` for the async runtime: it doesn't block the thread, so a signal can
+    /// cut the wait short, and `within` caps the whole wait (R10); see
+    /// `Delivery::finish_async`. Dropping the future early is safe.
+    pub async fn wait_delivered_async(
+        &mut self,
+        stall: Option<Duration>,
+        within: Option<Duration>,
+    ) -> io::Result<()> {
+        self.delivery.finish_async(stall, within).await
+    }
 }
 
 impl Deref for Stream {
