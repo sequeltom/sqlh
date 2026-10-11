@@ -1,11 +1,17 @@
 //! Output delivery (PLAN.md 2.3, review F07): a thread does the writing, so a reader that
 //! stops reading can't block the async runtime.
 //!
-//! - The sinks write into `ChannelWriter`s, which hand full chunks to the thread through a
-//!   queue and never block.
+//! - The sinks write into `ChannelWriter`s, which hand full chunks (never more than `CHUNK`
+//!   bytes, however much a caller writes at once) to the thread through a queue and never
+//!   block.
 //! - While the queue holds more than `QUEUE_LIMIT` bytes, the batch loop awaits
 //!   `Gate::room` instead of reading more rows, so the runtime keeps handling timers and
-//!   Ctrl+C, and memory stays bounded.
+//!   Ctrl+C, and the queue stays about that size. The limit is a threshold checked between
+//!   rows, not a hard ceiling.
+//! - The thread writes a chunk in units of at most `WRITE_UNIT` bytes. Each write that takes
+//!   bytes is progress: the bytes stop counting as queued, so room opens as the reader
+//!   drains, and the stall clock restarts. A reader that keeps taking output isn't stalled,
+//!   however slowly.
 //! - When the reader makes no progress on waiting output for the stall limit (the query
 //!   timeout, `-t`), the output couldn't be delivered: exit 7. Time with nothing to write
 //!   doesn't count.
@@ -19,6 +25,14 @@ use std::time::{Duration, Instant};
 
 /// Bytes a `ChannelWriter` collects before handing them to the thread.
 const CHUNK: usize = 64 * 1024;
+
+/// The most the thread hands to one `write` call. A write to a pipe returns only when the
+/// reader has taken all of it, and the stall clock restarts after each write, so a reader
+/// must take this much within the stall limit to not be a stall. 4 KiB is the buffer of a
+/// small pipe (the ones `std::process` makes). Smaller units mean more system calls: 9 MB
+/// written to a file took about 15 ms longer than with 64 KiB writes, and a run within the
+/// default 1 MB output cap showed no difference.
+const WRITE_UNIT: usize = 4 * 1024;
 
 /// Bytes queued for the thread before the batch loop waits for the reader.
 const QUEUE_LIMIT: usize = 256 * 1024;
@@ -38,9 +52,9 @@ struct State {
     done: bool,
     /// The first write error, kept as kind and text because `io::Error` isn't `Clone`.
     error: Option<(io::ErrorKind, String)>,
-    /// When the thread last finished a write, or was handed work while it waited for some: a
-    /// reader that has made no progress since then for the stall limit has stalled. Time with
-    /// nothing to write doesn't count.
+    /// When the reader last took a write (of at most `WRITE_UNIT` bytes), or the thread was
+    /// handed work while it waited for some: a reader that has made no progress since then
+    /// for the stall limit has stalled. Time with nothing to write doesn't count.
     progress: Instant,
     /// The thread is waiting for work, not for the reader.
     idle: bool,
@@ -263,32 +277,60 @@ fn write_out(
                 state = shared.work.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let written = match (dest, meta.as_mut()) {
-            (Dest::Meta, Some(meta)) => meta.write_all(&chunk),
-            _ => main.write_all(&chunk),
+        let out: &mut dyn Write = match (dest, meta.as_mut()) {
+            (Dest::Meta, Some(meta)) => &mut **meta,
+            _ => &mut *main,
         };
-        shared.queued.fetch_sub(chunk.len(), Ordering::Relaxed);
-        let mut state = shared.lock();
-        match written {
-            Ok(()) => state.progress = Instant::now(),
-            Err(e) => {
-                shared.fail(&mut state, &e);
-                state.done = true;
-                let dropped: usize = state.queue.drain(..).map(|(_, c)| c.len()).sum();
-                shared.queued.fetch_sub(dropped, Ordering::Relaxed);
-                shared.progress.notify_all();
-                shared.room.notify_one();
-                return;
-            }
+        if let Err(e) = write_units(shared, out, &chunk) {
+            let mut state = shared.lock();
+            shared.fail(&mut state, &e);
+            state.done = true;
+            // Nothing is written from here on, and `ChannelWriter::send` queues nothing once
+            // `done` is set (under this lock), so nothing is left counted as queued.
+            state.queue.clear();
+            shared.queued.store(0, Ordering::Relaxed);
+            drop(state);
+            shared.progress.notify_all();
+            shared.room.notify_one();
+            return;
         }
-        shared.progress.notify_all();
-        shared.room.notify_one();
     }
 }
 
-/// A sink's end of the delivery: collects bytes and hands full chunks to the thread. It never
-/// blocks. A write fails once the thread has hit an error, such as a reader that closed the
-/// pipe, so the run sees it at once (exit 7).
+/// Writes `chunk` to `out` in units of at most `WRITE_UNIT` bytes, like `write_all`: it goes
+/// on after a partial write, retries an interrupted one, and fails on a write that takes
+/// nothing. After every write that took `n` bytes, those bytes stop counting as queued, the
+/// stall clock restarts and the waiters are woken. Progress is therefore what the reader
+/// actually takes, not whole chunks: a reader that keeps reading is never a stall, however
+/// slowly, and one that blocks a single write for the stall limit is.
+fn write_units(shared: &Shared, out: &mut dyn Write, chunk: &[u8]) -> io::Result<()> {
+    let mut rest = chunk;
+    while !rest.is_empty() {
+        match out.write(&rest[..rest.len().min(WRITE_UNIT)]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                rest = &rest[n..];
+                shared.queued.fetch_sub(n, Ordering::Relaxed);
+                let now = Instant::now();
+                shared.lock().progress = now;
+                shared.progress.notify_all();
+                shared.room.notify_one();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A sink's end of the delivery: collects bytes and hands full chunks to the thread, none
+/// larger than `CHUNK`. It never blocks. A write fails once the thread has hit an error, such
+/// as a reader that closed the pipe, so the run sees it at once (exit 7).
 pub struct ChannelWriter {
     shared: Arc<Shared>,
     dest: Dest,
@@ -316,9 +358,17 @@ impl Write for ChannelWriter {
         if let Some(error) = self.shared.error() {
             return Err(error);
         }
-        self.buf.extend_from_slice(buf);
-        if self.buf.len() >= CHUNK {
-            self.send();
+        // Fill the buffer up to a chunk, send it, and go on with the rest: a caller's buffer
+        // of any size never becomes one queued item larger than a chunk.
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let room = CHUNK.saturating_sub(self.buf.len());
+            let (head, tail) = rest.split_at(rest.len().min(room));
+            self.buf.extend_from_slice(head);
+            rest = tail;
+            if self.buf.len() >= CHUNK {
+                self.send();
+            }
         }
         Ok(buf.len())
     }
@@ -570,6 +620,242 @@ mod tests {
         out.flush().unwrap();
         delivery.finish(None).unwrap();
         releaser.join().unwrap();
+    }
+
+    /// A reader that is slow but never stops: it takes at most 100 bytes per call and
+    /// dawdles over each one.
+    struct Trickle {
+        got: Arc<Mutex<Vec<u8>>>,
+        delay: Duration,
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let n = buf.len().min(100);
+            self.got.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // R11: the stall clock measures what the reader takes, not finished chunks. Delivering
+    // this takes the reader longer than the stall limit, but it takes some of the output
+    // every few milliseconds, so it never stalls, and everything arrives in order.
+    #[test]
+    fn a_slow_reader_that_keeps_taking_output_is_not_a_stall() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let reader = Trickle {
+            got: Arc::clone(&got),
+            delay: Duration::from_millis(3),
+        };
+        let limit = Duration::from_millis(200);
+        let data: Vec<u8> = (0..2000)
+            .flat_map(|i| format!("row {i}\n").into_bytes())
+            .collect();
+        let started = Instant::now();
+        let mut delivery = Delivery::start(Box::new(reader), None, Some(limit));
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(&data).unwrap();
+        drop(out);
+        delivery.finish(None).unwrap();
+        assert!(
+            started.elapsed() > limit * 2,
+            "the delivery was meant to outlast the limit: {:?}",
+            started.elapsed()
+        );
+        assert!(*got.lock().unwrap() == data, "bytes lost or out of order");
+    }
+
+    /// Waits for something the thread does in its own time.
+    fn eventually(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // R11: a write bigger than a chunk is queued in chunks, whatever the caller's buffer.
+    #[test]
+    fn a_big_write_is_queued_in_chunks() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(Box::new(Stalled(Mutex::new(blocked))), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        // Park the thread inside a write, so that nothing else leaves the queue.
+        out.write_all(b"first\n").unwrap();
+        out.flush().unwrap();
+        eventually("the thread to take the first chunk", || {
+            delivery.shared.lock().queue.is_empty()
+        });
+        let big = vec![b'x'; 3 * CHUNK + 5];
+        assert_eq!(out.write(&big).unwrap(), big.len());
+        let sizes: Vec<usize> = delivery
+            .shared
+            .lock()
+            .queue
+            .iter()
+            .map(|(_, chunk)| chunk.len())
+            .collect();
+        let queued = delivery.shared.queued.load(Ordering::Relaxed);
+        // Let the thread go before asserting, so a failure can't leave it parked.
+        drop(release);
+        assert_eq!(sizes, [CHUNK; 3]);
+        // The 5 bytes left over are still with the writer; the rest is queued or in flight.
+        assert_eq!(queued, 6 + 3 * CHUNK);
+        out.flush().unwrap();
+        delivery.finish(None).unwrap();
+        assert_eq!(delivery.shared.queued.load(Ordering::Relaxed), 0);
+    }
+
+    // R11: bytes stop counting as queued as the reader takes them, not when a whole chunk is
+    // through, so the batch loop's wait for room ends as soon as the queue is back under its
+    // limit. Here the queue is 10,000 bytes over, and the reader takes one 4 KiB write at a
+    // time, on cue: room opens at the third, with the 64 KiB chunk in flight far from done.
+    #[test]
+    fn room_opens_as_bytes_drain() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(Box::new(Stalled(Mutex::new(blocked))), None, None);
+        let gate = delivery.gate();
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(&vec![b'x'; QUEUE_LIMIT + 10_000]).unwrap();
+        out.flush().unwrap();
+        let shared = Arc::clone(&delivery.shared);
+        let queued = move || shared.queued.load(Ordering::Relaxed);
+        let full = queued();
+        assert_eq!(full, QUEUE_LIMIT + 10_000);
+        assert!(gate.is_full());
+        for _ in 0..2 {
+            release.send(()).unwrap();
+        }
+        eventually("two writes to leave the queue", || {
+            queued() == full - 2 * WRITE_UNIT
+        });
+        assert!(gate.is_full());
+        release.send(()).unwrap();
+        runtime().block_on(gate.room()).unwrap();
+        assert_eq!(queued(), full - 3 * WRITE_UNIT);
+        assert!(!gate.is_full());
+        drop(release);
+        delivery.finish(None).unwrap();
+        assert_eq!(queued(), 0);
+    }
+
+    /// Takes every write at once, but its flush never returns.
+    struct FlushStalls(Mutex<mpsc::Receiver<()>>);
+
+    impl Write for FlushStalls {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
+    // R11: the flush when the delivery closes is part of delivering, and it doesn't restart
+    // the stall clock, so a reader that blocks it is a stall like any other.
+    #[test]
+    fn a_flush_that_never_returns_is_a_stall() {
+        let (release, blocked) = mpsc::channel();
+        let limit = Duration::from_millis(300);
+        let mut delivery = Delivery::start(
+            Box::new(FlushStalls(Mutex::new(blocked))),
+            None,
+            Some(limit),
+        );
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"all written\n").unwrap();
+        drop(out);
+        let started = Instant::now();
+        let error = delivery.finish(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    // R11: one thread writes both streams in order, so a stalled stream holds up the other
+    // one and delivery fails, however well the other reader keeps up.
+    #[test]
+    fn a_stalled_stream_is_caught_although_the_other_keeps_up() {
+        let (release, blocked) = mpsc::channel();
+        let data = Sink::default();
+        let mut delivery = Delivery::start(
+            Box::new(data.clone()),
+            Some(Box::new(Stalled(Mutex::new(blocked)))),
+            Some(Duration::from_millis(300)),
+        );
+        let mut info = delivery.writer(Dest::Meta);
+        let mut rows = delivery.writer(Dest::Main);
+        info.write_all(b"-- metadata\n").unwrap();
+        info.flush().unwrap();
+        rows.write_all(b"row\n").unwrap();
+        rows.flush().unwrap();
+        let error = delivery.finish(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(data.0.lock().unwrap().is_empty(), "written out of order");
+        drop(release);
+    }
+
+    /// Takes a few bytes per call, and every third call is interrupted.
+    struct Interrupted {
+        got: Arc<Mutex<Vec<u8>>>,
+        calls: usize,
+    }
+
+    impl Write for Interrupted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls.is_multiple_of(3) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(7);
+            self.got.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Never takes anything, and says so with `Ok(0)`.
+    struct Takes0;
+
+    impl Write for Takes0 {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // R11: the thread's own write loop does what `write_all` does: it continues after a
+    // partial write, retries an interrupted one, and fails on a write that takes nothing.
+    #[test]
+    fn interrupted_writes_are_retried_and_a_write_of_zero_is_an_error() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let reader = Interrupted {
+            got: Arc::clone(&got),
+            calls: 0,
+        };
+        let mut delivery = Delivery::start(Box::new(reader), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        let data: Vec<u8> = (0..3 * WRITE_UNIT).map(|i| (i % 251) as u8).collect();
+        out.write_all(&data).unwrap();
+        drop(out);
+        delivery.finish(None).unwrap();
+        assert!(*got.lock().unwrap() == data, "bytes lost or out of order");
+
+        let mut delivery = Delivery::start(Box::new(Takes0), None, None);
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(b"x").unwrap();
+        out.flush().unwrap();
+        let error = delivery.finish(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
     // F02 still holds: a reader that closed the pipe fails the next write and `finish`.
