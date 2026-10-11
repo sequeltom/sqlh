@@ -15,8 +15,8 @@ use std::io::{self, Write};
 
 use super::text::write_diagnostic;
 use super::{
-    BatchInfo, Layout, Limits, OutOfOrder, Output, Summary, Tally, cut, cut_marker, hex,
-    push_blocked, push_within,
+    BatchInfo, Layout, Limits, NAME_CHARS, OutOfOrder, Output, Summary, Tally, cut, cut_marker,
+    hex, push_blocked, push_within,
 };
 use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
 
@@ -27,13 +27,6 @@ use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
 /// version has to ignore what it doesn't know. 1.0 is the document with `contract_version`,
 /// `connection`, `connect_ms` and the batches' `elapsed_ms`.
 pub const CONTRACT_VERSION: &str = "1.0";
-
-/// The most characters of a name from the server (the server, the database, the version) that
-/// the `connection` object carries. SQL Server names stop at 128, so a longer one isn't from
-/// a SQL Server; it is cut like a long value. That also bounds the object: at six bytes for a
-/// character that has to be escaped, it takes under 2,000 bytes, which fits the smallest
-/// `--max-output` with room to spare.
-const NAME_CHARS: usize = 128;
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;

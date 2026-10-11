@@ -7,13 +7,13 @@ use std::io::{self, Write};
 
 use super::text::{
     batch_line, blocked_layout, closing_lines, error_line, message_line, note_layout,
-    rows_affected_line, write_diagnostic,
+    rows_affected_line, status_ending, write_diagnostic,
 };
 use super::{
     BatchInfo, Layout, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex, push_char,
     push_type,
 };
-use crate::db::{BatchSink, Column, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
 
 pub struct CsvSink<W: Write> {
     data: W,
@@ -23,6 +23,8 @@ pub struct CsvSink<W: Write> {
     results_written: usize,
     /// Bytes written to both streams so far: the output budget covers what the agent reads.
     written: u64,
+    /// The tail of the status line, as in the text format (`text::status_ending`).
+    ending: String,
 }
 
 impl<W: Write> CsvSink<W> {
@@ -34,6 +36,7 @@ impl<W: Write> CsvSink<W> {
             line: String::with_capacity(1024),
             results_written: 0,
             written: 0,
+            ending: String::new(),
         }
     }
 
@@ -253,6 +256,13 @@ impl<W: Write> BatchSink for CsvSink<W> {
 }
 
 impl<W: Write> Output for CsvSink<W> {
+    /// The status line, on the metadata stream, ends as it does in the text format. The data
+    /// stream holds data only.
+    fn connected(&mut self, connection: &Connection, connect_ms: u128) -> io::Result<()> {
+        self.ending = status_ending(&mut self.tally, self.written, connection, connect_ms)?;
+        Ok(())
+    }
+
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.flush_affected()?;
         self.tally.begin_batch(batch);
@@ -284,7 +294,7 @@ impl<W: Write> Output for CsvSink<W> {
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
         self.flush_affected()?;
         self.data.flush()?;
-        let lines = closing_lines(&self.tally, summary, self.written);
+        let lines = closing_lines(&self.tally, summary, &self.ending, self.written);
         self.written += lines.len() as u64;
         self.meta.write_all(lines.as_bytes())
     }
@@ -302,8 +312,9 @@ impl<W: Write> Output for CsvSink<W> {
 #[cfg(test)]
 mod tests {
     use super::super::text::tests::{
-        ADVICE, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, capped, col, cut_by, error,
-        interrupted_run, limits, mid_result_events_are_refused, msg, quoting, ragged_run, summary,
+        ADVICE, FILLING_STATUS, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, WIDEST_ENDING, batch,
+        capped, col, connection_to, cut_by, error, filling_run, interrupted_run, limits,
+        mid_result_events_are_refused, msg, quoting, ragged_run, summary, widest_names,
     };
     use super::*;
 
@@ -661,5 +672,159 @@ mod tests {
         assert_eq!(lines[3], "-- ok: 0 batches, 3 ms");
         assert_eq!(data.bytes(), 0);
         assert!(total(&data, &meta) <= 4096);
+    }
+
+    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.3: the status line, on the metadata
+    // stream, ends with the server, the database the run started in and the connect time, as in
+    // the text format. The data stream holds data only, and is the same with and without it.
+    #[test]
+    fn a_connected_run_ends_its_status_line_with_where_it_ran() {
+        let (mut s, data, meta) = sink(capped(0));
+        s.connected(&connection_to("db01", "master"), 195).unwrap();
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(40).unwrap();
+        s.finish(&summary("ok: 1 batch, 241 ms")).unwrap();
+        assert_eq!(data.text(), "x\n1\n");
+        assert_eq!(
+            meta.text(),
+            "-- result 1: x:int\n-- 1 row\n\
+             -- ok: 1 batch, 241 ms; db01/master, connect 195 ms\n"
+        );
+    }
+
+    // Nothing connected: the status line is what it always was. A server that gave no name is
+    // `?`, and names are escaped and cut like the text format's (DESIGN.md §5.1).
+    #[test]
+    fn the_tail_is_left_off_without_a_connection_and_names_are_escaped_and_cut() {
+        let (mut s, data, meta) = sink(capped(0));
+        s.finish(&Summary {
+            exit: 3,
+            status: "failed (exit 3): usage error, 0 ms",
+            error: Some("-P is rejected"),
+            elapsed_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            meta.text(),
+            "-- error: -P is rejected\n-- failed (exit 3): usage error, 0 ms\n"
+        );
+        assert_eq!(data.bytes(), 0);
+
+        let (mut s, _, meta) = sink(capped(0));
+        s.connected(
+            &Connection {
+                server: None,
+                ..connection_to("", "a\nb\\c\u{2028}-- ok: forged")
+            },
+            7,
+        )
+        .unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            meta.text(),
+            "-- ok: 0 batches, 3 ms; ?/a\\nb\\\\c\\u2028-- ok: forged, connect 7 ms\n"
+        );
+
+        let (mut s, _, meta) = sink(capped(0));
+        s.connected(&connection_to(&"s".repeat(129), &"d".repeat(300)), 1)
+            .unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            meta.text(),
+            format!(
+                "-- ok: 0 batches, 3 ms; {}…[+1]/{}…[+172], connect 1 ms\n",
+                "s".repeat(128),
+                "d".repeat(128)
+            )
+        );
+    }
+
+    // A run cut by --max-output keeps the tail, whole, as the last line of the metadata, and
+    // the body stops by the tail's length sooner (the text format's test has the exact
+    // output). The budget covers both streams.
+    #[test]
+    fn a_run_cut_by_the_cap_keeps_the_tail_and_gives_it_its_room() {
+        let tail = "; db01/master, connect 195 ms";
+        let rows = |s: &mut CsvSink<Shared>| {
+            s.columns(&[col("v", "varchar(9)")]).unwrap();
+            for _ in 0..5 {
+                if s.wants_values() {
+                    s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+                } else {
+                    s.skipped_row();
+                }
+            }
+            s.end_rows().unwrap();
+            s.message(&msg("later")).unwrap();
+            s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        };
+        let budget = |body: u64| capped(crate::output::OUTPUT_RESERVE + body);
+        let (mut plain, without, _) = sink(budget(81));
+        rows(&mut plain);
+
+        let (mut s, data, meta) = sink(budget(81 + tail.len() as u64));
+        s.connected(&connection_to("db01", "master"), 195).unwrap();
+        rows(&mut s);
+        assert_eq!(data.text(), without.text());
+        assert_eq!(
+            data.text(),
+            "v\naaaaaaaaa\naaaaaaaaa\naaaaaaaaa\naaaaaaaaa\naaaaaaaaa\n"
+        );
+        let max = crate::output::OUTPUT_RESERVE + 81 + tail.len() as u64;
+        assert!(total(&data, &meta) as u64 <= max);
+        assert_eq!(
+            meta.text(),
+            format!(
+                "-- result 1: v:varchar(9)\n-- 5 rows\n\
+                 -- note: output stopped at the --max-output limit of {max} bytes; the run \
+                 continued, and these weren't shown: 1 message\n\
+                 -- ok: 1 batch, 3 ms{tail}\n"
+            )
+        );
+    }
+
+    // The sweeps of `the_cap_holds_wherever_the_body_ends`, with a short tail and with the
+    // widest one (at the caps the CLI accepts): within the cap, and the metadata ends with the
+    // status line whole, tail included.
+    #[test]
+    fn the_cap_holds_with_the_status_tail() {
+        use crate::output::OUTPUT_RESERVE;
+        let widest = format!(
+            "; {0}…[+127]/{0}…[+127], connect {1} ms",
+            "\\u2028".repeat(128),
+            u128::MAX
+        );
+        assert_eq!(widest.len(), WIDEST_ENDING);
+        for (connection, ending, connect_ms, caps) in [
+            (
+                connection_to("N", "N"),
+                "; N/N, connect 12 ms".to_owned(),
+                12,
+                OUTPUT_RESERVE..OUTPUT_RESERVE + 1800,
+            ),
+            (widest_names(), widest, u128::MAX, 4096..4096 + 1800),
+        ] {
+            for max in caps {
+                for (run, status) in [
+                    (ragged_run as fn(&mut dyn Output), RAGGED_STATUS),
+                    (interrupted_run, INTERRUPTED_STATUS),
+                    (filling_run, FILLING_STATUS),
+                ] {
+                    let (mut s, data, meta) = sink(capped(max));
+                    s.connected(&connection, connect_ms).unwrap();
+                    run(&mut s);
+                    let spent = total(&data, &meta) as u64;
+                    assert!(spent <= max, "cap {max}: {spent} bytes\n{}", meta.text());
+                    assert_eq!(
+                        meta.text().lines().last().unwrap(),
+                        format!("-- {status}{ending}"),
+                        "cap {max}"
+                    );
+                }
+            }
+        }
     }
 }

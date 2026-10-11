@@ -6,10 +6,10 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::{
-    BatchInfo, Layout, Limits, Output, Summary, Tally, escaped, hex, push_blocked, push_char,
-    push_escaped, push_type,
+    BatchInfo, Layout, Limits, NAME_CHARS, Output, Summary, Tally, escaped, hex, push_blocked,
+    push_char, push_escaped, push_type,
 };
-use crate::db::{BatchSink, Column, ServerMessage, Value};
+use crate::db::{BatchSink, Column, Connection, ServerMessage, Value};
 
 pub struct TextSink<W: Write> {
     out: W,
@@ -19,6 +19,9 @@ pub struct TextSink<W: Write> {
     line: String,
     /// Bytes written so far to both streams, for the output budget.
     written: u64,
+    /// The tail of the status line that says where the run went (`status_ending`); empty
+    /// until the connection is described, and when nothing connected.
+    ending: String,
 }
 
 impl<W: Write> TextSink<W> {
@@ -35,6 +38,7 @@ impl<W: Write> TextSink<W> {
             tally: Tally::new(limits),
             line: String::with_capacity(1024),
             written: 0,
+            ending: String::new(),
         }
     }
 
@@ -206,10 +210,44 @@ pub fn write_diagnostic(
     }
 }
 
-/// The closing lines: the error that stopped the run, limit notes, then the status. Given
-/// the `used` bytes written so far, the status is laid out first and never shortened; the
-/// error and the notes share what it leaves, each shortened (`…[+N]`) only as far as needed.
-pub fn closing_lines(tally: &Tally, summary: &Summary, used: u64) -> String {
+/// The tail a connected run's status line ends with, in text and csv (DESIGN.md §5.1):
+/// `; db01/master, connect 195 ms`, the server, the database the run started in and the
+/// connect time. A name is escaped like every variable field of a metadata line and cut after
+/// `NAME_CHARS` characters with `…[+N]`, as in JSON's `connection`; a server that reported no
+/// name is `?`. The server never holds a `/` (it is a machine name and an instance name), so
+/// the database is everything after the first one. Nothing from a credential, no login name.
+///
+/// Its bytes are reserved in the budget on top of the reserves (`Tally::reserve_ending`), so
+/// the status line, which is never shortened, still fits whatever the names hold. Empty when
+/// there was no room left for it; the closing note then counts it as not shown.
+pub fn status_ending(
+    tally: &mut Tally,
+    used: u64,
+    connection: &Connection,
+    connect_ms: u128,
+) -> io::Result<String> {
+    let mut ending = String::from("; ");
+    match &connection.server {
+        Some(server) => {
+            push_escaped(&mut ending, server, NAME_CHARS);
+        }
+        None => ending.push('?'),
+    }
+    ending.push('/');
+    push_escaped(&mut ending, &connection.database, NAME_CHARS);
+    let _ = write!(ending, ", connect {connect_ms} ms");
+    Ok(if tally.reserve_ending(used, ending.len())? {
+        ending
+    } else {
+        String::new()
+    })
+}
+
+/// The closing lines: the error that stopped the run, limit notes, then the status, which
+/// ends with `ending` (see `status_ending`) when the run connected. Given the `used` bytes
+/// written so far, the status is laid out first and never shortened; the error and the
+/// notes share what it leaves, each shortened (`…[+N]`) only as far as needed.
+pub fn closing_lines(tally: &Tally, summary: &Summary, ending: &str, used: u64) -> String {
     let notes = tally.limit_notes();
     let mut layout = Layout::new();
     if let Some(error) = summary.error {
@@ -218,12 +256,16 @@ pub fn closing_lines(tally: &Tally, summary: &Summary, used: u64) -> String {
     for note in &notes {
         layout.text("-- note: ").part(note).text("\n");
     }
-    layout.text("-- ").text(summary.status).text("\n");
+    layout
+        .text("-- ")
+        .text(summary.status)
+        .text(ending)
+        .text("\n");
     layout
         .fit(tally.closing_room(used), push_char)
         // No room for even a cut error or note (the reserve makes this unreachable): the
         // status alone.
-        .unwrap_or_else(|| format!("-- {}\n", summary.status))
+        .unwrap_or_else(|| format!("-- {}{ending}\n", summary.status))
 }
 
 impl<W: Write> BatchSink for TextSink<W> {
@@ -333,6 +375,11 @@ impl<W: Write> BatchSink for TextSink<W> {
 }
 
 impl<W: Write> Output for TextSink<W> {
+    fn connected(&mut self, connection: &Connection, connect_ms: u128) -> io::Result<()> {
+        self.ending = status_ending(&mut self.tally, self.written, connection, connect_ms)?;
+        Ok(())
+    }
+
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.flush_affected()?;
         self.tally.begin_batch(batch);
@@ -363,7 +410,7 @@ impl<W: Write> Output for TextSink<W> {
 
     fn finish(&mut self, summary: &Summary) -> io::Result<()> {
         self.flush_affected()?;
-        let lines = closing_lines(&self.tally, summary, self.written);
+        let lines = closing_lines(&self.tally, summary, &self.ending, self.written);
         self.written += lines.len() as u64;
         self.out.write_all(lines.as_bytes())
     }
@@ -445,6 +492,28 @@ pub(super) mod tests {
             elapsed_ms: 3,
         }
     }
+
+    /// The facts of a login to `server`, in `database`. Text and csv use only those two.
+    pub fn connection_to(server: &str, database: &str) -> Connection {
+        Connection {
+            server: Some(server.into()),
+            version: Some("17.0.1000".into()),
+            database: database.into(),
+            auth: "sql",
+            encrypted: true,
+        }
+    }
+
+    /// Server and database names that make the widest status tail: 255 characters (the most a
+    /// TDS name field holds), each cut to 128 and each written as a six-byte escape.
+    pub fn widest_names() -> Connection {
+        let name = "\u{2028}".repeat(255);
+        connection_to(&name, &name)
+    }
+
+    /// The tail `widest_names` and a connect time of `u128::MAX` give: `; `, two names of 128
+    /// escapes (768 bytes) and `…[+127]` (9), the `/`, `, connect `, 39 digits and ` ms`.
+    pub const WIDEST_ENDING: usize = 2 + 777 + 1 + 777 + 10 + 39 + 3;
 
     fn text(sink: TextSink<Vec<u8>>) -> String {
         String::from_utf8(sink.out).unwrap()
@@ -583,6 +652,39 @@ pub(super) mod tests {
     }
 
     pub const INTERRUPTED_STATUS: &str = "failed (exit 4): timeout, 2000 ms";
+
+    /// A run whose body is far larger than any cap the sweeps use, so that the cap is what
+    /// ends it and the ending has to fit where the body stopped: 500 rows, a message, a note
+    /// and a closing error longer than the room, and a status line at the widest numbers.
+    pub fn filling_run(out: &mut dyn Output) {
+        out.begin_batch(&batch("-Q", false, 1)).unwrap();
+        out.columns(&[col("id", "int"), col("v", "varchar(20)")])
+            .unwrap();
+        for i in 0..500 {
+            if out.wants_values() {
+                out.row(&[Value::Int(i), Value::Text(format!("value {i}"))])
+                    .unwrap();
+            } else {
+                out.skipped_row();
+            }
+        }
+        out.end_rows().unwrap();
+        out.message(&msg("a message after the rows")).unwrap();
+        out.end_batch(5).unwrap();
+        out.note(&"a late note ".repeat(40)).unwrap();
+        let closing = "closing error ".repeat(400);
+        out.finish(&Summary {
+            exit: 1,
+            status: FILLING_STATUS,
+            error: Some(&closing),
+            elapsed_ms: 7,
+        })
+        .unwrap();
+    }
+
+    pub const FILLING_STATUS: &str = "failed (exit 1): 4294967295 errors, first in batch \
+        18446744073709551615; 18446744073709551615 later batches not run (--continue-on-error \
+        runs them), 340282366920938463463374607431768211455 ms";
 
     /// PLAN.md 2.12, the same calls for every format (with `limits()`: one result set and one
     /// message shown). A message, an error and a row count that arrive between a result set's
@@ -871,6 +973,339 @@ pub(super) mod tests {
             "-- note: output stopped at the --max-output limit of 520 bytes; the run \
              continued, and these weren't shown: 1 note\n-- ok: 0 batches, 3 ms\n"
         );
+    }
+
+    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.1: a run that connected ends its status
+    // line with the server, the database it started in and the connect time. The elapsed time
+    // before the tail is the run's own and includes the connect.
+    #[test]
+    fn a_connected_run_ends_its_status_line_with_where_it_ran() {
+        let (mut s, main, meta) = sink(capped(0));
+        s.connected(&connection_to("db01", "master"), 195).unwrap();
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(40).unwrap();
+        s.finish(&summary("ok: 1 batch, 241 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            "-- result 1\nx:int\n1\n-- 1 row\n\
+             -- ok: 1 batch, 241 ms; db01/master, connect 195 ms\n"
+        );
+        // Nothing else carries it, and nothing goes to the diagnostics stream.
+        assert_eq!(meta.bytes(), 0);
+    }
+
+    // A run that failed after connecting says where it was too: the closing error comes first,
+    // the status line last, with the tail at its end.
+    #[test]
+    fn a_failed_run_that_connected_keeps_the_tail_after_its_error() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to("db01", "AppDb"), 0).unwrap();
+        s.finish(&Summary {
+            exit: 4,
+            status: "failed (exit 4): timeout, 60012 ms",
+            error: Some("query timeout after 60 s in batch 1; raise -t or narrow the query"),
+            elapsed_ms: 60012,
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            "-- error: query timeout after 60 s in batch 1; raise -t or narrow the query\n\
+             -- failed (exit 4): timeout, 60012 ms; db01/AppDb, connect 0 ms\n"
+        );
+    }
+
+    // Nothing connected (a usage error, a guard refusal, a failed connect): the status line is
+    // what it always was.
+    #[test]
+    fn a_run_that_never_connected_has_no_tail() {
+        let (mut s, main, _) = sink(capped(0));
+        s.finish(&Summary {
+            exit: 3,
+            status: "failed (exit 3): usage error, 0 ms",
+            error: Some("-P is rejected"),
+            elapsed_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            "-- error: -P is rejected\n-- failed (exit 3): usage error, 0 ms\n"
+        );
+        let (mut s, main, _) = sink(capped(0));
+        s.blocked("line 2", "INSERT ##t would write", "Use a #temp table")
+            .unwrap();
+        s.finish(&Summary {
+            exit: 5,
+            status: "failed (exit 5): blocked by the read-only guard, 0 ms",
+            error: None,
+            elapsed_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            "-- blocked: line 2: INSERT ##t would write; nothing was run. Use a #temp table\n\
+             -- failed (exit 5): blocked by the read-only guard, 0 ms\n"
+        );
+    }
+
+    // A server that gave no name is `?`, as in `--verbose`; the database is always known.
+    #[test]
+    fn a_server_that_reported_no_name_is_a_question_mark() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(
+            &Connection {
+                server: None,
+                ..connection_to("", "master")
+            },
+            7,
+        )
+        .unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            "-- ok: 0 batches, 3 ms; ?/master, connect 7 ms\n"
+        );
+    }
+
+    // Names are escaped like every variable field of a metadata line (DESIGN.md §5.1): they
+    // can't start a line or pass for a `-- ` line, whether the consumer splits at `\n` only or
+    // at every Unicode line break, and a backslash is doubled. A bracket-quoted database name
+    // can hold any of this.
+    #[test]
+    fn hostile_server_and_database_names_are_escaped() {
+        let name = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h\u{85}i\u{2028}j\u{2029}k]}{,\"x\":1";
+        let escaped = "a\"b\\\\c\\nd\\re\\tf\\x01g\\x7Fh\\x85i\\u2028j\\u2029k]}{,\"x\":1";
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to(name, name), 1).unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            format!("-- ok: 0 batches, 3 ms; {escaped}/{escaped}, connect 1 ms\n")
+        );
+
+        // The forged line is one line of metadata, the real status line.
+        let forged = "x\n-- ok: forged\u{2028}-- ok: forged";
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to(forged, forged), 1).unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        let out = main.text();
+        let breaks = |c: char| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}');
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+        assert_eq!(out.split(breaks).count(), 2, "{out:?}");
+        assert_eq!(
+            out.split(breaks).filter(|l| l.starts_with("-- ")).count(),
+            1
+        );
+    }
+
+    // A name longer than SQL Server's own limit is cut like a long value, with the number of
+    // characters left out, as JSON's `connection` cuts it; one of exactly 128 characters is not.
+    #[test]
+    fn a_name_beyond_128_characters_is_cut() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to(&"s".repeat(128), &"d".repeat(300)), 1)
+            .unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            format!(
+                "-- ok: 0 batches, 3 ms; {}/{}…[+172], connect 1 ms\n",
+                "s".repeat(128),
+                "d".repeat(128)
+            )
+        );
+        // The cut counts characters before escaping, and never splits an escape.
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to("a", &"\u{1}".repeat(130)), 1)
+            .unwrap();
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            format!(
+                "-- ok: 0 batches, 3 ms; a/{}…[+2], connect 1 ms\n",
+                "\\x01".repeat(128)
+            )
+        );
+    }
+
+    // A run cut by --max-output: the tail is held back from the budget to the byte. The body
+    // stops exactly as much sooner as the tail is long, so the same run under a cap larger by
+    // that many bytes writes the same body, and the status line, whole with its tail, is
+    // still the last line.
+    #[test]
+    fn a_run_cut_by_the_cap_keeps_the_tail_and_gives_it_its_room() {
+        fn run(s: &mut TextSink<Shared>) {
+            s.columns(&[col("v", "varchar(9)")]).unwrap();
+            for _ in 0..5 {
+                if s.wants_values() {
+                    s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+                } else {
+                    s.skipped_row();
+                }
+            }
+            s.end_rows().unwrap();
+            s.message(&msg("later")).unwrap();
+            s.error(&error(1)).unwrap();
+            s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+                .unwrap();
+        }
+        let tail = "; db01/master, connect 195 ms";
+        let (mut plain, without, _) = sink(budget(50));
+        run(&mut plain);
+
+        let (mut s, main, meta) = sink(budget(50 + tail.len() as u64));
+        s.connected(&connection_to("db01", "master"), 195).unwrap();
+        run(&mut s);
+        let max = crate::output::OUTPUT_RESERVE + 50 + tail.len() as u64;
+        assert_eq!(
+            main.text(),
+            format!(
+                "-- result 1\nv:varchar(9)\naaaaaaaaa\naaaaaaaaa\n\
+                 -- 2 of 5 rows shown (--max-output)\n\
+                 -- note: output stopped at the --max-output limit of {max} bytes; the run \
+                 continued, and these weren't shown: 1 message, 1 error\n\
+                 -- failed (exit 1): 1 error, 3 ms{tail}\n"
+            )
+        );
+        assert_eq!(meta.bytes(), 0);
+        // The same rows as without a connection and the smaller cap; only the cap, and with it
+        // the note that names it, and the tail differ.
+        let plain = without.text();
+        assert!(plain.starts_with("-- result 1\nv:varchar(9)\naaaaaaaaa\naaaaaaaaa\n"));
+        assert_eq!(
+            main.text().replace(&format!("{max} bytes"), "1074 bytes"),
+            format!("{}{tail}\n", plain.strip_suffix('\n').unwrap())
+        );
+    }
+
+    // The tail is a promise of room made when the connection is described. Notes written
+    // before that (the one about ignored sqlcmd flags) may already have used it, only with a cap
+    // near the minimum: the tail is then left out, counted among what wasn't shown, and the
+    // status line is whole without it, within the cap.
+    #[test]
+    fn a_tail_the_budget_has_no_room_for_is_left_out_and_counted() {
+        let (mut s, main, _) = sink(capped(4096));
+        s.note(&"n".repeat(10_000)).unwrap();
+        s.connected(&connection_to("db01", "master"), 195).unwrap();
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        let out = main.text();
+        assert!(out.len() <= 4096, "{} bytes", out.len());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("-- note: nnnn"), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            "-- note: output stopped at the --max-output limit of 4096 bytes; the run \
+             continued, and these weren't shown: 1 connection description"
+        );
+        assert_eq!(lines[2], "-- ok: 1 batch, 3 ms");
+    }
+
+    // The connection is described once, before the first batch (`Output::connected`): a second
+    // call, or one that comes after a batch began, is refused and changes nothing.
+    #[test]
+    fn the_connection_is_described_once_before_anything_else() {
+        let (mut s, main, _) = sink(capped(0));
+        s.connected(&connection_to("db01", "master"), 1).unwrap();
+        let error = s.connected(&connection_to("other", "x"), 2).unwrap_err();
+        assert!(crate::output::OutOfOrder::is(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("before the first batch"));
+        s.finish(&summary("ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            "-- ok: 0 batches, 3 ms; db01/master, connect 1 ms\n"
+        );
+
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        let error = s
+            .connected(&connection_to("db01", "master"), 1)
+            .unwrap_err();
+        assert!(crate::output::OutOfOrder::is(&error), "{error}");
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(main.text(), "-- ok: 1 batch, 3 ms\n");
+    }
+
+    // The widest tail there can be is the one pinned in `WIDEST_ENDING`: 1,609 bytes. It is
+    // reserved, so at every cap the CLI accepts (4096 up) the whole response stays within the
+    // cap and ends with the status line, whole, with the tail at its end.
+    #[test]
+    fn the_cap_holds_with_the_widest_status_tail() {
+        let mut ending = String::new();
+        {
+            let mut tally = Tally::new(capped(0));
+            ending.push_str(&status_ending(&mut tally, 0, &widest_names(), u128::MAX).unwrap());
+        }
+        assert_eq!(ending.len(), WIDEST_ENDING);
+        assert!(ending.starts_with("; \\u2028") && ending.ends_with(" ms"));
+        for max in 4096..4096 + 1800 {
+            for (run, status) in [
+                (ragged_run as fn(&mut dyn Output), RAGGED_STATUS),
+                (interrupted_run, INTERRUPTED_STATUS),
+                (filling_run, FILLING_STATUS),
+            ] {
+                let (mut s, main, meta) = sink(capped(max));
+                s.connected(&widest_names(), u128::MAX).unwrap();
+                run(&mut s);
+                let out = main.text();
+                let total = (main.bytes() + meta.bytes()) as u64;
+                assert!(
+                    total <= max,
+                    "cap {max}: {total} bytes\n{out}{}",
+                    meta.text()
+                );
+                assert_eq!(
+                    out.lines().last().unwrap(),
+                    format!("-- {status}{ending}"),
+                    "cap {max}"
+                );
+            }
+        }
+    }
+
+    // The sweep of `the_cap_holds_wherever_the_body_ends` with a short tail, down to the
+    // smallest caps the sinks can be given: the tail is always reserved there, and the
+    // response is within the cap and ends with the status line and its tail.
+    #[test]
+    fn the_cap_holds_wherever_the_body_ends_with_a_tail() {
+        use crate::output::OUTPUT_RESERVE;
+        for max in OUTPUT_RESERVE..OUTPUT_RESERVE + 1800 {
+            for (run, error, status) in [
+                (
+                    ragged_run as fn(&mut dyn Output),
+                    "-- error: closing error ",
+                    RAGGED_STATUS,
+                ),
+                (
+                    interrupted_run,
+                    "-- error: query timeout ",
+                    INTERRUPTED_STATUS,
+                ),
+                (filling_run, "-- error: closing error ", FILLING_STATUS),
+            ] {
+                let (mut s, main, meta) = sink(capped(max));
+                s.connected(&connection_to("N", "N"), 12).unwrap();
+                run(&mut s);
+                let out = main.text();
+                let total = (main.bytes() + meta.bytes()) as u64;
+                assert!(
+                    total <= max,
+                    "cap {max}: {total} bytes\n{out}{}",
+                    meta.text()
+                );
+                assert!(out.contains(error), "cap {max}: no closing error\n{out}");
+                assert_eq!(
+                    out.lines().last().unwrap(),
+                    format!("-- {status}; N/N, connect 12 ms"),
+                    "cap {max}"
+                );
+            }
+        }
     }
 
     #[test]
