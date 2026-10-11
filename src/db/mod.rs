@@ -93,7 +93,7 @@ pub struct ServerMessage {
 ///   (its result set, its row count, its errors), and once more after the last statement.
 ///   So a message the server sends while a result set's rows are streaming comes after that
 ///   result set's `end_rows`, never between its rows. When the rows end in an error, the
-///   order is `end_rows`, the messages held, then the errors.
+///   order is `end_rows_incomplete`, the messages held, then the errors.
 /// - **A row count** (`rows_affected`) and **an error** are outside any result set too.
 ///
 /// Messages keep their order among themselves. Their order against results, row counts and
@@ -122,6 +122,11 @@ pub trait BatchSink {
     /// get; held messages may still follow.
     fn counting_stopped(&mut self, by: Stop);
     fn end_rows(&mut self) -> io::Result<()>;
+    /// The rows of the current result set are over because a SQL error ended the stream: what
+    /// arrived is not the query's result. Closes the result like `end_rows`, but marked
+    /// incomplete, so the count is not exact (DESIGN.md §5.1 to §5.3); the messages held and the
+    /// errors follow, as after `end_rows`. A later result is a new one and is exact again.
+    fn end_rows_incomplete(&mut self) -> io::Result<()>;
     fn rows_affected(&mut self, count: u64) -> io::Result<()>;
     fn message(&mut self, message: &ServerMessage) -> io::Result<()>;
     fn error(&mut self, error: &ServerMessage) -> io::Result<()>;
@@ -871,7 +876,7 @@ impl Session {
                 }
                 Ok(Row::End) => break,
                 Err(TdsError::SqlServerError { diagnostics }) => {
-                    sink.end_rows()?;
+                    sink.end_rows_incomplete()?;
                     self.flush_messages(sink)?;
                     for error in &diagnostics.errors {
                         sink.error(&from_error(error))?;

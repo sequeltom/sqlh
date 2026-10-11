@@ -229,6 +229,15 @@ impl<W: Write> BatchSink for CsvSink<W> {
         self.meta_line(&footer)
     }
 
+    fn end_rows_incomplete(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
+        if self.tally.result_hidden() {
+            return Ok(());
+        }
+        let footer = format!("-- {}", self.tally.footer_incomplete());
+        self.meta_line(&footer)
+    }
+
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
         self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
@@ -385,6 +394,55 @@ mod tests {
              -- msg: done\n\
              -- error 208 (severity 16, state 1, line 4): Invalid object name 'dbo.Nope'.\n\
              -- failed (exit 1): 1 error, 5 ms\n"
+        );
+    }
+
+    // R17, exact output: the footer of a result a SQL error ended says so on the metadata
+    // stream, as the text format does; the data stream is the rows that arrived and nothing
+    // else. A result that ended on its own, and a later one in the same batch, are exact.
+    #[test]
+    fn a_result_a_sql_error_ended_has_an_incomplete_footer() {
+        let (mut s, data, meta) = sink(Limits {
+            max_rows: 2,
+            max_cell: 0,
+            ..capped(0)
+        });
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.row(&[Value::Int(2)]).unwrap();
+        s.skipped_row();
+        s.end_rows_incomplete().unwrap();
+        s.message(&msg("held")).unwrap();
+        s.error(&error(2)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(9)]).unwrap();
+        s.end_rows_incomplete().unwrap();
+        s.error(&error(3)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(9)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&summary("failed (exit 1): 2 errors, 3 ms"))
+            .unwrap();
+        assert_eq!(data.text(), "x\n1\n\nx\n1\n2\n\nx\n9\n\nx\n9\n");
+        assert_eq!(
+            meta.text(),
+            "-- result 1: x:int\n\
+             -- 1 row\n\
+             -- result 2: x:int\n\
+             -- 2 of ≥3 rows shown (--max-rows 2; interrupted)\n\
+             -- msg: held\n\
+             -- error 208 (severity 16, state 1, line 2): Invalid object name 'dbo.Nope'.\n\
+             -- result 3: x:int\n\
+             -- 1 row so far (interrupted)\n\
+             -- error 208 (severity 16, state 1, line 3): Invalid object name 'dbo.Nope'.\n\
+             -- result 4: x:int\n\
+             -- 1 row\n\
+             -- failed (exit 1): 2 errors, 3 ms\n"
         );
     }
 

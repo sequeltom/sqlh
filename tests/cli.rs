@@ -1479,7 +1479,7 @@ fn verbose_runs_stay_within_max_output() {
     }
 }
 
-/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 1.1)`.
+/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 2.0)`.
 fn contract_version() -> String {
     let r = sqlh_args(&["--version"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -1535,7 +1535,7 @@ fn json_documents_start_with_the_contract_version() {
 }
 
 // PLAN.md 2.11: `--version` names the JSON contract version after the program's own, in
-// `sqlh 0.1.0 (json contract 1.1)` form, and nothing else. The contract is pinned here: a
+// `sqlh 0.1.0 (json contract 2.0)` form, and nothing else. The contract is pinned here: a
 // new version is an updated DESIGN.md §5.2 and an updated test.
 #[test]
 fn version_reports_the_json_contract() {
@@ -1544,9 +1544,9 @@ fn version_reports_the_json_contract() {
     assert_eq!(r.stderr, "");
     assert_eq!(
         r.stdout,
-        format!("sqlh {} (json contract 1.1)\n", env!("CARGO_PKG_VERSION"))
+        format!("sqlh {} (json contract 2.0)\n", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract_version(), "1.1");
+    assert_eq!(contract_version(), "2.0");
 }
 
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
@@ -3709,7 +3709,7 @@ mod live {
         assert_eq!(r.code, 1, "{}", r.stdout);
         assert!(
             r.stdout.contains(
-                "-- batch 2 (line 3)\n-- result 2\nn:int\n-- 0 rows\n-- error 1222 (severity 16, state "
+                "-- batch 2 (line 3)\n-- result 2\nn:int\n-- 0 rows so far (interrupted)\n-- error 1222 (severity 16, state "
             ) && r.stdout.contains(", line 4): Lock request time out period exceeded.\n"),
             "{}",
             r.stdout
@@ -3872,8 +3872,17 @@ mod live {
                 .collect();
                 let footer = lines
                     .iter()
-                    .position(|l| l.starts_with("-- ") && l.ends_with(" rows"))
+                    .position(|l| {
+                        l.starts_with("-- ")
+                            && (l.ends_with(" rows") || l.ends_with("(interrupted)"))
+                    })
                     .unwrap_or_else(|| panic!("{what}, {format}: no footer: {lines:?}"));
+                // R17: the rows an error cut short are not the result, and the footer says so.
+                assert_eq!(
+                    lines[footer].ends_with("rows so far (interrupted)"),
+                    code == 1,
+                    "{what}, {format}: {lines:?}"
+                );
                 assert!(
                     lines[footer + 1].starts_with(then),
                     "{what}, {format}: {lines:?}"
@@ -3891,8 +3900,16 @@ mod live {
             let events = doc["batches"][0]["events"].as_array().expect("events");
             assert_eq!(events.len(), 2, "{what}, json: {doc}");
             assert_eq!(events[0]["type"], "result", "{what}, json: {doc}");
-            assert!(
-                events[0].get("interrupted").is_none(),
+            // R17: the warning's result is complete and exact; the one an error cut short is
+            // marked interrupted and its count is not the total.
+            assert_eq!(
+                events[0].get("interrupted").and_then(Value::as_bool),
+                (code == 1).then_some(true),
+                "{what}, json: {doc}"
+            );
+            assert_eq!(
+                events[0]["row_count_exact"],
+                code == 0,
                 "{what}, json: {doc}"
             );
             assert_eq!(
@@ -3903,6 +3920,70 @@ mod live {
             let kind = if code == 0 { "msg" } else { "error" };
             assert_eq!(events[1]["type"], kind, "{what}, json: {doc}");
         }
+    }
+
+    // R17: the incomplete state is the failed result's own. A statement-terminating error
+    // (the divide by zero) leaves the batch running, so a later result in the same batch is
+    // exact, and so is a result in a later batch under --continue-on-error. The sink unit
+    // tests cover the closure itself in each format.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn an_incomplete_result_does_not_make_the_later_results_incomplete() {
+        use serde_json::Value;
+        let (p, db) = target();
+        let sql = "SELECT 1 AS first_ok\n\
+                   SELECT n, 10 / (n - 3) AS q FROM (VALUES (1), (2), (3), (4), (5)) AS x(n)\n\
+                   SELECT 7 AS later\n\
+                   GO\n\
+                   SELECT 8 AS next";
+        let r = live(
+            &p,
+            &db,
+            &["--format", "json", "--continue-on-error", "-Q", sql],
+        );
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        let doc: Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let batches = doc["batches"].as_array().expect("batches");
+        assert_eq!(batches.len(), 2, "{doc}");
+        let events = batches[0]["events"].as_array().expect("events");
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["type"].as_str().expect("a type"))
+            .collect();
+        assert_eq!(kinds, ["result", "result", "error", "result"], "{doc}");
+        let exact: Vec<bool> = [0, 1, 3]
+            .iter()
+            .map(|&i| events[i]["row_count_exact"].as_bool().expect("a bool"))
+            .collect();
+        assert_eq!(exact, [true, false, true], "{doc}");
+        assert_eq!(events[1]["interrupted"], true, "{doc}");
+        for i in [0, 3] {
+            assert!(events[i].get("interrupted").is_none(), "{doc}");
+        }
+        assert_eq!(events[3]["rows"], serde_json::json!([[7]]), "{doc}");
+        let next = &batches[1]["events"][0];
+        assert_eq!(next["rows"], serde_json::json!([[8]]), "{doc}");
+        assert_eq!(next["row_count_exact"], true, "{doc}");
+        assert!(next.get("interrupted").is_none(), "{doc}");
+
+        // The same input in text: the footers, in order, around the error.
+        let r = live(&p, &db, &["--continue-on-error", "-Q", sql]);
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        let footers: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter(|l| l.starts_with("-- ") && (l.contains(" row")))
+            .filter(|l| !l.contains("affected"))
+            .collect();
+        assert_eq!(footers.len(), 4, "{}", r.stdout);
+        assert_eq!(footers[0], "-- 1 row", "{}", r.stdout);
+        assert!(
+            footers[1].ends_with(" rows so far (interrupted)")
+                || footers[1].ends_with(" row so far (interrupted)"),
+            "{}",
+            r.stdout
+        );
+        assert_eq!(&footers[2..], ["-- 1 row", "-- 1 row"], "{}", r.stdout);
     }
 
     // PLAN.md 2.11: a JSON document starts with the contract version and says where the run
