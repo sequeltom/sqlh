@@ -56,7 +56,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 **Output an agent can afford to read**
 - **Compact, typed output.** `name:type` headers, tab-separated rows, ISO dates, exact decimals, and `NULL` kept apart from the string `'NULL'` (written `\NULL`). *(MVP)*
-- **Hard limits by default.** 100 rows, 500 characters per value, 20 result sets and 1 MB of output per run (`--max-rows`, `--max-cell`, `--max-results`, `--max-output`), and 10 MB of input. *(MVP; `--max-output` in Phase 2.2)*
+- **Hard limits by default.** 100 rows, 500 characters per value, 20 result sets, and 1 MB for the whole response, errors, notes and diagnostics included (`--max-rows`, `--max-cell`, `--max-results`, `--max-output`), and 10 MB of input. Text that doesn't fit is cut with a marker; the status line never is. *(MVP; `--max-output` in Phase 2.2)*
 - **Hidden rows are counted; cut values say how much.** `-- 100 of 48213 rows shown (--max-rows 100)` and `…[+N]`, so the agent knows what it didn't see and can narrow the query. *(MVP)*
 - **A status line that proves the output is complete.** The last line is `-- ok: ...` or `-- failed (exit N): ...`. Without it (exit 7 or 10), the output can't be trusted. *(MVP)*
 - **Loops don't flood.** Consecutive row counts collapse into `-- 300 statements, 300 rows affected`. *(Phase 2.2)*
@@ -79,9 +79,9 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 **Never stuck**
 - **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
 - **Timeouts by default.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. *(MVP)*
-- **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. *(Phase 2.3)*
-- **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query or waits on a slow reader. It exits 6 and says whether the server confirmed the cancel. A harness that kills sqlh also stops the server's work (measured for a waiting query). *(MVP; every console event in Phase 2.4)*
-- **Connect failures come back fast, and the same way every time.** One attempt only: a refused server fails in about 2 s, and an unreachable one after `-l` seconds. A remote name never falls back to a slow Named Pipes attempt. *(Phase 2.4)*
+- **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. A slow reader that keeps reading isn't cut off, and sqlh's own diagnostics can't hang on a stalled stream either. *(Phase 2.3)*
+- **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query, waits on a slow reader or delivers its last lines. It exits 6 and says what became of the statement. A harness that kills sqlh also stops the server's work (measured for a waiting query). *(MVP; every console event in Phase 2.4)*
+- **Connect failures come back fast, and the same way every time.** One attempt per address: a refused one fails in about 2 s, and one that doesn't answer after `-l` seconds. sqlh never makes the slow, uncancellable Named Pipes attempt to another machine: remote names go over TCP, and an explicit remote pipe is refused with the TCP spelling to use. *(Phase 2.4)*
 
 **Fits how models already work**
 - **sqlcmd-compatible.** `-S -d -U -Q -i -v -t`, `GO`, `GO n` and `$(var)`; sqlcmd's formatting flags are accepted and ignored with one note, so a model's habits don't break. *(MVP)*

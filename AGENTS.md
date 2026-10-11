@@ -57,6 +57,7 @@ docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect late
 docs/schema-commands.md, docs/mcp-mode.md   designs and plans for later phases
 code-review.md   the architecture review the plan responds to
 code-review-phase1.md   the follow-up review of Phase 1 (R01–R05)
+code-review-phase2.md   the review of Phase 2 so far (R08–R11)
 ```
 
 Planned, not built: `src/schema.rs` (subcommands), an md format in `src/output/`, and `.github/workflows/` (`ci.yml` and a signed `release.yml`, modeled on the owner's ssms-executor repo; PLAN.md 3.5 and 3.6).
@@ -127,6 +128,6 @@ Profiles and Credential Manager are built, and so are the json and csv formats. 
 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of [code-review.md](code-review.md). Owner decisions are recorded in its §6. Work in order:
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
-2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done. Next is 2.5, harness-kill behavior.
+2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is the login step, which the measurements attribute to SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done, and so are the fixes the Phase 2 review asked for ([code-review-phase2.md](code-review-phase2.md); PLAN.md, Phase 2 follow-up). Next is 2.5, harness-kill behavior.
 3. Phase 3, execution core, release checks, live fixtures, and GitHub Actions CI plus a signed release workflow (3.5, 3.6).
 4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

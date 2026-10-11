@@ -1247,6 +1247,48 @@ fn a_huge_connection_error_stays_within_max_output_in_every_format() {
     }
 }
 
+// R08: an error found before the run starts keeps to --max-output too, whether it comes
+// from the options (a remote pipe named in -S), the input (an unknown $(var)) or -o.
+#[test]
+fn early_errors_stay_within_max_output_in_every_format() {
+    let long = "x".repeat(20_000);
+    let pipe = format!("np:{long}");
+    let query = format!("SELECT $({long})");
+    let out = format!("C:/nonexistent-dir-{long}/out.txt");
+    let cases = [
+        ("remote pipe", vec!["-S", pipe.as_str(), "-Q", "SELECT 1"]),
+        ("unknown variable", vec!["-Q", query.as_str()]),
+        ("-o", vec!["-Q", "SELECT 1", "-o", out.as_str()]),
+    ];
+    for (what, args) in &cases {
+        for format in ["text", "json", "csv"] {
+            let mut all = args.clone();
+            all.extend(["--max-output", "4096", "--format", format]);
+            let r = sqlh_args(&all);
+            let shown = format!(
+                "{what}, {format}: {} + {} bytes",
+                r.stdout.len(),
+                r.stderr.len()
+            );
+            assert_eq!(r.code, 3, "{shown}");
+            assert!(response_bytes(&r) <= 4096, "{shown}");
+            if format == "json" {
+                let doc: serde_json::Value =
+                    serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{shown}: {e}"));
+                assert_eq!(doc["exit_code"], 3, "{shown}");
+                assert!(doc["error"].as_str().unwrap().contains("…[+"), "{shown}");
+            } else {
+                let stream = status_stream(format, &r);
+                assert!(
+                    last_line(stream).starts_with("-- failed (exit 3)"),
+                    "{shown}"
+                );
+                assert!(stream.contains("…[+"), "{shown}: no cut marker");
+            }
+        }
+    }
+}
+
 // R08: --verbose lines go through the output and count against --max-output. Offline the
 // connection never succeeds, so no line is produced, but the budget, the exit code and the
 // status line must be the same with the flag as without.

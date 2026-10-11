@@ -115,26 +115,30 @@ fn run_command(opts: Opts, started: Instant) -> Exit {
     if std::env::var_os("SQLH_DEBUG_PANIC").is_some() {
         panic!("forced by SQLH_DEBUG_PANIC");
     }
+    // A failure before the settings are resolved still keeps to the flags' own limits, and
+    // one after keeps to the run's (R08: the cap covers the whole response).
+    let flagged = flag_limits(&opts);
     if opts.write_policy.is_some() || opts.new_password {
-        return fail(
+        return fail_within(
             Failure::usage("--write-policy and --new-password only apply to sqlh profile add"),
             format,
+            flagged,
             started,
         );
     }
     let settings = match config::resolve(&opts) {
         Ok(settings) => settings,
-        Err(failure) => return fail(failure, format, started),
+        Err(failure) => return fail_within(failure, format, flagged, started),
     };
     // Everything that can fail before the run happens before `-o` is opened, so bad input
     // never truncates or replaces an existing output file.
     let prepared = match prepare(&opts, &settings) {
         Ok(prepared) => prepared,
-        Err(failure) => return fail(failure, format, started),
+        Err(failure) => return fail_within(failure, format, settings.limits, started),
     };
     let (destination, writer) = match Destination::open(opts.output.as_deref(), &prepared.sources) {
         Ok(opened) => opened,
-        Err(failure) => return fail(failure, format, started),
+        Err(failure) => return fail_within(failure, format, settings.limits, started),
     };
     let mut out = output::create(format, writer, settings.limits);
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -207,13 +211,26 @@ fn stdout_sink(limits: Limits) -> Out {
     stdout_output(Format::Text, limits)
 }
 
-/// Reports a failure that happened before any output was set up.
+/// Reports a failure that happened before any output was set up, before even the options
+/// were understood: the default limits apply.
 fn fail(failure: Failure, format: Format, started: Instant) -> Exit {
-    finish(
-        &mut stdout_output(format, Limits::default()),
-        Err(failure),
-        started,
-    )
+    fail_within(failure, format, Limits::default(), started)
+}
+
+/// Reports a failure that happened before any output was set up, within `limits`.
+fn fail_within(failure: Failure, format: Format, limits: Limits, started: Instant) -> Exit {
+    finish(&mut stdout_output(format, limits), Err(failure), started)
+}
+
+/// The output limits the flags give on their own (`--max-output`, `-t`), for a failure found
+/// before a profile could add its own.
+fn flag_limits(opts: &Opts) -> Limits {
+    let defaults = Limits::default();
+    Limits {
+        max_output: opts.max_output.unwrap_or(defaults.max_output),
+        stall_secs: opts.query_timeout.unwrap_or(defaults.stall_secs),
+        ..defaults
+    }
 }
 
 /// How a run ends: its exit code, the status line, and the error that stopped it, if any.
@@ -514,13 +531,19 @@ impl Abandonable {
     }
 }
 
-/// Output that has no status line (`--help`, `--version`): exit 0, or 7 if stdout is gone.
+/// Output that has no status line (`--help`, `--version`): exit 0, or 7 if stdout is gone or
+/// its reader stops reading for the default stall limit. It goes through the delivery thread
+/// like any other output, so a reader that keeps the pipe open and reads nothing can't hold
+/// sqlh forever (R09).
 fn print_plain(text: &str) -> Exit {
-    let mut stdout = io::stdout().lock();
-    match stdout
+    let stall = Duration::from_secs(Limits::default().stall_secs.into());
+    let mut delivery = output::delivery::Delivery::start(Box::new(io::stdout()), None, Some(stall));
+    let mut writer = delivery.writer(output::delivery::Dest::Main);
+    let queued = writer
         .write_all(text.as_bytes())
-        .and_then(|()| stdout.flush())
-    {
+        .and_then(|()| writer.flush());
+    drop(writer);
+    match queued.and_then(|()| delivery.finish(None)) {
         Ok(()) => Exit::Ok,
         Err(e) => {
             diag(format_args!(
@@ -756,9 +779,9 @@ fn location(sources: &[Source], source: usize, line: u32) -> String {
 }
 
 /// Runs the session, cancelling it on Ctrl+C, Ctrl+Break, the console closing, logoff or
-/// shutdown. The error then says whether the server confirmed the cancel or the connection
-/// was closed instead (DESIGN.md §4.3). The listeners are the caller's, and outlive this:
-/// the closing lines still need them (R10).
+/// shutdown. The error then says what sqlh observed: the statement was cancelled and the
+/// connection stayed usable, or the connection was closed instead (DESIGN.md §4.3). The
+/// listeners are the caller's, and outlive this: the closing lines still need them (R10).
 ///
 /// The second value is the signal when it came too late to change the outcome (every batch
 /// had run), so the caller can still hold the delivery to `DELIVERY_GRACE`.
