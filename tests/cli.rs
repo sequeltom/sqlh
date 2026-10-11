@@ -1871,6 +1871,28 @@ mod live {
                 peak >> 20
             );
         }
+        // With no --max-cell, the output budget is the limit: a value of 40,000,000 characters
+        // can't fit in 1,000,000 bytes, so the row is withheld as it was before, and what the
+        // run held is still a few megabytes, not 80 MB of text and the same again to write it.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-cell",
+            "0",
+            "-Q",
+            "SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 40000000) AS big",
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains("\n-- 0 of 1 rows shown (--max-output)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
         // The same in json, which builds its rows in a buffer of its own.
         let sql = "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big";
         let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
