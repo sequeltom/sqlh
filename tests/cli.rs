@@ -1747,6 +1747,25 @@ fn help_stays_within_its_line_budget() {
     assert!(lines <= 62, "--help is {lines} lines");
 }
 
+/// `text` as UTF-16LE in base64, the form PowerShell's `-EncodedCommand` takes.
+#[cfg(windows)]
+fn base64_of_utf16(text: &str) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let group = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        let digit = |shift: u32| DIGITS[(group >> shift) as usize & 63] as char;
+        encoded.push(digit(18));
+        encoded.push(digit(12));
+        encoded.push(if chunk.len() > 1 { digit(6) } else { '=' });
+        encoded.push(if chunk.len() > 2 { digit(0) } else { '=' });
+    }
+    encoded
+}
+
 /// A shell a person types commands in.
 #[cfg(windows)]
 #[derive(Clone, Copy)]
@@ -1785,31 +1804,25 @@ impl Shell {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut command = match self {
             Shell::Cmd => {
-                // /s takes off exactly the outer quotes, as typing at a prompt would.
+                // /s takes off exactly the outer quotes, as typing at a prompt would, and /d
+                // skips the AutoRun commands some machines have in the registry.
                 let mut command = Command::new("cmd.exe");
-                command.raw_arg(format!("/s /c \"{line}\""));
+                command.raw_arg(format!("/d /s /c \"{line}\""));
                 command
             }
             Shell::PowerShell51 | Shell::PowerShell7 => {
-                // A file, not -Command, so the line reaches the parser unchanged. The BOM
-                // makes Windows PowerShell 5.1 read it as UTF-8.
-                let script = dir.join(format!("shell-{}.ps1", self as u8));
-                fs::write(&script, format!("\u{feff}{line}\r\nexit $LASTEXITCODE\r\n")).unwrap();
+                // -EncodedCommand (the script as base64 of UTF-16) puts the line in front of
+                // the parser unchanged, and unlike a script file no execution policy can
+                // block it.
+                let script = format!("{line}\r\nexit $LASTEXITCODE\r\n");
                 let exe = if matches!(self, Shell::PowerShell7) {
                     "pwsh.exe"
                 } else {
                     "powershell.exe"
                 };
                 let mut command = Command::new(exe);
-                command
-                    .args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                    ])
-                    .arg("-File")
-                    .arg(&script);
+                command.args(["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+                command.arg(base64_of_utf16(&script));
                 command
             }
         };
@@ -1993,7 +2006,7 @@ fn sqlh_leaves_the_console_code_page_alone() {
     // Started without redirected handles, the child's stdout is its own hidden console, and
     // so is sqlh's inside it. Windows PowerShell does that through .NET.
     let launcher = "$i = New-Object System.Diagnostics.ProcessStartInfo; \
-        $i.FileName = 'cmd.exe'; $i.Arguments = '/s /c \"' + $env:SQLH_TEST_LINE + '\"'; \
+        $i.FileName = 'cmd.exe'; $i.Arguments = '/d /s /c \"' + $env:SQLH_TEST_LINE + '\"'; \
         $i.UseShellExecute = $false; $i.CreateNoWindow = $true; \
         $p = [System.Diagnostics.Process]::Start($i); $p.WaitForExit()";
     let r = run(Command::new("powershell.exe")
