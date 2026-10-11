@@ -4281,6 +4281,56 @@ mod live {
         CROSS JOIN sys.all_objects AS b CROSS JOIN sys.all_objects AS c \
         WHERE CONVERT(bigint, a.object_id) + b.object_id + c.object_id = -1";
 
+    /// 154 rows of 400 characters (about 60 KB, so the server sends them before it stalls), and
+    /// then the same stall as above.
+    const STALL_AFTER_154_WIDE_ROWS: &str = "SELECT TOP (154) REPLICATE('x', 400) AS s \
+        FROM sys.all_objects AS x CROSS JOIN sys.all_objects AS y UNION ALL SELECT 'y' \
+        FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b \
+        CROSS JOIN sys.all_objects AS c \
+        WHERE CONVERT(bigint, a.object_id) + b.object_id + c.object_id = -1";
+
+    // A count stopped after only a few hidden rows must not read as if nothing was hidden:
+    // 154 rows counted floor to 100 with one significant digit, which is the 100 rows shown. The
+    // bound is one more than the rows shown, and the result is `truncated`. (The server sent at
+    // least 101 of the 154 rows before it stalled, and fewer than 200; the bound is 101 for all
+    // of them.)
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_stop_after_a_few_hidden_rows_still_says_that_rows_were_hidden() {
+        let (p, db) = target();
+        let args = [
+            "--max-rows",
+            "100",
+            "--max-cell",
+            "5",
+            "-t",
+            "10",
+            "-Q",
+            STALL_AFTER_154_WIDE_ROWS,
+        ];
+        let r = live(&p, &db, &args);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains(
+                "-- 100 of ≥101 rows shown (--max-rows 100; counting stopped); 100 values cut \
+                 (--max-cell 5)\n"
+            ),
+            "{}",
+            r.stdout
+        );
+        let mut json_args = vec!["--format", "json"];
+        json_args.extend(args);
+        let r = live(&p, &db, &json_args);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["rows"].as_array().unwrap().len(), 100, "{doc}");
+        assert_eq!(result["row_count"], 101, "{doc}");
+        assert_eq!(result["row_count_exact"], false, "{doc}");
+        assert_eq!(result["truncated"], true, "{doc}");
+        assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
+    }
+
     // `-t` expiring while only hidden rows are counted is no failure of a read-only run: the
     // rows shown are complete, so the run reports a lower bound and ends with its own exit
     // code, and the note advises raising `-t` (not `--exact-count`, which is already on).
