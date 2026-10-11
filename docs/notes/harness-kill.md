@@ -82,11 +82,11 @@ Killed about 5 s in (3.5 to 5.4 s of CPU used), while the request was `running`.
 
 The request's `cpu_time` grew by at most 45 ms between the last sample before the kill and the last one after it (the 10 runs of the second series; it is in ms).
 
-A **parallel** variant (an about 299,000 x 299,000 row cross join of `StackOverflow2010.dbo.Users` at `MAXDOP 2`, degree of parallelism 2 confirmed in `sys.dm_exec_requests.dop`, killed about 5 s in at 10.4 to 10.9 s of CPU): request ended by 28, 43, 49 and 58 ms. In between, the request showed the teardown waits (`EXECSYNC`, `CXSYNC_PORT`).
+A **parallel** variant (a cross join of `StackOverflow2010.dbo.Users` with itself, about 299,000 x 299,000 rows, at `MAXDOP 2`; degree of parallelism 2 confirmed in `sys.dm_exec_requests.dop`; killed about 5 s in, at 10.4 to 10.9 s of CPU): request ended by 28, 43, 49 and 58 ms. In between, the request showed the teardown waits (`EXECSYNC`, `CXSYNC_PORT`).
 
 ### Lock-blocked query
 
-Table `T` of the harness's own in `sqlh_test`, 1,000 rows. **A** (`--allow-write`): `BEGIN TRANSACTION; UPDATE T SET v = v + 1;` then `WAITFOR DELAY '00:03:00'`, holding 1,017 locks. **B**: a read-only `SELECT SUM(v) FROM T`, waiting on `LCK_M_S` behind A (blocking session confirmed in every run). 7 runs.
+A table `T` of the harness's own in `sqlh_test`, 1,000 rows. **A** (`--allow-write`): `BEGIN TRANSACTION; UPDATE T SET v = v + 1;` then `WAITFOR DELAY '00:03:00'`, holding 1,017 locks. **B**: a read-only `SELECT SUM(v) FROM T`, waiting on `LCK_M_S` behind A (blocking session confirmed in every run). 7 runs.
 
 **Kill B**, 1.5 s after it blocked:
 
@@ -193,5 +193,7 @@ target\release\sqlh.exe --profile test -Q $check     # 0
 ```
 
 The `session_id <> @@SPID` is needed: the freed id goes to the next login, which can be the check itself.
+
+The live test `a_killed_run_leaves_no_work_on_the_server` (`tests/cli.rs`) repeats the first two cases, a waiting and a CPU-bound run, and fails if the session is still on the server 5 s after the kill. It takes about 2 s: `SQLH_TEST_PROFILE=test cargo test --test cli -- --ignored a_killed_run_leaves_no_work_on_the_server`.
 
 The numbers above came from a throwaway std-only Rust harness (about 850 lines, and an analyzer of its logs) that is not part of the repo. It does what the Method section says: victims and observers as sqlh processes, the SQL shown there, and `Child::kill`. The harness checked the scratch marker first and dropped its tables.
