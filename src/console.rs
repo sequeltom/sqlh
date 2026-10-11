@@ -1,24 +1,53 @@
-//! Console setup and the password prompt. Output is always UTF-8; a console needs telling.
+//! The console and the shell around it: the password prompt, and the hint for a Git Bash path.
+//!
+//! sqlh never changes a console's code page. When stdout is a console, Rust's standard
+//! library writes it as UTF-16 (`WriteConsoleW`), so sqlh's UTF-8 text shows correctly under
+//! any code page. Switching the console to UTF-8 (`SetConsoleOutputCP`), as sqlh once did,
+//! was not needed, and the change stayed behind in the shell's console for every program run
+//! after sqlh, with no way to put it back after a kill or an early Ctrl+C. Measured in
+//! docs/notes/windows-shells.md; DESIGN.md §4.1 has the rules for the bytes of a pipe or file.
 
 use std::io::{self, IsTerminal, Write};
 
-#[cfg(windows)]
-pub fn use_utf8() {
-    const CP_UTF8: u32 = 65001;
-    if io::stdout().is_terminal() {
-        SetConsoleOutputCP(CP_UTF8);
+/// The Windows spelling of a path written the way Git Bash writes drive paths: `/c/code/x.sql`
+/// is `C:\code\x.sql`. Git Bash converts such arguments before a program sees them; cmd.exe
+/// and PowerShell don't, and Windows reads them as paths on the current drive
+/// (`\c\code\x.sql`). None for any other path, including a UNC path written with forward
+/// slashes (`//server/share/x.sql`).
+pub fn git_bash_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    let tail = chars.as_str();
+    if !tail.is_empty() && !tail.starts_with('/') {
+        return None;
     }
+    let tail = tail.replace('/', "\\");
+    let tail = if tail.is_empty() { "\\" } else { &tail };
+    Some(format!("{}:{tail}", drive.to_ascii_uppercase()))
 }
 
-#[cfg(not(windows))]
-pub fn use_utf8() {}
+/// What to add to the message for a path that wasn't found when it is written like a Git Bash
+/// path, so the caller can name the spellings that work (PLAN.md 2.13). The forward-slash one
+/// is there because the text format doubles a backslash (DESIGN.md §5.1), and `C:/code/x.sql`
+/// reads the same in every format.
+pub fn git_bash_hint(path: &str) -> Option<String> {
+    git_bash_path(path).map(|windows| {
+        format!(
+            "that is a Git Bash path, which only Git Bash converts; in cmd.exe and PowerShell \
+             write {windows} or {}",
+            windows.replace('\\', "/")
+        )
+    })
+}
 
-// SAFETY: SetConsoleOutputCP takes a code page number by value and has no
-// memory-safety preconditions, so it is declared `safe`.
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    safe fn SetConsoleOutputCP(code_page: u32) -> i32;
+/// `message` for a path that couldn't be opened, with the Git Bash hint after it when the path
+/// wasn't found and is written like one.
+pub fn path_error(message: String, path: &str, error: &io::Error) -> String {
+    match git_bash_hint(path) {
+        Some(hint) if error.kind() == io::ErrorKind::NotFound => format!("{message}; {hint}"),
+        _ => message,
+    }
 }
 
 /// Reads one line from the console with echo off. The prompt goes to stderr. Callers
@@ -172,4 +201,57 @@ impl EchoOff {
 unsafe extern "system" fn restore_on_signal(_event: u32) -> windows_sys::Win32::Foundation::BOOL {
     restore_echo();
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PLAN.md 2.13: only `/<drive letter>` followed by `/` or the end is a Git Bash drive path.
+    #[test]
+    fn git_bash_drive_paths_have_a_windows_spelling() {
+        let cases = [
+            ("/c/code/x.sql", Some(r"C:\code\x.sql")),
+            ("/C/Code/X.sql", Some(r"C:\Code\X.sql")),
+            ("/d/a b/c.sql", Some(r"D:\a b\c.sql")),
+            ("/c/code\\x.sql", Some(r"C:\code\x.sql")),
+            ("/c", Some(r"C:\")),
+            ("/c/", Some(r"C:\")),
+            // Not drive paths: UNC with forward slashes, other first components, and the
+            // forms Windows reads correctly as they are.
+            ("//c/code", None),
+            ("//server/share/x.sql", None),
+            ("/cd/x", None),
+            ("/1/x", None),
+            ("/\u{e9}/x", None),
+            ("/c:/x", None),
+            ("/tmp/x.sql", None),
+            ("/", None),
+            ("", None),
+            ("c/x", None),
+            ("C:/x/y.sql", None),
+            (r"\c\x.sql", None),
+            (r"C:\x\y.sql", None),
+            (r"\\server\share\x.sql", None),
+        ];
+        for (path, windows) in cases {
+            assert_eq!(git_bash_path(path).as_deref(), windows, "{path}");
+        }
+    }
+
+    // The hint is added to a path that wasn't found, and to nothing else.
+    #[test]
+    fn the_hint_follows_only_a_not_found_git_bash_path() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let message = || "-i /c/code/x.sql: gone".to_owned();
+        let hinted = path_error(message(), "/c/code/x.sql", &missing);
+        assert_eq!(
+            hinted,
+            r"-i /c/code/x.sql: gone; that is a Git Bash path, which only Git Bash converts; in cmd.exe and PowerShell write C:\code\x.sql or C:/code/x.sql"
+        );
+        assert_eq!(path_error(message(), "/c/code/x.sql", &denied), message());
+        assert_eq!(path_error(message(), "/tmp/x.sql", &missing), message());
+        assert_eq!(path_error(message(), r"C:\x.sql", &missing), message());
+    }
 }

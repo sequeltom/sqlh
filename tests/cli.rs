@@ -1443,6 +1443,585 @@ fn odd_length_utf16_is_rejected() {
     assert!(r.stdout.contains("odd number of bytes"), "{}", r.stdout);
 }
 
+// PLAN.md 2.13, Windows shells and paths. The measurements are in docs/notes/windows-shells.md.
+
+/// The text format writes a backslash as two (DESIGN.md §5.1).
+fn text_escaped(text: &str) -> String {
+    text.replace('\\', r"\\")
+}
+
+/// The sentence the Git Bash hint ends with, for the Windows spelling `windows`.
+fn git_bash_hint(windows: &str) -> String {
+    format!(
+        "that is a Git Bash path, which only Git Bash converts; in cmd.exe and PowerShell write \
+         {windows} or {}",
+        windows.replace('\\', "/")
+    )
+}
+
+/// The first line of the output of a run that ended in a usage error.
+fn error_line(r: &Run) -> &str {
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    r.stdout.lines().next().unwrap_or("")
+}
+
+// cmd.exe and PowerShell don't convert Git Bash's /c/dir paths, and Windows reads them as \c\dir
+// on the current drive. A path in that form that isn't found says so and names the spellings
+// that work, for -i, -o and SQLH_CONFIG. (Git Bash converts such arguments before sqlh sees
+// them, so this is what cmd.exe and PowerShell users get.) The folder named below must not
+// exist on the current drive, which the first assertion checks.
+#[test]
+fn a_git_bash_path_that_is_not_found_names_the_windows_spelling() {
+    let gone = Path::new("/c/sqlh-no-such-dir");
+    assert!(
+        !gone.exists(),
+        "this test needs a folder named \\c\\sqlh-no-such-dir to be missing on the current drive"
+    );
+
+    let r = sqlh_args(&["-i", "/c/sqlh-no-such-dir/in.sql"]);
+    let line = error_line(&r);
+    assert!(
+        line.starts_with("-- error: -i /c/sqlh-no-such-dir/in.sql: "),
+        "{line}"
+    );
+    let hint = text_escaped(&git_bash_hint(r"C:\sqlh-no-such-dir\in.sql"));
+    assert!(line.ends_with(&format!("; {hint}")), "{line}");
+
+    // In json the same text is a string, so a backslash is the JSON escape of one.
+    let r = sqlh_args(&["--format", "json", "-i", "/c/sqlh-no-such-dir/in.sql"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+    let error = doc["error"].as_str().expect("an error string");
+    assert!(
+        error.ends_with(&format!(
+            "; {}",
+            git_bash_hint(r"C:\sqlh-no-such-dir\in.sql")
+        )),
+        "{error}"
+    );
+
+    // -o: the folder isn't found for the output file either, and isn't created.
+    let r = sqlh_args(&["-Q", "SELECT 1", "-o", "/c/sqlh-no-such-dir/out.txt"]);
+    let line = error_line(&r);
+    assert!(
+        line.starts_with("-- error: -o /c/sqlh-no-such-dir/out.txt: "),
+        "{line}"
+    );
+    let hint = text_escaped(&git_bash_hint(r"C:\sqlh-no-such-dir\out.txt"));
+    assert!(line.ends_with(&format!("; {hint}")), "{line}");
+
+    // SQLH_CONFIG: a missing profiles file is normally "no profiles yet", and saving one
+    // creates its folder, which here would be \c\sqlh-no-such-dir on the current drive. Every
+    // command that reads or writes the file refuses it first.
+    let config = "/c/sqlh-no-such-dir/profiles.toml";
+    let hint = text_escaped(&git_bash_hint(r"C:\sqlh-no-such-dir\profiles.toml"));
+    for args in [
+        vec!["profile", "list"],
+        vec!["profile", "rm", "nothing"],
+        vec!["--profile", "dev", "-Q", "SELECT 1"],
+    ] {
+        let r = run(sqlh().env("SQLH_CONFIG", config).args(&args));
+        assert_eq!(
+            error_line(&r),
+            format!(
+                "-- error: SQLH_CONFIG /c/sqlh-no-such-dir/profiles.toml: the folder wasn't \
+                 found; {hint}"
+            ),
+            "{args:?}"
+        );
+    }
+    assert!(!gone.exists(), "a command created the folder");
+
+    // The hint is only for a Git Bash path. Other paths that aren't found get the plain error.
+    for path in [
+        r"C:\sqlh-no-such-dir\in.sql",
+        "C:/sqlh-no-such-dir/in.sql",
+        "/tmp/sqlh-no-such-dir/in.sql",
+        "//localhost/sqlh-no-such-share/in.sql",
+        "sqlh-no-such-dir/in.sql",
+    ] {
+        let r = sqlh_args(&["-i", path]);
+        let line = error_line(&r);
+        assert!(
+            line.starts_with("-- error: -i ") && !line.contains("Git Bash"),
+            "{path}: {line}"
+        );
+    }
+}
+
+/// `dir\rel` as a UNC path to this computer's administrative share (`\\localhost\C$\...`), if it
+/// can be reached. It can't on a machine without the share or without the right to use it.
+#[cfg(windows)]
+fn unc_to_this_machine(dir: &Path, rel: &str) -> Option<String> {
+    let native = dir.display().to_string();
+    let (drive, rest) = native.split_once(":\\")?;
+    let unc = format!(r"\\localhost\{drive}$\{rest}\{rel}");
+    // The directory is what has to be reachable; the file may not exist yet.
+    let reachable = fs::metadata(Path::new(&unc).parent()?).is_ok();
+    reachable.then_some(unc)
+}
+
+/// The ways to write the path of `rel` (relative to `dir`, written with backslashes) when the
+/// working directory is `dir`. A UNC form comes last when this machine's own share can be
+/// reached.
+fn spellings(dir: &Path, rel: &str) -> Vec<(&'static str, String)> {
+    let native = dir.join(rel).display().to_string();
+    let parent = dir.file_name().unwrap().to_string_lossy().into_owned();
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut forms = vec![
+        ("backslashes", native.clone()),
+        ("forward slashes", native.replace('\\', "/")),
+        (
+            "mixed slashes",
+            format!("{}/{}", dir.display(), rel.replace('\\', "/")),
+        ),
+        ("relative", rel.to_owned()),
+        ("relative with .", format!(r".\{rel}")),
+        ("relative with ..", format!(r"..\{parent}\{rel}")),
+        ("relative, forward slashes", rel.replace('\\', "/")),
+    ];
+    #[cfg(windows)]
+    if let Some(unc) = unc_to_this_machine(dir, rel) {
+        forms.push(("UNC", unc));
+    }
+    forms
+}
+
+// PLAN.md 2.13: -i, -o and SQLH_CONFIG take C:\dir, C:/dir, mixed slashes, relative paths
+// (with . and ..), UNC paths and paths with spaces. A blocked statement ends the run at the
+// guard (exit 5) without connecting, so exit 5 means the input was read, the output file got
+// the refusal, and (for SQLH_CONFIG) the profile was found: without it the exit would be 3.
+// The folder and the files have a space in their names, so every form is one with spaces too.
+// The forms run side by side, each with its own output file: the UNC ones are slow.
+#[test]
+fn path_forms_work_for_input_output_and_config() {
+    let blocked = "UPDATE dbo.T SET x = 1";
+    let profiles =
+        "[profiles.win]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n";
+    let dir = scratch("path forms");
+    let dir = dir.as_path();
+    fs::write(dir.join("in file.sql"), blocked).unwrap();
+    fs::write(dir.join("profiles file.toml"), profiles).unwrap();
+    let inputs = spellings(dir, "in file.sql");
+    let configs = spellings(dir, "profiles file.toml");
+    if !inputs.iter().any(|(name, _)| *name == "UNC") {
+        eprintln!("skipped: no UNC path to this machine (\\\\localhost\\C$) is reachable");
+    }
+    std::thread::scope(|scope| {
+        for (n, ((name, input_form), (_, config_form))) in inputs.iter().zip(&configs).enumerate() {
+            scope.spawn(move || {
+                // -i
+                let r = run(sqlh().current_dir(dir).args(["-i", input_form]));
+                assert_eq!(r.code, 5, "-i {name}: {input_form}: {}", r.stdout);
+                assert!(
+                    r.stdout.contains("-- blocked: line 1: UPDATE dbo.T"),
+                    "-i {name}: {input_form}"
+                );
+
+                // -o: the refusal lands in the file, and nothing else is left in the folder.
+                let output = format!("out {n}.txt");
+                let output_form = &spellings(dir, &output)[n].1;
+                let r = run(sqlh()
+                    .current_dir(dir)
+                    .args(["-Q", blocked, "-o", output_form]));
+                assert_eq!(
+                    r.code, 5,
+                    "-o {name}: {output_form}: {}{}",
+                    r.stdout, r.stderr
+                );
+                let written = fs::read_to_string(dir.join(&output))
+                    .unwrap_or_else(|e| panic!("-o {name}: {output_form}: {e}"));
+                assert!(
+                    written.starts_with("-- blocked: line 1: UPDATE dbo.T"),
+                    "-o {name}: {written}"
+                );
+
+                // SQLH_CONFIG
+                let r = run(sqlh()
+                    .current_dir(dir)
+                    .env("SQLH_CONFIG", config_form)
+                    .args(["--profile", "win", "-Q", blocked]));
+                assert_eq!(r.code, 5, "SQLH_CONFIG {name}: {config_form}: {}", r.stdout);
+
+                // The same file spelled two ways is still the same file: -o can't overwrite -i.
+                let native = dir.join("in file.sql").display().to_string();
+                let r = run(sqlh()
+                    .current_dir(dir)
+                    .args(["-i", input_form, "-o", &native]));
+                assert_eq!(r.code, 3, "-i {name} -o {native}: {}", r.stdout);
+                assert!(
+                    r.stdout.contains("would overwrite the input file"),
+                    "-i {name} -o {native}: {}",
+                    r.stdout
+                );
+            });
+        }
+    });
+    assert_eq!(
+        fs::read_to_string(dir.join("in file.sql")).unwrap(),
+        blocked
+    );
+    let left = names(dir);
+    assert!(
+        !left.iter().any(|n| n.ends_with(".partial")),
+        "a .partial file was left: {left:?}"
+    );
+}
+
+/// Runs `command` with `input` on stdin.
+fn run_with_stdin(command: &mut Command, input: &[u8]) -> Run {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let mut stdin = child.stdin.take().expect("a piped stdin");
+    std::io::Write::write_all(&mut stdin, input).expect("input is accepted");
+    drop(stdin);
+    let output = child.wait_with_output().expect("sqlh ends");
+    Run {
+        code: output.status.code().expect("an exit code"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+// PLAN.md 2.13: what a shell pipes to sqlh is whatever its encoding makes of the text. UTF-8
+// with or without a BOM, and UTF-16 with one (what `>` in Windows PowerShell 5.1 writes), are
+// read as they are. Anything else (cmd.exe at an OEM code page, PowerShell with $OutputEncoding
+// set to the console's) isn't valid UTF-8 and is refused with what to change. Text already
+// turned into "?" can't be told from a question mark; DESIGN.md §4.1 and --help warn about it.
+#[test]
+fn piped_text_in_another_encoding_is_refused_and_utf8_is_read_as_it_is() {
+    // OEM code page 437: e acute is the single byte 0x82, at offset 11.
+    let oem = b"UPDATE [Caf\x82] SET x = 1";
+    for args in [vec![], vec!["-i", "-"]] {
+        let r = run_with_stdin(sqlh().args(&args), oem);
+        assert_eq!(
+            error_line(&r),
+            "-- error: stdin: not valid UTF-8 (byte 11); save it as UTF-8, or UTF-16 with a BOM. \
+             Piped text is encoded by the shell: in cmd.exe run chcp 65001 first, in Windows \
+             PowerShell run $OutputEncoding = [Text.Encoding]::UTF8 first, or pass the SQL with \
+             -Q or -i",
+            "{args:?}"
+        );
+    }
+    // The same bytes in a file were saved that way, so the advice is about saving it.
+    let dir = scratch("piped_encodings");
+    fs::write(dir.join("oem.sql"), oem).unwrap();
+    let r = sqlh_args(&["-i", &dir.join("oem.sql").display().to_string()]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(r.stdout.contains("not valid UTF-8 (byte 11);") && !r.stdout.contains("chcp"));
+
+    // UTF-8 (what PowerShell 7 and Git Bash send), with a BOM (what Windows PowerShell 5.1
+    // sends after $OutputEncoding = [Text.Encoding]::UTF8), and UTF-16 with a BOM: the
+    // identifier arrives intact, which the refusal shows.
+    let sql = "UPDATE [Caf\u{e9} \u{2026}] SET x = 1";
+    let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+    with_bom.extend_from_slice(sql.as_bytes());
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(sql.encode_utf16().flat_map(u16::to_le_bytes));
+    for (what, bytes) in [
+        ("utf-8", sql.as_bytes().to_vec()),
+        ("utf-8 with a BOM", with_bom),
+        ("utf-16 with a BOM", utf16),
+    ] {
+        let r = run_with_stdin(&mut sqlh(), &bytes);
+        assert_eq!(r.code, 5, "{what}: {}", r.stdout);
+        assert!(
+            r.stdout
+                .contains("-- blocked: line 1: UPDATE [Caf\u{e9} \u{2026}] would write"),
+            "{what}: {}",
+            r.stdout
+        );
+    }
+}
+
+// AGENTS.md: models read --help, so it stays short. PLAN.md 2.13 holds it at 62 lines.
+#[test]
+fn help_stays_within_its_line_budget() {
+    let r = sqlh_args(&["--help"]);
+    assert_eq!(r.code, 0);
+    let lines = r.stdout.lines().count();
+    assert!(lines <= 62, "--help is {lines} lines");
+}
+
+/// `text` as UTF-16LE in base64, the form PowerShell's `-EncodedCommand` takes.
+#[cfg(windows)]
+fn base64_of_utf16(text: &str) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let group = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        let digit = |shift: u32| DIGITS[(group >> shift) as usize & 63] as char;
+        encoded.push(digit(18));
+        encoded.push(digit(12));
+        encoded.push(if chunk.len() > 1 { digit(6) } else { '=' });
+        encoded.push(if chunk.len() > 2 { digit(0) } else { '=' });
+    }
+    encoded
+}
+
+/// A shell a person types commands in.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Shell {
+    Cmd,
+    PowerShell51,
+    PowerShell7,
+}
+
+#[cfg(windows)]
+impl Shell {
+    fn name(self) -> &'static str {
+        match self {
+            Shell::Cmd => "cmd.exe",
+            Shell::PowerShell51 => "Windows PowerShell 5.1",
+            Shell::PowerShell7 => "PowerShell 7",
+        }
+    }
+
+    /// Whether the shell is installed. cmd.exe and Windows PowerShell 5.1 come with Windows.
+    fn installed(self) -> bool {
+        match self {
+            Shell::Cmd | Shell::PowerShell51 => true,
+            Shell::PowerShell7 => Command::new("pwsh.exe")
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_ok(),
+        }
+    }
+
+    /// Runs `line` the way it is typed at the prompt, in `dir`, with `sqlh` resolving to the
+    /// binary under test, in a console of its own so no window opens and no earlier
+    /// code page applies.
+    fn run(self, line: &str, dir: &Path, env: &[(&str, String)]) -> Run {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = match self {
+            Shell::Cmd => {
+                // /s takes off exactly the outer quotes, as typing at a prompt would, and /d
+                // skips the AutoRun commands some machines have in the registry.
+                let mut command = Command::new("cmd.exe");
+                command.raw_arg(format!("/d /s /c \"{line}\""));
+                command
+            }
+            Shell::PowerShell51 | Shell::PowerShell7 => {
+                // -EncodedCommand (the script as base64 of UTF-16) puts the line in front of
+                // the parser unchanged, and unlike a script file no execution policy can
+                // block it.
+                let script = format!("{line}\r\nexit $LASTEXITCODE\r\n");
+                let exe = if matches!(self, Shell::PowerShell7) {
+                    "pwsh.exe"
+                } else {
+                    "powershell.exe"
+                };
+                let mut command = Command::new(exe);
+                command.args(["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+                command.arg(base64_of_utf16(&script));
+                command
+            }
+        };
+        let sqlh_dir = Path::new(env!("CARGO_BIN_EXE_sqlh")).parent().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        // Isolated from the machine's profiles and SQLCMD* variables, as `sqlh()` is.
+        for var in [
+            "SQLH_PROFILE",
+            "SQLCMDSERVER",
+            "SQLCMDDBNAME",
+            "SQLCMDUSER",
+            "SQLCMDPASSWORD",
+        ] {
+            command.env_remove(var);
+        }
+        command
+            .current_dir(dir)
+            .env("PATH", format!("{};{path}", sqlh_dir.display()))
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        run(&mut command)
+    }
+}
+
+// PLAN.md 2.13: the examples in --help run as written in cmd.exe, Windows PowerShell 5.1 and
+// PowerShell 7, the shells a person (or an agent's harness) is likely to be in. (Git Bash is
+// checked by hand: docs/notes/windows-shells.md.) A listener that closes every connection
+// stands in for the server, and `myserver` is swapped for it, so the run gets as far as the
+// connect (exit 2) only if the shell handed sqlh the arguments the help meant: the input file
+// was found and read, the options parsed, the profile found, and the server named is the one
+// in the line. The examples use no other name for a server, so nothing else is rewritten.
+#[cfg(windows)]
+#[test]
+fn the_help_examples_run_as_written_in_every_shell() {
+    let help = sqlh_args(&["--help"]);
+    assert_eq!(help.code, 0);
+    let examples: Vec<String> = help
+        .stdout
+        .lines()
+        .skip_while(|l| !l.starts_with("EXAMPLES"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  sqlh "))
+        .map(|l| {
+            let command = l.trim().split("   (").next().unwrap_or("");
+            command.to_owned()
+        })
+        .collect();
+    assert!(
+        examples.len() >= 4,
+        "--help has {} examples",
+        examples.len()
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            drop(connection);
+        }
+    });
+
+    let base = scratch("help_examples");
+    let config = base.join("profiles.toml");
+    fs::write(
+        &config,
+        format!("[profiles.dev]\nserver = \"{server}\"\nauth = \"windows\"\nlogin_timeout = 10\n"),
+    )
+    .unwrap();
+    let env = [
+        ("SQLH_CONFIG", config.display().to_string()),
+        // Only the example that names a login needs a password; this one is never sent.
+        ("SQLCMDPASSWORD", "not-a-real-password".to_owned()),
+    ];
+
+    let shells: Vec<Shell> = [Shell::Cmd, Shell::PowerShell51, Shell::PowerShell7]
+        .into_iter()
+        .filter(|shell| {
+            let installed = shell.installed();
+            if !installed {
+                eprintln!("skipped: {} isn't installed here", shell.name());
+            }
+            installed
+        })
+        .collect();
+    // Each shell in its own thread, as starting Windows PowerShell takes a moment, and in a
+    // working directory of its own, since one example writes report.txt.
+    let results: Vec<_> = shells
+        .iter()
+        .map(|&shell| {
+            let dir = base.join(format!("shell-{}", shell as u8));
+            fs::create_dir_all(dir.join("my queries")).unwrap();
+            fs::write(dir.join("report.sql"), "SELECT 1").unwrap();
+            fs::write(dir.join("my queries").join("report.sql"), "SELECT 1").unwrap();
+            let (env, server, examples) = (env.clone(), server.clone(), examples.clone());
+            std::thread::spawn(move || {
+                examples
+                    .iter()
+                    .enumerate()
+                    .map(|(n, example)| {
+                        let line = example
+                            .replace("myserver,1433", &server)
+                            .replace("myserver", &server);
+                        // Each example writes its own report.txt, so clear the last one's.
+                        let _ = fs::remove_file(dir.join("report.txt"));
+                        let r = shell.run(&line, &dir, &env);
+                        let output = fs::read_to_string(dir.join("report.txt")).unwrap_or_default();
+                        (n, line, r, output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    for (shell, result) in shells.iter().zip(results) {
+        for (n, line, r, report) in result.join().unwrap() {
+            let what = format!("{}, example {}: {line}", shell.name(), n + 1);
+            // -o sends the output to report.txt; the others print it.
+            let text = format!("{}{report}", r.stdout);
+            assert_eq!(r.code, 2, "{what}\n{text}\n{}", r.stderr);
+            assert!(
+                text.contains(&format!("-- error: cannot connect to {server}")),
+                "{what}\n{text}\n{}",
+                r.stderr
+            );
+        }
+    }
+}
+
+// PLAN.md 2.13, DESIGN.md §4.1: `-Q "..."` with single quotes inside reaches sqlh as typed in
+// every shell, a space, brackets and a non-ASCII letter included. A blocked statement shows the
+// name it writes to, so the refusal proves what arrived. The same line with a character that
+// belongs to a shell would not: DESIGN.md lists them, and docs/notes/windows-shells.md has the
+// measurements, so they aren't re-run here.
+#[cfg(windows)]
+#[test]
+fn the_documented_q_form_reaches_sqlh_intact_in_every_shell() {
+    let line = "sqlh -Q \"UPDATE [it's a caf\u{e9}] SET x = 'it''s'\"";
+    let base = scratch("q_form");
+    let results: Vec<_> = [Shell::Cmd, Shell::PowerShell51, Shell::PowerShell7]
+        .into_iter()
+        .filter(|shell| shell.installed())
+        .map(|shell| {
+            let dir = base.join(format!("shell-{}", shell as u8));
+            fs::create_dir_all(&dir).unwrap();
+            std::thread::spawn(move || (shell, shell.run(line, &dir, &[])))
+        })
+        .collect();
+    assert!(!results.is_empty());
+    for result in results {
+        let (shell, r) = result.join().unwrap();
+        assert_eq!(r.code, 5, "{}: {}{}", shell.name(), r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("-- blocked: line 1: UPDATE [it's a caf\u{e9}] would write"),
+            "{}: {}",
+            shell.name(),
+            r.stdout
+        );
+    }
+}
+
+// PLAN.md 2.13: sqlh leaves the console's code page as it found it. It used to switch the
+// console to UTF-8 whenever stdout was a console and never switch back, so every program run
+// afterwards in that console (and every later PowerShell 5.1 session) inherited UTF-8. The
+// switch was never needed: Rust writes a console as UTF-16. The check needs a console that
+// sqlh's stdout is, so a hidden one is made, started at code page 437 whatever this machine's
+// default is, and the code page is read back after sqlh has run in it.
+#[cfg(windows)]
+#[test]
+fn sqlh_leaves_the_console_code_page_alone() {
+    let exe = env!("CARGO_BIN_EXE_sqlh");
+    let dir = scratch("console_code_page");
+    let result = dir.join("code-page.txt");
+    // `chcp` sets both code pages; reading the output one needs the API, here through
+    // PowerShell, because `chcp` and `mode con` report the input page.
+    let inner = format!(
+        "chcp 437>nul & \"{exe}\" --help & \"{exe}\" -Q \"UPDATE dbo.T SET x = 1\" \
+         & powershell.exe -NoProfile -Command [Console]::OutputEncoding.CodePage > \"{}\"",
+        result.display()
+    );
+    // Started without redirected handles, the child's stdout is its own hidden console, and
+    // so is sqlh's inside it. Windows PowerShell does that through .NET.
+    let launcher = "$i = New-Object System.Diagnostics.ProcessStartInfo; \
+        $i.FileName = 'cmd.exe'; $i.Arguments = '/d /s /c \"' + $env:SQLH_TEST_LINE + '\"'; \
+        $i.UseShellExecute = $false; $i.CreateNoWindow = $true; \
+        $p = [System.Diagnostics.Process]::Start($i); $p.WaitForExit()";
+    let r = run(Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", launcher])
+        .env("SQLH_TEST_LINE", inner)
+        .stdin(Stdio::null()));
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    let page = fs::read_to_string(&result).expect("the code page was written");
+    assert_eq!(
+        page.trim(),
+        "437",
+        "the console's output code page after sqlh ran (437 is what it was set to)"
+    );
+}
+
 // F09: a Windows-auth profile stays Windows auth whatever SQLCMDUSER says.
 #[test]
 fn windows_profile_ignores_sqlcmduser() {
