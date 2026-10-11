@@ -90,7 +90,7 @@ These flags are sqlcmd-compatible:
 
 | Flag | Meaning |
 |---|---|
-| `-S server` | `host`, `host\instance`, `host,port`, with an optional `tcp:` prefix. Env: `SQLCMDSERVER`. |
+| `-S server` | `host`, `host\instance`, `host,port`, with an optional `tcp:` prefix. Env: `SQLCMDSERVER`. sqlh connects over TCP. Unlike sqlcmd, it doesn't fall back to Named Pipes for a remote name: the driver opens a pipe synchronously, so an unreachable host would hold the run for about 21 s, past `-l` and Ctrl+C. Local names (`.`, `(local)`, `localhost`, `127.0.0.1`, LocalDB) keep the driver's order: shared memory, TCP, then a local pipe. An explicit `np:` or `lpc:` prefix is passed to the driver as written. |
 | `-d db` | Database. Env: `SQLCMDDBNAME`. Without it, the profile's database applies, else the login's default, which is often `master`. |
 | `-E` | Windows integrated auth. This is the default when there is no `-U`, same as sqlcmd. |
 | `-U user` | SQL login. The password comes from the profile's credential or `SQLCMDPASSWORD`. Env: `SQLCMDUSER`. |
@@ -100,7 +100,7 @@ These flags are sqlcmd-compatible:
 | `-o file` | Write output to a file (UTF-8). Input is read and checked first, so a bad input never touches an existing file. Naming an input file (however spelled, including a hard link) is refused with exit 3, and so is an existing file that can't be written. Each run writes its own new `file.<pid>-<n>.partial`, which no other process can change, and renames it over `file` when the output is complete: the file is replaced whole or not at all. A run whose output isn't complete, or that is killed while writing, leaves no `.partial` file behind: Windows deletes it when the last handle closes, because the file is marked for deletion as soon as it is created. If that mark can't be set (not expected), a run that ends normally still removes the file by name, but a kill, or an error while removing it, can leave it behind. A kill in the moment between finishing and the rename can leave one in either case. sqlh never touches a `.partial` file it didn't create. When runs overlap, each publishes a complete file and the last one wins. A device or pipe (`-o NUL`, `\\.\pipe\name`) is written directly. |
 | `-v n=v ...` | Values for `$(n)` substitution. Environment variables also resolve, as in sqlcmd. |
 | `-x` | Turn off `$(var)` substitution. |
-| `-l sec` | Login timeout covering TCP, TLS and login. Default 15. |
+| `-l sec` | Login timeout. Default 15. Each TCP connect attempt gets `-l` seconds, the whole login (TCP, TLS and login) one second more, and nothing is retried. An address that refuses or doesn't answer fails at TCP (exit 2); a refused one takes about 2 s, because Windows retries it. A server that takes the connection but doesn't finish the login hits the deadline (exit 4), and so does a name whose addresses all fail to answer, if it has more than one. |
 | `-t sec` | Query timeout per batch. Default 60; 0 means none. sqlcmd's default of none is wrong for agents. It is also how long sqlh waits for a reader that stops reading its output (exit 7, §6). |
 | `-b` | Accepted. Stopping at the first failing batch is already the default. |
 | `-c term` | Batch terminator. Default `GO`. |
@@ -136,7 +136,12 @@ These long flags are our own:
 - **Session SET options** match SSMS: `ANSI_NULLS`, `ANSI_PADDING`, `ANSI_WARNINGS`, `ARITHABORT`, `CONCAT_NULL_YIELDS_NULL` and `QUOTED_IDENTIFIER` ON, and `NUMERIC_ROUNDABORT` OFF. That way filtered and computed-column indexes behave as people expect. (§14 covers the ARITHABORT question.)
 - **Error line numbers** are mapped back to the original input: a file and line, not just a line within the batch.
 - **Query timeout** sends a TDS attention, reports `-- error: query timeout after 60 s (batch 2)` and exits 4.
-- **Ctrl+C** sends an attention, waits up to 2 s for the acknowledgment, then exits 6. Ctrl+Break and console close are not handled yet (PLAN.md 2.4). A harness that kills sqlh outright also cancels the server's work: the server ends the request within about 200 ms of the connection dropping (measured for a waiting query; CPU-bound and blocked queries are PLAN.md 2.5).
+- **Cancellation.** Ctrl+C, Ctrl+Break, the console closing, logoff and shutdown cancel the run wherever it is: connecting, setting up the session, running a batch, or waiting for a slow reader.
+  - A running statement gets an attention. sqlh waits up to 2 s for the server to confirm it, or 1 s after a close, logoff or shutdown, because Windows ends the process about 5 s after those. Then it closes the connection, which stops the server's work too. A pending connect is dropped at once. No later batch starts.
+  - The run exits 6 and says what became of the work: `-- error: cancelled by Ctrl+C: the server confirmed the cancel`, or `...: the server didn't confirm the cancel, so the connection was closed`, `...: cancelled while connecting`, `...: cancelled while waiting for the reader; the connection was closed`. A run whose batches had all finished keeps its own outcome.
+  - The closing lines get 1 s to reach the reader; past that, the run is exit 7 and stderr gives exit 6 and the reason (§6).
+  - Before it connects, while it reads and checks the input, Ctrl+C ends sqlh at once; nothing has run. A process started in a new process group gets no Ctrl+C from Windows, so a harness sends it Ctrl+Break. Windows sends logoff and shutdown only to services; other processes are just ended.
+  - A harness that kills sqlh outright also cancels the server's work: the server ends the request within about 200 ms of the connection dropping (measured for a waiting query; CPU-bound and blocked queries are PLAN.md 2.5).
 - **Malformed input never crashes sqlh.** Unterminated strings and names reach the server, which reports the syntax error.
 - **Expected failures are results, never crashes,** including a closed stdout or stderr (§6).
 - **A bug that panics still exits 10,** never an abort. Everything else about it is best effort: a stderr line, and a status line on stdout in text output if stdout takes it. Output still buffered is lost, a JSON document stays unfinished, `-o` output isn't published, and a password prompt's console mode is restored. Panic injection (`SQLH_DEBUG_PANIC`) exists only in debug builds, so the tests exercise the hook there; release builds have the same hook.
@@ -286,7 +291,7 @@ Usage errors found while parsing the arguments happen before `--format` is known
 | 3 | Usage or config error: bad flag, missing profile, unknown `$(var)`, `-P`. |
 | 4 | Timeout (login or query). |
 | 5 | Blocked by the read-only guard. Nothing was executed. |
-| 6 | Cancelled (Ctrl+C). |
+| 6 | Cancelled: Ctrl+C, Ctrl+Break, the console closing, logoff or shutdown (§4.3). |
 | 7 | Output could not be delivered (see below). |
 | 10 | Internal error (a bug), including any panic. Details go to stderr, best effort (§4.3). |
 
@@ -401,7 +406,7 @@ write_policy = "deny"
 
 **Profile commands**
 - `sqlh profile add NAME -S server [-d db] [-U login] [-C] [-N..] [--write-policy ..]`
-  - It asks for the password with echo off. This is the tool's only prompt, and it refuses to run if stdin isn't a console, or if echo can't actually be turned off (Git Bash's mintty: use PowerShell, cmd or `winpty`). Echo comes back on every return path, errors included, and after a crash. A process killed at the prompt, by Ctrl+C for example, can leave echo off in that console (PLAN.md 2.4).
+  - It asks for the password with echo off. This is the tool's only prompt, and it refuses to run if stdin isn't a console, or if echo can't actually be turned off (Git Bash's mintty: use PowerShell, cmd or `winpty`). Echo comes back on every return path, errors included, and after a crash. Ctrl+C, Ctrl+Break or closing the console at the prompt restores it before the process ends; only a process killed outright can leave echo off in that console.
   - It saves the profile and runs `profile test`.
   - Options you leave out keep their saved values, so rerunning `sqlh profile add NAME` just replaces the password.
   - The first profile you add becomes the default.
@@ -446,6 +451,7 @@ The primary product measure is time to the next useful answer across repeated ag
 - **Size:** a stripped exe under 6 MB. Measure at M0, and justify any growth over 10%.
 - **Startup:** under 10 ms from process start to the first TDS packet, on a warm cache.
 - **Connect:** measured in [notes/connect-latency.md](notes/connect-latency.md). Against SQL Server 2025 with SQL authentication, a connect takes about 195 ms on the dev LAN, and about 150 ms of it is the server hashing the password (PBKDF2), by design. sqlh and the driver add about 5 ms. Fast repeated turns therefore need connection reuse (PLAN.md Phase 5), not client tuning.
+- **Failing fast:** a refused connection fails after one attempt, in about 2 s, and an address that doesn't answer after `-l` seconds (§4.2). Ctrl+C ends a pending connect at once.
 - **Memory:** rows stream, and no result set is ever buffered. The sinks hand 64 KB chunks to an output thread (`output/delivery.rs`), with at most 256 KB queued. Past that, the batch stops reading rows and waits for the reader, without blocking the async runtime. The queue is flushed at the end of each batch, and sqlh waits for it to drain before it exits.
 - **Runtime:** Tokio `current_thread`, with only the features we use enabled in our crate.
 - **Lazy setup:** the profile file isn't read when flags alone are enough.
@@ -461,7 +467,7 @@ The primary product measure is time to the next useful answer across repeated ag
   - the guard classifier, table-driven, including adversarial cases: keywords hidden in comments or strings, nested brackets, a CTE followed by `UPDATE`, `SELECT INTO`, `EXEC('...')`
   - "never panics" property tests for both lexers, over generated input
 - **Golden tests:** fixed outputs for text, json, csv and md on representative result sets.
-- **Process-level tests** (`tests/cli.rs`): run the real binary, isolated from the machine's profiles and `SQLCMD*` variables, and assert exit codes, files and output: `-o` safety (identity, concurrent runs, files that can't be replaced, devices), exit 7, closed stdout/stderr in every format, the panic net, `--check`, guard blocks and their advice, auth precedence. Tests that need no server use an unreachable address. They run against the debug and the release binary (`cargo test --release --test cli`); the panic-injection tests exist only in debug builds.
+- **Process-level tests** (`tests/cli.rs`): run the real binary, isolated from the machine's profiles and `SQLCMD*` variables, and assert exit codes, files and output: `-o` safety (identity, concurrent runs, files that can't be replaced, devices), exit 7, closed stdout/stderr in every format, the panic net, `--check`, guard blocks and their advice, auth precedence, connect failures (refused, a server that never answers) and Ctrl+Break during a connect. Tests that need no server use an unreachable address or a local listener that never answers. Ctrl+Break reaches a child started in its own process group, which needs a console shared with the test; `cargo test` run from a terminal has one. They run against the debug and the release binary (`cargo test --release --test cli`); the panic-injection tests exist only in debug builds.
 - **Live tests:** the `live` tests in `tests/cli.rs` are `#[ignore]`d, so a plain `cargo test` reports them as ignored rather than passing. Run them with `cargo test --test cli -- --ignored live` and `SQLH_TEST_PROFILE` naming a profile on the dev box; asked for without it, they fail. They use the scratch database `sqlh_test` (default; override with `SQLH_TEST_DATABASE`), created by `tests/fixtures/sqlh_test.sql` and removed by `tests/fixtures/drop_sqlh_test.sql`. A test that writes first checks the database's `dbo.sqlh_scratch` marker, then writes only to a table of its own, which it drops. Planned coverage (PLAN.md 3.4):
   - every data type
   - multiple result sets

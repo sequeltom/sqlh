@@ -100,14 +100,54 @@ fn last_line(text: &str) -> &str {
     text.lines().last().unwrap_or("")
 }
 
-/// The run got past the guard and failed only at the dead address. Which timer fires first
-/// decides between exit 2 (TCP connect timed out) and exit 4 (login deadline).
+/// The run got past the guard and failed only at the dead address (exit 2: the TCP connect
+/// gets -l seconds, the login deadline one more).
 fn assert_reached_connect(r: &Run, what: &str) {
-    assert!(
-        matches!(r.code, 2 | 4),
-        "{what}: exit {}: {}",
-        r.code,
-        r.stdout
+    assert_eq!(r.code, 2, "{what}: {}", r.stdout);
+}
+
+/// Waits for `child`, killing it and failing the test after `limit`.
+fn wait_within(
+    child: &mut std::process::Child,
+    limit: Duration,
+    what: &str,
+) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("child status") {
+            return status;
+        }
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            panic!("{what}: sqlh still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Starts sqlh in a process group of its own, so `ctrl_break` reaches it and not the tests.
+#[cfg(windows)]
+fn spawn_in_group(command: &mut Command) -> std::process::Child {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+    command
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .expect("sqlh starts")
+}
+
+/// Presses Ctrl+Break for a child started by `spawn_in_group`. That needs a console shared
+/// with the child, which `cargo test` run from a terminal has.
+#[cfg(windows)]
+fn ctrl_break(child: &std::process::Child) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: takes an event code and a process group id by value.
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(
+        sent,
+        0,
+        "Ctrl+Break wasn't sent (run the tests from a console): {}",
+        std::io::Error::last_os_error()
     );
 }
 
@@ -222,17 +262,98 @@ fn concurrent_runs_publish_whole_files() {
     );
 
     let a = a.wait_with_output().unwrap();
-    let a_code = a.status.code().unwrap();
     let a_stderr = String::from_utf8_lossy(&a.stderr);
-    assert!(matches!(a_code, 2 | 4), "run A: exit {a_code}: {a_stderr}");
+    assert_eq!(a.status.code(), Some(4), "run A: {a_stderr}");
     let published_by_a = fs::read_to_string(&out).unwrap();
     assert!(
-        published_by_a.starts_with("-- error: ")
+        published_by_a.starts_with("-- error: login timeout: ")
             && !published_by_a.contains("blocked")
-            && last_line(&published_by_a).starts_with(&format!("-- failed (exit {a_code})")),
+            && last_line(&published_by_a).starts_with("-- failed (exit 4)"),
         "{published_by_a}"
     );
     assert_eq!(names(&dir), ["out.txt"]);
+}
+
+// PLAN.md 2.4: a refused connection fails after one attempt (it took 14 s with the driver's
+// retries), and a server that takes the connection but never answers hits the login deadline,
+// -l plus one second. Neither depends on which timer fires first.
+#[test]
+fn connect_failures_end_the_same_way_every_time() {
+    let started = Instant::now();
+    let r = sqlh_args(&["-S", "127.0.0.1,1", "-Q", "SELECT 1"]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .starts_with("-- error: cannot connect to 127.0.0.1,1 "),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    let mut child = sqlh()
+        .args(["-S", &server, "-l", "1", "-Q", "SELECT 1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let (_held, _) = listener.accept().expect("sqlh connects");
+    let status = wait_within(&mut child, Duration::from_secs(10), "silent server");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.starts_with(&format!(
+            "-- error: login timeout: {server} (Windows auth, encrypt mandatory) didn't \
+             complete the login within 2 s;"
+        )),
+        "{stdout}"
+    );
+}
+
+// PLAN.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with exit 6.
+#[cfg(windows)]
+#[test]
+fn ctrl_break_cancels_a_connect() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    let mut child = spawn_in_group(
+        sqlh()
+            .args(["-S", &server, "-l", "30", "-Q", "SELECT 1"])
+            .stdout(Stdio::piped()),
+    );
+    // Connected, so the console handlers are in place, and waiting for the login answer.
+    let (_held, _) = listener.accept().expect("sqlh connects");
+    let started = Instant::now();
+    ctrl_break(&child);
+    let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+    let elapsed = started.elapsed();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(status.code(), Some(6), "{stdout}");
+    assert!(
+        stdout.starts_with("-- error: cancelled by Ctrl+Break: cancelled while connecting\n"),
+        "{stdout}"
+    );
+    assert!(
+        last_line(&stdout).starts_with("-- failed (exit 6): cancelled, "),
+        "{stdout}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
 
 // R01: an existing file that can't be replaced is refused before anything runs, or, if it
@@ -776,16 +897,7 @@ mod live {
                 .expect("sqlh starts");
             let _held_open = child.stdout.take();
             let started = Instant::now();
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status;
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    panic!("{limits:?}: sqlh hung behind a stalled reader");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            };
+            let status = wait_within(&mut child, Duration::from_secs(30), &format!("{limits:?}"));
             let elapsed = started.elapsed();
             let mut stderr = String::new();
             child
@@ -796,11 +908,98 @@ mod live {
                 .unwrap();
             assert_eq!(status.code(), Some(7), "{limits:?}: {stderr}");
             assert!(
-                stderr.contains("the reader stopped reading for 2 s"),
+                stderr.contains("the reader stopped reading for 2 s (-t)"),
                 "{limits:?}: {stderr}"
             );
             assert!(elapsed < Duration::from_secs(15), "{limits:?}: {elapsed:?}");
         }
+    }
+
+    // PLAN.md 2.4: Ctrl+Break cancels a running statement, and the server confirms it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn ctrl_break_cancels_a_running_query() {
+        use std::io::BufRead;
+        let (p, db) = target();
+        let mut child = spawn_in_group(
+            Command::new(env!("CARGO_BIN_EXE_sqlh"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(["--profile", &p, "-d", &db, "--verbose", "--allow-write"])
+                .args(["-Q", "WAITFOR DELAY '00:00:30'"]),
+        );
+        // --verbose reports the connection just before the batch is sent.
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        while !line.starts_with("sqlh: profile ") {
+            line.clear();
+            let read = stderr.read_line(&mut line).unwrap();
+            assert_ne!(read, 0, "sqlh ended before it connected");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        ctrl_break(&child);
+        let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+        let elapsed = started.elapsed();
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(6), "{stdout}");
+        assert!(
+            stdout.contains("-- error: cancelled by Ctrl+Break: the server confirmed the cancel\n"),
+            "{stdout}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    // PLAN.md 2.4: Ctrl+Break also ends a run that waits for a stalled reader, without waiting
+    // out -t. What was written can't be delivered, so the exit is 7, and stderr says that the
+    // run itself was cancelled.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn ctrl_break_cancels_a_run_waiting_for_its_reader() {
+        let (p, db) = target();
+        let sql = "SELECT TOP (200000) a.object_id, a.name FROM sys.all_objects AS a \
+                   CROSS JOIN sys.all_objects AS b";
+        let mut child = spawn_in_group(
+            Command::new(env!("CARGO_BIN_EXE_sqlh"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(["--profile", &p, "-d", &db, "-t", "60"])
+                .args(["--max-rows", "0", "--max-output", "0", "-Q", sql]),
+        );
+        let _held_open = child.stdout.take();
+        // Time to connect and fill both the pipe and sqlh's queue; -t is far off.
+        std::thread::sleep(Duration::from_secs(4));
+        let started = Instant::now();
+        ctrl_break(&child);
+        let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+        let elapsed = started.elapsed();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(7), "{stderr}");
+        assert!(
+            stderr.contains("the run itself ended with exit 6: failed (exit 6): cancelled, ")
+                && stderr.contains(
+                    "(cancelled by Ctrl+Break: cancelled while waiting for the reader; the \
+                     connection was closed)"
+                ),
+            "{stderr}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
     // PLAN.md 2.1: --verbose says where the time to the first batch went; a build with

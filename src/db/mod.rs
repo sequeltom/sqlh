@@ -5,6 +5,7 @@ pub mod phases;
 mod types;
 mod value;
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -82,7 +83,9 @@ pub enum DbError {
     /// The connection broke mid-run.
     Lost(String),
     Timeout(String),
-    Cancelled,
+    /// A cancel ended the work. The text says what became of it: whether the server
+    /// confirmed the cancel, or the connection was closed instead.
+    Cancelled(String),
     /// A statement the tool itself sent failed.
     Sql(String),
     /// Writing output failed (e.g. the reader closed the pipe).
@@ -132,6 +135,10 @@ impl Cancel {
         self.handle.cancel();
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.set.load(Ordering::SeqCst)
+    }
+
     /// Resolves once the root is cancelled.
     pub async fn cancelled(&self) {
         loop {
@@ -161,7 +168,9 @@ async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(),
     }
     tokio::select! {
         room = gate.room() => room.map_err(DbError::Output),
-        () = cancel.cancelled() => Err(DbError::Cancelled),
+        () = cancel.cancelled() => Err(DbError::Cancelled(
+            "cancelled while waiting for the reader; the connection was closed".into(),
+        )),
     }
 }
 
@@ -192,8 +201,14 @@ impl Session {
             host_name_in_cert: None,
             server_certificate: None,
         };
+        // One attempt, no retries: the driver would retry a refused connection after 10 s,
+        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner.
+        context.connect_retry_count = 0;
+        // Each TCP connect attempt gets -l seconds and the whole login one more, so an
+        // unreachable address fails at TCP (exit 2) and a server that takes the connection
+        // but doesn't log in hits the deadline (exit 4). Equal limits raced.
         context.connect_timeout = options.login_timeout;
-        context.login_timeout = Some(options.login_timeout);
+        context.login_timeout = Some(options.login_timeout.saturating_add(1));
         context.application_intent = if options.read_only_intent {
             ApplicationIntent::ReadOnly
         } else {
@@ -201,10 +216,17 @@ impl Session {
         };
         context.multi_subnet_failover = options.multi_subnet_failover;
 
-        let mut client = TdsConnectionProvider::new()
-            .create_client(context, &options.server, Some(&cancel.handle))
-            .await
-            .map_err(|e| connect_error(e, options))?;
+        let source = data_source(&options.server);
+        let provider = TdsConnectionProvider::new();
+        let connecting = provider.create_client(context, &source, Some(&cancel.handle));
+        // The driver checks its cancel only between attempts; dropping the attempt closes
+        // the socket, and a login that never finished leaves nothing to clean up.
+        let mut client = tokio::select! {
+            client = connecting => client.map_err(|e| connect_error(e, options))?,
+            () = cancel.cancelled() => {
+                return Err(DbError::Cancelled("cancelled while connecting".into()));
+            }
+        };
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
         client.take_info_messages();
         Ok(Session { client })
@@ -264,12 +286,26 @@ impl Session {
                         break;
                     }
                 }
-                Err(error) => return Err(runtime_error(error)),
+                Err(error) => return Err(self.failure(error)),
             }
             step = self.client.advance().await;
         }
         self.flush_messages(sink)?;
         Ok(())
+    }
+
+    /// A driver error mid-run. A cancel says whether the server confirmed it: the driver
+    /// marks the connection dead when its attention goes unacknowledged.
+    fn failure(&self, error: TdsError) -> DbError {
+        match error {
+            TdsError::OperationCancelledError(_) if !self.client.is_connection_dead() => {
+                DbError::Cancelled("the server confirmed the cancel".into())
+            }
+            TdsError::OperationCancelledError(_) => DbError::Cancelled(
+                "the server didn't confirm the cancel, so the connection was closed".into(),
+            ),
+            error => runtime_error(error),
+        }
     }
 
     async fn read_rows(
@@ -305,22 +341,30 @@ impl Session {
                     }
                     return Ok(());
                 }
-                Err(error) => return Err(runtime_error(error)),
+                Err(error) => return Err(self.failure(error)),
             }
         }
         sink.end_rows()?;
         Ok(())
     }
 
-    /// Runs a statement the tool needs (session setup, wrapper transaction), discarding output.
-    pub async fn exec_internal(&mut self, sql: &str, timeout_secs: u32) -> Result<(), DbError> {
-        let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+    /// Runs a statement the tool needs (session setup, NOEXEC, the wrapper transaction),
+    /// discarding output. It can be cancelled like a batch.
+    pub async fn exec_internal(
+        &mut self,
+        sql: &str,
+        timeout_secs: u32,
+        cancel: &Cancel,
+    ) -> Result<(), DbError> {
+        let options = ExecuteOptions::new()
+            .timeout_secs(timeout_secs)
+            .cancel(&cancel.handle);
         let result = match self.client.execute(sql.to_owned(), options).await {
             Ok(_) => self.client.close_query().await,
             Err(error) => Err(error),
         };
         self.client.take_info_messages();
-        result.map_err(runtime_error)
+        result.map_err(|error| self.failure(error))
     }
 
     pub async fn close(mut self) {
@@ -368,7 +412,7 @@ fn sql_errors(errors: &[SqlErrorInfo]) -> String {
 fn runtime_error(error: TdsError) -> DbError {
     match error {
         TdsError::TimeoutError(_) => DbError::Timeout("query timeout".into()),
-        TdsError::OperationCancelledError(_) => DbError::Cancelled,
+        TdsError::OperationCancelledError(_) => DbError::Cancelled("cancelled".into()),
         TdsError::SqlServerError { diagnostics } => DbError::Sql(sql_errors(&diagnostics.errors)),
         TdsError::Io(e) => DbError::Lost(e.to_string()),
         e @ (TdsError::ConnectionClosed(_)
@@ -376,6 +420,25 @@ fn runtime_error(error: TdsError) -> DbError {
         | TdsError::SessionRecoveryFailed { .. }
         | TdsError::SessionNotRecoverable(_)) => DbError::Lost(e.to_string()),
         e => DbError::Protocol(e.to_string()),
+    }
+}
+
+/// What the driver gets for `-S`. Without a protocol, the driver tries TCP and then Named
+/// Pipes, and it opens the pipe synchronously: for an unreachable remote host that blocks the
+/// whole runtime for about 21 s while SMB gives up, and neither -l nor Ctrl+C can end it. sqlh
+/// connects over TCP (DESIGN.md §4.2), so a remote name gets `tcp:`. Local names keep the
+/// driver's order (shared memory, TCP, a local pipe), which never reaches SMB. A protocol, a
+/// colon (IPv6, which takes no prefix), a pipe path or LocalDB passes through as written.
+fn data_source(server: &str) -> Cow<'_, str> {
+    let server = server.trim();
+    let host = server.split(['\\', '/', ',']).next().unwrap_or_default();
+    let local = [".", "(local)", "(localdb)", "localhost", "127.0.0.1"]
+        .iter()
+        .any(|name| host.eq_ignore_ascii_case(name));
+    if local || host.is_empty() || server.contains(':') {
+        Cow::Borrowed(server)
+    } else {
+        Cow::Owned(format!("tcp:{server}"))
     }
 }
 
@@ -393,11 +456,14 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     let (detail, hint) = match &error {
         TdsError::TimeoutError(_) => {
             return DbError::Timeout(format!(
-                "login timeout after {} s connecting to {target}; check the server name and port, or raise -l",
-                options.login_timeout
+                "login timeout: {target} didn't complete the login within {} s; check that it \
+                 is a reachable SQL Server and not overloaded, or raise -l",
+                options.login_timeout.saturating_add(1)
             ));
         }
-        TdsError::OperationCancelledError(_) => return DbError::Cancelled,
+        TdsError::OperationCancelledError(_) => {
+            return DbError::Cancelled("cancelled while connecting".into());
+        }
         TdsError::SqlServerError { diagnostics } => {
             let detail = sql_errors(&diagnostics.errors);
             let hint = match diagnostics.errors.first().map(|e| e.number) {
@@ -473,7 +539,37 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::tls_hint;
+    use super::{data_source, tls_hint};
+
+    #[test]
+    fn remote_names_connect_over_tcp_only() {
+        for (server, expected) in [
+            ("db01", "tcp:db01"),
+            (" db01.corp.example ", "tcp:db01.corp.example"),
+            (r"db01\SALES", r"tcp:db01\SALES"),
+            ("db01,14330", "tcp:db01,14330"),
+            ("10.1.2.3", "tcp:10.1.2.3"),
+            // A protocol is the user's choice.
+            ("tcp:db01", "tcp:db01"),
+            ("TCP:db01,1433", "TCP:db01,1433"),
+            ("np:db01", "np:db01"),
+            ("admin:db01", "admin:db01"),
+            // Local names keep the driver's order (shared memory, TCP, a local pipe).
+            (".", "."),
+            (r".\SQLEXPRESS", r".\SQLEXPRESS"),
+            ("(local)", "(local)"),
+            ("LocalHost", "LocalHost"),
+            ("localhost,1433", "localhost,1433"),
+            ("127.0.0.1", "127.0.0.1"),
+            (r"(localdb)\MSSQLLocalDB", r"(localdb)\MSSQLLocalDB"),
+            // IPv6 takes no prefix, and a pipe path names its protocol.
+            ("::1", "::1"),
+            ("2001:db8::5,1433", "2001:db8::5,1433"),
+            (r"\\db01\pipe\sql\query", r"\\db01\pipe\sql\query"),
+        ] {
+            assert_eq!(data_source(server), expected, "{server}");
+        }
+    }
 
     #[test]
     fn tls_hints_from_schannel_status() {

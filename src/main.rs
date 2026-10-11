@@ -9,6 +9,7 @@ mod guard;
 mod output;
 mod profile;
 mod script;
+mod signals;
 
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
@@ -238,8 +239,10 @@ fn deliver(out: &mut Out, summary: &Summary, exit: Exit) -> Exit {
     match delivered {
         Ok(()) => exit,
         Err(e) => {
+            let error = summary.error.map(|e| format!(" ({e})")).unwrap_or_default();
             diag(format_args!(
-                "sqlh: output could not be delivered ({e}); the run itself ended with exit {}: {}",
+                "sqlh: output could not be delivered ({e}); the run itself ended with exit {}: \
+                 {}{error}",
                 exit as u8, summary.status
             ));
             Exit::Undelivered
@@ -484,7 +487,9 @@ fn location(sources: &[Source], source: usize, line: u32) -> String {
     }
 }
 
-/// Runs the session; Ctrl+C sends an attention and gives it two seconds to land.
+/// Runs the session, cancelling it on Ctrl+C, Ctrl+Break, the console closing, logoff or
+/// shutdown. The error then says whether the server confirmed the cancel or the connection
+/// was closed instead (DESIGN.md §4.3).
 async fn run_cancellable(
     opts: &Opts,
     settings: &Settings,
@@ -492,16 +497,38 @@ async fn run_cancellable(
     batches: &[Batch],
     out: &mut Out,
 ) -> Result<Stats, Failure> {
+    let mut signals = signals::Signals::new().map_err(|e| {
+        Failure::new(
+            Exit::Internal,
+            format!("cannot watch for Ctrl+C and other console events: {e}"),
+        )
+    })?;
     let root = Cancel::new();
     let cancel = root.child();
     let work = run_session(opts, settings, sources, batches, out, &cancel);
     tokio::pin!(work);
     tokio::select! {
         result = &mut work => result,
-        _ = tokio::signal::ctrl_c() => {
+        signal = signals.recv() => {
+            // The cancel reaches the connect, every statement and sqlh's own output wait.
+            // Whatever is still running when the grace ends is dropped, closing the
+            // connection, which makes the server stop too.
             root.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), &mut work).await;
-            Err(Failure::new(Exit::Cancelled, "interrupted; the running batch was cancelled"))
+            let grace = signal.grace();
+            let detail = match tokio::time::timeout(grace, &mut work).await {
+                // Every batch had run; the cancel came too late to change the outcome.
+                Ok(Ok(stats)) => return Ok(stats),
+                Ok(Err(failure)) if failure.exit == Exit::Cancelled => failure.message,
+                Ok(Err(failure)) => format!("the run stopped: {}", failure.message),
+                Err(_) => format!(
+                    "nothing confirmed the cancel within {} s, so the connection was closed",
+                    grace.as_secs()
+                ),
+            };
+            Err(Failure::new(
+                Exit::Cancelled,
+                format!("cancelled by {}: {detail}", signal.name()),
+            ))
         }
     }
 }
@@ -538,7 +565,7 @@ async fn run_session(
     }
     let setup_started = Instant::now();
     session
-        .exec_internal(&setup, timeout)
+        .exec_internal(&setup, timeout, cancel)
         .await
         .map_err(db_failure)?;
     if report {
@@ -563,6 +590,13 @@ async fn run_session(
     'batches: for batch in batches {
         for run in 1..=batch.repeat {
             number += 1;
+            // A cancel ends the batch it reaches; this makes sure no later one starts.
+            if cancel.is_cancelled() {
+                return Err(Failure::new(
+                    Exit::Cancelled,
+                    format!("cancelled before batch {number} ran"),
+                ));
+            }
             if wrap && !session.in_transaction() {
                 return Err(Failure::new(
                     Exit::SqlError,
@@ -573,7 +607,7 @@ async fn run_session(
                 // Re-armed before every batch. The guard already refuses input that mentions
                 // NOEXEC; this keeps compile-only mode in force regardless.
                 session
-                    .exec_internal("SET NOEXEC ON;", timeout)
+                    .exec_internal("SET NOEXEC ON;", timeout, cancel)
                     .await
                     .map_err(db_failure)?;
             }
@@ -619,11 +653,13 @@ async fn run_session(
              when a query runs (SQL Server defers their name resolution)",
         )
         .map_err(output_failure)?;
-        let _ = session.exec_internal("SET NOEXEC OFF;", timeout).await;
+        let _ = session
+            .exec_internal("SET NOEXEC OFF;", timeout, cancel)
+            .await;
     }
     if wrap && session.in_transaction() {
         let _ = session
-            .exec_internal("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", timeout)
+            .exec_internal("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", timeout, cancel)
             .await;
     }
     session.close().await;
@@ -637,7 +673,7 @@ fn db_failure(error: DbError) -> Failure {
             Failure::new(Exit::Connect, format!("connection lost: {message}"))
         }
         DbError::Timeout(message) => Failure::new(Exit::Timeout, message),
-        DbError::Cancelled => Failure::new(Exit::Cancelled, "cancelled"),
+        DbError::Cancelled(detail) => Failure::new(Exit::Cancelled, detail),
         DbError::Sql(message) => Failure::new(Exit::SqlError, message),
         DbError::Output(e) => output_failure(e),
         DbError::Protocol(message) => Failure::new(Exit::Internal, message),

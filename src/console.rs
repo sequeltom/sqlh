@@ -82,8 +82,9 @@ pub fn restore_echo() {
 pub fn restore_echo() {}
 
 /// Turns console echo off for its lifetime and restores the saved mode when dropped, on
-/// every return path. A panic restores it through `restore_echo`; a process killed while
-/// waiting at the prompt (Ctrl+C included) can leave echo off in that console.
+/// every return path. A panic restores it through `restore_echo`, and so do Ctrl+C,
+/// Ctrl+Break and the console closing (`restore_on_signal`). Only a process killed outright
+/// can leave echo off in the console it shares with the shell.
 struct EchoOff {
     #[cfg_attr(not(windows), allow(dead_code))]
     saved: u32,
@@ -93,7 +94,8 @@ struct EchoOff {
 impl EchoOff {
     fn new() -> io::Result<Self> {
         use windows_sys::Win32::System::Console::{
-            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            SetConsoleCtrlHandler, SetConsoleMode,
         };
         let mut saved = 0;
         // SAFETY: GetStdHandle has no preconditions. GetConsoleMode writes one u32 to
@@ -115,6 +117,11 @@ impl EchoOff {
         }
         SAVED_MODE.store(saved, std::sync::atomic::Ordering::SeqCst);
         ECHO_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: registers a handler that stays valid for the life of the process; it is
+        // removed again in `drop`.
+        unsafe {
+            SetConsoleCtrlHandler(Some(restore_on_signal), 1);
+        }
         Ok(EchoOff { saved })
     }
 }
@@ -122,12 +129,16 @@ impl EchoOff {
 #[cfg(windows)]
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_INPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+        };
         ECHO_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
-        // SAFETY: restores the mode saved in `new` on the same standard handle. Failure
-        // can't be reported from a destructor, and the prompt has already returned.
+        // SAFETY: restores the mode saved in `new` on the same standard handle, and removes
+        // the handler `new` added. Failure can't be reported from a destructor, and the
+        // prompt has already returned.
         unsafe {
             SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), self.saved);
+            SetConsoleCtrlHandler(Some(restore_on_signal), 0);
         }
     }
 }
@@ -140,4 +151,13 @@ impl EchoOff {
             "hidden password input needs Windows",
         ))
     }
+}
+
+/// Runs on its own thread when Ctrl+C, Ctrl+Break or a close arrives at the prompt. It puts
+/// echo back, then returns FALSE so the default handling still ends the process: a handled
+/// Ctrl+C would only restart the read, leaving no way out of the prompt.
+#[cfg(windows)]
+unsafe extern "system" fn restore_on_signal(_event: u32) -> windows_sys::Win32::Foundation::BOOL {
+    restore_echo();
+    0
 }

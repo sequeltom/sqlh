@@ -80,11 +80,12 @@ impl Shared {
     }
 }
 
-fn stalled(limit: Duration) -> io::Error {
+/// `why` names the limit when it is the stall limit (-t), and is empty for a one-off limit.
+fn stalled(limit: Duration, why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "the reader stopped reading for {} s (-t)",
+            "the reader stopped reading for {} s{why}",
             limit.as_secs().max(1)
         ),
     )
@@ -161,7 +162,10 @@ impl Delivery {
     /// (`None`: the delivery's own limit). On a stall the thread is left blocked; the
     /// process ends without it.
     pub fn finish(&mut self, stall: Option<Duration>) -> io::Result<()> {
-        let stall = stall.or(self.stall);
+        let (stall, why) = match stall {
+            Some(limit) => (Some(limit), ""),
+            None => (self.stall, " (-t)"),
+        };
         let mut state = self.shared.lock();
         state.closed = true;
         self.shared.work.notify_one();
@@ -170,7 +174,10 @@ impl Delivery {
                 Some(limit) => {
                     let waited = state.progress.elapsed();
                     if waited >= limit {
-                        return Err(stalled(limit));
+                        // Detached for good, so dropping the delivery doesn't wait again
+                        // (for the full stall limit, after a cancel's shorter one).
+                        self.thread = None;
+                        return Err(stalled(limit, why));
                     }
                     state = self
                         .shared
@@ -354,7 +361,7 @@ impl Gate {
                     Some(limit) => {
                         let waited = state.progress.elapsed();
                         if waited >= limit {
-                            return Err(stalled(limit));
+                            return Err(stalled(limit, " (-t)"));
                         }
                         Some(limit - waited)
                     }
@@ -479,6 +486,35 @@ mod tests {
         out.flush().unwrap();
         let error = delivery.finish(None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().ends_with("for 1 s (-t)"), "{error}");
+        drop(release);
+    }
+
+    // PLAN.md 2.4: after a cancel, finishing waits a second, not the stall limit, and once
+    // it has given up, dropping the delivery doesn't wait again.
+    #[test]
+    fn a_shorter_wait_gives_up_for_good() {
+        let (release, blocked) = mpsc::channel();
+        let mut delivery = Delivery::start(
+            Box::new(Stalled(Mutex::new(blocked))),
+            None,
+            Some(Duration::from_secs(60)),
+        );
+        let mut out = delivery.writer(Dest::Main);
+        out.write_all(&[b'x'; CHUNK]).unwrap();
+        drop(out);
+        let started = Instant::now();
+        let error = delivery
+            .finish(Some(Duration::from_millis(200)))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "the reader stopped reading for 1 s");
+        drop(delivery);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         drop(release);
     }
 
