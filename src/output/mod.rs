@@ -876,18 +876,37 @@ impl Tally {
 
     /// `3 rows`, or `5 of 2775 rows shown (--max-rows 5); 2 values cut (--max-cell 40)`.
     pub fn footer(&self) -> String {
+        self.footer_for(false)
+    }
+
+    /// The footer of a result a SQL error ended (`end_rows_incomplete`, DESIGN.md §5.1): the
+    /// rows that arrived, and `interrupted`, so a reader doesn't take the count for the total.
+    /// `3 rows so far (interrupted)`, or `5 of ≥2775 rows shown (--max-rows 5; interrupted)`.
+    pub fn footer_incomplete(&self) -> String {
+        self.footer_for(true)
+    }
+
+    fn footer_for(&self, incomplete: bool) -> String {
         let total = self.rows_total();
-        let mut footer = if self.stopped {
-            // A lower bound: `≥`, and what stopped the count after the limit that hid the rows.
+        let mut footer = if self.stopped || (incomplete && self.rows_shown != total) {
+            // A lower bound: `≥`, and what ended the count after the limit that hid the rows.
             let limit = if self.cut {
                 "--max-output".to_owned()
             } else {
                 format!("--max-rows {}", self.limits.max_rows)
             };
+            let why = match (self.stopped, incomplete) {
+                (true, true) => "counting stopped; interrupted",
+                (true, false) => "counting stopped",
+                _ => "interrupted",
+            };
             format!(
-                "{} of ≥{total} rows shown ({limit}; counting stopped)",
+                "{} of ≥{total} rows shown ({limit}; {why})",
                 self.rows_shown
             )
+        } else if incomplete {
+            let s = if total == 1 { "" } else { "s" };
+            format!("{total} row{s} so far (interrupted)")
         } else if self.rows_shown == total {
             let s = if total == 1 { "" } else { "s" };
             format!("{total} row{s}")
@@ -1740,6 +1759,14 @@ mod tests {
         assert_eq!(status, format!("-- {widest}\n"));
         let worst = footer.len() + status.len();
         assert!(worst <= STATUS_RESERVE as usize, "{worst} bytes");
+        // R17: the footer of a result a SQL error ended is no wider, even in the combination
+        // the database layer never produces (a stopped count that is also incomplete).
+        for stopped in [false, true] {
+            tally.stopped = stopped;
+            let incomplete = format!("-- {}\n", tally.footer_incomplete());
+            let worst = incomplete.len() + status.len();
+            assert!(worst <= STATUS_RESERVE as usize, "{worst} bytes");
+        }
     }
 
     // PLAN.md 2.11, DESIGN.md §4.4: the status line's tail (`; db01/master, connect 195 ms`)

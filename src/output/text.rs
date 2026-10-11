@@ -348,6 +348,15 @@ impl<W: Write> BatchSink for TextSink<W> {
         self.write_line(&footer)
     }
 
+    fn end_rows_incomplete(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
+        if self.tally.result_hidden() {
+            return Ok(());
+        }
+        let footer = format!("-- {}", self.tally.footer_incomplete());
+        self.write_line(&footer)
+    }
+
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
         self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
@@ -933,6 +942,65 @@ pub(super) mod tests {
              -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
              later statements did not run; --exact-count counts every row\n\
              -- ok: 2 batches, counting stopped in 1, 7 ms\n"
+        );
+    }
+
+    // R17, exact output: a SQL error that ends a result's rows closes it with an incomplete
+    // footer (`so far`, or `≥` with the hidden rows counted, and `interrupted`), before the
+    // messages held and the error. A result that ended on its own, and a later result in the
+    // same batch, keep the exact footer.
+    #[test]
+    fn a_result_a_sql_error_ended_has_an_incomplete_footer() {
+        let (mut s, main, _) = sink(Limits {
+            max_rows: 2,
+            max_cell: 0,
+            ..capped(0)
+        });
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows_incomplete().unwrap();
+        s.message(&msg("held")).unwrap();
+        s.error(&error(2)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.row(&[Value::Int(2)]).unwrap();
+        s.skipped_row();
+        s.skipped_row();
+        s.end_rows_incomplete().unwrap();
+        s.error(&error(3)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(9)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&summary("failed (exit 1): 2 errors, 3 ms"))
+            .unwrap();
+        assert_eq!(
+            main.text(),
+            "-- result 1\n\
+             x:int\n\
+             1\n\
+             -- 1 row\n\
+             -- result 2\n\
+             x:int\n\
+             1\n\
+             -- 1 row so far (interrupted)\n\
+             -- msg: held\n\
+             -- error 208 (severity 16, state 1, line 2): Invalid object name 'dbo.Nope'.\n\
+             -- result 3\n\
+             x:int\n\
+             1\n\
+             2\n\
+             -- 2 of ≥4 rows shown (--max-rows 2; interrupted)\n\
+             -- error 208 (severity 16, state 1, line 3): Invalid object name 'dbo.Nope'.\n\
+             -- result 4\n\
+             x:int\n\
+             9\n\
+             -- 1 row\n\
+             -- failed (exit 1): 2 errors, 3 ms\n"
         );
     }
 

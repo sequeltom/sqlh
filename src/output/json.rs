@@ -25,10 +25,13 @@ use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 /// change, such as a field or event removed or renamed, or its type or meaning changed. A
 /// minor may add optional fields, event types or enum values, so a reader written for a
 /// version has to ignore what it doesn't know. 1.0 is the document with `contract_version`,
-/// `connection`, `connect_ms` and the batches' `elapsed_ms`. 1.1 adds `row_count_exact` to
+/// `connection`, `connect_ms` and the batches' `elapsed_ms`. 1.1 added `row_count_exact` to
 /// every result and `counting_stopped` to every batch (the bounded count of hidden rows,
-/// PLAN.md 2.15).
-pub const CONTRACT_VERSION: &str = "1.1";
+/// PLAN.md 2.15) but was never released as a stable contract. 2.0 is the major bump it
+/// needed: a result's `row_count` may now be a lower bound, which a reader of 1.x would take
+/// for the exact total, so that reader must reject the document at its major version (code
+/// review R16). 2.0 keeps 1.1's fields.
+pub const CONTRACT_VERSION: &str = "2.0";
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;
@@ -147,7 +150,7 @@ impl<W: Write> JsonSink<W> {
         self.drain(false)
     }
 
-    /// Writes the document head once, if nothing has: `{"contract_version":"1.1","batches":[`.
+    /// Writes the document head once, if nothing has: `{"contract_version":"2.0","batches":[`.
     fn open(&mut self) {
         if !self.opened {
             self.push_head(None);
@@ -452,6 +455,12 @@ impl<W: Write> BatchSink for JsonSink<W> {
         self.drain(false)
     }
 
+    fn end_rows_incomplete(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
+        self.end_result(true);
+        self.drain(false)
+    }
+
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
         self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
@@ -737,7 +746,7 @@ mod tests {
         assert_eq!(
             parse(s),
             json!({
-                "contract_version": "1.1",
+                "contract_version": "2.0",
                 "batches": [{
                     "batch": 1, "source": "q.sql", "line": 1,
                     "events": [
@@ -921,7 +930,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.1","batches":["#,
+                r#"{"contract_version":"2.0","batches":["#,
                 r#"{"batch":1,"source":"-Q","line":1,"events":["#,
                 r#"{"type":"rows_affected","count":2},"#,
                 r#"{"type":"result","columns":[{"name":"id","type":"int","nullable":true},"#,
@@ -940,6 +949,66 @@ mod tests {
                 "\n"
             )
         );
+    }
+
+    // R16: a stopped count's `row_count` is a lower bound that a reader of the 1.x contract
+    // would take for the total (the document has `ok: true`, no `interrupted`, and 1.0 never
+    // had the fields that qualify it). The major version is what stops it: a reader that
+    // follows DESIGN.md §5.2 checks `contract_version` first and rejects what it doesn't know.
+    #[test]
+    fn a_reader_of_the_1_x_contract_rejects_a_stopped_count_document_by_its_major_version() {
+        use super::super::text::tests::{stopped_limits, stopped_run};
+        // The check DESIGN.md §5.2 prescribes: accept the supported major, reject any other.
+        fn reads(supported_major: u64, doc: &head_reader::Doc) -> Result<(), String> {
+            if doc.major != supported_major {
+                return Err(format!(
+                    "unsupported contract_version {} (this reader handles {supported_major}.x)",
+                    doc.version
+                ));
+            }
+            Ok(())
+        }
+        let (mut s, main, _) = sink(stopped_limits());
+        stopped_run(&mut s);
+        let text = main.text();
+        let doc = head_reader::parse(&text);
+        // The document is the one a 1.x reader would misread: successful, no `interrupted`, and
+        // a first result whose `row_count` is not the total.
+        let parsed = document(&main);
+        let result = &parsed["batches"][0]["events"][1];
+        assert_eq!(parsed["ok"], true);
+        assert!(result.get("interrupted").is_none(), "{result}");
+        assert_eq!(result["row_count_exact"], false);
+        assert_eq!(parsed["contract_version"], CONTRACT_VERSION);
+        assert_eq!(
+            reads(1, &doc),
+            Err(format!(
+                "unsupported contract_version {CONTRACT_VERSION} (this reader handles 1.x)"
+            ))
+        );
+        assert_eq!(reads(doc.major, &doc), Ok(()));
+        // The bump is a major one: it can't be 1.x again while a stopped count is a bound.
+        assert!(doc.major >= 2, "{}", doc.version);
+    }
+
+    /// Just enough of a reader to apply the major-version check to a document's head.
+    mod head_reader {
+        pub struct Doc {
+            pub version: String,
+            pub major: u64,
+        }
+
+        pub fn parse(text: &str) -> Doc {
+            let head = text.strip_prefix("{\"contract_version\":\"").expect("head");
+            let version = head.split('"').next().expect("version").to_owned();
+            let major = version
+                .split('.')
+                .next()
+                .expect("major")
+                .parse()
+                .expect("n");
+            Doc { version, major }
+        }
     }
 
     // PLAN.md 2.15 (review), exact output: a stopped count is `truncated` whenever a hidden row
@@ -967,7 +1036,7 @@ mod tests {
             main.text(),
             format!(
                 concat!(
-                    r#"{{"contract_version":"1.1","batches":["#,
+                    r#"{{"contract_version":"2.0","batches":["#,
                     r#"{{"batch":1,"source":"-Q","line":1,"events":[{}],"#,
                     r#""elapsed_ms":5,"counting_stopped":true}},"#,
                     r#"{{"batch":2,"source":"-Q","line":6,"events":[{}],"#,
@@ -1009,7 +1078,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.1","batches":[{"batch":1,"source":"-Q","line":1,"#,
+                r#"{"contract_version":"2.0","batches":[{"batch":1,"source":"-Q","line":1,"#,
                 r#""events":[{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
                 r#""rows":[[1],[2]],"row_count":3,"row_count_exact":false,"truncated":true,"#,
                 r#""cells_cut":0,"interrupted":true}],"elapsed_ms":2000,"counting_stopped":false}],"#,
@@ -1034,6 +1103,64 @@ mod tests {
         let result = &document(&main)["batches"][0]["events"][0];
         assert_eq!(result["row_count_exact"], true, "{result}");
         assert!(result.get("interrupted").is_none(), "{result}");
+    }
+
+    // R17: a SQL error that ends a result's rows closes it as incomplete, in the order
+    // `BatchSink` promises (the result, the messages held, the error). The incomplete state
+    // is the result's own: a later result in the same batch, and one in the next batch, are
+    // exact again, and a result that ended on its own before the error stays exact.
+    #[test]
+    fn a_result_a_sql_error_ended_is_incomplete_and_the_state_does_not_leak() {
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.end_rows().unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(1)]).unwrap();
+        s.row(&[Value::Int(2)]).unwrap();
+        s.end_rows_incomplete().unwrap();
+        s.message(&msg("held")).unwrap();
+        s.error(&error(2)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(7)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+        s.begin_batch(&batch("-Q", false, 3)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.row(&[Value::Int(8)]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(2).unwrap();
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        let doc = document(&main);
+        let events = doc["batches"][0]["events"].as_array().unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["result", "result", "msg", "error", "result"]);
+        let exact: Vec<_> = [0, 1, 4]
+            .iter()
+            .map(|&i| events[i]["row_count_exact"].as_bool().unwrap())
+            .collect();
+        assert_eq!(exact, [true, false, true], "{doc}");
+        assert_eq!(events[1]["row_count"], 2);
+        assert_eq!(events[1]["interrupted"], true);
+        assert_eq!(events[1]["truncated"], false);
+        for i in [0, 4] {
+            assert!(events[i].get("interrupted").is_none(), "{doc}");
+        }
+        let later = &doc["batches"][1]["events"][0];
+        assert_eq!(later["row_count_exact"], true, "{doc}");
+        assert!(later.get("interrupted").is_none(), "{doc}");
+        // Exact output of the interrupted result: the marker comes last in the object.
+        assert!(
+            main.text().contains(concat!(
+                r#"{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
+                r#""rows":[[1],[2]],"row_count":2,"row_count_exact":false,"truncated":false,"#,
+                r#""cells_cut":0,"interrupted":true},{"type":"msg","text":"held"}"#
+            )),
+            "{}",
+            main.text()
+        );
     }
 
     // The whole-response budget (R08). A json sink with a stream each for the document and
@@ -1115,7 +1242,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.1","#,
+                r#"{"contract_version":"2.0","#,
                 r#""connection":{"server":"SQL01","database":"master","auth":"sql","#,
                 r#""encrypted":true,"server_version":"17.0.1000"},"connect_ms":195,"#,
                 r#""batches":[{"batch":1,"source":"-Q","line":1,"events":["#,
@@ -1138,7 +1265,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"1.1","batches":[],"ok":false,"exit_code":3,"#,
+                r#"{"contract_version":"2.0","batches":[],"ok":false,"exit_code":3,"#,
                 r#""summary":"failed (exit 3): usage error, 0 ms","elapsed_ms":0}"#,
                 "\n"
             )
@@ -1479,7 +1606,7 @@ mod tests {
         assert_eq!(
             document(&main),
             json!({
-                "contract_version": "1.1",
+                "contract_version": "2.0",
                 "batches": [{"events": [
                     {"type": "result",
                      "columns": [{"name": "v", "type": "int", "nullable": true}],
@@ -1577,7 +1704,7 @@ mod tests {
     // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
     // the 640-byte status reserve, 728 - 640 = 88 bytes, 13 of them for the array and quotes
     // around the first note: 66 characters and "…[+134]". The document head
-    // (`{"contract_version":"1.1","batches":[`) and `]` take 38, and what the notes array,
+    // (`{"contract_version":"2.0","batches":[`) and `]` take 38, and what the notes array,
     // the error's wrapper and the outcome leave of the other 690 goes to the error: 507
     // characters and "…[+493]".
     #[test]
@@ -1595,7 +1722,7 @@ mod tests {
         assert_eq!(
             main.text(),
             format!(
-                "{{\"contract_version\":\"1.1\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
+                "{{\"contract_version\":\"2.0\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
                  \"error\":\"{}…[+493]\",\"ok\":false,\"exit_code\":1,\
                  \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":3}}\n",
                 "x".repeat(66),
@@ -1776,7 +1903,7 @@ mod tests {
         s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
         assert_eq!(
             main.text(),
-            "{\"contract_version\":\"1.1\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
+            "{\"contract_version\":\"2.0\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
              \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":0}\n"
         );
     }
