@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use crate::cli::{Opts, ProfileCommand};
-use crate::config::{self, AuthKind, Profile};
+use crate::config::{self, AuthKind, DEFAULT_LOCK_TIMEOUT, Profile};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
@@ -105,6 +105,8 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         query_timeout: opts.query_timeout.or(base.query_timeout),
         max_rows: opts.max_rows.or(base.max_rows),
         max_cell: opts.max_cell.or(base.max_cell),
+        lock_timeout: opts.lock_timeout.or(base.lock_timeout),
+        read_uncommitted: opts.read_uncommitted.or(base.read_uncommitted),
     };
     let server = profile
         .server
@@ -197,6 +199,16 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
         column("user"),
         column("password"),
         column("write_policy"),
+        Column {
+            name: "lock_timeout".into(),
+            type_name: "int".into(),
+            nullable: false,
+        },
+        Column {
+            name: "read_uncommitted".into(),
+            type_name: "bit".into(),
+            nullable: false,
+        },
     ];
     let text = |v: &Option<String>| v.clone().map_or(Value::Null, Value::Text);
     let write = |out: &mut Out| -> std::io::Result<()> {
@@ -222,6 +234,9 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
                 text(&p.user),
                 Value::Text(password.into()),
                 Value::Text(p.write_policy.map_or("flag", |w| w.as_str()).into()),
+                // What a run with this profile gets, so an unset key shows its default.
+                Value::Int(p.lock_timeout.unwrap_or(DEFAULT_LOCK_TIMEOUT).into()),
+                Value::Int(p.read_uncommitted.unwrap_or(false).into()),
             ])?;
         }
         out.end_rows()

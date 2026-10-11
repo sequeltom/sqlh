@@ -2202,6 +2202,302 @@ fn windows_profile_ignores_sqlcmduser() {
     assert!(r.stdout.contains("(Windows auth,"), "{}", r.stdout);
 }
 
+// PLAN.md 2.8: --lock-timeout is whole seconds, 0 means no limit, and the most that
+// SET LOCK_TIMEOUT can hold is 2,147,483 s. Anything else is a usage error found before
+// anything connects (exit 3, where the dead address would give 2).
+#[test]
+fn a_bad_lock_timeout_is_a_usage_error() {
+    for (value, reason) in [
+        ("abc", "expected a non-negative whole number"),
+        ("-1", "expected a non-negative whole number"),
+        ("2.5", "expected a non-negative whole number"),
+        ("2147484", "at most 2147483 seconds; use 0 for no limit"),
+    ] {
+        let mut args = DEAD.to_vec();
+        args.extend(["--lock-timeout", value, "-Q", "SELECT 1"]);
+        let r = sqlh_args(&args);
+        assert_eq!(
+            error_line(&r),
+            format!("-- error: --lock-timeout {value}: {reason}")
+        );
+        assert!(
+            last_line(&r.stdout).starts_with("-- failed (exit 3): usage error"),
+            "{}",
+            r.stdout
+        );
+    }
+    let r = sqlh_args(&["--lock-timeout"]);
+    assert!(error_line(&r).contains("--lock-timeout"), "{}", r.stdout);
+    // The largest value, and 0, are accepted: the run goes on to the connect.
+    for value in ["2147483", "0", "1"] {
+        let mut args = DEAD.to_vec();
+        args.extend(["--lock-timeout", value, "-Q", "SELECT 1"]);
+        assert_reached_connect(&sqlh_args(&args), value);
+    }
+}
+
+// PLAN.md 2.8, owner decision 7: READ UNCOMMITTED is for read-only runs. Asked for on the
+// command line in a run that can write, it is a usage error that says why; saved in a
+// profile, it is ignored in such a run. Switched off explicitly, it is no conflict.
+#[test]
+fn read_uncommitted_with_writes_is_a_usage_error() {
+    let mut with_writes = DEAD.to_vec();
+    with_writes.extend(["--read-uncommitted", "--allow-write", "-Q", "SELECT 1"]);
+    let r = sqlh_args(&with_writes);
+    let expected = "-- error: --read-uncommitted can't be used with --allow-write: a write \
+                    could be based on rows that were never committed. Drop one of the two";
+    assert_eq!(error_line(&r), expected);
+    assert!(
+        last_line(&r.stdout).starts_with("-- failed (exit 3): usage error"),
+        "{}",
+        r.stdout
+    );
+    // The order of the flags doesn't matter, and every format says it.
+    let r = sqlh_args(&[
+        "--allow-write",
+        "--format",
+        "json",
+        "--read-uncommitted=true",
+        "-S",
+        "127.0.0.1,1",
+        "-Q",
+        "SELECT 1",
+    ]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+    assert_eq!(doc["error"], expected.trim_start_matches("-- error: "));
+    assert_eq!(doc["exit_code"], 3);
+
+    // Off, or not given, is no conflict: these go on to connect.
+    for flags in [
+        vec!["--read-uncommitted=false", "--allow-write"],
+        vec!["--read-uncommitted"],
+        vec!["--allow-write"],
+    ] {
+        let mut args = DEAD.to_vec();
+        args.extend(flags.iter().copied());
+        args.extend(["-Q", "SELECT 1"]);
+        assert_reached_connect(&sqlh_args(&args), &format!("{flags:?}"));
+    }
+    let r = sqlh_args(&["--read-uncommitted=sometimes", "-Q", "SELECT 1"]);
+    assert_eq!(
+        error_line(&r),
+        "-- error: --read-uncommitted=sometimes: expected true or false"
+    );
+
+    // Profiles: the saved setting never conflicts, and a profile that lets every run write
+    // refuses the flag.
+    let dir = scratch("read_uncommitted_profiles");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.dirty]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         read_uncommitted = true\n\
+         [profiles.writer]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"allow\"\nread_uncommitted = true\n",
+    )
+    .unwrap();
+    let profiled = |args: &[&str]| {
+        run(sqlh()
+            .args(args)
+            .args(["-Q", "SELECT 1"])
+            .env("SQLH_CONFIG", &config))
+    };
+    assert_reached_connect(&profiled(&["--profile", "dirty"]), "saved setting");
+    assert_reached_connect(
+        &profiled(&["--profile", "dirty", "--allow-write"]),
+        "saved setting, writes allowed",
+    );
+    assert_reached_connect(
+        &profiled(&["--profile", "writer"]),
+        "saved setting, a profile that lets every run write",
+    );
+    let r = profiled(&["--profile", "writer", "--read-uncommitted"]);
+    assert_eq!(
+        error_line(&r),
+        "-- error: --read-uncommitted applies to read-only runs, and profile writer has \
+         write_policy = \"allow\", so this run can write. Use a profile whose write_policy \
+         is \"flag\" or \"deny\""
+    );
+    assert_reached_connect(
+        &profiled(&["--profile", "writer", "--read-uncommitted=false"]),
+        "switched off",
+    );
+}
+
+// PLAN.md 2.8: the profile keys are checked like the others, with the line in the message.
+#[test]
+fn a_profile_with_a_bad_lock_setting_is_a_usage_error() {
+    let dir = scratch("lock_setting_profiles");
+    let config = dir.join("profiles.toml");
+    let shown = text_escaped(&config.display().to_string());
+    for (line, reason) in [
+        (
+            "lock_timeout = 99999999999",
+            "lock_timeout 99999999999 is out of range: at most 2147483 seconds; 0 means no limit",
+        ),
+        (
+            "lock_timeout = 2147484",
+            "lock_timeout 2147484 is out of range: at most 2147483 seconds; 0 means no limit",
+        ),
+        (
+            "lock_timeout = \"10\"",
+            "lock_timeout must be a whole number",
+        ),
+        (
+            "lock_timeout = -1",
+            "unsupported value -1; use \"text\", a whole number, true or false",
+        ),
+        (
+            "read_uncommitted = \"yes\"",
+            "read_uncommitted must be true or false",
+        ),
+        (
+            "read_uncommitted = 1",
+            "read_uncommitted must be true or false",
+        ),
+        (
+            "lock_timeout = 5\nlock_timeout = 6",
+            "lock_timeout is set twice",
+        ),
+    ] {
+        fs::write(
+            &config,
+            format!("[profiles.p]\nserver = \"127.0.0.1,1\"\n{line}\n"),
+        )
+        .unwrap();
+        let r = run(sqlh()
+            .args(["--profile", "p", "-Q", "SELECT 1"])
+            .env("SQLH_CONFIG", &config));
+        let line_no = if line.contains('\n') { 4 } else { 3 };
+        assert_eq!(
+            error_line(&r),
+            format!("-- error: {shown}:{line_no}: {reason}"),
+            "{line}"
+        );
+    }
+}
+
+// PLAN.md 2.8: `profile add` saves both settings, a later `add` without them keeps them,
+// `--read-uncommitted=false` and `--lock-timeout 0` are values that replace them, and
+// `profile list` shows what a run with each profile gets (10 and 0 when nothing is saved).
+// The profile points at a dead address, so the connection test at the end of `add` fails
+// (exit 2) after the profile is saved. Windows auth: no password is asked for or stored.
+#[test]
+fn profile_add_saves_the_lock_settings_and_list_shows_them() {
+    let dir = scratch("profile_lock_settings");
+    let config = dir.join("profiles.toml");
+    let profiles = |args: &[&str]| run(sqlh().args(args).env("SQLH_CONFIG", &config));
+    let saved = || fs::read_to_string(&config).expect("the profiles file");
+    let listed = || {
+        let r = profiles(&["profile", "list"]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let mut lines = r.stdout.lines().filter(|l| !l.starts_with("-- "));
+        let header = lines.next().expect("a header").to_owned();
+        assert!(
+            header.ends_with("\twrite_policy:text\tlock_timeout:int\tread_uncommitted:bit"),
+            "{header}"
+        );
+        lines.map(str::to_owned).collect::<Vec<_>>()
+    };
+
+    let r = profiles(&[
+        "profile",
+        "add",
+        "sqlh-ut-locks",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+        "--lock-timeout",
+        "5",
+        "--read-uncommitted",
+    ]);
+    assert_eq!(
+        r.code, 2,
+        "saved, then the connection test failed: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout
+            .contains("-- note: saved profile sqlh-ut-locks in "),
+        "{}",
+        r.stdout
+    );
+    let file = saved();
+    assert!(
+        file.contains("\nlock_timeout = 5\n") && file.contains("\nread_uncommitted = true\n"),
+        "{file}"
+    );
+    let rows = listed();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].ends_with("\tflag\t5\t1"), "{}", rows[0]);
+
+    // Left out, they stay.
+    let r = profiles(&["profile", "add", "sqlh-ut-locks", "-d", "AppDb"]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    let file = saved();
+    assert!(
+        file.contains("\nlock_timeout = 5\n") && file.contains("\nread_uncommitted = true\n"),
+        "{file}"
+    );
+
+    // Given, they replace: 0 (no limit) and false are values, not "unset".
+    let r = profiles(&[
+        "profile",
+        "add",
+        "sqlh-ut-locks",
+        "--lock-timeout",
+        "0",
+        "--read-uncommitted=false",
+    ]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    let file = saved();
+    assert!(
+        file.contains("\nlock_timeout = 0\n") && file.contains("\nread_uncommitted = false\n"),
+        "{file}"
+    );
+    let rows = listed();
+    assert!(rows[0].ends_with("\tflag\t0\t0"), "{}", rows[0]);
+
+    // A profile that never mentioned them shows what its runs get.
+    let r = profiles(&[
+        "profile",
+        "add",
+        "sqlh-ut-plain",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+    ]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    let file = saved();
+    let plain = file
+        .split("[profiles.sqlh-ut-plain]")
+        .nth(1)
+        .expect("the second table");
+    assert!(
+        !plain.contains("lock_timeout") && !plain.contains("read_uncommitted"),
+        "{file}"
+    );
+    let rows = listed();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[1].starts_with("sqlh-ut-plain\t"), "{}", rows[1]);
+    assert!(rows[1].ends_with("\tflag\t10\t0"), "{}", rows[1]);
+
+    // The out-of-range value is refused before anything is saved.
+    let before = saved();
+    let r = profiles(&[
+        "profile",
+        "add",
+        "sqlh-ut-locks",
+        "--lock-timeout",
+        "2147484",
+    ]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert_eq!(saved(), before);
+}
+
 mod live {
     //! Against the owner's dev/test server, through a local profile. They are ignored by a
     //! plain `cargo test`, which reports them as ignored, and fail if asked for without a
@@ -2921,6 +3217,354 @@ mod live {
         } else {
             assert!(!line.contains("(tcp "), "{line}");
         }
+    }
+
+    // PLAN.md 2.8, owner decision 7: what a connection looks like to the server. The lock
+    // timeout and the deadlock priority are in every session, writes allowed or not;
+    // READ UNCOMMITTED (isolation level 1, against the default READ COMMITTED, 2) only when
+    // asked for, with its note once.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn every_session_gets_the_agent_defaults() {
+        let (p, db) = target();
+        let sql = "SELECT @@LOCK_TIMEOUT AS lock_timeout, s.deadlock_priority, \
+                   s.transaction_isolation_level AS isolation \
+                   FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID";
+        let note = "-- note: reads were uncommitted (--read-uncommitted): rows may include \
+                    uncommitted, duplicated or missing data\n";
+        // (flags, @@LOCK_TIMEOUT in ms, isolation level, whether the note is said)
+        let cases: [(&[&str], &str, &str, bool); 9] = [
+            (&[], "10000", "2", false),
+            (&["--lock-timeout", "3"], "3000", "2", false),
+            (&["--lock-timeout", "0"], "-1", "2", false),
+            (&["--allow-write"], "10000", "2", false),
+            (
+                &["--allow-write", "--lock-timeout", "4"],
+                "4000",
+                "2",
+                false,
+            ),
+            (&["--read-uncommitted"], "10000", "1", true),
+            (
+                &["--read-uncommitted", "--lock-timeout", "0"],
+                "-1",
+                "1",
+                true,
+            ),
+            (&["--read-uncommitted=false"], "10000", "2", false),
+            // Nothing is read, so there is nothing to make uncommitted or to report.
+            (&["--check", "--read-uncommitted"], "", "", false),
+        ];
+        for (flags, lock_ms, isolation, noted) in cases {
+            let mut args = flags.to_vec();
+            args.extend(["-Q", sql]);
+            let r = live(&p, &db, &args);
+            assert_eq!(r.code, 0, "{flags:?}: {}", r.stdout);
+            // -5 is DEADLOCK_PRIORITY LOW.
+            if !lock_ms.is_empty() {
+                assert!(
+                    r.stdout
+                        .contains(&format!("\n{lock_ms}\t-5\t{isolation}\n-- 1 row\n")),
+                    "{flags:?}: {}",
+                    r.stdout
+                );
+            }
+            assert_eq!(r.stdout.contains(note), noted, "{flags:?}: {}", r.stdout);
+            assert_eq!(
+                r.stdout.matches("reads were uncommitted").count(),
+                usize::from(noted),
+                "{flags:?}: {}",
+                r.stdout
+            );
+        }
+
+        // json carries the note with the other notes, once.
+        let r = live(
+            &p,
+            &db,
+            &["--format", "json", "--read-uncommitted", "-Q", sql],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+        assert_eq!(
+            doc["notes"],
+            serde_json::json!([
+                "reads were uncommitted (--read-uncommitted): rows may include uncommitted, \
+                 duplicated or missing data"
+            ])
+        );
+        assert_eq!(
+            doc["batches"][0]["events"][0]["rows"][0],
+            serde_json::json!([10000, -5, 1])
+        );
+        // csv carries it on stderr, the metadata stream.
+        let r = live(
+            &p,
+            &db,
+            &["--format", "csv", "--read-uncommitted", "-Q", sql],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert_eq!(r.stderr.matches(note).count(), 1, "{}", r.stderr);
+        assert!(!r.stdout.contains("uncommitted"), "{}", r.stdout);
+    }
+
+    /// A sqlh run started in the background.
+    fn spawn_live(profile: &str, database: &str, args: &[&str]) -> std::process::Child {
+        Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(["--profile", profile, "-d", database])
+            .args(args)
+            .spawn()
+            .expect("sqlh starts")
+    }
+
+    /// Waits for a run started with `spawn_live`.
+    fn collect(child: std::process::Child) -> Run {
+        let output = child.wait_with_output().expect("sqlh finishes");
+        Run {
+            code: output.status.code().expect("an exit code, not a signal"),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    /// A background run that is killed when it goes out of scope, so a failed assertion
+    /// doesn't leave a transaction open on the server. Killing the process drops its
+    /// connection, and the server rolls the transaction back.
+    struct Reaped(Option<std::process::Child>);
+
+    impl Reaped {
+        fn child(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("not yet collected")
+        }
+    }
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Starts a run that inserts into `table` and keeps its transaction open for a minute,
+    /// and waits until a read of the table shows that the write is there: it blocks, and
+    /// fails with error 1222 after the 1 s timeout it is given.
+    fn hold_a_write(profile: &str, database: &str, table: &str) -> Reaped {
+        let hold =
+            format!("BEGIN TRAN; INSERT {table} VALUES (1); WAITFOR DELAY '00:01:00'; ROLLBACK");
+        let mut blocker = Reaped(Some(spawn_live(
+            profile,
+            database,
+            &["--allow-write", "-Q", &hold],
+        )));
+        let read = format!("SELECT COUNT(*) AS n FROM {table}");
+        let give_up = Instant::now() + Duration::from_secs(40);
+        loop {
+            let r = live(profile, database, &["--lock-timeout", "1", "-Q", &read]);
+            if r.code == 1 && r.stdout.contains("-- error 1222 ") {
+                return blocker;
+            }
+            if let Some(status) = blocker.child().try_wait().expect("child status") {
+                panic!(
+                    "the blocking run ended early ({status}); the last read: {}",
+                    r.stdout
+                );
+            }
+            assert!(
+                Instant::now() < give_up,
+                "the write never blocked the read; the last read: {}",
+                r.stdout
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    // PLAN.md 2.8: a read that waits behind another session's open write gives up after
+    // --lock-timeout (default 10 s, here 2) with error 1222: an ordinary SQL error, exit 1,
+    // on the line of the statement that waited. The same read with --read-uncommitted takes no
+    // shared lock, so it doesn't wait: it returns at once, with the uncommitted row, and says
+    // so. (sqlh_test has no row versioning, so READ COMMITTED reads take locks.)
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_blocked_read_fails_after_the_lock_timeout_unless_it_reads_uncommitted() {
+        let (p, db) = target();
+        let probe = Probe::create(&p, &db);
+        let t = &probe.name;
+        let _blocker = hold_a_write(&p, &db, t);
+
+        let read = format!("SELECT COUNT(*) AS n FROM {t}");
+        let started = Instant::now();
+        let r = live(&p, &db, &["--lock-timeout", "2", "-Q", &read]);
+        let waited = started.elapsed();
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("\n-- error 1222 (severity 16, state ")
+                && r.stdout
+                    .contains(", line 1): Lock request time out period exceeded.\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            last_line(&r.stdout).starts_with("-- failed (exit 1): 1 error, first in batch 1"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            waited >= Duration::from_millis(1900) && waited < Duration::from_secs(8),
+            "the read waited {waited:?} for a 2 s lock timeout"
+        );
+
+        // In a file, the error is on the line of the statement, in the right batch.
+        let dir = scratch("lock_timeout_lines");
+        let input = dir.join("blocked.sql");
+        fs::write(
+            &input,
+            format!("SELECT 1 AS a\nGO\n-- waits here\nSELECT COUNT(*) AS n\nFROM {t}\nGO\nSELECT 2 AS b\n"),
+        )
+        .unwrap();
+        let r = live(
+            &p,
+            &db,
+            &[
+                "--lock-timeout",
+                "1",
+                "--continue-on-error",
+                "-i",
+                input.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "-- batch 2 (line 3)\n-- result 2\nn:int\n-- 0 rows\n-- error 1222 (severity 16, state "
+            ) && r.stdout.contains(", line 4): Lock request time out period exceeded.\n"),
+            "{}",
+            r.stdout
+        );
+        // Later batches still run, with the session intact: an error 1222 doesn't roll the
+        // wrapper transaction back.
+        assert!(
+            r.stdout
+                .contains("-- batch 3 (line 7)\n-- result 3\nb:int\n2\n"),
+            "{}",
+            r.stdout
+        );
+
+        // The same read, dirty, with the default lock timeout: nothing to wait for.
+        let started = Instant::now();
+        let r = live(&p, &db, &["--read-uncommitted", "-Q", &read]);
+        let elapsed = started.elapsed();
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with(
+                "-- note: reads were uncommitted (--read-uncommitted): rows may include \
+                 uncommitted, duplicated or missing data\n-- result 1\nn:int\n1\n-- 1 row\n-- ok: "
+            ),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the dirty read took {elapsed:?}"
+        );
+    }
+
+    // The note counts against --max-output like any note: the same rows, the same cap, fewer
+    // rows fit when the run read uncommitted, and the cap still holds.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_read_uncommitted_note_counts_against_the_output_cap() {
+        let (p, db) = target();
+        // 51 bytes a row.
+        let sql = "SELECT TOP 1000 REPLICATE('x', 50) AS c FROM sys.all_objects";
+        let shown = |r: &Run| r.stdout.lines().filter(|l| l.starts_with("xxxx")).count();
+        let clean = live(
+            &p,
+            &db,
+            &["--max-output", "4096", "--max-rows", "0", "-Q", sql],
+        );
+        let dirty = live(
+            &p,
+            &db,
+            &[
+                "--max-output",
+                "4096",
+                "--max-rows",
+                "0",
+                "--read-uncommitted",
+                "-Q",
+                sql,
+            ],
+        );
+        for r in [&clean, &dirty] {
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(response_bytes(r) <= 4096, "{} bytes", response_bytes(r));
+            assert!(
+                r.stdout.contains("rows shown (--max-output)"),
+                "{}",
+                r.stdout
+            );
+        }
+        assert!(
+            dirty.stdout.starts_with("-- note: reads were uncommitted"),
+            "{}",
+            dirty.stdout
+        );
+        let note_bytes = dirty.stdout.lines().next().unwrap().len() + 1;
+        let (clean_rows, dirty_rows) = (shown(&clean), shown(&dirty));
+        assert!(
+            dirty_rows < clean_rows && (clean_rows - dirty_rows) * 51 >= note_bytes - 51,
+            "{clean_rows} rows fit without the note and {dirty_rows} with it ({note_bytes} bytes)"
+        );
+    }
+
+    // PLAN.md 2.8: DEADLOCK_PRIORITY LOW makes the agent's session the victim when it
+    // deadlocks with ordinary work. The two sessions update the same two tables in opposite
+    // order; the other one (NORMAL, the server's default) wins, and sqlh's run ends with
+    // error 1205, an ordinary SQL error (exit 1) on the line of the statement that was chosen.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_agent_session_loses_a_deadlock() {
+        let (p, db) = target();
+        let one = Probe::create(&p, &db);
+        let two = Probe::create(&p, &db);
+        let (a, b) = (&one.name, &two.name);
+        let seed = format!("INSERT {a} VALUES (1); INSERT {b} VALUES (1)");
+        assert_eq!(live(&p, &db, &["--allow-write", "-Q", &seed]).code, 0);
+
+        let agent = format!(
+            "BEGIN TRAN;\nUPDATE {a} SET id = id;\nWAITFOR DELAY '00:00:02';\nUPDATE {b} SET id = id;\nROLLBACK;"
+        );
+        let production = format!(
+            "SET DEADLOCK_PRIORITY NORMAL;\nBEGIN TRAN;\nUPDATE {b} SET id = id;\nWAITFOR DELAY '00:00:02';\nUPDATE {a} SET id = id;\nROLLBACK;"
+        );
+        let started = Instant::now();
+        let agent = spawn_live(&p, &db, &["--allow-write", "-Q", &agent]);
+        let production = spawn_live(&p, &db, &["--allow-write", "-Q", &production]);
+        let (agent, production) = (collect(agent), collect(production));
+        assert!(
+            started.elapsed() < Duration::from_secs(40),
+            "{:?}",
+            started.elapsed()
+        );
+
+        assert_eq!(agent.code, 1, "{}", agent.stdout);
+        assert!(
+            agent
+                .stdout
+                .contains("\n-- error 1205 (severity 13, state ")
+                && agent.stdout.contains(", line 4): Transaction (Process ID ")
+                && agent
+                    .stdout
+                    .contains("has been chosen as the deadlock victim. Rerun the transaction.\n"),
+            "{}",
+            agent.stdout
+        );
+        assert_eq!(production.code, 0, "{}", production.stdout);
     }
 
     // PLAN.md 2.12 / DESIGN.md §5.1 and §5.2: where a message lands. No query was found that

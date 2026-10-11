@@ -46,6 +46,26 @@ impl WritePolicy {
     }
 }
 
+/// How long a statement waits for a lock by default, in seconds (DESIGN.md §4.3). Long
+/// enough for an ordinary short blocker, short enough to fail well inside `-t` so an agent
+/// gets error 1222 and can look at what blocks it.
+pub const DEFAULT_LOCK_TIMEOUT: u32 = 10;
+
+/// The longest `--lock-timeout`, in seconds: `SET LOCK_TIMEOUT` takes milliseconds in an
+/// `int`, so 2,147,483 s (about 24.8 days) is the most that fits.
+pub const MAX_LOCK_TIMEOUT: u32 = 2_147_483;
+
+/// The argument of `SET LOCK_TIMEOUT` for a timeout in seconds: milliseconds, or -1 (wait
+/// for ever) for 0. On the server 0 would mean "don't wait at all", which no setting asks
+/// for; `--lock-timeout 1` is the shortest wait.
+pub fn lock_timeout_ms(seconds: u32) -> i64 {
+    if seconds == 0 {
+        -1
+    } else {
+        i64::from(seconds) * 1000
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthKind {
     Windows,
@@ -77,6 +97,10 @@ pub struct Profile {
     pub query_timeout: Option<u32>,
     pub max_rows: Option<u64>,
     pub max_cell: Option<usize>,
+    /// Seconds a statement waits for a lock; 0 means no limit.
+    pub lock_timeout: Option<u32>,
+    /// Read without shared locks in read-only runs; ignored when writes are allowed.
+    pub read_uncommitted: Option<bool>,
 }
 
 impl Profile {
@@ -187,6 +211,11 @@ pub struct Settings {
     pub limits: Limits,
     pub query_timeout: u32,
     pub allow_write: bool,
+    /// Seconds a statement waits for a lock; 0 means no limit.
+    pub lock_timeout: u32,
+    /// Whether reads run under READ UNCOMMITTED: asked for by `--read-uncommitted` or the
+    /// profile, and never when writes are allowed.
+    pub read_uncommitted: bool,
     pub profile: Option<String>,
 }
 
@@ -284,6 +313,30 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
             p.name
         )));
     }
+    let allow_write = opts.allow_write || policy == WritePolicy::Allow;
+    // READ UNCOMMITTED is for reads that nothing is written from: a write based on a dirty
+    // read could store rows that never existed. Asked for on the command line in a run that
+    // can write, it is refused; saved in a profile, it just doesn't apply to that run
+    // (DESIGN.md §4.3).
+    if allow_write && opts.read_uncommitted == Some(true) {
+        return Err(Failure::usage(if opts.allow_write {
+            "--read-uncommitted can't be used with --allow-write: a write could be based on \
+             rows that were never committed. Drop one of the two"
+                .to_owned()
+        } else {
+            format!(
+                "--read-uncommitted applies to read-only runs, and profile {} has \
+                 write_policy = \"allow\", so this run can write. Use a profile whose \
+                 write_policy is \"flag\" or \"deny\"",
+                p.name
+            )
+        }));
+    }
+    let read_uncommitted = !allow_write
+        && opts
+            .read_uncommitted
+            .or(p.read_uncommitted)
+            .unwrap_or(false);
     let defaults = Limits::default();
     let query_timeout = opts.query_timeout.or(p.query_timeout).unwrap_or(60);
     Ok(Settings {
@@ -313,7 +366,12 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
             stall_secs: query_timeout,
         },
         query_timeout,
-        allow_write: opts.allow_write || policy == WritePolicy::Allow,
+        allow_write,
+        lock_timeout: opts
+            .lock_timeout
+            .or(p.lock_timeout)
+            .unwrap_or(DEFAULT_LOCK_TIMEOUT),
+        read_uncommitted,
         profile: profile.map(|p| p.name),
     })
 }
@@ -467,6 +525,21 @@ fn parse(text: &str) -> Result<Config, String> {
             "query_timeout" => p.query_timeout = Some(value.integer(key).map_err(err)?),
             "max_rows" => p.max_rows = Some(value.integer(key).map_err(err)?),
             "max_cell" => p.max_cell = Some(value.integer(key).map_err(err)?),
+            "lock_timeout" => {
+                let seconds: u64 = value.integer(key).map_err(err)?;
+                p.lock_timeout = Some(
+                    u32::try_from(seconds)
+                        .ok()
+                        .filter(|s| *s <= MAX_LOCK_TIMEOUT)
+                        .ok_or_else(|| {
+                            err(format!(
+                                "lock_timeout {seconds} is out of range: at most \
+                                 {MAX_LOCK_TIMEOUT} seconds; 0 means no limit"
+                            ))
+                        })?,
+                );
+            }
+            "read_uncommitted" => p.read_uncommitted = Some(value.boolean(key).map_err(err)?),
             _ => return Err(err(format!("unknown key {key} in [profiles.{}]", p.name))),
         }
     }
@@ -537,10 +610,14 @@ fn render(config: &Config) -> String {
             ("query_timeout", p.query_timeout.map(u64::from)),
             ("max_rows", p.max_rows),
             ("max_cell", p.max_cell.map(|v| v as u64)),
+            ("lock_timeout", p.lock_timeout.map(u64::from)),
         ] {
             if let Some(v) = value {
                 let _ = writeln!(out, "{key} = {v}");
             }
+        }
+        if let Some(v) = p.read_uncommitted {
+            let _ = writeln!(out, "read_uncommitted = {v}");
         }
     }
     out
@@ -659,6 +736,8 @@ mod tests {
                     query_timeout: Some(120),
                     max_rows: Some(50),
                     max_cell: Some(1000),
+                    lock_timeout: Some(0),
+                    read_uncommitted: Some(true),
                 },
                 Profile {
                     name: "local".into(),
@@ -678,6 +757,79 @@ mod tests {
         let config = parse(text).unwrap();
         assert_eq!(config.find("A").unwrap().server.as_deref(), Some("x#1"));
         assert_eq!(config.find("a").unwrap().max_rows, Some(10));
+    }
+
+    #[test]
+    fn lock_timeout_and_read_uncommitted_keys() {
+        let config = parse(
+            "[profiles.a]\nlock_timeout = 0\nread_uncommitted = true\n\
+             [profiles.b]\nlock_timeout = 2147483\nread_uncommitted = false\n[profiles.c]\n",
+        )
+        .unwrap();
+        let a = config.find("a").unwrap();
+        assert_eq!((a.lock_timeout, a.read_uncommitted), (Some(0), Some(true)));
+        let b = config.find("b").unwrap();
+        assert_eq!(
+            (b.lock_timeout, b.read_uncommitted),
+            (Some(2_147_483), Some(false))
+        );
+        let c = config.find("c").unwrap();
+        assert_eq!((c.lock_timeout, c.read_uncommitted), (None, None));
+        // Unset keys are not written, so a saved file doesn't pin the defaults.
+        let text = render(&config);
+        let c_table = text.split("[profiles.c]").nth(1).unwrap();
+        assert!(
+            !c_table.contains("lock_timeout") && !c_table.contains("read_uncommitted"),
+            "{text}"
+        );
+
+        for (line, expected) in [
+            (
+                "lock_timeout = 2147484",
+                "2: lock_timeout 2147484 is out of range: at most 2147483 seconds; 0 means no limit",
+            ),
+            (
+                "lock_timeout = 99999999999",
+                "2: lock_timeout 99999999999 is out of range: at most 2147483 seconds; 0 means no limit",
+            ),
+            (
+                "lock_timeout = \"10\"",
+                "2: lock_timeout must be a whole number",
+            ),
+            (
+                "lock_timeout = true",
+                "2: lock_timeout must be a whole number",
+            ),
+            (
+                "read_uncommitted = 1",
+                "2: read_uncommitted must be true or false",
+            ),
+            (
+                "read_uncommitted = \"true\"",
+                "2: read_uncommitted must be true or false",
+            ),
+        ] {
+            assert_eq!(
+                parse(&format!("[profiles.a]\n{line}")).unwrap_err(),
+                expected,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            parse("[profiles.a]\nlock_timeout = 5\nlock_timeout = 6").unwrap_err(),
+            "3: lock_timeout is set twice"
+        );
+    }
+
+    #[test]
+    fn lock_timeouts_become_milliseconds() {
+        assert_eq!(lock_timeout_ms(DEFAULT_LOCK_TIMEOUT), 10_000);
+        assert_eq!(lock_timeout_ms(1), 1000);
+        // 0 is "no limit" for the user, but 0 on the server means "don't wait at all".
+        assert_eq!(lock_timeout_ms(0), -1);
+        // The largest setting still fits SET LOCK_TIMEOUT's int.
+        assert!(lock_timeout_ms(MAX_LOCK_TIMEOUT) <= i64::from(i32::MAX));
+        assert!(lock_timeout_ms(MAX_LOCK_TIMEOUT + 1) > i64::from(i32::MAX));
     }
 
     #[test]
@@ -866,6 +1018,124 @@ mod tests {
                 };
                 assert!(resolve_in(&opts, file, &[]).is_ok(), "{local}");
             }
+        }
+
+        const LOCKS: &str = "[profiles.plain]\nserver = \"srv\"\nauth = \"windows\"\n\
+                             [profiles.patient]\nserver = \"srv\"\nauth = \"windows\"\nlock_timeout = 30\n\
+                             [profiles.forever]\nserver = \"srv\"\nauth = \"windows\"\nlock_timeout = 0\n";
+
+        // PLAN.md 2.8: 10 s by default, from a profile, and a flag beats the profile. 0 is a
+        // value ("no limit"), not "unset". There is no environment variable for it.
+        #[test]
+        fn the_lock_timeout_defaults_to_ten_seconds_and_follows_the_usual_precedence() {
+            let timeout = |opts: &Opts| resolve_in(opts, LOCKS, &[]).unwrap().lock_timeout;
+            assert_eq!(timeout(&with_profile("plain")), 10);
+            assert_eq!(timeout(&with_profile("patient")), 30);
+            assert_eq!(timeout(&with_profile("forever")), 0);
+            let flagged = |name: &str, seconds: u32| Opts {
+                lock_timeout: Some(seconds),
+                ..with_profile(name)
+            };
+            assert_eq!(timeout(&flagged("patient", 3)), 3);
+            assert_eq!(timeout(&flagged("patient", 0)), 0);
+            assert_eq!(timeout(&flagged("forever", 7)), 7);
+            // Without a profile, and the same in write runs.
+            let bare = Opts {
+                server: Some("srv".into()),
+                ..Opts::default()
+            };
+            assert_eq!(timeout(&bare), 10);
+            let writing = Opts {
+                allow_write: true,
+                ..with_profile("patient")
+            };
+            assert_eq!(timeout(&writing), 30);
+        }
+
+        const DIRTY: &str = "[profiles.plain]\nserver = \"srv\"\nauth = \"windows\"\n\
+                             [profiles.dirty]\nserver = \"srv\"\nauth = \"windows\"\nread_uncommitted = true\n\
+                             [profiles.dirty_writer]\nserver = \"srv\"\nauth = \"windows\"\nread_uncommitted = true\nwrite_policy = \"allow\"\n\
+                             [profiles.writer]\nserver = \"srv\"\nauth = \"windows\"\nwrite_policy = \"allow\"\n";
+
+        // Decision 7: READ UNCOMMITTED is opt-in, for read-only runs only.
+        #[test]
+        fn read_uncommitted_is_opt_in_and_for_read_only_runs() {
+            let dirty = |opts: &Opts| resolve_in(opts, DIRTY, &[]).unwrap().read_uncommitted;
+            let with = |name: &str, flag: Option<bool>, allow_write: bool| Opts {
+                read_uncommitted: flag,
+                allow_write,
+                ..with_profile(name)
+            };
+            // Off unless asked for.
+            assert!(!dirty(&with("plain", None, false)));
+            // On by the flag, or by the profile; the flag can turn a saved setting off.
+            assert!(dirty(&with("plain", Some(true), false)));
+            assert!(dirty(&with("dirty", None, false)));
+            assert!(dirty(&with("dirty", Some(true), false)));
+            assert!(!dirty(&with("dirty", Some(false), false)));
+            let bare = Opts {
+                server: Some("srv".into()),
+                read_uncommitted: Some(true),
+                ..Opts::default()
+            };
+            assert!(dirty(&bare));
+            // A profile's setting is ignored when this run can write: with --allow-write, or
+            // because the profile lets every run write.
+            assert!(!dirty(&with("dirty", None, true)));
+            assert!(!dirty(&with("dirty", Some(false), true)));
+            assert!(!dirty(&with("dirty_writer", None, false)));
+            assert!(!dirty(&with("dirty_writer", Some(false), false)));
+            // The settings that follow it are not touched.
+            let settings = resolve_in(&with("dirty", None, true), DIRTY, &[]).unwrap();
+            assert!(settings.allow_write);
+            assert_eq!(settings.lock_timeout, 10);
+        }
+
+        #[test]
+        fn read_uncommitted_on_the_command_line_with_writes_is_a_usage_error() {
+            use crate::error::Exit;
+            let refused = |opts: &Opts| {
+                let failure = resolve_in(opts, DIRTY, &[]).err().expect("refused");
+                assert_eq!(failure.exit, Exit::Usage);
+                failure.message
+            };
+            // With --allow-write, whichever profile or none: the message says why.
+            for profile in ["plain", "dirty", "writer"] {
+                let message = refused(&Opts {
+                    read_uncommitted: Some(true),
+                    allow_write: true,
+                    ..with_profile(profile)
+                });
+                assert!(
+                    message.starts_with("--read-uncommitted can't be used with --allow-write: ")
+                        && message.contains("never committed"),
+                    "{message}"
+                );
+            }
+            let message = refused(&Opts {
+                read_uncommitted: Some(true),
+                allow_write: true,
+                server: Some("srv".into()),
+                ..Opts::default()
+            });
+            assert!(message.contains("--allow-write"), "{message}");
+            // A profile that lets every run write is the same thing without the flag.
+            let message = refused(&Opts {
+                read_uncommitted: Some(true),
+                ..with_profile("writer")
+            });
+            assert!(
+                message.contains("profile writer has write_policy = \"allow\"")
+                    && message.contains("can write"),
+                "{message}"
+            );
+            // Turned off explicitly, it is no conflict.
+            let off = Opts {
+                read_uncommitted: Some(false),
+                allow_write: true,
+                ..with_profile("dirty")
+            };
+            assert!(resolve_in(&off, DIRTY, &[]).is_ok());
         }
 
         #[test]
