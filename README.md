@@ -50,7 +50,7 @@ Orders	2026-09-30T14:02:11.483
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 25 built, 9 planned.**
+**Tally: 26 built, 8 planned.**
 
 ### Built
 
@@ -80,7 +80,8 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
 - **Timeouts by default.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. *(MVP)*
 - **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. *(Phase 2.3)*
-- **Cancelling works.** Ctrl+C sends an attention and exits 6, and a harness that kills sqlh also stops the server's work (measured for a waiting query). *(MVP)*
+- **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query or waits on a slow reader. It exits 6 and says whether the server confirmed the cancel. A harness that kills sqlh also stops the server's work (measured for a waiting query). *(MVP; every console event in Phase 2.4)*
+- **Connect failures come back fast, and the same way every time.** One attempt only: a refused server fails in about 2 s, and an unreachable one after `-l` seconds. A remote name never falls back to a slow Named Pipes attempt. *(Phase 2.4)*
 
 **Fits how models already work**
 - **sqlcmd-compatible.** `-S -d -U -Q -i -v -t`, `GO`, `GO n` and `$(var)`; sqlcmd's formatting flags are accepted and ignored with one note, so a model's habits don't break. *(MVP)*
@@ -93,7 +94,6 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 - **Schema discovery commands.** `tables`, `describe`, `find`, `def`, `dbs` and `info`: focused answers instead of catalog queries. *(Phase 4)*
 - **Profile descriptions and search**, so an agent can pick the right server in one call. *(Phase 4)*
-- **Cancellation and connect failures that end promptly.** Ctrl+Break, console close, logoff and shutdown, a report of whether the server confirmed a cancel, and one attempt only on a refused connection. *(Phase 2.4, in progress)*
 - **Early stop for huge results.** A bounded drain that reports `≥N rows` instead of reading every hidden row, if the owner chooses it. *(Phase 2.6)*
 - **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` shouldn't be read whole. *(Phase 2.7)*
 - **Agent session defaults.** `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY LOW`, and perhaps `READ UNCOMMITTED` for read-only runs, so agent queries give way to production work. *(Phase 2.8)*
