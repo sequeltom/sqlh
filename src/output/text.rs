@@ -107,6 +107,20 @@ fn push_value(line: &mut String, max: usize, value: &Value, first: bool) -> bool
                 return true;
             }
         }
+        // Cut by the read, to the sink's own limit: the marker is all that's left to add.
+        Value::TextCut(s, more) => {
+            if first && s.starts_with("--") {
+                line.push('\\');
+            }
+            push_escaped(line, s, 0);
+            line.push_str(&super::cut_marker(*more, false));
+            return true;
+        }
+        Value::BinCut(bytes, more) => {
+            line.push_str(&hex(bytes, 0).0);
+            line.push_str(&super::cut_marker(*more, true));
+            return true;
+        }
     }
     false
 }
@@ -243,6 +257,10 @@ impl<W: Write> BatchSink for TextSink<W> {
 
     fn wants_values(&self) -> bool {
         self.tally.wants_values()
+    }
+
+    fn cell_limit(&self) -> usize {
+        self.tally.cell_limit()
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {

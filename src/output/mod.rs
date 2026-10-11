@@ -574,6 +574,18 @@ impl Tally {
             && (self.limits.max_rows == 0 || self.rows_shown < self.limits.max_rows)
     }
 
+    /// The most characters of a value worth reading (`BatchSink::cell_limit`): `--max-cell`.
+    /// With no cell limit, a value longer than the whole output budget in characters: every
+    /// character takes at least a byte of the response, so such a row can only be withheld, and
+    /// the read stops keeping the value there (DESIGN.md §11). 0 when neither is limited.
+    pub fn cell_limit(&self) -> usize {
+        match (self.limits.max_cell, self.limits.max_output) {
+            (0, 0) => 0,
+            (0, output) => usize::try_from(output).unwrap_or(usize::MAX),
+            (cell, _) => cell,
+        }
+    }
+
     pub fn row_shown(&mut self) {
         self.rows_total += 1;
         self.rows_shown += 1;
@@ -978,6 +990,137 @@ mod tests {
         let unlimited = tally(0);
         assert_eq!(unlimited.note_room(u64::MAX), usize::MAX);
         assert_eq!(unlimited.closing_room(7), usize::MAX);
+    }
+
+    // PLAN.md 2.7: the read cuts a large value to `cell_limit()` characters as it arrives. With
+    // `--max-cell` that is the limit itself; without, the output budget in characters, since a
+    // value longer than the whole response can only be withheld; with neither, no limit.
+    #[test]
+    fn the_cell_limit_is_what_the_sink_can_show() {
+        let limit = |max_cell, max_output| {
+            Tally::new(Limits {
+                max_cell,
+                max_output,
+                ..Limits::default()
+            })
+            .cell_limit()
+        };
+        assert_eq!(limit(500, 1_000_000), 500);
+        assert_eq!(limit(500, 0), 500);
+        assert_eq!(limit(0, 1_000_000), 1_000_000);
+        assert_eq!(limit(0, MIN_MAX_OUTPUT), 4096);
+        assert_eq!(limit(0, 0), 0);
+        assert_eq!(Tally::new(Limits::default()).cell_limit(), 500);
+    }
+
+    // PLAN.md 2.7: a value the read cut (`TextCut`, `BinCut`) is written exactly as the same
+    // value is when the sink cuts it: the same bytes and the same count of values cut, in
+    // every format. The first column starts with `--`, which the text format guards.
+    #[test]
+    fn a_value_cut_by_the_read_is_written_like_one_cut_by_the_sink() {
+        use crate::db::Value;
+        let limits = Limits {
+            max_rows: 0,
+            max_cell: 5,
+            max_results: 0,
+            max_messages: 0,
+            max_output: 0,
+            stall_secs: 0,
+        };
+        let columns = [
+            crate::db::Column {
+                name: "p".into(),
+                type_name: "nvarchar(max)".into(),
+                nullable: true,
+            },
+            crate::db::Column {
+                name: "t".into(),
+                type_name: "varchar(max)".into(),
+                nullable: true,
+            },
+            crate::db::Column {
+                name: "b".into(),
+                type_name: "varbinary(max)".into(),
+                nullable: true,
+            },
+        ];
+        // Cut by the sink, and the same rows cut by the read (five characters or two bytes
+        // kept, the rest counted).
+        let by_sink = [
+            Value::Text("--abc\"defg".into()),
+            Value::Text("héllo, wörld".into()),
+            Value::Bin(vec![0xAB, 0xCD, 0xEF]),
+        ];
+        let by_read = [
+            Value::TextCut("--abc".into(), 5),
+            Value::TextCut("héllo".into(), 7),
+            Value::BinCut(vec![0xAB, 0xCD], 1),
+        ];
+        // What a sink writes for one row, to the data stream and to the metadata stream.
+        let write = |format, row: &[Value]| {
+            let (main, meta) = (Capture::default(), Capture::default());
+            let mut out: Box<dyn Output> = match format {
+                Format::Text => Box::new(text::TextSink::with_meta(
+                    main.clone(),
+                    Box::new(meta.clone()),
+                    limits,
+                )),
+                Format::Json => Box::new(json::JsonSink::with_meta(
+                    main.clone(),
+                    Box::new(meta.clone()),
+                    limits,
+                )),
+                Format::Csv => Box::new(csv::CsvSink::new(
+                    main.clone(),
+                    Box::new(meta.clone()),
+                    limits,
+                )),
+            };
+            out.columns(&columns).unwrap();
+            assert_eq!(out.cell_limit(), 5);
+            out.row(row).unwrap();
+            out.end_rows().unwrap();
+            out.finish(&Summary {
+                exit: 0,
+                status: "ok: 1 batch, 3 ms",
+                error: None,
+                elapsed_ms: 3,
+            })
+            .unwrap();
+            out.flush().unwrap();
+            drop(out);
+            let text = |c: &Capture| String::from_utf8(c.0.lock().unwrap().clone()).unwrap();
+            (text(&main), text(&meta))
+        };
+        for format in [Format::Text, Format::Json, Format::Csv] {
+            let sunk = write(format, &by_sink);
+            let read = write(format, &by_read);
+            assert_eq!(read, sunk, "{format:?}");
+        }
+        // The text format, exactly: the guard on the first column's `--`, the markers' counts,
+        // and the footer's.
+        assert_eq!(
+            write(Format::Text, &by_read).0,
+            "-- result 1\np:nvarchar(max)\tt:varchar(max)\tb:varbinary(max)\n\
+             \\--abc…[+5]\théllo…[+7]\t0xABCD…[+1 bytes]\n\
+             -- 1 row; 3 values cut (--max-cell 5)\n-- ok: 1 batch, 3 ms\n"
+        );
+        // csv: the data, then the footer on the metadata stream.
+        let (data, meta) = write(Format::Csv, &by_read);
+        assert_eq!(data, "p,t,b\n--abc…[+5],héllo…[+7],0xABCD…[+1 bytes]\n");
+        assert!(
+            meta.contains("-- 1 row; 3 values cut (--max-cell 5)\n"),
+            "{meta}"
+        );
+        // json: one row of three strings, and the count of cut cells.
+        let doc: serde_json::Value =
+            serde_json::from_str(&write(Format::Json, &by_read).0).expect("a JSON document");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(
+            result["rows"],
+            serde_json::json!([["--abc…[+5]", "héllo…[+7]", "0xABCD…[+1 bytes]"]])
+        );
+        assert_eq!(result["cells_cut"], 3);
     }
 
     // A note that cannot fit exhausts the budget and shows in the closing note's counts.

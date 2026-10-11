@@ -1810,6 +1810,126 @@ mod live {
         }
     }
 
+    // PLAN.md 2.7: a large value shown with --max-cell is cut as it arrives, so memory stays
+    // flat. The values are built on the server, 60 MB each; before the change a run held two
+    // copies of one (about 120 MB at the peak, and 2 GB for a value of 1 GB), and now it holds
+    // the 500 characters it shows, plus the few buffers it reads through. The count of what was
+    // cut stays exact: the text has a surrogate pair that chunk boundaries fall in, and a
+    // double-byte code page.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_large_value_is_cut_as_it_arrives() {
+        let (p, db) = target();
+        let cases = [
+            // varchar(max): 60,000,000 characters, one byte each.
+            (
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big",
+                format!("{}…[+59999500]", "x".repeat(500)),
+            ),
+            // nvarchar(max): 20,000,000 characters, 60,000,000 bytes, half of them in pairs.
+            (
+                "SELECT REPLICATE(CAST(N'é😀' AS nvarchar(max)), 10000000) AS big",
+                format!("{}…[+19999500]", "é😀".repeat(250)),
+            ),
+            // varchar(max) in Japanese code page 932: 20,000,000 characters of two bytes.
+            // Built from code points, so that nothing on the way to the server can turn the
+            // text into question marks.
+            (
+                "SELECT REPLICATE(CAST((NCHAR(26085) + NCHAR(26412)) COLLATE Japanese_CI_AS \
+                 AS varchar(max)), 10000000) AS big",
+                format!("{}…[+19999500]", "日本".repeat(250)),
+            ),
+            // varbinary(max): 60,000,000 bytes; 500 hex digits are 250 bytes. (REPLICATE
+            // turns binary into varchar, so the bytes are made from text.)
+            (
+                "SELECT CAST(REPLICATE(CAST('ab' AS varchar(max)), 30000000) AS varbinary(max)) \
+                 AS big",
+                format!("0x{}…[+59999750 bytes]", "6162".repeat(125)),
+            ),
+        ];
+        for (sql, shown) in cases {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command.stdin(Stdio::null()).args([
+                "--profile",
+                &p,
+                "-d",
+                &db,
+                "--max-cell",
+                "500",
+                "-Q",
+                sql,
+            ]);
+            let (r, peak) = run_measured(&mut command);
+            assert_eq!(r.code, 0, "{sql}: {}{}", r.stdout, r.stderr);
+            let lines: Vec<&str> = r.stdout.lines().collect();
+            assert_eq!(lines[2], shown, "{sql}");
+            assert_eq!(lines[3], "-- 1 row; 1 value cut (--max-cell 500)", "{sql}");
+            assert!(
+                peak < 40 << 20,
+                "{sql}: peak working set {} MB for a value of 60 MB",
+                peak >> 20
+            );
+        }
+        // The same in json, which builds its rows in a buffer of its own.
+        let sql = "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big";
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-cell",
+            "500",
+            "--format",
+            "json",
+            "-Q",
+            sql,
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        let result = &doc["batches"][0]["events"][0];
+        assert_eq!(
+            result["rows"][0][0],
+            format!("{}…[+59999500]", "x".repeat(500))
+        );
+        assert_eq!(result["cells_cut"], 1);
+        assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
+    }
+
+    // PLAN.md 2.7: rows past --max-rows are counted without decoding their values. The first
+    // row is small and shown; the five after it hold 40 MB each, and are skipped chunk by
+    // chunk. Reading each into memory first took 40 MB or more at the peak.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn hidden_rows_are_not_materialized() {
+        let (p, db) = target();
+        let sql = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), CASE WHEN n = 1 THEN 10 \
+                   ELSE 40000000 END) AS v FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n)";
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-d",
+            &db,
+            "--max-rows",
+            "1",
+            "-Q",
+            sql,
+        ]);
+        let (r, peak) = run_measured(&mut command);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("\n1\txxxxxxxxxx\n-- 1 of 6 rows shown (--max-rows 1)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(peak < 25 << 20, "peak working set {} MB", peak >> 20);
+    }
+
     // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the
     // connection stayed usable, and not that the server confirmed the cancel: the driver gives
     // no receipt for its attention (see `Session::failure`).

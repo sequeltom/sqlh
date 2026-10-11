@@ -2,6 +2,7 @@
 //! driver can be upgraded or swapped here without touching the rest of the tool.
 
 pub mod phases;
+mod stream;
 mod types;
 mod value;
 
@@ -14,10 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{
-    BatchErrorMode, ExecuteOptions, ResultSet, StatementResult, TdsClient,
+    BatchErrorMode, CursorColumn, CursorPoll, ExecuteOptions, ResultSet, StatementResult, TdsClient,
 };
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting};
+use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::datatypes::row_writer::DiscardRowWriter;
 use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage};
 use mssql_tds::message::login_options::ApplicationIntent;
 
@@ -68,6 +70,13 @@ pub trait BatchSink {
     fn columns(&mut self, columns: &[Column]) -> io::Result<()>;
     /// False once the row limit is reached; remaining rows are then only counted.
     fn wants_values(&self) -> bool;
+    /// The most characters of a value the sink can show (for binary, hex digits: two for each
+    /// byte); 0 for all of them. The read cuts a large value (`varchar(max)` and the other types
+    /// the driver streams) to this size as it arrives and hands it over as `Value::TextCut` or
+    /// `Value::BinCut`, so it never holds more than what is shown (DESIGN.md §11). With no
+    /// `--max-cell`, the output budget is the limit: a value with more characters than the
+    /// response has bytes can't be written whole.
+    fn cell_limit(&self) -> usize;
     fn row(&mut self, values: &[Value]) -> io::Result<()>;
     fn skipped_row(&mut self);
     fn end_rows(&mut self) -> io::Result<()>;
@@ -177,6 +186,19 @@ async fn wait_for_output(gate: &dyn Backpressure, cancel: &Cancel) -> Result<(),
 
 pub struct Session {
     client: TdsClient,
+    /// Buffers for reading large values, made on first use.
+    scratch: stream::Scratch,
+}
+
+/// What the batch loop gets from one step through a result set's rows.
+enum Row {
+    /// A row to show.
+    Values(Vec<Value>),
+    /// A row read only to count it: past `--max-rows`, in a result set `--max-results` hides, or
+    /// after the output budget ran out.
+    Hidden,
+    /// The result set has ended.
+    End,
 }
 
 impl Session {
@@ -241,7 +263,10 @@ impl Session {
         };
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
         client.take_info_messages();
-        Ok(Session { client })
+        Ok(Session {
+            client,
+            scratch: stream::Scratch::default(),
+        })
     }
 
     /// One line of connection facts for --verbose.
@@ -330,31 +355,40 @@ impl Session {
         }
     }
 
+    /// Streams one result set's rows to `sink`, holding one row at a time (DESIGN.md §11).
+    ///
+    /// A result set with a column the driver can stream (`stream::plan`: `varchar(max)` and the
+    /// other PLP types) is read through the driver's column cursor, so that a large value is
+    /// cut as it arrives, and a row nobody will see is skipped without being decoded. Any other
+    /// result set is read a row at a time, which is faster for narrow rows, and a hidden row is
+    /// decoded into nothing: no value is built, and no string is copied out of the read buffer.
     async fn read_rows(
         &mut self,
         sink: &mut dyn BatchSink,
         gate: &dyn Backpressure,
         cancel: &Cancel,
     ) -> Result<(), DbError> {
-        let columns: Vec<Column> = self
-            .client
-            .get_metadata()
-            .iter()
-            .map(types::column)
-            .collect();
+        let metadata = self.client.get_metadata();
+        let columns: Vec<Column> = metadata.iter().map(types::column).collect();
+        let plan = stream::plan(metadata);
         sink.columns(&columns)?;
         loop {
-            match self.client.next_row().await {
-                Ok(Some(row)) => {
-                    if sink.wants_values() {
-                        let values: Vec<Value> = row.into_iter().map(value::convert).collect();
-                        sink.row(&values)?;
-                        wait_for_output(gate, cancel).await?;
-                    } else {
-                        sink.skipped_row();
-                    }
+            // Asked for every row: the row limit and the output budget can run out at any row.
+            let shown = sink.wants_values();
+            let step = match &plan {
+                Some(plan) => {
+                    let cap = sink.cell_limit();
+                    self.streamed_row(plan, shown.then_some(cap)).await
                 }
-                Ok(None) => break,
+                None => self.plain_row(shown).await,
+            };
+            match step {
+                Ok(Row::Values(values)) => {
+                    sink.row(&values)?;
+                    wait_for_output(gate, cancel).await?;
+                }
+                Ok(Row::Hidden) => sink.skipped_row(),
+                Ok(Row::End) => break,
                 Err(TdsError::SqlServerError { diagnostics }) => {
                     sink.end_rows()?;
                     self.flush_messages(sink)?;
@@ -368,6 +402,104 @@ impl Session {
         }
         sink.end_rows()?;
         Ok(())
+    }
+
+    /// The next row of a result set with nothing to stream. Every value is at most 8,016 bytes
+    /// (`sql_variant`), apart from `text`, `ntext` and `image`, which the driver reads whole
+    /// (and refuses over 100 MB).
+    async fn plain_row(&mut self, shown: bool) -> TdsResult<Row> {
+        if shown {
+            return Ok(match self.client.next_row().await? {
+                Some(row) => Row::Values(row.into_iter().map(value::convert).collect()),
+                None => Row::End,
+            });
+        }
+        let more = self.client.next_row_into(&mut DiscardRowWriter).await?;
+        Ok(if more { Row::Hidden } else { Row::End })
+    }
+
+    /// The next row of a result set with a column to stream, through the driver's cursor.
+    /// `cap` is `Some(limit)` for a row to show (see `BatchSink::cell_limit`), and `None` for
+    /// one to count only: the cursor stays on that row, and the next call skips its columns
+    /// without decoding them, a large value chunk by chunk.
+    async fn streamed_row(&mut self, plan: &[stream::Cell], cap: Option<usize>) -> TdsResult<Row> {
+        let positioned = match self.client.try_next_row_cursor()? {
+            CursorPoll::Ready(positioned) => positioned,
+            CursorPoll::Pending => self.client.next_row_cursor().await?,
+        };
+        if !positioned {
+            return Ok(Row::End);
+        }
+        let Some(cap) = cap else {
+            return Ok(Row::Hidden);
+        };
+        let mut values = Vec::with_capacity(plan.len());
+        for (index, cell) in plan.iter().enumerate() {
+            values.push(match cell {
+                stream::Cell::Whole => {
+                    let column = match self.client.try_read_row_column(index)? {
+                        CursorPoll::Ready(column) => column,
+                        CursorPoll::Pending => self.client.read_row_column(index).await?,
+                    };
+                    match column {
+                        CursorColumn::Value { value, .. } => value::convert(value),
+                        _ => return Err(unreadable(index)),
+                    }
+                }
+                cell => self.large_value(index, *cell, cap).await?,
+            });
+        }
+        Ok(Row::Values(values))
+    }
+
+    /// Reads column `index`, a PLP column, keeping the first `cap` characters (see `stream`).
+    ///
+    /// A small value that is already in the read buffer comes in one piece, which also leaves
+    /// the row where the next column can follow it without a stream. Anything else is opened
+    /// and read chunk by chunk.
+    async fn large_value(
+        &mut self,
+        index: usize,
+        cell: stream::Cell,
+        cap: usize,
+    ) -> TdsResult<Value> {
+        let (chunk, room) = self.scratch.buffers();
+        match self.client.try_read_row_plp_complete(index, chunk)? {
+            CursorPoll::Ready(None) => return Ok(Value::Null),
+            CursorPoll::Ready(Some(piece)) => {
+                let mut cutter =
+                    stream::Cutter::new(cell, cap, room).map_err(TdsError::ProtocolError)?;
+                cutter.push(filled(chunk, piece.read)?, true);
+                return Ok(cutter.finish());
+            }
+            CursorPoll::Pending => {}
+        }
+        let opened = match self.client.try_read_row_column(index)? {
+            CursorPoll::Ready(column) => column,
+            CursorPoll::Pending => self.client.read_row_column(index).await?,
+        };
+        match opened {
+            CursorColumn::PlpStreaming { .. } => {}
+            // NULL.
+            CursorColumn::Value { value, .. } => return Ok(value::convert(value)),
+            _ => return Err(unreadable(index)),
+        }
+        let mut cutter = stream::Cutter::new(cell, cap, room).map_err(TdsError::ProtocolError)?;
+        loop {
+            let piece = match self.client.try_read_active_plp_chunk(chunk)? {
+                CursorPoll::Ready(piece) => piece,
+                CursorPoll::Pending => self.client.read_active_plp_chunk(chunk).await?,
+            };
+            cutter.push(filled(chunk, piece.read)?, piece.reached_end);
+            if piece.reached_end {
+                return Ok(cutter.finish());
+            }
+            if piece.read == 0 {
+                return Err(TdsError::ProtocolError(
+                    "a large value's stream made no progress".into(),
+                ));
+            }
+        }
     }
 
     /// Runs a statement the tool needs (session setup, NOEXEC, the wrapper transaction),
@@ -399,6 +531,19 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// The cursor couldn't give a column of the row it is on (a bug in the driver or a protocol
+/// anomaly, never expected).
+fn unreadable(index: usize) -> TdsError {
+    TdsError::ProtocolError(format!("column {} of a row could not be read", index + 1))
+}
+
+/// The part of `chunk` a read filled, as the driver counted it.
+fn filled(chunk: &[u8], read: usize) -> TdsResult<&[u8]> {
+    chunk.get(..read).ok_or_else(|| {
+        TdsError::ProtocolError(format!("a read of {read} bytes overran its buffer"))
+    })
 }
 
 fn from_error(e: &SqlErrorInfo) -> ServerMessage {
@@ -674,7 +819,21 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, data_source, split_protocol, tcp_form, tls_hint};
+    use super::{check, data_source, filled, split_protocol, tcp_form, tls_hint};
+
+    // A count from the driver that doesn't fit the buffer it was given is an error, not a panic.
+    #[test]
+    fn a_read_count_past_the_buffer_is_an_error() {
+        let chunk = [1u8, 2, 3, 4];
+        assert_eq!(filled(&chunk, 0).unwrap(), &[] as &[u8]);
+        assert_eq!(filled(&chunk, 3).unwrap(), &[1, 2, 3]);
+        assert_eq!(filled(&chunk, 4).unwrap(), &chunk);
+        let error = filled(&chunk, 5).unwrap_err().to_string();
+        assert!(
+            error.contains("a read of 5 bytes overran its buffer"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn remote_names_connect_over_tcp_only() {
