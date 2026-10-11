@@ -579,7 +579,7 @@ async fn run_session(
         if opts.show_connection {
             out.note(&line).map_err(output_failure)?;
         } else {
-            diag(format_args!("sqlh: {line}"));
+            out.diagnostic(&line).map_err(output_failure)?;
         }
     }
 

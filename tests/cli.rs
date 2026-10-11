@@ -871,6 +871,157 @@ fn noexec_refusal_advice_fits_in_every_format() {
     }
 }
 
+/// What a run with `--max-output` wrote in all: stdout plus stderr.
+fn response_bytes(r: &Run) -> usize {
+    r.stdout.len() + r.stderr.len()
+}
+
+/// The text and csv status line is the last line of the stream that carries the metadata:
+/// stdout for text, stderr for csv.
+fn status_stream<'a>(format: &str, r: &'a Run) -> &'a str {
+    if format == "csv" {
+        &r.stderr
+    } else {
+        &r.stdout
+    }
+}
+
+// R08: --max-output caps the whole response, not only the body. A guard refusal that quotes
+// a 20,000-character identifier used to print about 20 KB under --max-output 4096 in every
+// format. The refusal is shortened in its variable part; the exit code, the advice and the
+// status (JSON: the outcome fields) are not.
+#[test]
+fn a_huge_refusal_stays_within_max_output_in_every_format() {
+    let dir = scratch("r08_refusal");
+    let file = dir.join("huge.sql");
+    fs::write(&file, format!("UPDATE [{}] SET x = 1", "a".repeat(20_000))).unwrap();
+    let path = file.display().to_string();
+    for format in ["text", "json", "csv"] {
+        let mut args = DEAD.to_vec();
+        args.extend(["-i", &path, "--max-output", "4096", "--format", format]);
+        let r = sqlh_args(&args);
+        let what = format!("{format}: {} + {} bytes", r.stdout.len(), r.stderr.len());
+        assert_eq!(r.code, 5, "{what}");
+        assert!(response_bytes(&r) <= 4096, "{what}");
+        let refusal = if format == "json" {
+            assert_eq!(r.stderr, "", "{what}");
+            let doc: serde_json::Value =
+                serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(doc["exit_code"], 5, "{what}");
+            assert_eq!(doc["ok"], false, "{what}");
+            assert!(
+                doc["summary"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("failed (exit 5)"),
+                "{what}: {doc}"
+            );
+            doc["error"].as_str().unwrap().to_owned()
+        } else {
+            // text keeps everything on stdout, csv puts its metadata on stderr and nothing
+            // on stdout.
+            let other = if format == "csv" {
+                &r.stdout
+            } else {
+                &r.stderr
+            };
+            assert_eq!(other, "", "{what}");
+            let shown = status_stream(format, &r);
+            assert!(
+                last_line(shown).starts_with("-- failed (exit 5)"),
+                "{what}: {}",
+                last_line(shown)
+            );
+            shown.lines().next().unwrap().to_owned()
+        };
+        assert!(refusal.contains("…[+"), "{what}: no cut marker");
+        assert!(
+            refusal.ends_with("nothing was run. Rerun with --allow-write if the write is intended"),
+            "{what}: the advice must survive: …{}",
+            &refusal[refusal.len().saturating_sub(120)..]
+        );
+    }
+}
+
+// R08: a long closing error is shortened the same way. A server name of 20,000 characters
+// can't be resolved, and the connection error quotes it. The run still ends with its own
+// exit code, and the status line says the same.
+#[test]
+fn a_huge_connection_error_stays_within_max_output_in_every_format() {
+    let server = "h".repeat(20_000);
+    for format in ["text", "json", "csv"] {
+        let r = sqlh_args(&[
+            "-S",
+            &server,
+            "-l",
+            "1",
+            "--max-output",
+            "4096",
+            "--format",
+            format,
+            "-Q",
+            "SELECT 1",
+        ]);
+        let what = format!("{format}: {} + {} bytes", r.stdout.len(), r.stderr.len());
+        // 2 when the name fails at once; 4 if the resolver is slow enough for the login
+        // deadline. Either way the status line must agree with the exit code.
+        assert!([2, 4].contains(&r.code), "{what}");
+        assert!(response_bytes(&r) <= 4096, "{what}");
+        let want = format!("failed (exit {})", r.code);
+        if format == "json" {
+            let doc: serde_json::Value =
+                serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(doc["exit_code"], r.code, "{what}");
+            assert!(
+                doc["summary"].as_str().unwrap().starts_with(&want),
+                "{what}"
+            );
+            assert!(doc["error"].as_str().unwrap().contains("…[+"), "{what}");
+        } else {
+            let shown = status_stream(format, &r);
+            assert!(
+                last_line(shown).starts_with(&format!("-- {want}")),
+                "{what}"
+            );
+            assert!(shown.contains("…[+"), "{what}: no cut marker");
+        }
+    }
+}
+
+// R08: --verbose lines go through the output and count against --max-output. Offline the
+// connection never succeeds, so no line is produced, but the budget, the exit code and the
+// status line must be the same with the flag as without.
+#[test]
+fn verbose_runs_stay_within_max_output() {
+    for format in ["text", "json", "csv"] {
+        let mut args = DEAD.to_vec();
+        args.extend([
+            "--verbose",
+            "--max-output",
+            "4096",
+            "--format",
+            format,
+            "-Q",
+            "SELECT 1",
+        ]);
+        let r = sqlh_args(&args);
+        let what = format!("{format}: {} + {} bytes", r.stdout.len(), r.stderr.len());
+        assert_reached_connect(&r, &what);
+        assert!(response_bytes(&r) <= 4096, "{what}");
+        if format == "json" {
+            let doc: serde_json::Value =
+                serde_json::from_str(&r.stdout).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(doc["exit_code"], 2, "{what}");
+        } else {
+            let shown = status_stream(format, &r);
+            assert!(
+                last_line(shown).starts_with("-- failed (exit 2)"),
+                "{what}: {shown}"
+            );
+        }
+    }
+}
+
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
 // break (U+0085, U+2028, U+2029) either. The run is refused before it connects, so no server
 // is needed. json is left out: its strings may hold these characters, and it has no
