@@ -23,6 +23,8 @@ CPU time for the 1 GiB values went from 1.5 s to 0.9 s (`varchar`) and from 1.8 
 
 The output of the two builds was compared byte for byte (timings aside) in 180 runs, in text, json and csv: cut limits from 6 to 1000 characters; values of 2 to 6 MB, so that chunk boundaries fall inside surrogate pairs and double-byte characters; the Japanese, Chinese (simplified and traditional), Korean, Cyrillic and Latin-1 code pages and a UTF-8 collation, all built from code points on the server; `nvarchar`, `varbinary`, `xml`, `json`, `geography`, `hierarchyid`, `text`, `ntext` and `image`; NULLs and empty strings; `FOR XML` and `FOR JSON`; procedures; rows past `--max-rows`; `--max-results`; errors after some rows; messages between result sets; and `--max-cell 0` with and without `--max-output`. None differed. The unit tests in `db/stream.rs` pin the same thing against the driver's own whole-value decoding, for 11 encodings and for random malformed bytes, in chunks of 1 byte upward.
 
+One difference is known, found afterwards and left: in the text format a value in the first column that starts with `--` gets a backslash, so that it can't pass for a metadata line. The sink decides that from the whole value, and a cut value arrives without the part past the cut, so with `--max-cell 1` the first column's `--abc` of a `(max)` column is now written `-…[+4]` where it was `\-…[+4]`. From `--max-cell 2` on the kept part still starts with `--` and nothing changes. Neither form can be mistaken for a `-- ` line.
+
 ## Why not a cutting `RowWriter`
 
 PLAN.md proposed `next_row_into` with a `RowWriter` that cuts at `--max-cell`. In 0.2.0 that cuts after the peak:
