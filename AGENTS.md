@@ -39,12 +39,13 @@ src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW)
 src/profile.rs   sqlh profile add | list | test | rm
 src/help.txt     --help text (models read it)
 src/error.rs     exit codes (DESIGN.md §6) and Failure
-src/console.rs   UTF-8 console output, echo-off password prompt
+src/console.rs   echo-off password prompt; the Git Bash path hint (the console code page is left alone)
 src/signals.rs   the console events that cancel a run: Ctrl+C, Ctrl+Break, close, logoff, shutdown
 src/files.rs     -o files: identity (refusing an input file) and the run's own .partial file
 src/script.rs    input decoding, GO splitting, $(var) substitution, line mapping
 src/guard.rs     read-only classifier (own T-SQL tokenizer)
-src/db/          the only mssql-tds user: connect, run a batch into a BatchSink, value/type rendering
+src/db/          the only mssql-tds user: connect, run a batch into a BatchSink, value/type rendering;
+                 stream.rs reads large (PLP) values in chunks and cuts them as they arrive
 src/output/      Output trait + Tally (shared limits/counts); text.rs (default), json.rs, csv.rs;
                  delivery.rs (the writer thread and its bounded queue)
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
@@ -53,7 +54,8 @@ tests/smoke.sql  read-only end-to-end script for a real server (manual)
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
-docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, agent trials)
+docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, harness kill, drain
+                 experiment, memory, Windows shells, agent trials)
 docs/schema-commands.md, docs/mcp-mode.md   designs and plans for later phases
 code-review.md   the architecture review the plan responds to
 code-review-phase1.md   the follow-up review of Phase 1 (R01–R05)
@@ -108,7 +110,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 ### Code conventions
 
 - **Errors:** one error enum in `src/error.rs`, mapped to the exit codes in DESIGN.md §6. No `unwrap` or `expect` on anything derived from user input, the network or the server.
-- **unsafe:** only in the FFI modules (`credman.rs`, `console.rs`, `files.rs`) and the tests' Ctrl+Break helper, with a `// SAFETY:` comment on each block.
+- **unsafe:** only in the FFI modules (`credman.rs`, `console.rs`, `files.rs`) and the tests' Ctrl+Break and peak-memory helpers, with a `// SAFETY:` comment on each block.
 - **Driver logging:** never install a general logger (an `env_logger`, a tracing subscriber, a `log::Log` that prints) while mssql-tds runs. At debug level it dumps TDS packets before encryption, including the login packet and its password. `db::phases`, built only with `--features timing`, keeps timestamps of a few events and never their text.
 - **Catalog SQL** must be validated on the first-release target, SQL Server 2025 Standard. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but there is no unconditional SQL Server 2012 or Azure requirement. Additional version-specific paths need a supported-target decision and a maintenance justification.
 - **Tests:**
@@ -128,6 +130,6 @@ Profiles and Credential Manager are built, and so are the json and csv formats. 
 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of [code-review.md](code-review.md). Owner decisions are recorded in its §6. Work in order:
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review [code-review-phase1.md](code-review-phase1.md) (PLAN.md, Phase 1 follow-up).
-2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is the login step, which the measurements attribute to SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done, and so are the fixes the Phase 2 review asked for ([code-review-phase2.md](code-review-phase2.md); PLAN.md, Phase 2 follow-up). Next is 2.5, harness-kill behavior.
+2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is the login step, which the measurements attribute to SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done, and so are the fixes the Phase 2 review asked for ([code-review-phase2.md](code-review-phase2.md); PLAN.md, Phase 2 follow-up). 2.5 (harness kill), 2.6 (the drain experiment; the default is owner decision 6), 2.7 (memory), 2.12 (where messages land), 2.13 (Windows shells and paths, except decision 11) and the json part of 2.11 are done too. What is left of Phase 2 waits for the owner: decisions 6, 7, 10 and 11, and agent trial 2 (2.10); 2.14 (the guard's memory) is open.
 3. Phase 3, execution core, release checks, live fixtures, and GitHub Actions CI plus a signed release workflow (3.5, 3.6).
 4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

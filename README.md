@@ -50,7 +50,7 @@ Orders	2026-09-30T14:02:11.483
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 26 built, 8 planned.**
+**Tally: 31 built, 7 planned.**
 
 ### Built
 
@@ -62,6 +62,8 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Loops don't flood.** Consecutive row counts collapse into `-- 300 statements, 300 rows affected`. *(Phase 2.2)*
 - **Data can't pass for metadata.** Control characters and Unicode line breaks are escaped, and a leading `--` in a value is too, so nothing stored in a database can forge an `-- ok:` line. *(Phase 1)*
 - **Three formats.** Text (the default, cheapest in tokens), json (one streamed document of ordered events, valid even when cut short) and csv (data only on stdout, metadata on stderr). *(MVP)*
+- **A message never lands in the middle of a result.** A PRINT or warning that arrives while a result streams is written after that result, never among its rows, and the output refuses an event out of order instead of writing a broken document. *(Phase 2.12)*
+- **JSON says where it ran and how long it took.** A json document starts with its contract version, then the server, database, auth method and encryption it connected with and the connect time; each batch ends with its duration. `sqlh --version` gives the contract version. *(Phase 2.11, json part)*
 
 **Errors an agent can act on**
 - **Errors point at the input.** File and line, mapped back through `GO` batches and `$(var)` substitution; inside a procedure, the procedure and its own line. *(MVP)*
@@ -80,22 +82,24 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
 - **Timeouts by default.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. *(MVP)*
 - **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. A slow reader isn't cut off as long as it takes each 4 KB within `-t`, and an unread stderr can't hold up the response or hang sqlh's own diagnostics. *(Phase 2.3)*
-- **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query, waits on a slow reader or delivers its last lines. It exits 6 and says what became of the statement. A harness that kills sqlh also stops the server's work (measured for a waiting query). *(MVP; every console event in Phase 2.4)*
+- **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query, waits on a slow reader or delivers its last lines. It exits 6 and says what became of the statement. A harness that kills sqlh also stops the server's work: measured for waiting, CPU-bound and lock-blocked queries, the server ends the request within about 0.1 s. *(MVP; every console event in Phase 2.4)*
 - **Connect failures come back fast, and the same way every time.** One attempt per address: a refused one fails in about 2 s, and one that doesn't answer after `-l` seconds. sqlh never makes the slow, uncancellable Named Pipes attempt to another machine: remote names go over TCP, and an explicit remote pipe is refused with the TCP spelling to use. *(Phase 2.4)*
 
 **Fits how models already work**
 - **sqlcmd-compatible.** `-S -d -U -Q -i -v -t`, `GO`, `GO n` and `$(var)`; sqlcmd's formatting flags are accepted and ignored with one note, so a model's habits don't break. *(MVP)*
 - **`--help` written for models.** Example-first, about 60 lines, with the discovery tips agent trial 1 showed were missing (`SELECT TOP 0 * FROM x` for a table's columns). *(Phase 2.9)*
-- **Multi-line SQL on stdin.** Heredocs and `-i -` work, and UTF-8 and UTF-16 input are decoded. *(MVP)*
+- **Multi-line SQL from any shell.** `-i file.sql` works everywhere, and stdin (`-i -`, heredocs) where the shell has it; UTF-8 and UTF-16 input are decoded. *(MVP)*
+- **Works the same in cmd.exe, PowerShell and Git Bash.** The `--help` examples run unchanged in each, and a test runs them. A Git Bash path (`/c/dir/f.sql`) that cmd.exe or PowerShell can't find is answered with the Windows spelling to use, and sqlh leaves the console's code page as it found it. *(Phase 2.13)*
+- **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. *(Phase 2.13)*
 - **The same answers as SSMS.** Session `SET` options match SSMS, so plans and filtered-index behavior match what the DBA sees. *(MVP)*
 - **One exe, no dependencies.** About 2 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
+- **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, and a runaway `$(var)` expansion is refused at 10 MB before it is built, so one careless query can't exhaust the machine the agent runs on. *(Phase 2.7)*
 
 ### Planned
 
 - **Schema discovery commands.** `tables`, `describe`, `find`, `def`, `dbs` and `info`: focused answers instead of catalog queries. *(Phase 4)*
 - **Profile descriptions and search**, so an agent can pick the right server in one call. *(Phase 4)*
 - **Early stop for huge results.** A bounded drain that reports `≥N rows` instead of reading every hidden row, if the owner chooses it. *(Phase 2.6)*
-- **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` shouldn't be read whole. *(Phase 2.7)*
 - **Agent session defaults.** `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY LOW`, and perhaps `READ UNCOMMITTED` for read-only runs, so agent queries give way to production work. *(Phase 2.8)*
 - **Connection reuse.** An MCP server or a local daemon, so repeated calls skip the connect, with native tools and read/write permissions the harness can gate. *(Phase 5)*
 - **A wider read-only allowlist** for DBA workflows (`xp_readerrorlog`, `xp_instance_regread`, showplans) from a categorization of commands, not a longer blocklist. *(Phase 6)*
