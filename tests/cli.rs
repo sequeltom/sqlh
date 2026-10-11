@@ -1432,6 +1432,98 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
+/// Runs `command` to its end and also returns the child's peak working set in bytes. Windows
+/// keeps that with the process handle, which `Child` holds until it is dropped, so it can be
+/// read after the child has exited. The pipes are drained in the order a run writes them: a
+/// run of sqlh writes little to stderr.
+#[cfg(windows)]
+fn run_measured(command: &mut Command) -> (Run, usize) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    /// PROCESS_MEMORY_COUNTERS.
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        size: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        peak_paged_pool: usize,
+        paged_pool: usize,
+        peak_non_paged_pool: usize,
+        non_paged_pool: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+
+    // kernel32 exports GetProcessMemoryInfo under this name since Windows 7.
+    unsafe extern "system" {
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut MemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().expect("sqlh ends");
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let mut counters = MemoryCounters {
+        size: std::mem::size_of::<MemoryCounters>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the handle is the child's own process handle, which `child` keeps open; the
+    // counters are a correctly sized, writable struct, and `size` says how big it is.
+    let read =
+        unsafe { K32GetProcessMemoryInfo(child.as_raw_handle(), &mut counters, counters.size) };
+    assert_ne!(read, 0, "peak memory: {}", std::io::Error::last_os_error());
+    let run = Run {
+        code: status.code().expect("an exit code, not a signal"),
+        stdout,
+        stderr,
+    };
+    (run, counters.peak_working_set)
+}
+
+// PLAN.md 2.7: $(var) substitution is checked against the 10 MB limit while the text is built,
+// so a reference repeated 200,000 times to a 3,000-byte value is refused when it reaches the
+// limit, not after it has been expanded: that would be 600 MB, and the whole run now takes a
+// few megabytes more than the file it reads.
+#[cfg(windows)]
+#[test]
+fn a_runaway_substitution_is_refused_without_being_built() {
+    let dir = scratch("f06_expansion");
+    let file = dir.join("expand.sql");
+    fs::write(&file, "$(big)".repeat(200_000)).unwrap();
+    let value = format!("big={}", "x".repeat(3_000));
+    let (r, peak) = run_measured(sqlh().args(DEAD).args(["-v", &value, "-i"]).arg(&file));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("after $(var) substitution the SQL is over the 10 MB limit; run it in parts"),
+        "{}",
+        r.stdout
+    );
+    assert!(peak < 100 << 20, "peak working set {} MB", peak >> 20);
+}
+
 // F10: a truncated UTF-16 file is an error, not a silent loss of the last byte.
 #[test]
 fn odd_length_utf16_is_rejected() {
