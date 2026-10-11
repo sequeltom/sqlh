@@ -919,7 +919,9 @@ mod live {
         }
     }
 
-    // PLAN.md 2.4: Ctrl+Break cancels a running statement, and the server confirms it.
+    // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the
+    // connection stayed usable, and not that the server confirmed the cancel: the driver gives
+    // no receipt for its attention (see `Session::failure`).
     #[cfg(windows)]
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -960,9 +962,13 @@ mod live {
         stderr.read_to_string(&mut rest).unwrap();
         assert_eq!(status.code(), Some(6), "{stdout}{rest}");
         assert!(
-            stdout.contains("-- error: cancelled by Ctrl+Break: the server confirmed the cancel\n"),
+            stdout.contains(
+                "-- error: cancelled by Ctrl+Break: the statement was cancelled; the connection \
+                 stayed usable\n"
+            ),
             "{stdout}"
         );
+        assert!(!stdout.contains("confirmed"), "{stdout}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 

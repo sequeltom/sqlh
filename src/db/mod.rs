@@ -83,8 +83,9 @@ pub enum DbError {
     /// The connection broke mid-run.
     Lost(String),
     Timeout(String),
-    /// A cancel ended the work. The text says what became of it: whether the server
-    /// confirmed the cancel, or the connection was closed instead.
+    /// A cancel ended the work. The text says what sqlh observed, no more: the connection
+    /// stayed usable, or it was closed instead. Never that the server confirmed the cancel
+    /// (see `Session::failure`).
     Cancelled(String),
     /// A statement the tool itself sent failed.
     Sql(String),
@@ -301,12 +302,22 @@ impl Session {
         Ok(())
     }
 
-    /// A driver error mid-run. A cancel says whether the server confirmed it: the driver
-    /// marks the connection dead when its attention goes unacknowledged.
+    /// A driver error mid-run. For a cancel, sqlh knows one thing: whether the driver marked
+    /// the connection dead, which it does when its attention goes unacknowledged.
+    ///
+    /// A connection not marked dead is a liveness observation, not a receipt for the
+    /// attention. In mssql-tds 0.2.0 the flag is still false after an acknowledged attention
+    /// (DONE_ATTN), but also when the cancel came before the request was sent and when a
+    /// partly sent request was withdrawn with EOM|IGNORE; in those two the server confirmed
+    /// nothing. The driver exposes no receipt: its settlement marker is private, and
+    /// `send_attention_with_timeout` would send a new attention rather than report the old one.
+    /// So that case says only what was observed, and "the server confirmed" is never claimed.
     fn failure(&self, error: TdsError) -> DbError {
         match error {
             TdsError::OperationCancelledError(_) if !self.client.is_connection_dead() => {
-                DbError::Cancelled("the server confirmed the cancel".into())
+                DbError::Cancelled(
+                    "the statement was cancelled; the connection stayed usable".into(),
+                )
             }
             TdsError::OperationCancelledError(_) => DbError::Cancelled(
                 "the server didn't confirm the cancel, so the connection was closed".into(),
