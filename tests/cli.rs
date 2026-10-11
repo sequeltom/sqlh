@@ -2599,6 +2599,8 @@ mod live {
             r.stdout
         );
         assert!(peak < 25 << 20, "peak working set {} MB", peak >> 20);
+    }
+
     // PLAN.md 2.5 (docs/notes/harness-kill.md): a harness that kills sqlh outright, here with
     // TerminateProcess, leaves no work running on the server. The session is gone within
     // seconds, for a waiting query and for a CPU-bound one that sends nothing. The note measured
