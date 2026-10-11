@@ -50,7 +50,7 @@ src/output/      Output trait + Tally (shared limits/counts); text.rs (default),
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
 tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server (manual)
-README.md        human-facing intro, build, quick start, safety note
+README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
 docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, agent trials)
@@ -94,7 +94,15 @@ The test server is the owner's, reached through a profile named `test`. The owne
 - Keep real server data, connection profiles, credentials and personal agent state out of commits. Do not blanket-ignore SQL, JSON or CSV: those formats can also hold legitimate fixtures and examples.
 - Keep `target/` as a local build cache during active development. Run `cargo clean` when reclaiming disk space or troubleshooting build artifacts; the next build must recreate them. Do not routinely clean between agent turns.
 - Before committing, inspect `git status --short`, `git diff --cached --stat`, and `git diff --cached`. Use `git ls-files --cached --ignored --exclude-standard` to catch previously tracked files that ignore rules do not remove. Review new files as well as edits.
+- Never commit executables. When releases are ready, distribute them as GitHub release assets.
 - Preserve useful development history. Move obsolete documents to a clearly named archive under `docs/` only when they are superseded, and update references in the same change. Before a public push, review the history as well as the current tree for private data.
+
+### Documents and their readers
+
+- **README.md is for humans:** people deciding whether to use sqlh, building it, or getting started. Write it plainly and briefly: what the tool does and why it matters, with little spec detail and no instructions addressed to agents.
+- **Everything else is consumed mostly by agents** (and the owner skimming): this file, `docs/` (VISION, PLAN, DESIGN, the notes, the designs), the reviews, and `--help`. Write these for exactness and completeness: precise strings, section numbers to cross-reference, and the reasons an agent needs to act correctly. Density is fine there.
+- **The docs are the source of truth.** A fact goes into DESIGN.md or PLAN.md first, and the README gets a plain-language summary of it, never the only record. If the README and the docs disagree, the docs win, and the README is corrected.
+- Instructions for agents go in this file, not the README.
 
 ### Code conventions
 
@@ -109,6 +117,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop.
   - Test server details and credentials never go in the repo.
 - **`--help`:** models read it, so keep it example-first and under about 60 lines.
+- **README's "Built for agents" is a running tally.** When a change adds, alters or removes something made for agents (output shape, limits, errors, exit codes, guard behavior, safeguards, `--help` content), update that list in the same change: the entry, its `*(since ...)*` tag and the tally line. A planned item moves to Built only when its code and tests are committed; until then it stays under Planned with its PLAN.md task number. The README has a human reader (see "Documents and their readers"), so write each entry as what an agent gains and why it matters, in one or two plain lines; the exact behavior belongs in DESIGN.md.
 
 ## Status
 
