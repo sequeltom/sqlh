@@ -156,10 +156,17 @@ These keep a careless query from flooding an agent's context:
 - **Cells.** A cell longer than `--max-cell` is cut at a character boundary and ends with `…[+N]`, where N is the number of characters left out. A binary value shows at most `--max-cell / 2` bytes and ends with `…[+N bytes]`. The result set's footer counts the truncated cells.
 - **Result sets and messages.** Past their caps (for example, a `WHILE` loop that selects or prints), output is counted, not printed.
 - **Row counts.** Consecutive row counts within a batch become one line, `-- 300 statements, 300 rows affected`, so a loop of inserts prints one line rather than 300. A result set, message or error in between starts a new line.
-- **Total output.** `--max-output` (default 1,000,000 bytes) caps everything a run writes, in every format, across stdout and stderr.
-  - Once the next piece wouldn't fit, nothing more of the body is written: no result sets, rows, messages, errors, row counts or batch markers.
-  - The result set being shown still ends with its footer: `-- 80 of 500 rows shown (--max-output)`. Notes and a guard refusal are always written too.
-  - The last 1,024 bytes are kept for the closing lines, which are always written: a note that the output stopped and what wasn't shown, then the status. JSON stays a valid document, with the cut result marked `"truncated":true`.
+- **Total output.** `--max-output` (default 1,000,000 bytes; 0 = no limit, otherwise at least 4096) caps the whole response in every format: the bytes sqlh writes to stdout (or `-o`) and stderr together never exceed it. They are counted as encoded UTF-8 after escaping, so a `\x01` costs 4 bytes and a `\u2028` 6. Everything counts: data, metadata, result footers, csv's `-- result` markers, JSON's brackets and closers, notes, a guard refusal, the closing error, the status line and `--verbose` lines. The exceptions are `--help` and `--version`; the last-resort messages on stderr when delivery itself has failed (exit 7) or sqlh has crashed (exit 10); and, for now, the exit 3 errors found while reading the options, the input and `-o`, which are written before the output is set up and so under the default cap of 1,000,000 bytes (known gap).
+  - **The body** (result sets, rows, messages, errors, row counts, batch markers) is written piece by piece while each piece fits in what the cap has left after a reserve of 1,024 bytes. Once one doesn't fit, nothing more of the body is written, even a small piece. The result set being shown still ends with its footer, `-- 80 of 500 rows shown (--max-output)`. JSON stays a valid document, with the cut result marked `"truncated":true`.
+  - **Text of any length** is shortened to fit, as a cut cell is: it ends with `…[+N]`, N being the number of characters left out (counted before escaping; a cut never splits an escape sequence or a character). That covers notes, a guard refusal, the closing error, the limit notes below, and `--verbose` lines.
+    - A note, a refusal or a `--verbose` line is shortened when it is written, to what the cap has left less 512 bytes. JSON counts a note from the moment it arrives, although the document gets it last.
+    - A guard refusal is cut in its variable parts only: the location, the reason (which can quote a huge identifier) and the advice. The words between them stay, so the agent still reads that nothing was run and what to do: `-- blocked: line 1: UPDATE [aaaa…[+16537]; nothing was run. Rerun with --allow-write if the write is intended`.
+    - The closing error and the limit notes are shortened when the run ends, to what the cap has left after the status line. When several need cutting they share that room evenly: a short one stays whole, and the long ones are cut by the same size.
+    - Text that cannot fit even as a bare marker is dropped and counted, and the closing note says so: `...these weren't shown: 1 note`. That stops the body too, like any piece that didn't fit.
+  - **The end is never cut.** The status line (JSON: `ok`, `exit_code`, `summary`, `elapsed_ms`) is always written whole, and in text and csv the result being shown gets its footer, in JSON the open result and batch their closers. Two reserves make room for them:
+    - The body stops 1,024 bytes short of the cap (the reserve above). The rest of the run's end uses that room: the footer or closers, the closing error, the note that the output stopped and what wasn't shown (counts of result sets, messages, errors, row counts, batches and notes), and the status. At the minimum cap of 4096 bytes the body has 3,072.
+    - Notes, refusals and `--verbose` lines stop 512 bytes short of the cap, however full it is. The widest ending that has to fit those 512 bytes (a footer or JSON's closers, and the status line, with every number at its widest and the longest status line sqlh builds) takes about 420, and the tests pin that. sqlh builds the status line from bounded parts and never shortens it; if a status line ever grows, the 512 must grow with it.
+  - **Shortening changes no outcome.** A refusal is still exit 5 and a SQL error exit 1; the exit code, the status line and the JSON outcome fields say what happened whether or not the text around them was cut.
 - **Limits never change what runs.** Like the row limit, the output limit only stops printing: the run continues to the end, and the counts (rows, errors, the status line) stay exact. Whether to stop early instead is the open drain question (PLAN.md 2.6).
 - **Input.** At most 10 MB of SQL per run, across `-Q`, `-i` files and stdin, and again after `$(var)` substitution; `GO n` runs a batch at most 1000 times. Past either, the run is refused with exit 3 before anything connects.
 
@@ -195,7 +202,9 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 - **Statement summaries:** `-- N rows affected` for DML. Consecutive ones become one line, `-- 300 statements, 300 rows affected` (§4.4).
 - **Messages:** `-- msg: text` for PRINT and messages of severity 10 or lower.
 - **Errors:** `-- error <num> (severity S, state T, line L[, proc P]): message`.
-- **Final summary:** the last line of complete output, either `-- ok: ...` or `-- failed (exit N): ...`. Output is cut short only when it couldn't be delivered (exit 7) or sqlh crashed (exit 10, where the line is best effort). Then the exit code is what counts (§4.3, §6).
+- **Notes, refusals and the run's error:** `-- note: text`; `-- blocked: line L: reason; nothing was run. advice` for a guard refusal (exit 5); `-- error: text` for why the run stopped early (the closing lines come in this order: the error, the notes about limits that hid output, the status). With a short `--max-output` their variable text ends in `…[+N]`, N the characters left out (§4.4). The reason can quote an identifier of any length, so it is the part that gets cut; `; nothing was run.` and the advice are not.
+- **Final summary:** the last line of complete output, either `-- ok: ...` or `-- failed (exit N): ...`. It is never shortened, not even by `--max-output` (§4.4). Output is cut short only when it couldn't be delivered (exit 7) or sqlh crashed (exit 10, where the line is best effort). Then the exit code is what counts (§4.3, §6).
+- **Diagnostics:** `--verbose` writes `sqlh: <text>` lines to stderr, the one thing text and json put there. They are escaped like a note, counted in `--max-output` and shortened like a note; if stderr is closed they are lost and nothing else changes (§6).
 
 **Escaping (values, names, and every variable field in metadata lines)**
 
@@ -267,6 +276,7 @@ id:int	name:nvarchar(50)	created:datetime2(7)
 - `notes` (when present), `error` (when the run stopped early, including a guard block), `ok`, `exit_code`, `summary` (the text format's status line) and `elapsed_ms`.
 - Failures before any batch, such as a bad profile or a refused connection, still produce a well-formed document with `"batches":[]`.
 - A run that dies mid-result closes the open result with `"interrupted":true`.
+- **Within `--max-output` (§4.4)** the whole document is: valid, no longer than the cap, and with `ok`, `exit_code`, `summary` and `elapsed_ms` intact. What gives way is text. A note is shortened when it is recorded, and a note that can't fit even as a marker is left out and counted (`"...these weren't shown: 1 note"`). `error` is shortened when the document ends, in its variable parts if it is a guard refusal; a cut string ends in `…[+N]`, N the characters left out. The closers of the open result and batch (`],"row_count":...}]}`) and the outcome fields are never cut: the reserves in §4.4 leave room for them. `--verbose` lines are not in the document; they go to stderr, counted in the same cap.
 
 ### 5.3 csv and md
 
@@ -274,7 +284,8 @@ id:int	name:nvarchar(50)	created:datetime2(7)
   - RFC 4180 fields with LF line endings: a header row of column names, the rows, then a blank line before the next result set.
   - NULL is an empty unquoted field, and an empty string is `""`.
   - A field is quoted when it contains a comma, quote or line break, or starts or ends with whitespace.
-  - The data stream (stdout, or `-o`) holds only CSV. Everything else goes to stderr as text-format `-- ` lines: `-- result N: name:type, ...` with the column types, row counts and truncation, messages, errors, notes, and the status line.
+  - The data stream (stdout, or `-o`) holds only CSV. Everything else goes to stderr as text-format `-- ` lines: `-- result N: name:type, ...` with the column types, row counts and truncation, messages, errors, notes, and the status line. `--verbose` adds `sqlh: <text>` lines to the same stream.
+  - `--max-output` (§4.4) counts both streams together. Notes, a guard refusal and the closing error are shortened with `…[+N]` as in the text format, and the status line is the last line of stderr, whole.
   - Limits apply as everywhere; for a full export pass `--max-rows 0 --max-cell 0`.
   - Known ambiguity: a one-column row holding NULL is an empty line, the same as the separator between result sets.
 - **md (not built yet):** unpadded GitHub tables. `|` is written as `\|` and newlines as `<br>`. Messages are plain lines.

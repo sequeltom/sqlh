@@ -2,29 +2,49 @@
 //! `events` array (result, msg, rows_affected, error); the run's outcome comes last because
 //! it is only known at the end. `finish` closes whatever is open, so a run that fails
 //! mid-result still yields valid JSON.
+//!
+//! The output budget (`--max-output`) covers the whole document, which the sink counts
+//! piece by piece: events are admitted or taken back whole; a note is shortened when it is
+//! recorded and its bytes count from then on, though it is written last; the closers of
+//! the result and batch still open and the outcome fields come out of the reserve.
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use super::{BatchInfo, Limits, Output, Summary, Tally, blocked_message, cut, cut_marker, hex};
+use super::text::write_diagnostic;
+use super::{
+    BatchInfo, Layout, Limits, Output, Summary, Tally, cut, cut_marker, hex, push_blocked,
+    push_within,
+};
 use crate::db::{BatchSink, Column, ServerMessage, Value};
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;
 
+/// What the `notes` array costs once, however many notes it holds: `,"notes":[` and `]`.
+const NOTES_ARRAY: usize = ",\"notes\":[]".len();
+
 pub struct JsonSink<W: Write> {
     out: W,
+    /// stderr, for `Output::diagnostic` lines only.
+    meta: Box<dyn Write>,
     tally: Tally,
     buf: String,
     /// Bytes already written from `buf`, for the output budget.
     drained: u64,
+    /// Bytes of diagnostics written to `meta`.
+    meta_written: u64,
     opened: bool,
     batches: usize,
     in_batch: bool,
     events: usize,
     in_result: bool,
+    /// The notes, already shortened to fit and written as JSON string content (escaped,
+    /// without the quotes). `notes_bytes` is what they will take in the document.
     notes: Vec<String>,
-    blocked: Option<String>,
+    notes_bytes: u64,
+    /// A guard refusal as (location, reason, advice); it becomes the document's `error`.
+    blocked: Option<(String, String, String)>,
 }
 
 /// The buffer and document state before an event, so that an event the output budget
@@ -38,18 +58,27 @@ struct Mark {
 }
 
 impl<W: Write> JsonSink<W> {
+    /// A sink whose diagnostics go nowhere, for tests that look at the document only.
+    #[cfg(test)]
     pub fn new(out: W, limits: Limits) -> Self {
+        Self::with_meta(out, Box::new(io::sink()), limits)
+    }
+
+    pub fn with_meta(out: W, meta: Box<dyn Write>, limits: Limits) -> Self {
         JsonSink {
             out,
+            meta,
             tally: Tally::new(limits),
             buf: String::with_capacity(1024),
             drained: 0,
+            meta_written: 0,
             opened: false,
             batches: 0,
             in_batch: false,
             events: 0,
             in_result: false,
             notes: Vec::new(),
+            notes_bytes: 0,
             blocked: None,
         }
     }
@@ -64,9 +93,15 @@ impl<W: Write> JsonSink<W> {
         }
     }
 
+    /// Bytes counted against the output budget with `pending` bytes of `buf` not yet
+    /// accepted: what was written to either stream, plus what the notes will take.
+    fn spent(&self, pending: usize) -> u64 {
+        self.drained + pending as u64 + self.meta_written + self.notes_bytes
+    }
+
     /// Whether what was appended since `mark` fits the output budget; if not, takes it back.
     fn admit_since(&mut self, mark: Mark) -> bool {
-        let used = self.drained + mark.len as u64;
+        let used = self.spent(mark.len);
         if self.tally.admit(used, self.buf.len() - mark.len) {
             return true;
         }
@@ -206,18 +241,36 @@ fn push_str(out: &mut String, s: &str) {
 /// Appends the JSON-escaped content of `s`, without quotes.
 fn push_escaped(out: &mut String, s: &str) {
     for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
+        push_char(out, c);
     }
+}
+
+/// Appends one character as it is written inside a JSON string.
+fn push_char(out: &mut String, c: char) {
+    match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        c if (c as u32) < 0x20 => {
+            let _ = write!(out, "\\u{:04x}", c as u32);
+        }
+        c => out.push(c),
+    }
+}
+
+/// The document's last fields: `,"ok":...,"elapsed_ms":N}` and a newline. The status is
+/// never shortened.
+fn outcome(summary: &Summary) -> String {
+    let mut out = format!(
+        ",\"ok\":{},\"exit_code\":{},\"summary\":",
+        summary.exit == 0,
+        summary.exit
+    );
+    push_str(&mut out, summary.status);
+    let _ = writeln!(out, ",\"elapsed_ms\":{}}}", summary.elapsed_ms);
+    out
 }
 
 impl<W: Write> BatchSink for JsonSink<W> {
@@ -358,9 +411,11 @@ impl<W: Write> Output for JsonSink<W> {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()> {
         self.flush_affected()?;
         self.tally.begin_batch(batch);
-        self.open();
+        // The previous batch's closers are not up for admission. The document head is: it
+        // comes back out with the batch if the budget refuses both.
         self.close_batch();
         let mark = self.mark();
+        self.open();
         if self.batches > 0 {
             self.buf.push(',');
         }
@@ -386,15 +441,41 @@ impl<W: Write> Output for JsonSink<W> {
         self.drain(false)
     }
 
+    /// Shortened to fit what the budget has left before the status reserve, and counted at
+    /// once; the document gets it at the end.
     fn note(&mut self, text: &str) -> io::Result<()> {
         self.flush_affected()?;
-        self.notes.push(text.to_owned());
+        // The array costs `,"notes":[` and `]` once, plus quotes and a comma for each note.
+        let overhead = if self.notes.is_empty() {
+            NOTES_ARRAY + 2
+        } else {
+            3
+        };
+        let mut encoded = String::new();
+        let fitted = self
+            .tally
+            .note_room(self.spent(self.buf.len()))
+            .checked_sub(overhead)
+            .and_then(|room| push_within(&mut encoded, text, room, push_char));
+        if fitted.is_some() {
+            self.notes_bytes += (overhead + encoded.len()) as u64;
+            self.notes.push(encoded);
+        } else {
+            self.tally.withhold_note();
+        }
         Ok(())
     }
 
+    /// Kept for the end, where it becomes `error` and is shortened to the room that is left.
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {
         self.flush_affected()?;
-        self.blocked = Some(blocked_message(location, reason, advice));
+        self.blocked = Some((location.to_owned(), reason.to_owned(), advice.to_owned()));
+        Ok(())
+    }
+
+    fn diagnostic(&mut self, text: &str) -> io::Result<()> {
+        let used = self.spent(self.buf.len());
+        self.meta_written += write_diagnostic(&mut self.meta, &mut self.tally, used, text)?;
         Ok(())
     }
 
@@ -403,31 +484,53 @@ impl<W: Write> Output for JsonSink<W> {
         self.open();
         self.close_batch();
         self.buf.push(']');
-        let mut notes = std::mem::take(&mut self.notes);
-        notes.extend(self.tally.limit_notes());
-        if !notes.is_empty() {
-            self.buf.push_str(",\"notes\":[");
-            for (i, note) in notes.iter().enumerate() {
-                if i > 0 {
-                    self.buf.push(',');
-                }
-                push_str(&mut self.buf, note);
+        let limit_notes = self.tally.limit_notes();
+        let notes = std::mem::take(&mut self.notes);
+        let blocked = self.blocked.take();
+        let closing = outcome(summary);
+        // The notes already recorded, the limit notes and the error, then the outcome. Only
+        // the limit notes and the error can still be shortened: the recorded notes were
+        // fitted when they arrived, and the outcome never is.
+        let mut layout = Layout::new();
+        if !notes.is_empty() || !limit_notes.is_empty() {
+            layout.text(",\"notes\":[");
+            let mut first = true;
+            for note in &notes {
+                layout
+                    .text(if first { "\"" } else { ",\"" })
+                    .text(note)
+                    .text("\"");
+                first = false;
             }
-            self.buf.push(']');
+            for note in &limit_notes {
+                layout
+                    .text(if first { "\"" } else { ",\"" })
+                    .part(note)
+                    .text("\"");
+                first = false;
+            }
+            layout.text("]");
         }
-        if let Some(error) = summary.error.or(self.blocked.as_deref()) {
-            let error = error.to_owned();
-            self.buf.push_str(",\"error\":");
-            push_str(&mut self.buf, &error);
+        match (summary.error, &blocked) {
+            (Some(error), _) => {
+                layout.text(",\"error\":\"").part(error).text("\"");
+            }
+            (None, Some((location, reason, advice))) => {
+                layout.text(",\"error\":\"");
+                push_blocked(&mut layout, location, reason, advice);
+                layout.text("\"");
+            }
+            (None, None) => {}
         }
-        let _ = write!(
-            self.buf,
-            ",\"ok\":{},\"exit_code\":{},\"summary\":",
-            summary.exit == 0,
-            summary.exit
-        );
-        push_str(&mut self.buf, summary.status);
-        let _ = writeln!(self.buf, ",\"elapsed_ms\":{}}}", summary.elapsed_ms);
+        layout.text(&closing);
+        // The recorded notes are in the layout now, so they are not counted twice.
+        let room = self
+            .tally
+            .closing_room(self.drained + self.buf.len() as u64 + self.meta_written);
+        // No room for even a cut error or note (the reserve makes this unreachable): the
+        // outcome alone.
+        let tail = layout.fit(room, push_char).unwrap_or(closing);
+        self.buf.push_str(&tail);
         self.drain(true)
     }
 
@@ -437,13 +540,17 @@ impl<W: Write> Output for JsonSink<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.drain(true)?;
-        self.out.flush()
+        self.out.flush()?;
+        self.meta.flush()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::text::tests::{batch, col, error, limits, msg, summary};
+    use super::super::text::tests::{
+        ADVICE, INTERRUPTED_STATUS, RAGGED_STATUS, Shared, batch, capped, col, cut_by, error,
+        interrupted_run, limits, msg, quoting, ragged_run, summary,
+    };
     use super::*;
     use serde_json::{Value as Json, json};
 
@@ -652,5 +759,309 @@ mod tests {
         assert_eq!(events[0]["source"], json!("b.sql"));
         assert_eq!(events[1]["procedure"], json!("dbo.p"));
         assert_eq!(events[1]["line"], json!(7));
+    }
+
+    // The whole-response budget (R08). A json sink with a stream each for the document and
+    // the diagnostics; the document is parsed, so every test also proves it is valid JSON.
+
+    fn sink(limits: Limits) -> (JsonSink<Shared>, Shared, Shared) {
+        let (main, meta) = (Shared::default(), Shared::default());
+        let sink = JsonSink::with_meta(main.clone(), Box::new(meta.clone()), limits);
+        (sink, main, meta)
+    }
+
+    fn document(main: &Shared) -> Json {
+        let text = main.text();
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    fn refused(exit: u8, status: &str) -> Summary<'_> {
+        Summary {
+            exit,
+            status,
+            error: None,
+            elapsed_ms: 0,
+        }
+    }
+
+    // A guard refusal that quotes a 20,000-character identifier is shortened in its variable
+    // part: the document stays within --max-output, valid, with the advice and the outcome.
+    #[test]
+    fn a_huge_refusal_is_shortened_to_the_budget() {
+        let (mut s, main, meta) = sink(capped(4096));
+        s.blocked("line 1", &quoting(20_000), ADVICE).unwrap();
+        s.finish(&refused(
+            5,
+            "failed (exit 5): blocked by the read-only guard, 0 ms",
+        ))
+        .unwrap();
+        assert_eq!(meta.bytes(), 0);
+        assert!(main.bytes() <= 4096, "{} bytes", main.bytes());
+        assert!(main.bytes() >= 4096 - 8, "the error takes the room");
+        let doc = document(&main);
+        assert_eq!(doc["batches"], json!([]));
+        assert_eq!(doc["ok"], false);
+        assert_eq!(doc["exit_code"], 5);
+        assert_eq!(
+            doc["summary"],
+            "failed (exit 5): blocked by the read-only guard, 0 ms"
+        );
+        let error = doc["error"].as_str().unwrap();
+        assert!(error.starts_with("line 1: UPDATE [qqqq"), "{error}");
+        assert!(error.ends_with(ADVICE), "{error}");
+        assert!(error.contains("]; nothing was run. "), "{error}");
+        assert_eq!(
+            error.matches('q').count() + cut_by(error),
+            20_000 + "] would write".len()
+        );
+    }
+
+    // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
+    // the 512-byte status reserve, 600 - 512 = 88 bytes, 13 of them for the array and quotes
+    // around the first note: 66 characters and "…[+134]". The document head and `]` take 13,
+    // and what the notes array, the error's wrapper and the outcome leave of the other 587
+    // goes to the error: 404 characters and "…[+596]".
+    #[test]
+    fn a_tight_cap_shortens_exactly() {
+        let (mut s, main, _) = sink(capped(600));
+        s.note(&"x".repeat(200)).unwrap();
+        let error = "e".repeat(1000);
+        s.finish(&Summary {
+            exit: 1,
+            status: "ok: 0 batches, 3 ms",
+            error: Some(&error),
+            elapsed_ms: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            main.text(),
+            format!(
+                "{{\"batches\":[],\"notes\":[\"{}…[+134]\"],\"error\":\"{}…[+596]\",\
+                 \"ok\":false,\"exit_code\":1,\"summary\":\"ok: 0 batches, 3 ms\",\
+                 \"elapsed_ms\":3}}\n",
+                "x".repeat(66),
+                "e".repeat(404)
+            )
+        );
+    }
+
+    // A huge closing error is shortened; the outcome fields are not.
+    #[test]
+    fn a_huge_closing_error_is_shortened_and_the_outcome_is_not() {
+        let (mut s, main, _) = sink(capped(4096));
+        let error = "z".repeat(30_000);
+        s.finish(&Summary {
+            exit: 2,
+            status: "failed (exit 2): connection failed, 5 ms",
+            error: Some(&error),
+            elapsed_ms: 5,
+        })
+        .unwrap();
+        assert!(main.bytes() <= 4096, "{} bytes", main.bytes());
+        assert!(main.bytes() >= 4096 - 8, "the error takes the room");
+        let doc = document(&main);
+        let error = doc["error"].as_str().unwrap();
+        assert_eq!(error.matches('z').count() + cut_by(error), 30_000);
+        assert_eq!(doc["exit_code"], 2);
+        assert_eq!(doc["summary"], "failed (exit 2): connection failed, 5 ms");
+        assert_eq!(doc["elapsed_ms"], 5);
+    }
+
+    // Notes are shortened when they arrive and count from then on, though the document gets
+    // them last: the second long one finds no room and is counted as withheld.
+    #[test]
+    fn long_notes_are_shortened_and_late_ones_counted() {
+        let (mut s, main, _) = sink(capped(4096));
+        s.note(&"k".repeat(10_000)).unwrap();
+        s.note(&"k".repeat(10_000)).unwrap();
+        let error = "z".repeat(10_000);
+        s.finish(&Summary {
+            exit: 1,
+            status: "failed (exit 1): 1 error, 3 ms",
+            error: Some(&error),
+            elapsed_ms: 3,
+        })
+        .unwrap();
+        assert!(main.bytes() <= 4096, "{} bytes", main.bytes());
+        let doc = document(&main);
+        let notes = doc["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2, "{doc}");
+        let first = notes[0].as_str().unwrap();
+        assert_eq!(first.matches('k').count() + cut_by(first), 10_000);
+        assert_eq!(
+            notes[1],
+            "output stopped at the --max-output limit of 4096 bytes; the run continued, and \
+             these weren't shown: 1 note"
+        );
+        let error = doc["error"].as_str().unwrap();
+        assert_eq!(error.matches('z').count() + cut_by(error), 10_000);
+        assert_eq!(doc["summary"], "failed (exit 1): 1 error, 3 ms");
+    }
+
+    // The budget counts bytes as the document writes them: `\u0001` is six bytes, a quote or
+    // backslash two, a wide character its UTF-8 length. A cut never splits an escape or a
+    // character, and the count N is in characters.
+    #[test]
+    fn escapes_that_expand_are_counted_after_escaping() {
+        for ch in ['\u{1}', '"', '\\', '\n', 'é', '日', '😀'] {
+            let (mut s, main, _) = sink(capped(4096));
+            let reason = format!("[{}]", ch.to_string().repeat(5000));
+            s.blocked("line 1", &reason, ADVICE).unwrap();
+            s.finish(&refused(5, "failed (exit 5): x, 0 ms")).unwrap();
+            assert!(main.bytes() <= 4096, "{ch:?}: {} bytes", main.bytes());
+            let doc = document(&main);
+            let error = doc["error"].as_str().unwrap();
+            let kept = error.matches(ch).count();
+            // The "[" in front is kept, the "]" behind is cut, and the count is exact.
+            assert_eq!(kept + cut_by(error), 5001, "{ch:?}");
+            assert!(error.ends_with(ADVICE), "{ch:?}");
+        }
+    }
+
+    // Wherever the body ends, the document stays within the cap and valid, and its outcome
+    // fields are there.
+    #[test]
+    fn the_cap_holds_wherever_the_body_ends() {
+        use crate::output::OUTPUT_RESERVE;
+        for max in OUTPUT_RESERVE..OUTPUT_RESERVE + 1800 {
+            for (run, exit, error, status) in [
+                (
+                    ragged_run as fn(&mut dyn Output),
+                    1,
+                    "closing error ",
+                    RAGGED_STATUS,
+                ),
+                (interrupted_run, 4, "query timeout ", INTERRUPTED_STATUS),
+            ] {
+                let (mut s, main, meta) = sink(capped(max));
+                run(&mut s);
+                let total = (main.bytes() + meta.bytes()) as u64;
+                assert!(total <= max, "cap {max}: {total} bytes\n{}", main.text());
+                let doc = document(&main);
+                assert_eq!(doc["ok"], false, "cap {max}");
+                assert_eq!(doc["exit_code"], exit, "cap {max}");
+                assert_eq!(doc["summary"], status, "cap {max}");
+                assert!(doc["batches"].is_array(), "cap {max}");
+                // The reserve leaves room for the closing error, shortened if need be.
+                assert!(
+                    doc["error"].as_str().is_some_and(|e| e.starts_with(error)),
+                    "cap {max}: {doc}"
+                );
+            }
+        }
+        let (mut s, main, meta) = sink(capped(0));
+        ragged_run(&mut s);
+        assert!(!main.text().contains("…[+") && !meta.text().contains("…[+"));
+    }
+
+    // `--verbose` lines go to the second stream as plain `sqlh: ...` text and count against
+    // the budget, which includes what the notes will take.
+    #[test]
+    fn diagnostics_go_to_the_second_stream_and_count_against_the_budget() {
+        let (mut s, main, meta) = sink(capped(4096));
+        s.diagnostic("connected in 5 ms; server SQL01\\INST")
+            .unwrap();
+        assert_eq!(
+            meta.text(),
+            "sqlh: connected in 5 ms; server SQL01\\\\INST\n"
+        );
+        assert_eq!(main.bytes(), 0);
+        // A diagnostic is counted: the note that follows gets only what it leaves.
+        s.diagnostic(&"d".repeat(2_000)).unwrap();
+        s.note(&"k".repeat(20_000)).unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        let lines = meta.text();
+        let long = lines.lines().nth(1).unwrap();
+        assert_eq!(long.matches('d').count(), 2_000);
+        assert!(main.bytes() + meta.bytes() <= 4096);
+        let doc = document(&main);
+        assert_eq!(doc["ok"], true);
+        let note = doc["notes"][0].as_str().unwrap();
+        assert_eq!(note.matches('k').count() + cut_by(note), 20_000);
+        // The diagnostics and the note together take the room before the status reserve.
+        let room = 4096 - crate::output::STATUS_RESERVE as usize;
+        let spent = meta.bytes() + NOTES_ARRAY + 2 + note.len();
+        assert!((room - 8..=room).contains(&spent), "{spent} of {room}");
+        // A huge diagnostic is shortened like a note.
+        let (mut s, _, meta) = sink(capped(4096));
+        s.diagnostic(&"d".repeat(20_000)).unwrap();
+        let line = meta.text();
+        assert_eq!(line.matches('d').count() + cut_by(&line), 20_000);
+        assert!(meta.bytes() <= 4096 - 512);
+
+        // Too little room for even a marker: the line is dropped and counted.
+        let (mut s, main, meta) = sink(capped(520));
+        s.diagnostic(&"d".repeat(100)).unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(meta.bytes(), 0);
+        let doc = document(&main);
+        assert!(
+            doc["notes"][0]
+                .as_str()
+                .unwrap()
+                .ends_with("these weren't shown: 1 note"),
+            "{doc}"
+        );
+    }
+
+    // A cap too small for the outcome (the command line asks for 4096 at least) still gets a
+    // valid document with the outcome: the cap is the thing that gives way.
+    #[test]
+    fn a_cap_too_small_for_the_ending_still_yields_the_outcome() {
+        let (mut s, main, _) = sink(capped(100));
+        s.note("n").unwrap();
+        s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
+        assert_eq!(
+            main.text(),
+            "{\"batches\":[],\"ok\":true,\"exit_code\":0,\"summary\":\"ok: 0 batches, 3 ms\",\
+             \"elapsed_ms\":0}\n"
+        );
+    }
+
+    // The reserve is sized for this: the closers of an open result and batch, the end of the
+    // batches, and the notes and error wrappers, with every number at its widest and the
+    // longest status main.rs builds. The closers' template is checked against a real run.
+    #[test]
+    fn the_worst_case_ending_fits_the_status_reserve() {
+        let closers = |rows: u64, cut: u64, truncated: bool| {
+            format!(
+                "],\"row_count\":{rows},\"truncated\":{truncated},\"cells_cut\":{cut},\
+                 \"interrupted\":true}}]}}"
+            )
+        };
+        let (mut s, main, _) = sink(capped(0));
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("v", "int")]).unwrap();
+        s.row(&[Value::Int(7)]).unwrap();
+        s.finish(&refused(1, "x")).unwrap();
+        assert!(
+            main.text().contains(&closers(1, 0, false)),
+            "{}",
+            main.text()
+        );
+
+        let status = format!(
+            "failed (exit 1): {} errors, first in batch {}; {} later batches not run \
+             (--continue-on-error runs them), {} ms",
+            u32::MAX,
+            usize::MAX,
+            usize::MAX,
+            u128::MAX
+        );
+        let outcome = outcome(&Summary {
+            exit: 10,
+            status: &status,
+            error: None,
+            elapsed_ms: u128::MAX,
+        });
+        let worst = closers(u64::MAX, u64::MAX, false).len()
+            + "]".len()
+            + ",\"notes\":[\"\"]".len()
+            + ",\"error\":\"\"".len()
+            + outcome.len();
+        assert!(
+            worst <= crate::output::STATUS_RESERVE as usize,
+            "{worst} bytes"
+        );
     }
 }

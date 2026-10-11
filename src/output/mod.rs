@@ -1,6 +1,13 @@
 //! Output formats (DESIGN.md §5): text (default), json and csv. Each is an `Output`. The
 //! shared `Tally` applies the limits and keeps the counts, so every format agrees on what
 //! was shown, cut or hidden.
+//!
+//! `--max-output` caps every byte a run writes, on both streams (DESIGN.md §4.4). The body
+//! (rows, messages, errors, ...) is admitted piece by piece up to `OUTPUT_RESERVE` short of
+//! the cap and is withheld whole past it. Everything else is text of unbounded length that
+//! must still be written: notes, a guard refusal, the closing error, `--verbose` lines.
+//! `Layout` shortens such text to what is left, ending it with `…[+N]`, and keeps the
+//! status line (JSON: the outcome fields) out of reach of all of it.
 
 pub mod csv;
 pub mod delivery;
@@ -62,9 +69,17 @@ impl Default for Limits {
     }
 }
 
-/// The part of `max_output` kept for the closing lines (error, notes, status), which are
-/// always written.
+/// The part of `max_output` kept for the end of the run: the body (result sets, rows,
+/// messages, errors, row counts, batch markers) stops this many bytes short of the cap, so
+/// the footer of the result being shown, the closing error and notes, and the status line
+/// always fit.
 pub const OUTPUT_RESERVE: u64 = 1024;
+
+/// The last part of `OUTPUT_RESERVE`: notes, a guard refusal and `--verbose` lines are
+/// shortened to stop this many bytes short of the cap, so that the status line (JSON: the
+/// outcome fields) and the closers of the result or batch still open always fit. The worst
+/// case for those, with every number at its widest, is well under it (tested per format).
+pub const STATUS_RESERVE: u64 = 512;
 
 /// The smallest `--max-output` other than 0: room for some output plus the reserve.
 pub const MIN_MAX_OUTPUT: u64 = 4096;
@@ -113,32 +128,93 @@ pub struct Summary<'a> {
 pub trait Output: BatchSink {
     fn begin_batch(&mut self, batch: &BatchInfo) -> io::Result<()>;
     fn end_batch(&mut self) -> io::Result<()>;
+    /// A note about the run. Shortened (`…[+N]`) to fit what is left of `--max-output`, or
+    /// counted as withheld when not even that fits.
     fn note(&mut self, text: &str) -> io::Result<()>;
     /// The read-only guard refused the input; nothing ran. `advice` says how to get past it.
+    /// Shortened to fit like a note, in its variable parts first.
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()>;
+    /// A line about sqlh itself for whoever runs it (`--verbose`): `sqlh: <text>` on stderr
+    /// in every format, flushed at once. It counts against `--max-output` and is shortened
+    /// like a note. In text and json, stderr carries nothing else and a stderr that can't
+    /// take the line just drops it; in csv, stderr is the metadata stream (DESIGN.md §5.3).
+    fn diagnostic(&mut self, text: &str) -> io::Result<()>;
     /// Writes the end of the output: limit notes, any error, the status. Always called last,
-    /// also after a failure mid-result, and must leave well-formed output.
+    /// also after a failure mid-result, and must leave well-formed output. The status is
+    /// never shortened; the error and notes are, to fit the budget.
     fn finish(&mut self, summary: &Summary) -> io::Result<()>;
     fn tally(&self) -> &Tally;
     fn flush(&mut self) -> io::Result<()>;
 }
 
 /// The output for `format`. CSV keeps stdout (or `-o`) for data only, so its metadata goes
-/// to stderr.
+/// to stderr. The other formats use stderr for `Output::diagnostic` lines only.
 pub fn create(format: Format, out: Box<dyn Write + Send>, limits: Limits) -> Stream {
+    create_with(format, out, Box::new(io::stderr()), limits)
+}
+
+/// `create` with a stderr of the caller's choosing, so that tests can break it.
+fn create_with(
+    format: Format,
+    out: Box<dyn Write + Send>,
+    stderr: Box<dyn Write + Send>,
+    limits: Limits,
+) -> Stream {
     let stall = (limits.stall_secs > 0).then(|| Duration::from_secs(limits.stall_secs.into()));
-    let meta = (format == Format::Csv).then(|| Box::new(io::stderr()) as Box<dyn Write + Send>);
-    let delivery = delivery::Delivery::start(out, meta, stall);
+    // csv's stderr carries the metadata and the status, so a failure there is a delivery
+    // failure (exit 7). In the other formats it carries diagnostics only, which are best
+    // effort (DESIGN.md §6).
+    let stderr: Box<dyn Write + Send> = match format {
+        Format::Csv => stderr,
+        Format::Text | Format::Json => Box::new(BestEffort::new(stderr)),
+    };
+    let delivery = delivery::Delivery::start(out, Some(stderr), stall);
     let main = delivery.writer(delivery::Dest::Main);
+    let meta = Box::new(delivery.writer(delivery::Dest::Meta));
     let output: Box<dyn Output> = match format {
-        Format::Text => Box::new(text::TextSink::new(main, limits)),
-        Format::Json => Box::new(json::JsonSink::new(main, limits)),
-        Format::Csv => {
-            let meta = Box::new(delivery.writer(delivery::Dest::Meta));
-            Box::new(csv::CsvSink::new(main, meta, limits))
-        }
+        Format::Text => Box::new(text::TextSink::with_meta(main, meta, limits)),
+        Format::Json => Box::new(json::JsonSink::with_meta(main, meta, limits)),
+        Format::Csv => Box::new(csv::CsvSink::new(main, meta, limits)),
     };
     Stream { output, delivery }
+}
+
+/// A stream whose write errors are swallowed: diagnostics are best effort (DESIGN.md §6),
+/// so a closed or broken stderr loses them and fails nothing. After the first error it
+/// stops trying.
+struct BestEffort<W> {
+    inner: W,
+    failed: bool,
+    /// Something was written, so there is something to flush.
+    dirty: bool,
+}
+
+impl<W: Write> BestEffort<W> {
+    fn new(inner: W) -> Self {
+        BestEffort {
+            inner,
+            failed: false,
+            dirty: false,
+        }
+    }
+}
+
+impl<W: Write> Write for BestEffort<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.failed {
+            self.dirty = true;
+            self.failed = self.inner.write_all(buf).is_err();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.dirty && !self.failed {
+            self.dirty = false;
+            self.failed = self.inner.flush().is_err();
+        }
+        Ok(())
+    }
 }
 
 /// A run's output: the sink for its format, and the thread that delivers what it writes
@@ -175,10 +251,139 @@ impl DerefMut for Stream {
     }
 }
 
-/// A guard refusal as one message, for every format:
-/// `line 3: UPDATE dbo.T would write; nothing was run. <advice>`.
-pub fn blocked_message(location: &str, reason: &str, advice: &str) -> String {
-    format!("{location}: {reason}; nothing was run. {advice}")
+/// Adds a guard refusal to `layout` as one message, the same in every format:
+/// `line 3: UPDATE dbo.T would write; nothing was run. <advice>`. The location, the reason
+/// (which can quote a huge identifier) and the advice are the parts that get shortened when
+/// the budget is short; the words between them never are.
+pub fn push_blocked<'a>(
+    layout: &mut Layout<'a>,
+    location: &'a str,
+    reason: &'a str,
+    advice: &'a str,
+) {
+    layout
+        .part(location)
+        .text(": ")
+        .part(reason)
+        .text("; nothing was run. ")
+        .part(advice);
+}
+
+/// How one character is written in an output format: appends it to `out`. Text and csv
+/// metadata use `push_char`, json strings their own.
+pub type PushChar = fn(&mut String, char);
+
+/// The bytes `s` takes when written with `push`.
+pub fn encoded_len(s: &str, push: PushChar) -> usize {
+    let mut scratch = String::new();
+    s.chars()
+        .map(|c| {
+            scratch.clear();
+            push(&mut scratch, c);
+            scratch.len()
+        })
+        .sum()
+}
+
+/// Appends `s` written with `push` in at most `room` bytes. If it fits, all of it; if not,
+/// a prefix and the marker `…[+N]`, N being the characters cut (the style of a cut value,
+/// DESIGN.md §4.4). Returns N, or `None`, appending nothing, when not even the marker fits.
+/// `room == usize::MAX` means no limit.
+pub fn push_within(out: &mut String, s: &str, room: usize, push: PushChar) -> Option<usize> {
+    let whole = room == usize::MAX || encoded_len(s, push) <= room;
+    if whole {
+        s.chars().for_each(|c| push(out, c));
+        return Some(0);
+    }
+    // The marker is sized for the most it can say (every character cut), so the real one,
+    // which says fewer, always fits.
+    let total = s.chars().count();
+    let keep = room.checked_sub(cut_marker(total, false).len())?;
+    let (mut size, mut kept) = (0, 0);
+    let mut scratch = String::new();
+    for c in s.chars() {
+        scratch.clear();
+        push(&mut scratch, c);
+        if size + scratch.len() > keep {
+            break;
+        }
+        out.push_str(&scratch);
+        size += scratch.len();
+        kept += 1;
+    }
+    out.push_str(&cut_marker(total - kept, false));
+    Some(total - kept)
+}
+
+/// Splits `room` bytes among texts that want `needs[i]` each, as evenly as it can: a text
+/// that wants no more than an equal share gets all it wants, and what that leaves is split
+/// among the rest. The shares add up to at most `room`.
+fn shares(needs: &[usize], room: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..needs.len()).collect();
+    order.sort_by_key(|&i| needs[i]);
+    let mut left = room;
+    let mut shares = vec![0; needs.len()];
+    for (done, &i) in order.iter().enumerate() {
+        let share = needs[i].min(left / (needs.len() - done));
+        shares[i] = share;
+        left -= share;
+    }
+    shares
+}
+
+/// Text to write within a byte budget: fixed pieces, already in their output encoding,
+/// around parts of variable text (raw, written with the format's `PushChar` when laid out).
+/// What `fit` shortens are the parts, never the pieces.
+pub struct Layout<'a> {
+    fixed: Vec<String>,
+    parts: Vec<&'a str>,
+}
+
+impl Default for Layout<'_> {
+    fn default() -> Self {
+        Layout::new()
+    }
+}
+
+impl<'a> Layout<'a> {
+    pub fn new() -> Self {
+        Layout {
+            fixed: vec![String::new()],
+            parts: Vec::new(),
+        }
+    }
+
+    /// Fixed text, written as it is.
+    pub fn text(&mut self, s: &str) -> &mut Self {
+        if let Some(last) = self.fixed.last_mut() {
+            last.push_str(s);
+        }
+        self
+    }
+
+    /// Variable text, written with the format's escaping and shortened if it must be.
+    pub fn part(&mut self, s: &'a str) -> &mut Self {
+        self.parts.push(s);
+        self.fixed.push(String::new());
+        self
+    }
+
+    /// The layout in at most `room` bytes (`usize::MAX`: no limit). The parts get what the
+    /// fixed text leaves, shared as evenly as `shares` can, so a short part stays whole and
+    /// the long ones are cut. `None` when the fixed text alone doesn't fit, or a part would
+    /// have to be cut to less than its marker; nothing is then half written.
+    pub fn fit(&self, room: usize, push: PushChar) -> Option<String> {
+        let fixed: usize = self.fixed.iter().map(String::len).sum();
+        let needs: Vec<usize> = self.parts.iter().map(|p| encoded_len(p, push)).collect();
+        let allowed = shares(&needs, room.checked_sub(fixed)?);
+        let mut out = String::with_capacity(fixed + allowed.iter().sum::<usize>());
+        for (i, part) in self.parts.iter().enumerate() {
+            out.push_str(&self.fixed[i]);
+            push_within(&mut out, part, allowed[i], push)?;
+        }
+        out.push_str(&self.fixed[self.parts.len()]);
+        Some(out)
+    }
 }
 
 /// What the output budget kept back after it ran out, for the closing note. The result set
@@ -191,6 +396,8 @@ struct Withheld {
     /// Statements whose row counts weren't shown.
     row_counts: u64,
     batches: u64,
+    /// Notes and diagnostics that didn't fit, not even shortened.
+    notes: u64,
 }
 
 /// Limits and counts shared by all formats.
@@ -241,8 +448,9 @@ impl Tally {
     }
 
     /// Whether `bytes` more of the body fit in the output budget, given the `used` bytes
-    /// written so far. The budget keeps `OUTPUT_RESERVE` for the closing lines. Once
-    /// something doesn't fit, nothing more does, so output never resumes after a gap.
+    /// written so far (both streams, and anything promised to the end). The budget keeps
+    /// `OUTPUT_RESERVE` for the end of the run. Once something doesn't fit, nothing more
+    /// does, so output never resumes after a gap.
     pub fn admit(&mut self, used: u64, bytes: usize) -> bool {
         if self.exhausted {
             return false;
@@ -253,6 +461,35 @@ impl Tally {
         }
         self.exhausted = true;
         false
+    }
+
+    /// Bytes a note, a guard refusal or a diagnostic may take, given the `used` bytes
+    /// written so far: what the budget has left, less `STATUS_RESERVE` (`usize::MAX`: no
+    /// limit).
+    pub fn note_room(&self, used: u64) -> usize {
+        self.room(used, STATUS_RESERVE)
+    }
+
+    /// Bytes the closing lines may take: what the budget has left (`usize::MAX`: no limit).
+    /// The status line comes out of it first and is never shortened.
+    pub fn closing_room(&self, used: u64) -> usize {
+        self.room(used, 0)
+    }
+
+    fn room(&self, used: u64, keep: u64) -> usize {
+        match self.limits.max_output {
+            0 => usize::MAX,
+            max => {
+                usize::try_from(max.saturating_sub(used).saturating_sub(keep)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// A note or diagnostic didn't fit even shortened. The budget is then used up: nothing
+    /// more of the body is written, and the closing note counts what was lost.
+    pub fn withhold_note(&mut self) {
+        self.exhausted = true;
+        self.withheld.notes += 1;
     }
 
     /// A result set's header didn't fit the budget: the whole result set is withheld.
@@ -451,6 +688,7 @@ impl Tally {
                     "statements' row counts",
                 ),
                 (w.batches, "batch", "batches"),
+                (w.notes, "note", "notes"),
             ]
             .iter()
             .filter(|(n, _, _)| *n > 0)
@@ -537,24 +775,29 @@ pub fn push_type(out: &mut String, type_name: &str) {
 pub fn push_escaped(out: &mut String, s: &str, max: usize) -> bool {
     let (kept, cut_count) = cut(s, max);
     for ch in kept.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            // Control characters are all below U+0100, so two hex digits are enough.
-            c if c.is_control() => {
-                let _ = write!(out, "\\x{:02X}", c as u32);
-            }
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            c => out.push(c),
-        }
+        push_char(out, ch);
     }
     if cut_count > 0 {
         out.push_str(&cut_marker(cut_count, false));
     }
     cut_count > 0
+}
+
+/// Appends one character in the text format's escaping (see `push_escaped`).
+pub fn push_char(out: &mut String, ch: char) {
+    match ch {
+        '\\' => out.push_str("\\\\"),
+        '\t' => out.push_str("\\t"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        // Control characters are all below U+0100, so two hex digits are enough.
+        c if c.is_control() => {
+            let _ = write!(out, "\\x{:02X}", c as u32);
+        }
+        '\u{2028}' => out.push_str("\\u2028"),
+        '\u{2029}' => out.push_str("\\u2029"),
+        c => out.push(c),
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +888,230 @@ mod tests {
             ..Limits::default()
         });
         assert!(unlimited.admit(u64::MAX / 2, usize::MAX / 2));
+    }
+
+    // R08: text that must be written whatever its length is cut to the room it is given,
+    // marker included, and the marker says how many characters went.
+    #[test]
+    fn push_within_cuts_to_the_room() {
+        let within = |s: &str, room: usize| {
+            let mut out = String::new();
+            let cut = push_within(&mut out, s, room, push_char);
+            (out, cut)
+        };
+        assert_eq!(within("hello", 5), ("hello".into(), Some(0)));
+        assert_eq!(within("hello", usize::MAX), ("hello".into(), Some(0)));
+        assert_eq!(within("", 0), (String::new(), Some(0)));
+        // "…[+8]" is seven bytes, so 12 bytes keep "hél" (four) and one is left over: the
+        // marker is sized for the widest count, "…[+11]".
+        assert_eq!(within("héllo wörld", 12), ("hél…[+8]".into(), Some(8)));
+        // Escapes count as written: four bytes each, never half of one.
+        assert_eq!(
+            within("\u{1}\u{1}\u{1}\u{1}", 12),
+            ("\\x01…[+3]".into(), Some(3))
+        );
+        // Not even the marker fits: nothing is appended.
+        assert_eq!(within("abcdefg", 6), (String::new(), None));
+        assert_eq!(within("a", 0), (String::new(), None));
+        // Appends to what is there.
+        let mut out = String::from("> ");
+        assert_eq!(push_within(&mut out, "abc", 3, push_char), Some(0));
+        assert_eq!(out, "> abc");
+    }
+
+    #[test]
+    fn shares_split_a_room_evenly_without_wasting_it() {
+        assert_eq!(shares(&[10, 200, 30], 100), [10, 60, 30]);
+        assert_eq!(shares(&[50, 50], 60), [30, 30]);
+        assert_eq!(shares(&[50, 50], 1000), [50, 50]);
+        assert_eq!(shares(&[0, 100], 10), [0, 10]);
+        assert_eq!(shares(&[5], 0), [0]);
+        assert_eq!(shares(&[], 7), Vec::<usize>::new());
+        // What an even split leaves over goes to the last of the biggest.
+        assert_eq!(shares(&[100, 100, 100], 10), [3, 3, 4]);
+        for (needs, room) in [(vec![7, 300, 9, 300], 50), (vec![1, 2, 3], 4)] {
+            let given = shares(&needs, room);
+            assert!(given.iter().sum::<usize>() <= room, "{given:?}");
+            assert!(given.iter().zip(&needs).all(|(g, n)| g <= n), "{given:?}");
+        }
+    }
+
+    #[test]
+    fn a_layout_shortens_its_parts_and_never_its_fixed_text() {
+        let mut layout = Layout::new();
+        layout
+            .text("[")
+            .part("aaaaaaaaaaaaaaaaaaaa")
+            .text("|")
+            .part("bb")
+            .text("]");
+        let fit = |room| layout.fit(room, push_char);
+        assert_eq!(fit(usize::MAX).unwrap(), "[aaaaaaaaaaaaaaaaaaaa|bb]");
+        assert_eq!(fit(25).unwrap(), "[aaaaaaaaaaaaaaaaaaaa|bb]");
+        // Three bytes of fixed text leave 21 for the parts: "bb" keeps its two, and the
+        // other 19 hold eleven characters and "…[+9]".
+        assert_eq!(fit(24).unwrap(), "[aaaaaaaaaaa…[+9]|bb]");
+        // Fixed text alone doesn't fit, or a part would get less than its marker.
+        assert_eq!(fit(2), None);
+        assert_eq!(fit(10), None);
+        assert!(fit(25).unwrap().len() <= 25 && fit(24).unwrap().len() <= 24);
+    }
+
+    #[test]
+    fn rooms_leave_the_reserve() {
+        let tally = |max_output| {
+            Tally::new(Limits {
+                max_output,
+                ..Limits::default()
+            })
+        };
+        let t = tally(5000);
+        assert_eq!(t.note_room(1000), 5000 - 1000 - STATUS_RESERVE as usize);
+        assert_eq!(t.closing_room(1000), 4000);
+        assert_eq!(t.note_room(4800), 0);
+        assert_eq!(t.closing_room(6000), 0);
+        let unlimited = tally(0);
+        assert_eq!(unlimited.note_room(u64::MAX), usize::MAX);
+        assert_eq!(unlimited.closing_room(7), usize::MAX);
+    }
+
+    // A note that cannot fit exhausts the budget and shows in the closing note's counts.
+    #[test]
+    fn a_withheld_note_is_counted_and_ends_the_body() {
+        let mut tally = Tally::new(Limits {
+            max_output: 5000,
+            ..Limits::default()
+        });
+        tally.withhold_note();
+        tally.withhold_note();
+        assert!(!tally.admit(0, 1));
+        assert_eq!(
+            tally.limit_notes(),
+            [
+                "output stopped at the --max-output limit of 5000 bytes; the run continued, and \
+              these weren't shown: 2 notes"
+            ]
+        );
+    }
+
+    // R08: the reserve is sized for the widest footer plus the longest status line main.rs
+    // builds (the JSON equivalent is tested in json.rs). If a status line grows, this is the
+    // test that says the reserve must too.
+    #[test]
+    fn the_worst_case_footer_and_status_fit_the_status_reserve() {
+        let mut tally = Tally::new(Limits {
+            max_rows: u64::MAX,
+            max_cell: usize::MAX,
+            ..Limits::default()
+        });
+        tally.rows_total = u64::MAX;
+        tally.rows_shown = u64::MAX - 1;
+        tally.cells_cut = u64::MAX;
+        let footer = format!("-- {}\n", tally.footer());
+        let status = format!(
+            "-- failed (exit 1): {} errors, first in batch {}; {} later batches not run \
+             (--continue-on-error runs them), {} ms\n",
+            u32::MAX,
+            usize::MAX,
+            usize::MAX,
+            u128::MAX
+        );
+        let worst = footer.len() + status.len();
+        assert!(worst <= STATUS_RESERVE as usize, "{worst} bytes");
+    }
+
+    /// What the delivery thread wrote, readable from the test (the thread needs `Send`).
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A stderr whose reader has gone.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    // DESIGN.md §6, wired through `create`: in text and json, stderr carries diagnostics
+    // only, so a stderr that fails loses them and the output is still delivered. In csv it
+    // carries the metadata and the status, so the same failure is a delivery failure.
+    #[test]
+    fn a_failing_stderr_costs_only_the_diagnostics_except_in_csv() {
+        let summary = Summary {
+            exit: 0,
+            status: "ok: 0 batches, 3 ms",
+            error: None,
+            elapsed_ms: 3,
+        };
+        for format in [Format::Text, Format::Json] {
+            let stdout = Capture::default();
+            let mut stream = create_with(
+                format,
+                Box::new(stdout.clone()),
+                Box::new(Broken),
+                Limits::default(),
+            );
+            stream.diagnostic("connected in 5 ms").unwrap();
+            stream.note("a note").unwrap();
+            stream.finish(&summary).unwrap();
+            stream.flush().unwrap();
+            stream.wait_delivered(None).unwrap();
+            let written = String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                written.contains("a note") && written.contains("ok: 0 batches, 3 ms"),
+                "{format:?}: {written}"
+            );
+        }
+        let stdout = Capture::default();
+        let mut stream = create_with(
+            Format::Csv,
+            Box::new(stdout),
+            Box::new(Broken),
+            Limits::default(),
+        );
+        // Later writes may already fail once the thread has seen the broken stderr.
+        let _ = stream.diagnostic("connected in 5 ms");
+        let _ = stream.finish(&summary);
+        let _ = stream.flush();
+        let error = stream.wait_delivered(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // Diagnostics are best effort: a stream that fails loses them and fails nothing.
+    #[test]
+    fn best_effort_swallows_errors_and_stops_trying() {
+        struct Failing(usize);
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0 += 1;
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        let mut stream = BestEffort::new(Failing(0));
+        assert!(stream.flush().is_ok(), "nothing written, nothing to flush");
+        assert_eq!(stream.inner.0, 0);
+        stream.write_all(b"one").unwrap();
+        stream.write_all(b"two").unwrap();
+        stream.flush().unwrap();
+        assert_eq!(stream.inner.0, 1, "one failed write, then no more tries");
     }
 
     #[test]
