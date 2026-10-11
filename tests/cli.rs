@@ -1654,6 +1654,21 @@ fn the_guard_takes_memory_in_proportion_to_the_input() {
             5,
             "-- blocked: line 1: EXEC a.a.a.a.",
         ),
+        // R18: the clauses the classifier remembers are capped, and a call's arguments are
+        // read a bounded number of times.
+        (
+            "10 MB of TOP clauses that never close",
+            "DELETE TOP (".repeat(833_000),
+            5,
+            "-- blocked: line 1: DELETE ? would write; nothing was run.",
+        ),
+        (
+            "9.5 MB of sp_spaceused calls in parentheses",
+            "EXEC sp_spaceused (".repeat(500_000),
+            5,
+            "-- blocked: line 1: this input is too complex for the read-only check: the \
+             arguments of sp_spaceused have more than 8 parentheses; nothing was run.",
+        ),
     ];
     for (what, sql, code, expected) in cases {
         assert!(sql.len() <= 10_000_000, "{what}: {} bytes", sql.len());
@@ -1668,6 +1683,86 @@ fn the_guard_takes_memory_in_proportion_to_the_input() {
         );
         assert!(peak < LIMIT, "{what}: peak working set {} MB", peak >> 20);
     }
+}
+
+// R18: the guard's work is bounded, not only its memory. `UPDATE TOP (` repeated N times, `@t`,
+// then `) @t ` N times, is not SQL a server accepts, but it is a few hundred kilobytes that the
+// classifier passes, and its lookahead used to read the rest of the input again from every
+// UPDATE: 0.2 s at 2,000 deep, 0.9 s at 4,000, 3.4 s at 8,000 and 15 s at 16,000 (release
+// build), all before the run could be cancelled or timed. Now the clauses are read in one pass
+// (tens of milliseconds at the deepest), and input nested past what the guard remembers is
+// refused before anything connects. A refused `DELETE` is appended to each, so a run that was
+// classified to the end shows by the guard's refusal of it (exit 5) and not by a connect.
+#[test]
+fn nested_input_is_classified_or_refused_in_bounded_time() {
+    // The bound is the test's, with headroom for a debug build on a busy machine; the guard's
+    // own time is in DESIGN.md §11 and notes/memory.md.
+    const BOUND: Duration = Duration::from_secs(5);
+    let dir = scratch("guard_nested");
+    let file = dir.join("input.sql");
+    let nested = |n: usize| format!("{}@t{}", "UPDATE TOP (".repeat(n), ") @t ".repeat(n));
+    let timed = |sql: &str, extra: &[&str]| {
+        fs::write(&file, sql).unwrap();
+        let started = Instant::now();
+        let r = run(sqlh().args(DEAD).args(extra).arg("-i").arg(&file));
+        (r, started.elapsed())
+    };
+    for n in [2_000, 4_000, 8_000, 16_000] {
+        let (r, took) = timed(&format!("{}\nDELETE FROM dbo.T", nested(n)), &[]);
+        assert_eq!(r.code, 5, "{n}: {}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "-- blocked: line 2: DELETE dbo.T would write; nothing was run. Rerun with \
+                 --allow-write if the write is intended"
+            ),
+            "{n}: {}",
+            r.stdout
+        );
+        assert!(took < BOUND, "{n} deep: {took:?}");
+    }
+    // Nothing after it: classified to the end and let through to the connect (which fails: exit
+    // 2, after the connect timeout, so only the deepest passing case runs).
+    let (r, took) = timed(&nested(16_000), &[]);
+    assert_reached_connect(&r, "16,000 deep");
+    assert!(took < BOUND + Duration::from_secs(5), "{took:?}");
+
+    // Past what the guard remembers: refused, with a message that says what to do.
+    let (r, took) = timed(&nested(20_000), &[]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "-- blocked: line 1: this input is too complex for the read-only check: TOP ( \
+             clauses are nested more than 16384 deep; nothing was run. Simplify it or split it \
+             into smaller batches with GO, or rerun with --allow-write if the write is intended"
+        ),
+        "{}",
+        r.stdout
+    );
+    assert!(took < BOUND, "{took:?}");
+    // --allow-write skips the classifier, so it lifts this refusal as it does the others.
+    let (r, _) = timed(&nested(20_000), &["--allow-write"]);
+    assert_reached_connect(&r, "20,000 deep with --allow-write");
+
+    // A call's arguments in parentheses, one inside the next: refused at the first call.
+    let (r, took) = timed(&"EXEC sp_spaceused (".repeat(20_000), &[]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("this input is too complex for the read-only check"),
+        "{}",
+        r.stdout
+    );
+    assert!(took < BOUND, "{took:?}");
+
+    // After a GO the refusal's line is the line in the file, not in the batch.
+    let (r, _) = timed(&format!("SELECT 1\nGO\nSELECT 2\n{}", nested(20_000)), &[]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("-- blocked: line 4: this input is too complex"),
+        "{}",
+        r.stdout
+    );
 }
 
 /// Runs `command` to its end and also returns the child's peak working set in bytes. Windows
