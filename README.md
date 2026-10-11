@@ -50,7 +50,7 @@ Orders	2026-09-30T14:02:11.483
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 34 built, 5 planned.**
+**Tally: 36 built, 5 planned.**
 
 ### Built
 
@@ -69,6 +69,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 **Errors an agent can act on**
 - **Errors point at the input.** File and line, mapped back through `GO` batches and `$(var)` substitution; inside a procedure, the procedure and its own line. *(MVP)*
 - **Exit codes with a meaning.** 0 ok, 1 SQL error, 2 connect, 3 usage, 4 timeout, 5 blocked, 6 cancelled, 7 output not delivered, 10 internal. Exit 7 means "don't trust what you received", and it is no reason to retry a write blindly. *(MVP; exit 7 in Phase 1)*
+- **A result an error cut short says so.** The rows before a SQL error are marked incomplete in every format (`-- 2 rows so far (interrupted)`), so an agent never takes them for the whole answer. *(Phase 2 review)*
 - **Refusals say how to fix them.** A blocked write names the statement and the better spelling (`#temp` instead of `##t`, `sys.sp_who`) before it suggests `--allow-write`. *(Phase 1)*
 - **Connection errors name what was tried** (server, port, auth, encryption) and hint at the usual cause: SQL Browser, certificate trust, TLS version. *(MVP)*
 
@@ -82,7 +83,8 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 **Never stuck**
 - **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
-- **Timeouts by default.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. *(MVP)*
+- **Timeouts by default, and real ones.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. sqlh keeps the batch timeout itself, as elapsed time, so a result that streams faster than it is read, a huge value or thousands of tiny results can't outrun it. *(MVP; elapsed time since the Phase 2 review)*
+- **The read-only check can't hang.** Deeply nested or machine-generated SQL is classified in milliseconds, or refused before connecting with what to do (simplify it, split it with `GO`, or `--allow-write` if writes are meant). *(Phase 2 review)*
 - **A blocked query fails fast, and production work comes first.** Every session gives up on a lock after 10 s (error 1222; `--lock-timeout` changes it) and is the one chosen when it deadlocks with ordinary work, so an agent gets a clear error instead of waiting out the query timeout, and a deadlock costs the agent's query, not the application's. *(Phase 2.8)*
 - **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. A slow reader isn't cut off as long as it takes each 4 KB within `-t`, and an unread stderr can't hold up the response or hang sqlh's own diagnostics. *(Phase 2.3)*
 - **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query, waits on a slow reader or delivers its last lines. It exits 6 and says what became of the statement. A harness that kills sqlh also stops the server's work: measured for waiting, CPU-bound and lock-blocked queries, the server ends the request within about 0.1 s. *(MVP; every console event in Phase 2.4)*
@@ -96,7 +98,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. *(Phase 2.13)*
 - **The same answers as SSMS.** Session `SET` options match SSMS, so plans and filtered-index behavior match what the DBA sees. *(MVP)*
 - **One exe, no dependencies.** About 2 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
-- **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, a runaway `$(var)` expansion is refused at 10 MB before it is built, and the read-only guard checks a 10 MB script in under 60 MB whatever it holds, so one careless query can't exhaust the machine the agent runs on. *(Phase 2.7; the guard in 2.14)*
+- **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, a runaway `$(var)` expansion is refused at 10 MB before it is built, and the read-only guard checks a 10 MB script in under 60 MB whatever it holds, so one careless query can't exhaust the machine the agent runs on. The old `text`, `ntext` and `image` types are the exception: those values are still read whole. *(Phase 2.7; the guard in 2.14)*
 
 ### Planned
 

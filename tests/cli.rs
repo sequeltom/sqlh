@@ -4833,8 +4833,9 @@ mod live {
     // attention, which the server acknowledges after the data in flight: tens of milliseconds
     // in a release build, up to 2 s measured in a debug build that can't keep up with the
     // stream. The driver waits for it 5 s at most (DESIGN.md §4.4). These tests allow `-t`
-    // plus 4 s, which a run that reads to the end (7.4 s and up) does not meet.
-    const GRACE: Duration = Duration::from_secs(4);
+    // plus those 5 s, which a run that reads to the end (7.4 s and up) does not meet; 4 s was
+    // exceeded by a debug build with the whole live suite running in parallel.
+    const GRACE: Duration = Duration::from_secs(5);
 
     /// A run with `-t 1` that has to be over within `-t` plus the grace.
     fn timed(p: &str, db: &str, flags: &[&str], sql: &str) -> (Run, Duration) {
