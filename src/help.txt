@@ -22,7 +22,7 @@ CONNECTION
   -C              trust the server certificate (self-signed dev servers)
   -Ns | -Nm | -No encryption strict | mandatory (default) | optional
   -K ReadOnly     read-only application intent      -M  multi-subnet failover
-  -l seconds      login timeout (default 15); one attempt, no retries
+  -l seconds      login timeout (default 15; 0 = none); one attempt, no retries
 
 EXECUTION
   -Q sql          SQL to run

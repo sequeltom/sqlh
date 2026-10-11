@@ -293,6 +293,10 @@ fn connect_failures_end_the_same_way_every_time() {
         "{:?}",
         started.elapsed()
     );
+    // -l 0 is no limit, as in sqlcmd: the refusal itself ends the attempt, not a timer.
+    let r = sqlh_args(&["-S", "127.0.0.1,1", "-l", "0", "-Q", "SELECT 1"]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    assert!(!r.stdout.contains("timed out"), "{}", r.stdout);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());

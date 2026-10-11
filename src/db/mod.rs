@@ -207,8 +207,15 @@ impl Session {
         // Each TCP connect attempt gets -l seconds and the whole login one more, so an
         // unreachable address fails at TCP (exit 2) and a server that takes the connection
         // but doesn't log in hits the deadline (exit 4). Equal limits raced.
-        context.connect_timeout = options.login_timeout;
-        context.login_timeout = Some(options.login_timeout.saturating_add(1));
+        // -l 0 means no limit, as in sqlcmd and like -t 0. The driver would take a TCP limit
+        // of 0 as "give up at once", so that gets a day (Windows gives up on a TCP connect
+        // after about 21 s anyway); a login deadline of 0 is the driver's "none".
+        let (tcp, login) = match options.login_timeout {
+            0 => (86_400, 0),
+            limit => (limit, limit.saturating_add(1)),
+        };
+        context.connect_timeout = tcp;
+        context.login_timeout = Some(login);
         context.application_intent = if options.read_only_intent {
             ApplicationIntent::ReadOnly
         } else {
