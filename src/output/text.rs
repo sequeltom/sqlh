@@ -276,6 +276,7 @@ impl<W: Write> BatchSink for TextSink<W> {
     }
 
     fn end_rows(&mut self) -> io::Result<()> {
+        self.tally.end_rows();
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -284,11 +285,13 @@ impl<W: Write> BatchSink for TextSink<W> {
     }
 
     fn rows_affected(&mut self, count: u64) -> io::Result<()> {
+        self.tally.outside_rows("a row count")?;
         self.tally.add_affected(count);
         Ok(())
     }
 
     fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("a message")?;
         self.flush_affected()?;
         if !self.tally.message_visible() {
             return Ok(());
@@ -300,6 +303,7 @@ impl<W: Write> BatchSink for TextSink<W> {
     }
 
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.tally.outside_rows("an error")?;
         self.flush_affected()?;
         self.tally.error(error.severity);
         let line = error_line(&self.tally, error);
@@ -320,7 +324,7 @@ impl<W: Write> Output for TextSink<W> {
         Ok(())
     }
 
-    fn end_batch(&mut self) -> io::Result<()> {
+    fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
         self.flush_affected()
     }
 
@@ -411,6 +415,7 @@ pub(super) mod tests {
             line_map: &[],
             run: 1,
             runs: 1,
+            started_ms: 0,
         }
     }
 
@@ -510,17 +515,18 @@ pub(super) mod tests {
         out.message(&msg("a message after the rows")).unwrap();
         out.rows_affected(3).unwrap();
         out.error(&error(1)).unwrap();
-        out.end_batch().unwrap();
+        out.end_batch(5).unwrap();
         let second = BatchInfo {
             number: 2,
             total: 2,
+            started_ms: 5,
             ..batch("-Q", false, 3)
         };
         out.begin_batch(&second).unwrap();
         out.columns(&[col("w", "int")]).unwrap();
         out.row(&[Value::Int(1)]).unwrap();
         out.end_rows().unwrap();
-        out.end_batch().unwrap();
+        out.end_batch(6).unwrap();
         out.note(&"a late note ".repeat(40)).unwrap();
         let closing = "closing error ".repeat(60);
         out.finish(&Summary {
@@ -559,6 +565,46 @@ pub(super) mod tests {
     }
 
     pub const INTERRUPTED_STATUS: &str = "failed (exit 4): timeout, 2000 ms";
+
+    /// PLAN.md 2.12, the same calls for every format (with `limits()`: one result set and one
+    /// message shown). A message, an error and a row count that arrive between a result set's
+    /// `columns` and its `end_rows` are refused with an error, in a shown result set and in a
+    /// hidden one, and change nothing: not the counts, and not what the limits still allow.
+    /// Once the result set is closed the same calls are taken, so a message the server sent
+    /// during the result lands after it. Leaves the run open: the caller finishes it.
+    pub fn mid_result_events_are_refused(out: &mut dyn Output) {
+        fn refused(result: io::Result<()>, what: &str) {
+            let error = result.expect_err(what);
+            assert!(super::super::OutOfOrder::is(&error), "{what}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{what}");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{what} arrived while a result set's rows were")),
+                "{error}"
+            );
+        }
+        fn mid_result(out: &mut dyn Output) {
+            refused(out.message(&msg("too early")), "a message");
+            refused(out.error(&error(1)), "an error");
+            refused(out.rows_affected(9), "a row count");
+        }
+        // The first result set is shown.
+        out.columns(&[col("v", "int")]).unwrap();
+        out.row(&[Value::Int(1)]).unwrap();
+        mid_result(out);
+        out.row(&[Value::Int(2)]).unwrap();
+        out.end_rows().unwrap();
+        // The refused message was not counted: the one message `limits()` allows is still free.
+        out.message(&msg("kept")).unwrap();
+        // The second is hidden by --max-results, and the order is the caller's all the same.
+        out.columns(&[col("w", "int")]).unwrap();
+        mid_result(out);
+        out.end_rows().unwrap();
+        out.rows_affected(3).unwrap();
+        out.error(&error(2)).unwrap();
+        assert_eq!(out.tally().errors(), 1, "a refused error is not counted");
+    }
 
     /// A text sink with a stream each for the main output and the diagnostics.
     fn sink(limits: Limits) -> (TextSink<Shared>, Shared, Shared) {
@@ -843,6 +889,25 @@ pub(super) mod tests {
         );
     }
 
+    // PLAN.md 2.12, DESIGN.md §5.1: nothing but rows arrives inside a result set. A message,
+    // an error or a row count that did is refused and changes nothing; a message the server
+    // sent during the result is written after its footer.
+    #[test]
+    fn nothing_but_rows_arrives_inside_a_result_set() {
+        let (mut s, main, meta) = sink(limits());
+        mid_result_events_are_refused(&mut s);
+        s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
+            .unwrap();
+        assert_eq!(meta.bytes(), 0);
+        assert_eq!(
+            main.text(),
+            "-- result 1\nv:int\n1\n2\n-- 2 rows\n-- msg: kept\n-- 3 rows affected\n\
+             -- error 208 (severity 16, state 1, line 2): Invalid object name 'dbo.Nope'.\n\
+             -- note: 1 more result sets not shown (--max-results 1)\n\
+             -- failed (exit 1): 1 error, 3 ms\n"
+        );
+    }
+
     #[test]
     fn limits_hide_extra_results_and_messages() {
         let mut s = TextSink::new(Vec::new(), limits());
@@ -916,7 +981,7 @@ pub(super) mod tests {
         }
         s.message(&msg("done")).unwrap();
         s.rows_affected(1).unwrap();
-        s.end_batch().unwrap();
+        s.end_batch(0).unwrap();
         s.rows_affected(0).unwrap();
         s.rows_affected(0).unwrap();
         s.finish(&summary("ok: 2 batches, 3 ms")).unwrap();
