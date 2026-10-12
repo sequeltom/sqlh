@@ -163,7 +163,7 @@ Database permissions are expected to be configured appropriately. The tool's che
 
 ## 8. Implementation plan
 
-Prerequisites: fix the execution correctness findings in [../code-review.md](../code-review.md), make output and cancellation dependable, and validate response budgets plus connection cleanup. Product priority is fast, context-efficient investigation; the mechanisms below remain proposals until tested against that workflow. Bounded output must cover the collected MCP response as well as streamed rows.
+Prerequisites: fix the execution correctness findings in the architecture review, make output and cancellation dependable, and validate response budgets plus connection cleanup. Product priority is fast, context-efficient investigation; the mechanisms below remain proposals until tested against that workflow. Bounded output must cover the collected MCP response as well as streamed rows.
 
 1. **Runner refactor** (shared with the schema commands)
    - pull the batch loop out of `main.rs` into `Runner::run(&mut Session, &[Batch], &mut dyn Output, &RunOptions) -> RunResult`

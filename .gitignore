@@ -22,6 +22,12 @@ profiles.toml
 /scratch/
 /artifacts/
 
+# Local-only material that is never pushed: the external code reviews (archive/reviews/).
+/archive/
+
+# Worktrees that Claude Code and its workflows create inside the checkout.
+.claude/worktrees/
+
 # Editors and IDEs
 .vscode/
 .idea/

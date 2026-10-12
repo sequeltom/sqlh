@@ -115,9 +115,6 @@ This README is the human-facing overview. The other documents, [AGENTS.md](AGENT
 - [docs/VISION.md](docs/VISION.md): what the product is for, and its priorities
 - [docs/PLAN.md](docs/PLAN.md): the current plan of attack
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
-- [code-review.md](code-review.md): the architecture review the plan responds to
-- [code-review-phase1.md](code-review-phase1.md): the follow-up review of Phase 1
-- [code-review-phase2.md](code-review-phase2.md): the review of Phase 2
 
 ## Local housekeeping
 
