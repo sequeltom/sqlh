@@ -329,6 +329,37 @@ const CHUNK_TICKS: u32 = 16;
 /// and a result that is already in the read buffer never makes it wait.
 const YIELD_EVERY: Duration = Duration::from_millis(10);
 
+/// How long past a batch's deadline the driver gets to settle the cancel (an attention, or
+/// the withdrawal of a request it was still sending) before sqlh drops the work and retires
+/// the session: the batch always ends by `-t` plus this (R15 follow-up B, DESIGN.md §4.4). It
+/// matches the driver's own wait for an attention's acknowledgement.
+const SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Runs `work` to its end, or until `SETTLE_GRACE` past `deadline`, whichever comes first:
+/// `None` when the grace ran out, and `work` is then dropped where it stands. No deadline (`-t
+/// 0`), no bound. The batch's own loops yield every `YIELD_EVERY`, so the timer here runs even
+/// while they work on rows that are already there.
+async fn settle_within<T>(deadline: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    let expiry = async {
+        match deadline.and_then(|at| at.checked_add(SETTLE_GRACE)) {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        result = work => Some(result),
+        () = expiry => None,
+    }
+}
+
+/// `DbError::Timeout` when the grace ran out (`Session::run`).
+const UNSETTLED: &str =
+    "query timeout; the cancel was not settled in time, so the connection was closed";
+
+/// What a retired session answers (`Session::retired`).
+const RETIRED: &str = "the connection was closed after a batch that did not settle";
+
 /// Who cancelled the batch's statement, other than the user: the first of them to fire.
 const CAUSE_NONE: u8 = 0;
 const CAUSE_BUDGET: u8 = 1;
@@ -418,6 +449,9 @@ struct Drain {
     timer: Option<tokio::task::JoinHandle<()>>,
     pace: Pace,
     deadline_timer: Option<tokio::task::JoinHandle<()>>,
+    /// The last result read was read to its end with its shown rows complete and only hidden
+    /// rows left (`Session::finished_late`).
+    tail_hidden: bool,
 }
 
 impl Drain {
@@ -453,6 +487,7 @@ impl Drain {
                 yielded: Instant::now(),
             },
             deadline_timer,
+            tail_hidden: false,
         }
     }
 
@@ -483,6 +518,18 @@ impl Drain {
     /// Whether `-t` ended the work, as opposed to the user or the budget.
     fn deadline_fired(&self) -> bool {
         self.cause() == Some(Cause::Deadline)
+    }
+
+    /// Whether the batch is past its deadline, whether or not the deadline has fired yet (a
+    /// loop that never waited may not have looked at the clock since), unless the user
+    /// cancelled: then that cancel decides the outcome.
+    fn overdue(&self, cancel: &Cancel) -> bool {
+        !cancel.is_cancelled()
+            && (self.deadline_fired()
+                || self
+                    .pace
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline))
     }
 
     /// A result begins, or ends however it ends. The budget's timer stops, so that it can't
@@ -554,6 +601,10 @@ pub struct Session {
     auth: &'static str,
     /// Buffers for reading large values, made on first use.
     scratch: stream::Scratch,
+    /// Set when a batch's work was abandoned at `SETTLE_GRACE` past its deadline: the driver was
+    /// dropped in the middle of an operation, so the connection is in no known state and nothing
+    /// more may be sent on it. The caller drops the session, which closes the socket.
+    retired: bool,
 }
 
 /// What the batch loop gets from one step through a result set's rows.
@@ -643,6 +694,7 @@ impl Session {
                 .map(Duration::from_micros),
             auth: options.auth.method(),
             scratch: stream::Scratch::default(),
+            retired: false,
         })
     }
 
@@ -692,6 +744,10 @@ impl Session {
     /// With a bounded `counting`, a result whose hidden rows outrun the budget (or `-t`, when
     /// `Counting::timeout_stops`) ends the batch instead: the rest of it is cancelled, so the
     /// statements after that result do not run, and the sink is told (`counting_stopped`).
+    ///
+    /// However the driver settles the cancel, the call returns by `SETTLE_GRACE` past the
+    /// deadline: after that the batch's work is dropped where it stands, the session is retired
+    /// (nothing more may be sent on it) and the result is `DbError::Timeout`.
     pub async fn run(
         &mut self,
         sql: String,
@@ -701,12 +757,40 @@ impl Session {
         sink: &mut dyn BatchSink,
         gate: &dyn Backpressure,
     ) -> Result<(), DbError> {
+        if self.retired {
+            return Err(DbError::Lost(RETIRED.into()));
+        }
         // `-t` is sqlh's own deadline from here (R15); the driver's `timeout_secs` stays 0 (none),
         // because it adds up only the time spent waiting for the server and so can neither
         // bound a batch nor agree with this one.
         let deadline = (timeout_secs > 0)
             .then(|| Instant::now().checked_add(Duration::from_secs(u64::from(timeout_secs))))
             .flatten();
+        // The driver settles a cancel in its own time: an attention gets 5 s, but withdrawing a
+        // request that was cancelled between two of its packets waits up to 120 s for the
+        // server (mssql-tds 0.2.0, `withdraw_sent_message`), and does it with the cancel
+        // removed. So the bound on the whole batch is sqlh's: the deadline plus the grace,
+        // whatever the driver is doing then (R15 follow-up B).
+        let work = self.run_batch(sql, deadline, counting, cancel, sink, gate);
+        match settle_within(deadline, work).await {
+            Some(result) => result,
+            None => {
+                self.retired = true;
+                Err(DbError::Timeout(UNSETTLED.into()))
+            }
+        }
+    }
+
+    /// `run`, without the bound on settling.
+    async fn run_batch(
+        &mut self,
+        sql: String,
+        deadline: Option<Instant>,
+        counting: Counting,
+        cancel: &Cancel,
+        sink: &mut dyn BatchSink,
+        gate: &dyn Backpressure,
+    ) -> Result<(), DbError> {
         let mut drain = Drain::new(counting.budget, deadline, &cancel.handle);
         let options = ExecuteOptions::new()
             .timeout_secs(0)
@@ -718,6 +802,9 @@ impl Session {
             wait_for_output(gate, cancel, drain.deadline()).await?;
             // A batch of many small statements and results never waits for a read.
             drain.pace.slice().await;
+            // Whether the step before this one was a result read to its end while only hidden
+            // rows were left (see `finished_late`).
+            let hidden_tail = std::mem::take(&mut drain.tail_hidden);
             match step {
                 Ok(StatementResult::Rows) => {
                     if self
@@ -744,12 +831,24 @@ impl Session {
                 Ok(StatementResult::NoRows {
                     rows_affected: None,
                 }) => {}
-                Ok(StatementResult::End) => break,
+                // The batch is over as far as the driver knows. It is a success only if it was
+                // over in time: a deadline that fired (or passed) while the last row's work or
+                // the final DONE was handled is still a timeout, although there is nothing left
+                // to cancel (R15 follow-up A).
+                Ok(StatementResult::End) => {
+                    if self.finished_late(&drain, cancel, counting, hidden_tail) {
+                        return Err(DbError::Timeout("query timeout".into()));
+                    }
+                    break;
+                }
                 Err(TdsError::SqlServerError { diagnostics }) => {
                     for error in &diagnostics.errors {
                         sink.error(&from_error(error))?;
                     }
                     if !self.client.has_open_batch() {
+                        if self.finished_late(&drain, cancel, counting, false) {
+                            return Err(DbError::Timeout("query timeout".into()));
+                        }
                         break;
                     }
                 }
@@ -815,6 +914,24 @@ impl Session {
         stopped
     }
 
+    /// Whether a batch the driver has finished took longer than `-t`: its deadline fired, or
+    /// passed without a look at the clock catching it (the last few rows' work, the final
+    /// DONE, read without waiting). Not after the user cancelled, whose cancel wins.
+    ///
+    /// The owner's hidden-row exception still holds: when the last thing read was a result whose
+    /// shown rows were complete and whose hidden rows were all counted (`hidden_tail`), in a run
+    /// whose `-t` may stop a count (`Counting::timeout_stops`), the batch is complete and exact,
+    /// and nothing it would have run was skipped, so it is not a timeout.
+    fn finished_late(
+        &self,
+        drain: &Drain,
+        cancel: &Cancel,
+        counting: Counting,
+        hidden_tail: bool,
+    ) -> bool {
+        drain.overdue(cancel) && !(hidden_tail && counting.timeout_stops)
+    }
+
     /// Whether `drain`'s budget, not the user, cancelled the work, and the driver settled the
     /// cancel and kept the connection (it marks it dead when the server doesn't acknowledge).
     fn stopped_by_budget(&self, drain: &Drain, cancel: &Cancel) -> bool {
@@ -874,7 +991,18 @@ impl Session {
                     drain.counted_row();
                     drain.pace.tick(1).await;
                 }
-                Ok(Row::End) => break,
+                // The result is over, and so is the work its last rows took. If that crossed
+                // the deadline, the result is not reported complete: a result whose rows to show
+                // were still coming, or a run where `-t` may not stop a count, ends in a timeout
+                // (R15 follow-up A). With the shown rows complete and only hidden rows counted,
+                // in a run where `-t` may stop a count, the result is complete and exact.
+                Ok(Row::End) => {
+                    if drain.overdue(cancel) && (shown || !counting.timeout_stops) {
+                        return Err(DbError::Timeout("query timeout".into()));
+                    }
+                    drain.tail_hidden = !shown;
+                    break;
+                }
                 Err(TdsError::SqlServerError { diagnostics }) => {
                     sink.end_rows_incomplete()?;
                     self.flush_messages(sink)?;
@@ -1028,6 +1156,9 @@ impl Session {
         timeout_secs: u32,
         cancel: &Cancel,
     ) -> Result<(), DbError> {
+        if self.retired {
+            return Err(DbError::Lost(RETIRED.into()));
+        }
         let options = ExecuteOptions::new()
             .timeout_secs(timeout_secs)
             .cancel(&cancel.handle);
@@ -1842,5 +1973,408 @@ mod tests {
         );
         assert!(tls_hint("SEC_E_ILLEGAL_MESSAGE").unwrap().contains("-No"));
         assert_eq!(tls_hint("Connection refused"), None);
+    }
+}
+
+/// `Session::run` against a fake server on a loopback socket: a TDS 7.4 endpoint that answers
+/// the prelogin (no encryption) and the login, then plays a script, so the real execution path
+/// (driver included) meets a deadline at exactly the points a live server can't be made to
+/// hit on demand (R15 follow-ups A and B). Adapted from the reviewer's probe.
+#[cfg(test)]
+mod fake_server {
+    use super::{
+        Auth, Backpressure, BatchSink, Cancel, Column, ConnectOptions, Counting, DbError, Encrypt,
+        RETIRED, ServerMessage, Session, Stop, Value,
+    };
+    use std::future::Future;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::pin::Pin;
+    use std::time::{Duration, Instant};
+
+    /// The type of the next whole message from the client, after reading all its packets
+    /// (`None` once the client is gone). 0x12 prelogin, 0x10 login, 1 SQL batch, 6 attention.
+    fn receive(s: &mut TcpStream) -> Option<u8> {
+        loop {
+            let mut header = [0u8; 8];
+            s.read_exact(&mut header).ok()?;
+            let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            let mut payload = vec![0; length.checked_sub(8)?];
+            s.read_exact(&mut payload).ok()?;
+            if header[1] & 1 != 0 {
+                return Some(header[0]);
+            }
+        }
+    }
+
+    fn send(s: &mut TcpStream, payload: &[u8]) {
+        let length = u16::try_from(payload.len() + 8).unwrap();
+        let [high, low] = length.to_be_bytes();
+        s.write_all(&[4, 1, high, low, 0, 0, 1, 0]).unwrap();
+        s.write_all(payload).unwrap();
+    }
+
+    /// DONE, final, with a row count.
+    fn done(rows: u64) -> Vec<u8> {
+        let mut token = vec![0xfd, 0x10, 0, 0xc1, 0];
+        token.extend(rows.to_le_bytes());
+        token
+    }
+
+    /// One `int` column named x, `rows` rows of it, and the final DONE.
+    fn int_rows(rows: u64) -> Vec<u8> {
+        let mut reply = vec![0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, b'x', 0];
+        for _ in 0..rows {
+            reply.extend([0xd1, 1, 0, 0, 0]);
+        }
+        reply.extend(done(rows));
+        reply
+    }
+
+    /// The login's answer: LOGINACK, the packet size, database and collation changes, DONE.
+    fn login_reply() -> Vec<u8> {
+        let name: Vec<u8> = "fake".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut ack = vec![1, 0x74, 0, 0, 4, 4];
+        ack.extend(name);
+        ack.extend([17, 0, 0, 1]);
+        let mut reply = vec![0xad];
+        reply.extend(u16::try_from(ack.len()).unwrap().to_le_bytes());
+        reply.extend(ack);
+        reply.extend([0xe3, 8, 0, 7, 5, 9, 4, 0xd0, 0, 0x34, 0]);
+        let master: Vec<u8> = "master".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        reply.extend([0xe3, 15, 0, 1, 6]);
+        reply.extend(master);
+        reply.push(0);
+        let size: Vec<u8> = "4096".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        reply.extend([0xe3, 19, 0, 4, 4]);
+        reply.extend(&size);
+        reply.push(4);
+        reply.extend(&size);
+        reply.extend(done(0));
+        reply
+    }
+
+    /// What the fake server does with the batch `Session::run` sends.
+    enum Script {
+        /// Answer it at once with these tokens.
+        Reply(Vec<u8>),
+        /// Read it, and everything after it (the attention), and never answer.
+        Silent,
+        /// Read `bytes` of it, then stop reading altogether and never answer, so the client's
+        /// writes block part way through a request of several packets.
+        StopReading { bytes: usize },
+    }
+
+    /// Starts the fake server; returns its address for `-S`.
+    fn serve(script: Script) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            if receive(&mut s) != Some(0x12) {
+                return;
+            }
+            send(
+                &mut s,
+                &[0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff, 17, 0, 0, 0, 0, 0, 2],
+            );
+            if receive(&mut s) != Some(0x10) {
+                return;
+            }
+            send(&mut s, &login_reply());
+            match script {
+                Script::Reply(tokens) => {
+                    if receive(&mut s) == Some(1) {
+                        send(&mut s, &tokens);
+                    }
+                    while receive(&mut s).is_some() {}
+                }
+                Script::Silent => while receive(&mut s).is_some() {},
+                Script::StopReading { bytes } => {
+                    let mut taken = vec![0; bytes];
+                    let _ = s.read_exact(&mut taken);
+                    // Hold the socket open, unread, for longer than any test waits.
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+        });
+        format!("127.0.0.1,{port}")
+    }
+
+    /// Shows rows, or hides them all, and spends `work` on each.
+    struct Sink {
+        show: bool,
+        work: Duration,
+        stopped: Option<Stop>,
+        complete: bool,
+    }
+
+    impl Sink {
+        fn new(show: bool, work: Duration) -> Sink {
+            Sink {
+                show,
+                work,
+                stopped: None,
+                complete: false,
+            }
+        }
+
+        fn spend(&self) {
+            let until = Instant::now() + self.work;
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    impl BatchSink for Sink {
+        fn columns(&mut self, _: &[Column]) -> io::Result<()> {
+            Ok(())
+        }
+        fn wants_values(&self) -> bool {
+            self.show
+        }
+        fn cell_limit(&self) -> usize {
+            100
+        }
+        fn row(&mut self, _: &[Value]) -> io::Result<()> {
+            self.spend();
+            Ok(())
+        }
+        fn skipped_row(&mut self) {
+            self.spend();
+        }
+        fn counting_stopped(&mut self, by: Stop) {
+            self.stopped = Some(by);
+        }
+        fn end_rows(&mut self) -> io::Result<()> {
+            self.complete = true;
+            Ok(())
+        }
+        fn end_rows_incomplete(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn rows_affected(&mut self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn message(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Open;
+
+    impl Backpressure for Open {
+        fn is_full(&self) -> bool {
+            false
+        }
+        fn room(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Ran {
+        outcome: Result<(), DbError>,
+        elapsed: Duration,
+        sink: Sink,
+        /// What a later statement on the same session got, when the session was retired.
+        after: Option<Result<(), DbError>>,
+    }
+
+    /// Connects to `server`, runs `sql` with `-t 1`, and reports.
+    fn run_once(server: String, sql: String, counting: Counting, mut sink: Sink) -> Ran {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cancel = Cancel::new();
+            let options = ConnectOptions {
+                server,
+                database: None,
+                // Synthetic strings for the fake server, unrelated to any real account.
+                auth: Auth::Sql {
+                    user: "fake".into(),
+                    password: "fake".into(),
+                },
+                encrypt: Encrypt::Optional,
+                trust_server_certificate: false,
+                login_timeout: 5,
+                read_only_intent: false,
+                multi_subnet_failover: false,
+            };
+            let mut session = Session::connect(&options, &cancel)
+                .await
+                .expect("connected to the fake server");
+            let started = Instant::now();
+            let outcome = session
+                .run(sql, 1, counting, &cancel, &mut sink, &Open)
+                .await;
+            let elapsed = started.elapsed();
+            let after = if session.retired {
+                Some(session.exec_internal("SELECT 1", 1, &cancel).await)
+            } else {
+                None
+            };
+            Ran {
+                outcome,
+                elapsed,
+                sink,
+                after,
+            }
+        })
+    }
+
+    const SHOWN: Counting = Counting::EXACT;
+    /// `--exact-count` in a read-only run: exact, but `-t` may stop a count of hidden rows.
+    const HIDDEN_MAY_STOP: Counting = Counting {
+        budget: None,
+        timeout_stops: true,
+    };
+    const LATE: Duration = Duration::from_millis(1200);
+
+    fn timed_out(outcome: &Result<(), DbError>) -> bool {
+        matches!(outcome, Err(DbError::Timeout(_)))
+    }
+
+    // R15 follow-up A: a short result whose last row's work (sqlh's, not the driver's) crosses
+    // `-t`, with the final DONE already in the buffer, so no read waits and no look at the clock
+    // falls inside the result (fewer than 64 shown rows). It used to end `Ok(())`.
+    #[test]
+    fn a_deadline_crossed_by_the_last_rows_work_is_a_timeout() {
+        let reply = || serve(Script::Reply(int_rows(1)));
+        let ran = run_once(reply(), "SELECT 1".into(), SHOWN, Sink::new(true, LATE));
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+        assert!(
+            !ran.sink.complete,
+            "a result past -t is not closed as complete"
+        );
+
+        // Writes allowed (`-t` stops no count), with the row hidden: a timeout too.
+        let ran = run_once(reply(), "SELECT 1".into(), SHOWN, Sink::new(false, LATE));
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+
+        // A normal short result is a success, and complete.
+        let ran = run_once(
+            serve(Script::Reply(int_rows(3))),
+            "SELECT 1".into(),
+            SHOWN,
+            Sink::new(true, Duration::ZERO),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        assert!(ran.sink.complete);
+    }
+
+    // The owner's hidden-row exception is kept: in a read-only run, a result whose shown rows
+    // are complete and whose hidden rows were all counted, however late, is complete and exact.
+    #[test]
+    fn a_late_end_of_hidden_rows_in_a_read_only_run_is_still_complete() {
+        let ran = run_once(
+            serve(Script::Reply(int_rows(1))),
+            "SELECT 1".into(),
+            HIDDEN_MAY_STOP,
+            Sink::new(false, LATE),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        assert!(ran.sink.complete && ran.sink.stopped.is_none());
+    }
+
+    // R15 follow-up B: the server takes the batch and then never answers, not even the
+    // attention. The batch still ends within -t plus `SETTLE_GRACE`, as a timeout.
+    #[test]
+    fn a_cancel_the_server_never_acknowledges_ends_within_the_grace() {
+        let ran = run_once(
+            serve(Script::Silent),
+            "SELECT 1".into(),
+            SHOWN,
+            Sink::new(true, Duration::ZERO),
+        );
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+        assert!(
+            ran.elapsed < Duration::from_millis(7_500),
+            "{:?}",
+            ran.elapsed
+        );
+    }
+
+    // R15 follow-up B: a request of many packets that the server stops reading part way
+    // through, and never answers, so the deadline meets the driver in the middle of sending
+    // it (where it abandons the write, or withdraws the request and can wait up to 120 s).
+    // The batch ends within -t plus `SETTLE_GRACE`, and a retired session takes nothing more.
+    #[test]
+    fn a_request_cut_off_while_it_is_sent_ends_within_the_grace() {
+        let ran = run_once(
+            serve(Script::StopReading { bytes: 64 << 10 }),
+            long_sql(),
+            SHOWN,
+            Sink::new(true, Duration::ZERO),
+        );
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+        assert!(
+            ran.elapsed < Duration::from_millis(7_500),
+            "{:?}",
+            ran.elapsed
+        );
+        if let Some(after) = &ran.after {
+            assert!(
+                matches!(after, Err(DbError::Lost(message)) if message == RETIRED),
+                "{after:?}"
+            );
+        }
+    }
+
+    /// A batch of about 8 MB: some 2,000 packets of 4 KB, far more than the socket buffers hold.
+    fn long_sql() -> String {
+        format!("SELECT 1 --{}", "x".repeat(8 << 20))
+    }
+
+    // R15 follow-up B, the reviewer's case: the driver settles a cancel in its own time, and
+    // withdrawing a request cancelled between two of its packets waits up to 120 s for the
+    // server's DONE, with the cancel removed. `settle_within` is what bounds that: here the
+    // work is a future that never ends, standing in for the withdrawal, and the bound ends it
+    // at the deadline plus `SETTLE_GRACE`; without a deadline (`-t 0`) nothing is bounded.
+    //
+    // That driver state can't be reached through `Session::run` from outside the driver: it
+    // needs the cancel to land after one packet's write completes and before the next starts,
+    // in the same poll, and tokio wakes the writing task for the socket before the timer task
+    // that cancels, so an external deadline always meets a write in progress (which the driver
+    // abandons at once). A sweep of buffer sizes and runtime holds never reached it.
+    #[test]
+    fn a_settlement_that_never_ends_is_cut_at_the_grace() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let never = std::future::pending::<()>();
+            assert_eq!(super::settle_within(Some(deadline), never).await, None);
+            let waited = started.elapsed();
+            assert!(
+                waited >= super::SETTLE_GRACE
+                    && waited <= super::SETTLE_GRACE + Duration::from_secs(2),
+                "{waited:?}"
+            );
+            // Work that ends is never cut, and without a deadline there is no bound at all.
+            assert_eq!(
+                super::settle_within(Some(deadline), async { 7 }).await,
+                Some(7)
+            );
+            let slow = tokio::time::sleep(Duration::from_millis(50));
+            assert_eq!(
+                super::settle_within(None, async {
+                    slow.await;
+                    8
+                })
+                .await,
+                Some(8)
+            );
+        });
     }
 }
