@@ -754,7 +754,8 @@ async fn execute(
     started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     if let Some((location, blocked)) = &prepared.blocked {
-        if let Err(e) = out.blocked(location, &blocked.reason, &blocked.advice) {
+        let advice = blocked.advice_for(settings.write_denied_by.as_deref());
+        if let Err(e) = out.blocked(location, &blocked.reason, &advice) {
             return (Err(output_failure(e)), None);
         }
         return (Err(Failure::new(Exit::Blocked, "")), None);

@@ -439,10 +439,12 @@ Read-only is the default. Each profile sets a write policy:
 | Policy | Behavior |
 |---|---|
 | `deny` | The profile can never write, and `--allow-write` is rejected. |
-| `flag` (default) | `--allow-write` turns on writes for that run. |
+| `flag` | `--allow-write` turns on writes for that run. The policy of a profile saved without `write_policy`, and of runs without a profile. |
 | `allow` | Writes are on by default. |
 
 Database permissions are expected to provide the enforcement boundary. The tool's checks are also important when a DBA or developer has accidentally granted an agent excessive access. An agent can pass `--allow-write` itself, so `flag` is an accident guard; `deny` is the strongest tool policy, but does not replace restricted database permissions.
+
+**New profiles refuse writes** (owner decision 12, 2026-10-12): `sqlh profile add` saves `write_policy = "deny"` for a profile it creates, unless `--write-policy` is given, and says so in a note with the command that changes it. In agent trial 2 a model asked to clean up a table added `--allow-write` on its own and ran a 927,269-row `DELETE`; only the profile's `deny` stopped it. Writing therefore takes a deliberate change to a profile, made by a person, since `profile add` is the one command that reads from the console. Updating an existing profile keeps its policy, and a profile in the file without `write_policy` (saved before this change) is still `flag`.
 
 Command categorization and the balance of allowlists/blocklists need further design using legitimate DBA workflows and their risks. The current classifier below is the MVP mechanism, not the final categorization system. See [VISION.md](VISION.md).
 
@@ -470,7 +472,7 @@ In read-only mode, three layers apply:
    - **DBCC** is allowed only for `SHOW_STATISTICS`, `INPUTBUFFER`, `OPENTRAN`, `USEROPTIONS` and `TRACESTATUS`.
    - **These words are blocked anywhere:** `MERGE`, `COMMIT`, `ROLLBACK`, `SAVE`, `GRANT`, `REVOKE`, `DENY`, `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `RECONFIGURE`, `CHECKPOINT`, `BULK`, `OPENQUERY`, `OPENROWSET`, `OPENDATASOURCE`, `WAITFOR`, `RECEIVE`, `SEND`, `CONVERSATION`, `ENABLE`, `DISABLE`, `UPDATETEXT`, `WRITETEXT`, `SETUSER`. If one of these is really an unbracketed column name, the message suggests writing it as `[Name]`.
 
-   When it blocks something, nothing runs. It reports `-- blocked: <where>: <reason>; nothing was run. <advice>` and exits 5, for example `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended`. The advice fits the refusal. `--allow-write` is suggested only where it helps, and a better spelling comes first where there is one: a `#temp` table instead of `##t`, `sys.sp_who` instead of `dbo.sp_who`, `sp_spaceused` without `@updateusage`, or fixing a typo.
+   When it blocks something, nothing runs. It reports `-- blocked: <where>: <reason>; nothing was run. <advice>` and exits 5, for example `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended`. The advice fits the refusal. `--allow-write` is suggested only where it helps, and a better spelling comes first where there is one: a `#temp` table instead of `##t`, `sys.sp_who` instead of `dbo.sp_who`, `sp_spaceused` without `@updateusage`, or fixing a typo. Under a profile whose `write_policy` is `deny`, `--allow-write` is a usage error, so no refusal offers it: the alternative stays, and the advice says the profile doesn't allow writes instead, `-- blocked: line 1: DELETE dbo.T would write; nothing was run. Profile test doesn't allow writes (write_policy = "deny")`, or `… Use a #temp table; profile test doesn't allow writes (write_policy = "deny")` (PLAN.md 2.16, from agent trial 2). A refusal `--allow-write` can't lift (`NOEXEC` under `--check`) keeps its own advice.
 
    **Under `--check`** one more rule applies, whether or not writes are allowed: input that mentions `NOEXEC` is refused, because `SET NOEXEC OFF` would run the SQL instead of compiling it. The rule is deliberately coarse. It refuses the word anywhere outside strings, comments and quoted names, so a bare column or alias named `NOEXEC` is refused too, while `[NOEXEC]` is fine. The advice says so, and that `--allow-write` doesn't lift this rule.
 
@@ -519,7 +521,7 @@ database = "AppDb"
 auth = "windows"             # windows | sql
 encrypt = "mandatory"        # optional | mandatory | strict
 trust_server_certificate = false
-write_policy = "flag"        # deny | flag | allow
+write_policy = "deny"        # deny | flag | allow; profile add saves deny for a new profile
 max_rows = 100
 query_timeout = 60
 lock_timeout = 10            # seconds a statement waits for a lock; 0 = no limit (§4.2)

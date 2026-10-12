@@ -2699,7 +2699,8 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     );
     let rows = listed();
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].ends_with("\tflag\t5\t1\t1"), "{}", rows[0]);
+    // A new profile refuses writes unless told otherwise (owner decision 12).
+    assert!(rows[0].ends_with("\tdeny\t5\t1\t1"), "{}", rows[0]);
 
     // Left out, they stay.
     let r = profiles(&["profile", "add", "sqlh-ut-locks", "-d", "AppDb"]);
@@ -2729,7 +2730,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
         "{file}"
     );
     let rows = listed();
-    assert!(rows[0].ends_with("\tflag\t0\t0\t0"), "{}", rows[0]);
+    assert!(rows[0].ends_with("\tdeny\t0\t0\t0"), "{}", rows[0]);
 
     // A profile that never mentioned them shows what its runs get.
     let r = profiles(&[
@@ -2756,7 +2757,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     let rows = listed();
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows[1].starts_with("sqlh-ut-plain\t"), "{}", rows[1]);
-    assert!(rows[1].ends_with("\tflag\t10\t0\t0"), "{}", rows[1]);
+    assert!(rows[1].ends_with("\tdeny\t10\t0\t0"), "{}", rows[1]);
 
     // The out-of-range value is refused before anything is saved.
     let before = saved();
@@ -2769,6 +2770,108 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     ]);
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert_eq!(saved(), before);
+}
+
+// Owner decision 12 and PLAN.md 2.16 (agent trial 2): a new profile refuses writes unless
+// `--write-policy` says otherwise, and says so when saved; a refusal under a deny profile never
+// offers --allow-write, which that profile refuses. An existing profile keeps its policy.
+#[test]
+fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
+    let dir = scratch("profile_deny_default");
+    let config = dir.join("profiles.toml");
+    let with = |args: &[&str]| run(sqlh().args(args).env("SQLH_CONFIG", &config));
+    let section = |name: &str| {
+        let file = fs::read_to_string(&config).expect("the profiles file");
+        let start = file
+            .find(&format!("[profiles.{name}]"))
+            .unwrap_or_else(|| panic!("{name} in {file}"));
+        let rest = &file[start + 1..];
+        rest[..rest.find("\n[").unwrap_or(rest.len())].to_owned()
+    };
+
+    // New, with nothing said: deny, and the note says how to change it.
+    let r = with(&[
+        "profile",
+        "add",
+        "sqlh-ut-deny",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+    ]);
+    assert_eq!(
+        r.code, 2,
+        "saved, then the connection test failed: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains(
+            "-- note: sqlh-ut-deny refuses writes (write_policy deny, the default for a new \
+             profile); sqlh profile add sqlh-ut-deny --write-policy flag lets --allow-write \
+             through\n"
+        ),
+        "{}",
+        r.stdout
+    );
+    assert!(section("sqlh-ut-deny").contains("\nwrite_policy = \"deny\"\n"));
+    // Its refusals, found before anything connects, keep their alternative and never offer
+    // --allow-write.
+    let r = with(&["--profile", "sqlh-ut-deny", "-Q", "DELETE FROM dbo.T"]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "-- blocked: line 1: DELETE dbo.T would write; nothing was run. Profile \
+             sqlh-ut-deny doesn't allow writes (write_policy = \"deny\")\n"
+        ),
+        "{}",
+        r.stdout
+    );
+    let r = with(&[
+        "--profile",
+        "sqlh-ut-deny",
+        "-Q",
+        "INSERT ##shared VALUES (1)",
+    ]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "nothing was run. Use a #temp table; profile sqlh-ut-deny doesn't allow writes \
+             (write_policy = \"deny\")\n"
+        ),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("--allow-write"), "{}", r.stdout);
+
+    // New, with the policy given: that policy, no note, and the advice offers the flag.
+    let r = with(&[
+        "profile",
+        "add",
+        "sqlh-ut-flag",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+        "--write-policy",
+        "flag",
+    ]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    assert!(!r.stdout.contains("refuses writes"), "{}", r.stdout);
+    assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
+    let r = with(&["--profile", "sqlh-ut-flag", "-Q", "DELETE FROM dbo.T"]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("nothing was run. Rerun with --allow-write if the write is intended\n"),
+        "{}",
+        r.stdout
+    );
+
+    // Updated without the option: it keeps its policy, and nothing is said about it.
+    let r = with(&["profile", "add", "sqlh-ut-flag", "-d", "AppDb"]);
+    assert_eq!(r.code, 2, "{}", r.stdout);
+    assert!(!r.stdout.contains("refuses writes"), "{}", r.stdout);
+    assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
 }
 
 mod live {

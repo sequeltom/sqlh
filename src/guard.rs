@@ -19,6 +19,54 @@ pub struct Blocked {
     pub reason: String,
     /// How to get past the refusal; the output puts it after "nothing was run.".
     pub advice: String,
+    /// Whether `--allow-write` lifts the refusal (it skips the classifier). `advice` then
+    /// offers it, which is no use under a profile that refuses it (`advice_for`).
+    pub lifted_by_write: bool,
+    /// What to do short of writing, where there is something (`Use a #temp table`).
+    pub instead: Option<String>,
+}
+
+impl Blocked {
+    /// A refusal that `--allow-write` lifts, with nothing to try short of writing.
+    fn write(line: u32, reason: String) -> Blocked {
+        Blocked {
+            line,
+            reason,
+            advice: WRITE_ADVICE.into(),
+            lifted_by_write: true,
+            instead: None,
+        }
+    }
+
+    /// A refusal that `--allow-write` lifts, with `instead` to try first: the advice is
+    /// `<instead>, or rerun with --allow-write<tail>`.
+    fn write_or(line: u32, reason: String, instead: String, tail: &str) -> Blocked {
+        Blocked {
+            line,
+            reason,
+            advice: format!("{instead}, or rerun with --allow-write{tail}"),
+            lifted_by_write: true,
+            instead: Some(instead),
+        }
+    }
+
+    /// The advice to print. Under a profile whose `write_policy` is `deny` (`denied_by`, the
+    /// profile's name), `--allow-write` is a usage error, so the advice never offers it: it
+    /// says that the profile doesn't allow writes, after what can be done instead (PLAN.md
+    /// 2.16, from agent trial 2).
+    pub fn advice_for(&self, denied_by: Option<&str>) -> String {
+        match denied_by {
+            Some(profile) if self.lifted_by_write => match &self.instead {
+                Some(instead) => format!(
+                    "{instead}; profile {profile} doesn't allow writes (write_policy = \"deny\")"
+                ),
+                None => {
+                    format!("Profile {profile} doesn't allow writes (write_policy = \"deny\")")
+                }
+            },
+            _ => self.advice.clone(),
+        }
+    }
 }
 
 /// Advice for the refusals that `--allow-write` resolves.
@@ -306,13 +354,12 @@ impl Work {
 /// The refusal for input the read-only check can't classify in bounded work. `--allow-write`
 /// skips the classifier, so it lifts this one, as it does the others.
 fn too_complex(line: u32, why: &str) -> Blocked {
-    Blocked {
+    Blocked::write_or(
         line,
-        reason: format!("this input is too complex for the read-only check: {why}"),
-        advice: "Simplify it or split it into smaller batches with GO, or rerun with \
-                 --allow-write if the write is intended"
-            .into(),
-    }
+        format!("this input is too complex for the read-only check: {why}"),
+        "Simplify it or split it into smaller batches with GO".into(),
+        " if the write is intended",
+    )
 }
 
 pub fn check(sql: &str, policy: Policy) -> Result<(), Blocked> {
@@ -414,6 +461,8 @@ impl<'a> Guard<'a> {
                 advice: "Remove SET NOEXEC (--check sets it already); write a column named \
                          NOEXEC as [NOEXEC]. --allow-write doesn't lift this"
                     .into(),
+                lifted_by_write: false,
+                instead: None,
             }),
             None => Ok(()),
         }
@@ -561,24 +610,22 @@ impl<'a> Guard<'a> {
             }
             // Sequence allocation survives a rollback, so the wrapper can't undo it.
             "NEXT" if lex.word_is(0, "VALUE") && lex.word_is(1, "FOR") => {
-                return Err(Blocked {
+                return Err(Blocked::write(
                     line,
-                    reason: format!(
+                    format!(
                         "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
                         self.name_at(&lex.after(2))
                     ),
-                    advice: WRITE_ADVICE.into(),
-                });
+                ));
             }
             word if BLOCKED.contains(&word) => {
-                return Err(Blocked {
+                return Err(Blocked::write(
                     line,
-                    reason: format!(
+                    format!(
                         "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
                         token.text
                     ),
-                    advice: WRITE_ADVICE.into(),
-                });
+                ));
             }
             _ => {}
         }
@@ -639,14 +686,15 @@ impl<'a> Guard<'a> {
     /// `line` is the line of the keyword that makes the write.
     fn require_scratch(&self, line: u32, target: &Lexer<'a>, what: &str) -> Result<(), Blocked> {
         match target.ahead(0) {
-            Some(t) if t.kind == Kind::Temp && t.text.starts_with("##") => Err(Blocked {
+            Some(t) if t.kind == Kind::Temp && t.text.starts_with("##") => Err(Blocked::write_or(
                 line,
-                reason: format!(
+                format!(
                     "{what} {} would write to a global temp table, which other sessions share",
                     t.text
                 ),
-                advice: "Use a #temp table, or rerun with --allow-write".into(),
-            }),
+                "Use a #temp table".into(),
+                "",
+            )),
             Some(t) if matches!(t.kind, Kind::Temp | Kind::Var) => Ok(()),
             _ => Err(self.blocked(line, &format!("{what} {}", self.name_at(target)))),
         }
@@ -702,16 +750,16 @@ impl<'a> Guard<'a> {
         if !in_list(PROCS, name) && batch_start {
             // A batch that starts with an unknown word is run as a procedure call by SQL
             // Server, so a typo like `SELEC 1` lands here too.
-            return Err(Blocked {
+            return Err(Blocked::write_or(
                 line,
-                reason: format!(
+                format!(
                     "{} starts the batch, so SQL Server would run it as a stored procedure (a typo?); \
                      only read-only system procedures may run without --allow-write",
                     self.name_at(start)
                 ),
-                advice: "Fix it if it's a typo, or rerun with --allow-write to call the procedure"
-                    .into(),
-            });
+                "Fix it if it's a typo".into(),
+                " to call the procedure",
+            ));
         }
         if !in_list(PROCS, name) {
             return Err(self.blocked(line, &format!("{what} {}", self.name_at(start))));
@@ -720,32 +768,29 @@ impl<'a> Guard<'a> {
             // The policy, not a claim about what the name resolves to: it may well be the
             // system procedure, but another schema, database or linked server can name a
             // different one.
-            return Err(Blocked {
+            return Err(Blocked::write_or(
                 line,
-                reason: format!(
+                format!(
                     "{what} {}: only a bare, sys. or master. name is taken as the system \
                      procedure (another schema, database or linked server can name a different one)",
                     self.name_at(start)
                 ),
-                advice: format!(
-                    "Call it as sys.{}, or rerun with --allow-write to run it as written",
-                    last.map_or("", |t| t.text)
-                ),
-            });
+                format!("Call it as sys.{}", last.map_or("", |t| t.text)),
+                " to run it as written",
+            ));
         }
         if name.eq_ignore_ascii_case("SP_SPACEUSED") {
             match self.spaceused_updates_usage(&end) {
                 Some(false) => {}
                 Some(true) => {
-                    return Err(Blocked {
+                    return Err(Blocked::write_or(
                         line,
-                        reason: "sp_spaceused with @updateusage (named, or as the second \
-                                 argument) runs DBCC UPDATEUSAGE, which writes"
+                        "sp_spaceused with @updateusage (named, or as the second \
+                         argument) runs DBCC UPDATEUSAGE, which writes"
                             .into(),
-                        advice: "Leave @updateusage out to only read sizes, or rerun with \
-                                 --allow-write"
-                            .into(),
-                    });
+                        "Leave @updateusage out to only read sizes".into(),
+                        "",
+                    ));
                 }
                 None => {
                     return Err(too_complex(
@@ -860,11 +905,7 @@ impl<'a> Guard<'a> {
 
     /// A refusal for `what`, at the keyword on `line`.
     fn blocked(&self, line: u32, what: &str) -> Blocked {
-        Blocked {
-            line,
-            reason: format!("{what} would write"),
-            advice: WRITE_ADVICE.into(),
-        }
+        Blocked::write(line, format!("{what} would write"))
     }
 }
 
@@ -1218,6 +1259,8 @@ mod tests {
                 line: 2,
                 reason: "UPDATE dbo.Orders would write".into(),
                 advice: WRITE_ADVICE.into(),
+                lifted_by_write: true,
+                instead: None,
             }
         );
         assert_eq!(
@@ -1344,6 +1387,55 @@ mod tests {
         );
         assert_eq!(blocked("DELETE FROM dbo.T").advice, WRITE_ADVICE);
         assert_eq!(blocked("SELECT NEXT VALUE FOR dbo.S").advice, WRITE_ADVICE);
+    }
+
+    // PLAN.md 2.16 (agent trial 2): under a profile whose write_policy is deny, --allow-write is
+    // a usage error, so no refusal may offer it. The alternative short of writing stays, and the
+    // advice says the profile doesn't allow writes. Without a deny profile it is as before.
+    #[test]
+    fn refusals_under_a_deny_profile_never_offer_allow_write() {
+        let denied = "profile p doesn't allow writes (write_policy = \"deny\")";
+        for (sql, expected) in [
+            (
+                "DELETE FROM dbo.T",
+                "Profile p doesn't allow writes (write_policy = \"deny\")".to_owned(),
+            ),
+            (
+                "SELECT NEXT VALUE FOR dbo.S",
+                "Profile p doesn't allow writes (write_policy = \"deny\")".to_owned(),
+            ),
+            (
+                "INSERT ##shared VALUES (1)",
+                format!("Use a #temp table; {denied}"),
+            ),
+            (
+                "EXEC sp_spaceused N'dbo.T', N'true'",
+                format!("Leave @updateusage out to only read sizes; {denied}"),
+            ),
+            ("SELEC 1", format!("Fix it if it's a typo; {denied}")),
+            (
+                "EXEC dbo.sp_who",
+                format!("Call it as sys.sp_who; {denied}"),
+            ),
+        ] {
+            let b = blocked(sql);
+            assert_eq!(b.advice_for(Some("p")), expected, "{sql}");
+            assert!(!b.advice_for(Some("p")).contains("--allow-write"), "{sql}");
+            assert_eq!(b.advice_for(None), b.advice, "{sql}");
+        }
+        // Too complex to classify: simplify, nothing about writes.
+        let b = too_complex(1, "test");
+        assert_eq!(
+            b.advice_for(Some("p")),
+            format!("Simplify it or split it into smaller batches with GO; {denied}")
+        );
+        // A refusal --allow-write doesn't lift keeps its own advice.
+        let check_mode = Policy {
+            writes: false,
+            compile_only: true,
+        };
+        let b = check("SET NOEXEC OFF", check_mode).expect_err("refused");
+        assert_eq!(b.advice_for(Some("p")), b.advice);
     }
 
     #[test]

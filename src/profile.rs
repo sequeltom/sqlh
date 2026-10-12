@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use crate::cli::{Opts, ProfileCommand};
-use crate::config::{self, AuthKind, DEFAULT_LOCK_TIMEOUT, Profile};
+use crate::config::{self, AuthKind, DEFAULT_LOCK_TIMEOUT, Profile, WritePolicy};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
@@ -69,12 +69,16 @@ fn test(name: String, started: Instant) -> Exit {
     run_command(opts, started)
 }
 
-/// Creates or updates a profile. Options not given keep their saved values. The password is
+/// Creates or updates a profile. Options not given keep their saved values. A new profile
+/// refuses writes (`write_policy = "deny"`) unless `--write-policy` says otherwise: an agent
+/// given `--allow-write` in `--help` used it on its own (agent trial 2, owner decision 12). The password is
 /// asked for only when none is stored, when the server or login changes (so a profile can't
 /// be repointed at another server and handed the stored password), or with --new-password.
 fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
     let mut config = config::load().map_err(Failure::usage)?;
-    let base = config.find(name).cloned().unwrap_or_default();
+    let existing = config.find(name).cloned();
+    let new = existing.is_none();
+    let base = existing.unwrap_or_default();
     let user = if opts.integrated {
         None
     } else {
@@ -100,7 +104,10 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         trust_server_certificate: opts
             .trust_server_certificate
             .or(base.trust_server_certificate),
-        write_policy: opts.write_policy.or(base.write_policy),
+        write_policy: opts
+            .write_policy
+            .or(base.write_policy)
+            .or(new.then_some(WritePolicy::Deny)),
         login_timeout: opts.login_timeout.or(base.login_timeout),
         query_timeout: opts.query_timeout.or(base.query_timeout),
         max_rows: opts.max_rows.or(base.max_rows),
@@ -167,6 +174,12 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
         let _ = out.note(&format!(
             "{how} in Windows Credential Manager as {}",
             credman::target(name)
+        ));
+    }
+    if new && opts.write_policy.is_none() {
+        let _ = out.note(&format!(
+            "{name} refuses writes (write_policy deny, the default for a new profile); \
+             sqlh profile add {name} --write-policy flag lets --allow-write through"
         ));
     }
     if became_default {

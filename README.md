@@ -10,7 +10,7 @@ Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server
 
 Read-only mode **guards against accidents; it is not a security boundary.** Before anything runs, sqlh refuses SQL that writes, and it runs everything inside a transaction that it rolls back. That stops a confused agent from changing data. It can't stop a determined one with the same login, and some effects survive a rollback.
 
-**Give agents a login with only the permissions they need**, for example `db_datareader` and `VIEW DEFINITION`. The database is the enforcement boundary. Writes need `--allow-write`, and a profile can refuse even that (`--write-policy deny`).
+**Give agents a login with only the permissions they need**, for example `db_datareader` and `VIEW DEFINITION`. The database is the enforcement boundary. A new profile refuses writes altogether; a profile changed to allow them (`--write-policy flag`) still needs `--allow-write` on each run.
 
 ## Build
 
@@ -76,7 +76,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 **Safe to hand to a model**
 - **Read-only by default.** A guard refuses SQL that writes before anything runs, and everything runs in a transaction that is rolled back. This guards against accidents; the database's permissions are the real boundary. *(MVP)*
 - **`--check`.** Compile only: syntax errors and unknown columns, with nothing executed, and the input can't switch the check off. *(MVP; hardened in Phase 1)*
-- **A write policy per profile.** `deny` (never), `flag` (needs `--allow-write`) or `allow`. *(MVP)*
+- **A write policy per profile, and new profiles refuse writes.** `deny` (never), `flag` (needs `--allow-write`) or `allow`; `profile add` makes new profiles `deny`, because an agent in trial 2 added `--allow-write` on its own. Under `deny`, a refusal says the profile doesn't allow writes rather than suggesting a flag that would fail. *(MVP; deny by default and its refusals since Phase 2.16)*
 - **No secrets in the transcript.** `-P` is rejected. Passwords live in Windows Credential Manager (or `SQLCMDPASSWORD`), and a stored password is only ever sent to its own server and login, so a profile can't be repointed to harvest it. *(MVP)*
 - **`-o` can't hurt the input.** It refuses to write onto an input file, however it is spelled, and replaces the destination whole or not at all. *(Phase 1)*
 - **Dirty reads only on request.** `--read-uncommitted` lets a read-only run read past writers' locks without waiting, and the output says the rows may be uncommitted. It is refused when writes are allowed, so no write is ever based on a dirty read. *(Phase 2.8)*
