@@ -116,6 +116,10 @@ This README is the human-facing overview. The other documents, [AGENTS.md](AGENT
 - [docs/PLAN.md](docs/PLAN.md): the current plan of attack
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
 
+## License
+
+[MIT](LICENSE).
+
 ## Local housekeeping
 
 Builds go in the ignored `target/` directory; `cargo clean` frees the disk space, and the next build is slower. `scratch/` and `artifacts/` are ignored too, for experiments and local results. Real server data and connection profiles stay local, and committed examples use synthetic data. Executables will be distributed as GitHub release assets when releases are ready. The other contributor rules are in [AGENTS.md](AGENTS.md).

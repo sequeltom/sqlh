@@ -101,6 +101,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 - Keep real server data, connection profiles, credentials and personal agent state out of commits. Do not blanket-ignore SQL, JSON or CSV: those formats can also hold legitimate fixtures and examples.
 - Keep `target/` as a local build cache during active development. Run `cargo clean` when reclaiming disk space or troubleshooting build artifacts; the next build must recreate them. Do not routinely clean between agent turns.
 - Before committing, inspect `git status --short`, `git diff --cached --stat`, and `git diff --cached`. Use `git ls-files --cached --ignored --exclude-standard` to catch previously tracked files that ignore rules do not remove. Review new files as well as edits.
+- sqlh is licensed MIT (`LICENSE`). A new dependency must be under a license compatible with that (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, Unlicense or similar permissive terms); check its `license` field before adding it, and never add a copyleft one.
 - Never commit executables. When releases are ready, distribute them as GitHub release assets.
 - Preserve useful development history. Move obsolete documents to a clearly named archive under `docs/` only when they are superseded, and update references in the same change. Before a public push, review the history as well as the current tree for private data.
 
