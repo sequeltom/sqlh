@@ -18,7 +18,8 @@ CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
   -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
   -d database     (env SQLCMDDBNAME); default: the profile's, else the login's (often master)
-  -E              Windows integrated auth (default without -U)    -C  trust the server certificate
+  -E              Windows integrated auth (the default when there is no -U)
+  -C              trust the server certificate (self-signed servers); profile add NAME -C saves it
   -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
   -Ns | -Nm | -No encryption strict | mandatory (default) | optional
   -K ReadOnly     read-only application intent      -M  multi-subnet failover
@@ -48,8 +49,7 @@ OUTPUT
 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
   sqlh profile add NAME -S server [-d db] [-U login] [-C] [--write-policy deny|flag|allow] [--new-password]
-                  prompts for the password (again only if server or login change), tests it
-  sqlh profile list | test NAME | rm NAME
+  sqlh profile list | test NAME | rm NAME     (add asks for the password; new profiles deny writes)
 
 FORMAT
   "-- " lines are metadata: "-- result N", a header of name:type columns, tab-separated rows,
