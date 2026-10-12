@@ -983,6 +983,14 @@ impl Session {
                     spin(self.row_work);
                     wait_for_output(gate, cancel, drain.deadline()).await?;
                     drain.pace.tick(SHOWN_ROW_TICKS).await;
+                    // Time spent on a row to show (its reading, its formatting, the wait for the
+                    // reader) is never time spent counting hidden rows, so a deadline it crossed
+                    // is a timeout here and now, before the next row's visibility is asked. Even
+                    // when this row filled the quota and the next would be hidden, the hidden-row
+                    // exception must not take the overrun over (R15 A, second round).
+                    if drain.overdue(cancel) {
+                        return Err(DbError::Timeout("query timeout".into()));
+                    }
                 }
                 Ok(Row::Hidden) => {
                     sink.skipped_row();
@@ -1981,7 +1989,7 @@ mod tests {
 /// (driver included) meets a deadline at exactly the points a live server can't be made to
 /// hit on demand (R15 follow-ups A and B). Adapted from the reviewer's probe.
 #[cfg(test)]
-mod fake_server {
+pub(crate) mod fake_server {
     use super::{
         Auth, Backpressure, BatchSink, Cancel, Column, ConnectOptions, Counting, DbError, Encrypt,
         RETIRED, ServerMessage, Session, Stop, Value,
@@ -2022,7 +2030,7 @@ mod fake_server {
     }
 
     /// One `int` column named x, `rows` rows of it, and the final DONE.
-    fn int_rows(rows: u64) -> Vec<u8> {
+    pub(crate) fn int_rows(rows: u64) -> Vec<u8> {
         let mut reply = vec![0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, b'x', 0];
         for _ in 0..rows {
             reply.extend([0xd1, 1, 0, 0, 0]);
@@ -2055,7 +2063,7 @@ mod fake_server {
     }
 
     /// What the fake server does with the batch `Session::run` sends.
-    enum Script {
+    pub(crate) enum Script {
         /// Answer it at once with these tokens.
         Reply(Vec<u8>),
         /// Read it, and everything after it (the attention), and never answer.
@@ -2066,7 +2074,7 @@ mod fake_server {
     }
 
     /// Starts the fake server; returns its address for `-S`.
-    fn serve(script: Script) -> String {
+    pub(crate) fn serve(script: Script) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -2103,10 +2111,14 @@ mod fake_server {
         format!("127.0.0.1,{port}")
     }
 
-    /// Shows rows, or hides them all, and spends `work` on each.
+    /// Shows rows (up to `quota`, like `--max-rows`), or hides them all, and spends `work`
+    /// on each hidden row and on each shown row from number `work_from` on.
     struct Sink {
         show: bool,
+        quota: Option<u64>,
+        shown: u64,
         work: Duration,
+        work_from: u64,
         stopped: Option<Stop>,
         complete: bool,
     }
@@ -2115,9 +2127,22 @@ mod fake_server {
         fn new(show: bool, work: Duration) -> Sink {
             Sink {
                 show,
+                quota: None,
+                shown: 0,
                 work,
+                work_from: 1,
                 stopped: None,
                 complete: false,
+            }
+        }
+
+        /// Shows `quota` rows, then hides the rest, as `--max-rows` does: `wants_values` turns
+        /// false on the row that fills it. The work goes on the quota's last row only.
+        fn quota(quota: u64, work: Duration) -> Sink {
+            Sink {
+                quota: Some(quota),
+                work_from: quota,
+                ..Sink::new(true, work)
             }
         }
 
@@ -2134,13 +2159,16 @@ mod fake_server {
             Ok(())
         }
         fn wants_values(&self) -> bool {
-            self.show
+            self.show && self.quota.is_none_or(|quota| self.shown < quota)
         }
         fn cell_limit(&self) -> usize {
             100
         }
         fn row(&mut self, _: &[Value]) -> io::Result<()> {
-            self.spend();
+            self.shown += 1;
+            if self.shown >= self.work_from {
+                self.spend();
+            }
             Ok(())
         }
         fn skipped_row(&mut self) {
@@ -2178,16 +2206,21 @@ mod fake_server {
         }
     }
 
-    struct Ran {
-        outcome: Result<(), DbError>,
-        elapsed: Duration,
-        sink: Sink,
+    pub(crate) struct Ran<S> {
+        pub(crate) outcome: Result<(), DbError>,
+        pub(crate) elapsed: Duration,
+        pub(crate) sink: S,
         /// What a later statement on the same session got, when the session was retired.
         after: Option<Result<(), DbError>>,
     }
 
     /// Connects to `server`, runs `sql` with `-t 1`, and reports.
-    fn run_once(server: String, sql: String, counting: Counting, mut sink: Sink) -> Ran {
+    pub(crate) fn run_once<S: BatchSink>(
+        server: String,
+        sql: String,
+        counting: Counting,
+        mut sink: S,
+    ) -> Ran<S> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2270,6 +2303,68 @@ mod fake_server {
         assert!(ran.sink.complete);
     }
 
+    // R15 A, second round: the row that fills `--max-rows` is a row to show, so a deadline its
+    // work crosses is a timeout, although the next row would be hidden and the run may stop a
+    // count of hidden rows. No hidden row is read here: the result has exactly the quota. It
+    // used to be taken for a late hidden tail and end `Ok(())`, complete and exact.
+    #[test]
+    fn a_deadline_crossed_by_the_row_that_fills_the_quota_is_a_timeout() {
+        for counting in [HIDDEN_MAY_STOP, Counting::BOUNDED] {
+            let ran = run_once(
+                serve(Script::Reply(int_rows(1))),
+                "SELECT 1".into(),
+                counting,
+                Sink::quota(1, LATE),
+            );
+            assert!(timed_out(&ran.outcome), "{counting:?}: {:?}", ran.outcome);
+            assert!(!ran.sink.complete, "{counting:?}");
+        }
+        // The default quota, filled by the 100th row, which alone carries the work.
+        let ran = run_once(
+            serve(Script::Reply(int_rows(100))),
+            "SELECT 1".into(),
+            Counting::BOUNDED,
+            Sink::quota(100, LATE),
+        );
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+        assert!(!ran.sink.complete);
+        // The control: the same quota with no work is a success, complete.
+        let ran = run_once(
+            serve(Script::Reply(int_rows(1))),
+            "SELECT 1".into(),
+            HIDDEN_MAY_STOP,
+            Sink::quota(1, Duration::ZERO),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        assert!(ran.sink.complete);
+    }
+
+    // A genuine hidden tail after a filled quota: the shown row was done in time, and the
+    // deadline passed while a hidden row was counted. In a read-only run that is complete and
+    // exact (the owner's exception), with writes allowed a timeout.
+    #[test]
+    fn a_late_hidden_tail_after_the_quota_follows_the_owners_exception() {
+        let hidden_work = || Sink {
+            work_from: u64::MAX,
+            ..Sink::quota(1, LATE)
+        };
+        let ran = run_once(
+            serve(Script::Reply(int_rows(2))),
+            "SELECT 1".into(),
+            HIDDEN_MAY_STOP,
+            hidden_work(),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        assert!(ran.sink.complete && ran.sink.stopped.is_none());
+        let ran = run_once(
+            serve(Script::Reply(int_rows(2))),
+            "SELECT 1".into(),
+            SHOWN,
+            hidden_work(),
+        );
+        assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+    }
+
     // The owner's hidden-row exception is kept: in a read-only run, a result whose shown rows
     // are complete and whose hidden rows were all counted, however late, is complete and exact.
     #[test]
@@ -2339,11 +2434,12 @@ mod fake_server {
     // work is a future that never ends, standing in for the withdrawal, and the bound ends it
     // at the deadline plus `SETTLE_GRACE`; without a deadline (`-t 0`) nothing is bounded.
     //
-    // That driver state can't be reached through `Session::run` from outside the driver: it
-    // needs the cancel to land after one packet's write completes and before the next starts,
-    // in the same poll, and tokio wakes the writing task for the socket before the timer task
-    // that cancels, so an external deadline always meets a write in progress (which the driver
-    // abandons at once). A sweep of buffer sizes and runtime holds never reached it.
+    // That driver state was not reproduced through `Session::run` here: it needs the cancel to
+    // land after one packet's write completes and before the next starts, in the same poll. In
+    // a sweep of buffer sizes and runtime holds, sqlh's deadline always met a write in progress,
+    // which the driver abandons at once; the likely reason is that the runtime resumed the
+    // writing task before the timer task that cancels. That is an observation on this machine,
+    // not a guarantee, and the bound does not depend on it.
     #[test]
     fn a_settlement_that_never_ends_is_cut_at_the_grace() {
         let runtime = tokio::runtime::Builder::new_current_thread()

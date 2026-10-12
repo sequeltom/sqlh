@@ -1054,6 +1054,110 @@ mod tests {
         );
     }
 
+    // R15 A, second round, end to end: the real `Session::run` against a fake TDS server
+    // (`db::fake_server`), into this sink, whose own `--max-rows` turns `wants_values` false on
+    // the row that fills it. That row's work crosses `-t` with the final DONE already there,
+    // and no hidden row exists. The run is a timeout, and the document closes the result as
+    // interrupted and not exact, at a quota of 1 and at the default 100.
+    #[test]
+    fn a_deadline_crossed_by_the_row_that_fills_the_quota_closes_the_result_interrupted() {
+        use crate::db::fake_server::{Script, int_rows, run_once, serve};
+        use crate::db::{Counting, DbError};
+        use std::time::{Duration, Instant};
+
+        /// The JSON sink, with 1.2 s of work after its `slow`th row.
+        struct Slow {
+            inner: JsonSink<Vec<u8>>,
+            rows: u64,
+            slow: u64,
+        }
+        impl BatchSink for Slow {
+            fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+                self.inner.columns(columns)
+            }
+            fn wants_values(&self) -> bool {
+                self.inner.wants_values()
+            }
+            fn cell_limit(&self) -> usize {
+                self.inner.cell_limit()
+            }
+            fn row(&mut self, values: &[Value]) -> io::Result<()> {
+                self.inner.row(values)?;
+                self.rows += 1;
+                if self.rows == self.slow {
+                    let until = Instant::now() + Duration::from_millis(1200);
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                }
+                Ok(())
+            }
+            fn skipped_row(&mut self) {
+                self.inner.skipped_row();
+            }
+            fn counting_stopped(&mut self, by: Stop) {
+                self.inner.counting_stopped(by);
+            }
+            fn end_rows(&mut self) -> io::Result<()> {
+                self.inner.end_rows()
+            }
+            fn end_rows_incomplete(&mut self) -> io::Result<()> {
+                self.inner.end_rows_incomplete()
+            }
+            fn rows_affected(&mut self, count: u64) -> io::Result<()> {
+                self.inner.rows_affected(count)
+            }
+            fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+                self.inner.message(message)
+            }
+            fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+                self.inner.error(error)
+            }
+        }
+
+        for quota in [1, 100] {
+            let mut inner = JsonSink::new(
+                Vec::new(),
+                Limits {
+                    max_rows: quota,
+                    ..limits()
+                },
+            );
+            inner.begin_batch(&batch("-Q", false, 1)).unwrap();
+            let sink = Slow {
+                inner,
+                rows: 0,
+                slow: quota,
+            };
+            let ran = run_once(
+                serve(Script::Reply(int_rows(quota))),
+                "SELECT x".into(),
+                Counting::BOUNDED,
+                sink,
+            );
+            assert!(
+                matches!(ran.outcome, Err(DbError::Timeout(_))),
+                "quota {quota}: {:?}",
+                ran.outcome
+            );
+            // What the caller does with a failed batch: the closing lines, no `end_batch`.
+            let mut s = ran.sink.inner;
+            s.finish(&Summary {
+                exit: 4,
+                status: "failed (exit 4): timeout, 1200 ms",
+                error: Some("query timeout after 1 s in batch 1"),
+                elapsed_ms: 1200,
+            })
+            .unwrap();
+            let doc = parse(s);
+            let result = &doc["batches"][0]["events"][0];
+            assert_eq!(result["row_count"], json!(quota), "{doc}");
+            assert_eq!(result["row_count_exact"], json!(false), "{doc}");
+            assert_eq!(result["interrupted"], json!(true), "{doc}");
+            assert_eq!(doc["ok"], json!(false), "{doc}");
+        }
+    }
+
     // PLAN.md 2.15 (review): a result a failure cut short has only the rows that arrived, so
     // its count is never exact, whether or not anything was hidden. A reader that looks only at
     // `row_count_exact` is not told that a partial count is the total.
