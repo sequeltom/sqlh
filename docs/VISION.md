@@ -4,7 +4,7 @@ Owner direction recorded 2026-10-10. This document sets product priorities; [DES
 
 ## Purpose and primary workflow
 
-sqlharness is a fast, context-efficient SQL Server investigation tool for agents working through human-led DBA and developer questions. The human steers; the agent discovers, queries, interprets, and adjusts across several turns.
+sqlh is a fast, context-efficient SQL Server investigation tool for agents working through human-led DBA and developer questions. The human steers; the agent discovers, queries, interprets, and adjusts across several turns.
 
 The primary user is an agent with limited context that makes several queries while answering a person's question. Each call should return enough useful information to choose the next step without filling the context window with repetitive metadata or excessive data. Focused schema discovery, concise diagnostics, and easy recovery from an unhelpful query support that workflow.
 

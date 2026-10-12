@@ -2874,6 +2874,68 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
     assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
 }
 
+// The rename to sqlh (DESIGN.md §8): profiles saved under %APPDATA%\sqlharness move to
+// %APPDATA%\sqlh the first time sqlh reads them, comments and all, and the old file goes. A
+// file already at the new place is never overwritten, and an SQLH_CONFIG file is never
+// moved. Windows-auth profiles only, so no password is involved; the move of stored passwords
+// has its own test against the real Credential Manager (`credman_moves_a_legacy_credential`).
+#[test]
+fn profiles_from_before_the_rename_move_to_the_new_folder() {
+    let appdata = scratch("rename_migration");
+    let (old_dir, new_dir) = (appdata.join("sqlharness"), appdata.join("sqlh"));
+    let old_text = "# saved by an earlier sqlh\ndefault = \"dev\"\n\n[profiles.dev]\n\
+                    server = \"127.0.0.1,1\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n";
+    let list = || {
+        let mut command = sqlh();
+        command
+            .env_remove("SQLH_CONFIG")
+            .env("APPDATA", &appdata)
+            .args(["profile", "list"]);
+        run(&mut command)
+    };
+
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join("profiles.toml"), old_text).unwrap();
+    let r = list();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("\ndev\t1\t127.0.0.1,1\t"), "{}", r.stdout);
+    assert_eq!(
+        fs::read_to_string(new_dir.join("profiles.toml")).unwrap(),
+        old_text,
+        "copied as it was"
+    );
+    assert!(
+        !old_dir.join("profiles.toml").exists(),
+        "the old file is gone"
+    );
+    assert!(!old_dir.exists(), "and its empty folder");
+
+    // Once the new file exists, an old one is left alone and not read.
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(
+        old_dir.join("profiles.toml"),
+        "[profiles.stale]\nserver = \"x\"\nauth = \"windows\"\n",
+    )
+    .unwrap();
+    let r = list();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(!r.stdout.contains("stale"), "{}", r.stdout);
+    assert!(old_dir.join("profiles.toml").exists());
+
+    // An SQLH_CONFIG file is used where it is, with no move.
+    let elsewhere = scratch("rename_migration_config");
+    let config = elsewhere.join("profiles.toml");
+    fs::write(&config, old_text).unwrap();
+    let mut command = sqlh();
+    command
+        .env("SQLH_CONFIG", &config)
+        .env("APPDATA", &elsewhere)
+        .args(["profile", "list"]);
+    let r = run(&mut command);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(config.exists() && !elsewhere.join("sqlh").exists());
+}
+
 mod live {
     //! Against the owner's dev/test server, through a local profile. They are ignored by a
     //! plain `cargo test`, which reports them as ignored, and fail if asked for without a

@@ -1,6 +1,6 @@
 //! Connection profiles (DESIGN.md §8) and settings resolution.
 //!
-//! The file is `%APPDATA%\sqlharness\profiles.toml` (override: `SQLH_CONFIG`), read with a
+//! The file is `%APPDATA%\sqlh\profiles.toml` (override: `SQLH_CONFIG`), read with a
 //! small strict parser for the TOML subset we write: a top-level `default`, `[profiles.NAME]`
 //! tables, and string / integer / boolean values. Passwords are never in this file.
 //!
@@ -8,7 +8,7 @@
 //! `--profile`, else `SQLH_PROFILE`, else the file's `default` when no server was given.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::Opts;
 use crate::console;
@@ -178,22 +178,71 @@ pub fn path() -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
+    default_paths().map(|(path, _)| path)
+}
+
+/// The profiles file at its default place, and where it was before the project was named sqlh.
+fn default_paths() -> Result<(PathBuf, PathBuf), String> {
     let appdata = std::env::var_os("APPDATA")
         .filter(|p| !p.is_empty())
         .ok_or("APPDATA is not set; set SQLH_CONFIG to the profiles file path")?;
-    Ok(PathBuf::from(appdata)
-        .join("sqlharness")
-        .join("profiles.toml"))
+    let appdata = PathBuf::from(appdata);
+    Ok((
+        appdata.join("sqlh").join("profiles.toml"),
+        appdata.join("sqlharness").join("profiles.toml"),
+    ))
 }
 
-/// Loads the profiles file; a missing file is an empty config.
+/// Loads the profiles file; a missing file is an empty config. At the default place, profiles
+/// saved before the rename are moved across first (`migrate_from_sqlharness`).
 pub fn load() -> Result<Config, String> {
+    if std::env::var_os("SQLH_CONFIG").is_none_or(|p| p.is_empty()) {
+        let (new, old) = default_paths()?;
+        migrate_from_sqlharness(&new, &old)?;
+    }
     let path = path()?;
     match std::fs::read_to_string(&path) {
         Ok(text) => parse(&text).map_err(|e| format!("{}:{e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// The one-time move of profiles saved before the project was named sqlh (DESIGN.md §8):
+/// `%APPDATA%\sqlharness\profiles.toml` to `%APPDATA%\sqlh\profiles.toml`, and each SQL
+/// login's stored password from `sqlharness:<profile>` to `sqlh:<profile>`. It runs only while
+/// the new file doesn't exist and the old one does, and never for a `SQLH_CONFIG` file. The
+/// passwords move first and the file last, and each step can be repeated, so a move cut short
+/// by an error is finished by the next run. The file is copied as it is, comments included.
+fn migrate_from_sqlharness(new: &Path, old: &Path) -> Result<(), String> {
+    if new.exists() || !old.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(old).map_err(|e| format!("{}: {e}", old.display()))?;
+    let config = parse(&text).map_err(|e| format!("{}:{e}", old.display()))?;
+    for profile in &config.profiles {
+        if let Some(user) = &profile.user {
+            credman::move_legacy(&profile.name, user).map_err(|e| {
+                format!(
+                    "moving profile {}'s stored password to Credential Manager as {}: {e}",
+                    profile.name,
+                    credman::target(&profile.name)
+                )
+            })?;
+        }
+    }
+    if let Some(dir) = new.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let temp = new.with_extension("toml.tmp");
+    std::fs::write(&temp, &text).map_err(|e| format!("{}: {e}", temp.display()))?;
+    std::fs::rename(&temp, new).map_err(|e| format!("{}: {e}", new.display()))?;
+    // The copy is in place; the old file, and its folder if that leaves it empty, can go.
+    let _ = std::fs::remove_file(old);
+    if let Some(dir) = old.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
 }
 
 pub fn save(config: &Config) -> Result<PathBuf, String> {
@@ -583,7 +632,7 @@ fn parse(text: &str) -> Result<Config, String> {
 fn render(config: &Config) -> String {
     let mut out = String::from(
         "# sqlh connection profiles. Passwords are not stored here: they are in Windows\n\
-         # Credential Manager as \"sqlharness:<profile>\". `sqlh profile add` rewrites this file.\n",
+         # Credential Manager as \"sqlh:<profile>\". `sqlh profile add` rewrites this file.\n",
     );
     if let Some(default) = &config.default {
         let _ = writeln!(out, "default = {}", quote(default));

@@ -1,8 +1,8 @@
-# sqlharness
+# sqlh
 
 Shared repository instructions for Codex and Claude Code. Keep project guidance in this file; CLAUDE.md imports it.
 
-`sqlh.exe` (working name) is a SQL Server query tool for AI agents and harnesses. It does the job of `sqlcmd`, but as a single exe with no dependencies. Its output, errors and guardrails are built for models: compact typed output, hard row and size limits, errors with exit codes and real line numbers, no prompts, and read-only by default.
+`sqlh` (`sqlh.exe`; repository `tkwj/sqlh`, private for now) is a SQL Server query tool for AI agents and harnesses. It does the job of `sqlcmd`, but as a single exe with no dependencies. Its output, errors and guardrails are built for models: compact typed output, hard row and size limits, errors with exit codes and real line numbers, no prompts, and read-only by default.
 
 The product vision and priorities are in [docs/VISION.md](docs/VISION.md): fast, context-efficient, human-led DBA investigation across repeated agent turns. The full technical spec is [docs/DESIGN.md](docs/DESIGN.md). Before changing CLI behavior, output formats, exit codes or the read-only guard, read the relevant section, and update it in the same change.
 
@@ -97,6 +97,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 - Commit source, tests and synthetic fixtures, Cargo.lock, build configuration, shared agent instructions, and useful design, plan and review documents. Early-development notes are worth keeping when they record decisions or findings.
 - Put disposable experiments in `scratch/` and local query results, logs and copied executables in `artifacts/`. Both root directories are ignored. Promote useful work into source, tests or docs before relying on it.
 - Code reviews are kept in the git-ignored `archive/reviews/` and never committed. A reviewer's new round goes there; PLAN.md records each finding (R-number), its fix and its verification, so the plan never depends on the review files.
+- Never push to the remote, or create the GitHub repository, until the owner says the project is ready (owner, 2026-10-12). Before it goes public, the history is rewritten to drop the review files (PLAN.md §6.8).
 - Keep real server data, connection profiles, credentials and personal agent state out of commits. Do not blanket-ignore SQL, JSON or CSV: those formats can also hold legitimate fixtures and examples.
 - Keep `target/` as a local build cache during active development. Run `cargo clean` when reclaiming disk space or troubleshooting build artifacts; the next build must recreate them. Do not routinely clean between agent turns.
 - Before committing, inspect `git status --short`, `git diff --cached --stat`, and `git diff --cached`. Use `git ls-files --cached --ignored --exclude-standard` to catch previously tracked files that ignore rules do not remove. Review new files as well as edits.

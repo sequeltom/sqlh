@@ -1,4 +1,4 @@
-# sqlharness design
+# sqlh design
 
 Status: MVP built 2026-10-09; product direction updated 2026-10-10. [VISION.md](VISION.md) records the owner's strategy and takes precedence over older roadmap and compatibility assumptions. Rows marked **Decided** in §2 are the owner's calls. Unbuilt features remain proposals.
 
@@ -6,7 +6,7 @@ Status: MVP built 2026-10-09; product direction updated 2026-10-10. [VISION.md](
 
 Agents such as Claude Code need to query SQL Server. `sqlcmd` works, but it fights them. The classic version needs the ODBC driver installed. Its output is padded for humans. It can block on prompts. It wants the password on the command line. It has no row or size limits, prints NULL ambiguously, and reports errors without enough context to fix them.
 
-sqlharness (`sqlh.exe`, working name) is a single exe with no dependencies that runs T-SQL and returns compact, unambiguous, size-limited output. It never waits for input, reports errors that point at the failing line, and refuses writes unless asked.
+sqlh (`sqlh.exe`) is a single exe with no dependencies that runs T-SQL and returns compact, unambiguous, size-limited output. It never waits for input, reports errors that point at the failing line, and refuses writes unless asked.
 
 The primary workflow is an agent with limited context making several queries across a human-led DBA or developer question-and-answer session. Optimize time to the next useful answer: focused discovery, concise output, low repeated-call overhead, and quick cancellation so the agent can try again. Bulk analytics are secondary. An exact total row count costs the size of the result (seconds for millions of narrow rows, minutes for gigabytes), so a read-only run counts the rows it does not show for about 250 ms and then reports a lower bound, and exact counting is opt-in (§4.4; owner decision 6).
 
@@ -499,7 +499,7 @@ In read-only mode, three layers apply:
 
 ## 8. Credentials and profiles
 
-The profile file is `%APPDATA%\sqlharness\profiles.toml`. Override its path with `SQLH_CONFIG`, in any of the path forms of `-i` (§4.2). A missing file is "no profiles yet", and saving a profile creates its folder, so a Git Bash path (`/c/Users/me/profiles.toml`) in cmd.exe or PowerShell, which Windows reads as a folder on the current drive, is refused when that folder isn't found (exit 3, with the hint of §4.2) rather than creating `\c\Users\me` at the root of the drive.
+The profile file is `%APPDATA%\sqlh\profiles.toml`. Profiles saved before the project was named sqlh (2026-10-12) are in `%APPDATA%\sqlharness\profiles.toml` with passwords under `sqlharness:<profile>`; the first run that reads profiles while only the old file exists moves them across once: each SQL login's stored password to `sqlh:<profile>` first (deleting the old credential only after the new one is written), then the file, copied as it is, after which the old file and its empty folder are removed. Every step can be repeated, so a move cut short by an error is finished by the next run; an existing new file is never overwritten, and an `SQLH_CONFIG` file is never moved. Override its path with `SQLH_CONFIG`, in any of the path forms of `-i` (§4.2). A missing file is "no profiles yet", and saving a profile creates its folder, so a Git Bash path (`/c/Users/me/profiles.toml`) in cmd.exe or PowerShell, which Windows reads as a folder on the current drive, is refused when that folder isn't found (exit 3, with the hint of §4.2) rather than creating `\c\Users\me` at the root of the drive.
 
 It is read by a small, strict parser of our own, which avoids pulling in the `toml` and serde crates. It understands the subset `sqlh` writes:
 - a top-level `default`
@@ -532,12 +532,12 @@ exact_count = false          # true: count every hidden row, however long it tak
 server = "tcp:myserver.database.windows.net"
 database = "Reporting"
 auth = "sql"
-user = "agent_reader"        # password: Credential Manager target "sqlharness:reporting"
+user = "agent_reader"        # password: Credential Manager target "sqlh:reporting"
 write_policy = "deny"
 ```
 
 **Passwords**
-- Stored in Windows Credential Manager as a generic credential with target `sqlharness:<profile>`. Windows protects it per user with DPAPI.
+- Stored in Windows Credential Manager as a generic credential with target `sqlh:<profile>` (`sqlharness:<profile>` before the rename; moved once, above). Windows protects it per user with DPAPI.
 - Accessed through `CredWriteW` and `CredReadW` from `windows-sys`, so no extra crate is needed.
 - A stored password is only ever sent to its profile's own server and login. `--profile x -S elsewhere` refuses rather than leak it, and `profile add` asks for the password again whenever the server or login changes. Otherwise a prompt-injected agent could repoint a profile and harvest the password. Other edits, like `-C` or `-d`, keep the stored password; `--new-password` forces a new prompt.
 - `SQLCMDPASSWORD` also works, for CI.
@@ -671,7 +671,7 @@ The primary product measure is time to the next useful answer across repeated ag
 
 ## 14. Open questions and risks
 
-- **Name.** `sqlh` is a working name.
+- **Name.** Settled 2026-10-12: sqlh, repository `tkwj/sqlh` (PLAN.md §6.8). "sqlharness" collided with an active project in the same space.
 - **mssql-tds maturity.** We pin 0.2.0; size, imports, and SQL Server 2025 data rendering checks are recorded in `docs/notes/m0-driver-spike.md`. First-release validation still needs supported authentication, reliable attention/cancellation, and a clean Windows 11 workstation deployment. Older-server negotiation and Azure redirection are future compatibility questions.
 - **Compatibility cost.** Assess a Windows Server 2016 / SQL Server 2016 floor without letting it complicate or delay the first release. SQL Server 2012/2014 and Azure are not current release gates. Supporting any expansion needs explicit tests and an acceptable maintenance budget.
 - **Exact row counts.** Settled by owner decision 6 (PLAN.md §6, task 2.15): a read-only run counts the rows it does not show for about 250 ms and reports a lower bound, and `--exact-count` reads them all (§4.4). What is left is whether 250 ms is the right budget, which is for the agent evaluations to say (PLAN.md Phase 7).
