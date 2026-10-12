@@ -49,7 +49,7 @@ OUTPUT
 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
   sqlh profile add NAME -S server [-d db] [-U login] [-C] [--write-policy deny|flag|allow] [--new-password]
-  sqlh profile list | test NAME | rm NAME     (add asks for the password; new profiles deny writes)
+  sqlh profile list | test NAME | rm NAME     (add may ask for a SQL password; new profiles deny writes)
 
 FORMAT
   "-- " lines are metadata: "-- result N", a header of name:type columns, tab-separated rows,
