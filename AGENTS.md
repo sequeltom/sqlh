@@ -91,8 +91,6 @@ cargo fmt
 target\release\sqlh.exe --profile test -i tests\smoke.sql --continue-on-error   # end-to-end; expect exit 1
 ```
 
-Some live tests (the bounded count, R15's deadline) also read the `StackOverflow2010` sample database on the test server, read-only, until Phase 3's synthetic fixtures replace it.
-
 The test server is the owner's, reached through a profile named `test`. The owner creates it with `sqlh profile add test ...`, which prompts for the password. Never ask for the password, and never put it in a command, file or environment variable. To try profile commands without touching the real profiles, set `SQLH_CONFIG` to a scratch file.
 
 `dumpbin` isn't on PATH. Find it under `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64\`. `dumpbin /dependents target\release\sqlh.exe` must list only in-box Windows DLLs.

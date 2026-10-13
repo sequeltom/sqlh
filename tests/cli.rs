@@ -4329,15 +4329,25 @@ mod live {
         assert_eq!(doc["ok"], true);
     }
 
-    // PLAN.md 2.15 (decision 6, docs/notes/drain-experiment.md). The tests below read the
-    // StackOverflow2010 database, read-only: `dbo.Votes` has 10 million narrow rows, far more
-    // than a 250 ms count can read, and counting them all takes seconds.
+    // PLAN.md 2.15 (decision 6, docs/notes/drain-experiment.md). The tests below need a result
+    // of millions of narrow rows, far more than a 250 ms count can read, whose full count takes
+    // seconds. They used to read StackOverflow2010's `dbo.Votes`; since PLAN.md 3.4 the server
+    // makes the rows up: a cross join of the catalog view `sys.all_columns` (thousands of rows
+    // on any server, so millions of pairs), which streams as fast as a table scan, stores
+    // nothing, and needs no database beyond the scratch one.
 
-    const SO: &str = "StackOverflow2010";
+    const SO: &str = "sqlh_test";
 
-    /// `SELECT TOP (n) Id FROM dbo.Votes`, narrow rows from the big table.
+    /// `n` narrow rows (`Id:int`), made up by the server. The values are 7 digits wide, like the
+    /// ids of the table this replaced, so the 1 MB output budget holds about as many rows
+    /// (about 125,000; a one-digit column filled it with half a million, which a debug build
+    /// can't format within `-t 1` under load).
     fn votes(n: u32) -> String {
-        format!("SELECT TOP ({n}) Id FROM dbo.Votes")
+        format!(
+            "SELECT TOP ({n}) 1000000 + a.column_id * 1000 + b.column_id AS Id \
+             FROM sys.all_columns AS a \
+             CROSS JOIN sys.all_columns AS b"
+        )
     }
 
     /// The lower bound in a stopped count's footer: `-- 100 of ≥800000 rows shown (...)`.
@@ -4509,7 +4519,8 @@ mod live {
         let probe = Probe::create(&p, &db);
         let t = &probe.name;
         let sql = format!(
-            "BEGIN TRAN; INSERT {t} VALUES (7); SELECT TOP (3000000) Id FROM {SO}.dbo.Votes; COMMIT"
+            "BEGIN TRAN; INSERT {t} VALUES (7); {}; COMMIT",
+            votes(3_000_000)
         );
         let r = live(&p, &db, &["--allow-write", "-Q", &sql]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
@@ -5025,7 +5036,7 @@ mod live {
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_fast_narrow_result_is_bounded_by_t_in_every_mode() {
         let (p, _) = target();
-        let sql = "SELECT Id FROM dbo.Votes";
+        let sql = &votes(10_000_000);
         // Writes allowed: exact, and a failure when the time is up (a stop could skip a COMMIT).
         let (r, _) = timed(&p, SO, &["--allow-write"], sql);
         assert_eq!(r.code, 4, "{}{}", r.stdout, r.stderr);
@@ -5193,8 +5204,8 @@ mod live {
     fn the_row_loop_keeps_the_deadline_when_the_work_is_sqlhs_own() {
         let (p, _) = target();
         // 20,000 rows of 400 us is 8 s of work against a 1 s deadline: a run that ignores the
-        // deadline fails the bound in 8 s, where all of `Votes` would take half an hour.
-        let sql = "SELECT TOP (20000) Id FROM dbo.Votes";
+        // deadline fails the bound in 8 s, where 10 million rows would take over an hour.
+        let sql = &votes(20_000);
         // Shown rows, and writes allowed: a failure.
         for flags in [
             &["--allow-write"][..],
