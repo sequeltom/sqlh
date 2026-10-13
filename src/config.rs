@@ -9,6 +9,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::cli::Opts;
 use crate::console;
@@ -183,6 +184,54 @@ pub fn path() -> Result<PathBuf, String> {
     default_paths().map(|(path, _)| path)
 }
 
+/// How long a profile edit, the one-time migration, or a run whose stored password doesn't
+/// match its profile waits for the profiles lock that another sqlh holds.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Takes the profiles lock (`profiles.toml.lock`, DESIGN.md §8): profile edits, the one-time
+/// migration and a run re-reading a profile whose password doesn't match it all hold it, so
+/// none of them sees the others half done.
+pub fn lock() -> Result<files::Lock, String> {
+    files::lock(&path()?, LOCK_WAIT).map_err(|e| e.to_string())
+}
+
+/// A profile's connection identity: what its stored password is bound to (R20). It covers
+/// what decides where the password goes and how it is protected on the way: the server (case
+/// folded, as profiles match servers), the login, and the encryption and certificate
+/// settings, as a run would use them. A change of any of these needs the password to be
+/// stored again (or rebound), so a run never pairs a password with a profile it wasn't
+/// stored for. A 64-bit FNV-1a hash in hex: it detects a mismatch, it protects nothing.
+pub fn identity(profile: &Profile) -> String {
+    let encrypt = match profile.encrypt.unwrap_or(Encrypt::Mandatory) {
+        Encrypt::Optional => "optional",
+        Encrypt::Mandatory => "mandatory",
+        Encrypt::Strict => "strict",
+    };
+    let text = format!(
+        "1\0{}\0{}\0{encrypt}\0{}",
+        profile.server.as_deref().unwrap_or("").to_lowercase(),
+        profile.user.as_deref().unwrap_or(""),
+        profile.trust_server_certificate.unwrap_or(false),
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Whether a stored password belongs to `profile` as it is saved: stored for its login and,
+/// when the credential carries an identity, for its identity. A credential from before R20
+/// has none; its login is all that can be checked.
+pub fn fits(binding: &credman::Binding, profile: &Profile) -> bool {
+    profile.user.as_deref() == Some(binding.user.as_str())
+        && binding
+            .identity
+            .as_ref()
+            .is_none_or(|id| *id == identity(profile))
+}
+
 /// The profiles file at its default place, and where it was before the project was named sqlh.
 fn default_paths() -> Result<(PathBuf, PathBuf), String> {
     let appdata = std::env::var_os("APPDATA")
@@ -196,35 +245,85 @@ fn default_paths() -> Result<(PathBuf, PathBuf), String> {
 }
 
 /// Loads the profiles file; a missing file is an empty config. At the default place, profiles
-/// saved before the rename are moved across first (`migrate_from_sqlharness`).
+/// saved before the rename are moved across first (`migrate_from_sqlharness`), under the
+/// profiles lock. A caller that already holds the lock uses `load_locked`.
 pub fn load() -> Result<Config, String> {
-    if std::env::var_os("SQLH_CONFIG").is_none_or(|p| p.is_empty()) {
-        let (new, old) = default_paths()?;
-        migrate_from_sqlharness(&new, &old)?;
-    }
+    load_with(false)
+}
+
+/// `load` for a caller that holds the profiles lock (`lock`): a profile edit, or a run
+/// re-reading under it. The migration, when one is due, runs without taking the lock again.
+pub fn load_locked() -> Result<Config, String> {
+    load_with(true)
+}
+
+fn load_with(locked: bool) -> Result<Config, String> {
     let path = path()?;
-    match std::fs::read_to_string(&path) {
+    let old = if std::env::var_os("SQLH_CONFIG").is_none_or(|p| p.is_empty()) {
+        Some(default_paths()?.1)
+    } else {
+        None
+    };
+    load_at(&path, old.as_deref(), locked, &move_password)
+}
+
+/// The real move of one profile's password, for the migration.
+fn move_password(profile: &Profile) -> std::io::Result<()> {
+    credman::move_legacy(&profile.name, &identity(profile)).map(|_| ())
+}
+
+/// Loads the profiles file at `path`, first moving the one at `old` across if that is due.
+/// The check that a move is due is repeated under the lock, so of two runs that both see it
+/// due, the second finds it done (R21); `locked` says the caller holds the lock already.
+fn load_at(
+    path: &Path,
+    old: Option<&Path>,
+    locked: bool,
+    move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
+) -> Result<Config, String> {
+    if let Some(old) = old
+        && migration_due(path, old)
+    {
+        let _lock = if locked {
+            None
+        } else {
+            Some(files::lock(path, LOCK_WAIT).map_err(|e| e.to_string())?)
+        };
+        migrate_from_sqlharness(path, old, move_password)?;
+    }
+    match std::fs::read_to_string(path) {
         Ok(text) => parse(&text).map_err(|e| format!("{}:{e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 
+fn migration_due(new: &Path, old: &Path) -> bool {
+    !new.exists() && old.exists()
+}
+
 /// The one-time move of profiles saved before the project was named sqlh (DESIGN.md §8):
 /// `%APPDATA%\sqlharness\profiles.toml` to `%APPDATA%\sqlh\profiles.toml`, and each SQL
-/// login's stored password from `sqlharness:<profile>` to `sqlh:<profile>`. It runs only while
-/// the new file doesn't exist and the old one does, and never for a `SQLH_CONFIG` file. The
-/// passwords move first and the file last, and each step can be repeated, so a move cut short
-/// by an error is finished by the next run. The file is copied as it is, comments included.
-fn migrate_from_sqlharness(new: &Path, old: &Path) -> Result<(), String> {
-    if new.exists() || !old.exists() {
+/// login's stored password from `sqlharness:<profile>` to `sqlh:<profile>`, bound to that
+/// profile's identity (R20). The caller holds the profiles lock, so no edit or other
+/// migration runs meanwhile, and this checks again that the move is due: it runs only while
+/// the new file doesn't exist and the old one does (R21), and never for a `SQLH_CONFIG` file.
+/// The passwords move first and the file last, and each step can be repeated, so a move cut
+/// short by an error is finished by the next run. The file is copied as it is, comments
+/// included.
+fn migrate_from_sqlharness(
+    new: &Path,
+    old: &Path,
+    move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if !migration_due(new, old) {
         return Ok(());
     }
     let text = std::fs::read_to_string(old).map_err(|e| format!("{}: {e}", old.display()))?;
     let config = parse(&text).map_err(|e| format!("{}:{e}", old.display()))?;
     for profile in &config.profiles {
-        if let Some(user) = &profile.user {
-            credman::move_legacy(&profile.name, user).map_err(|e| {
+        if profile.user.is_some() {
+            move_password(profile).map_err(|e| {
                 format!(
                     "moving profile {}'s stored password to Credential Manager as {}: {e}",
                     profile.name,
@@ -247,12 +346,15 @@ fn migrate_from_sqlharness(new: &Path, old: &Path) -> Result<(), String> {
 
 pub fn save(config: &Config) -> Result<PathBuf, String> {
     let path = path()?;
+    save_at(&path, config)?;
+    Ok(path)
+}
+
+fn save_at(path: &Path, config: &Config) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    files::replace(&path, render(config).as_bytes())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
+    files::replace(path, render(config).as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Everything a run needs, after merging flags, profile, environment and defaults.
@@ -281,23 +383,77 @@ pub struct Sources<'a> {
     pub var: &'a dyn Fn(&str) -> Option<String>,
     /// The profiles file.
     pub load: &'a dyn Fn() -> Result<Config, String>,
-    /// A profile's stored password.
-    pub password: &'a dyn Fn(&str) -> std::io::Result<Option<Secret>>,
+    /// A profile's stored password, with what it was stored for.
+    pub password: &'a dyn Fn(&str) -> std::io::Result<Option<credman::Stored>>,
+    /// The profiles lock (`lock`); `load` is then called again, under it.
+    pub lock: &'a dyn Fn() -> Result<Option<files::Lock>, String>,
 }
 
 pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    // Once this run holds the lock, a load must not try to take it again for the migration.
+    let locked = std::cell::Cell::new(false);
+    let load = || if locked.get() { load_locked() } else { load() };
+    let take = || {
+        let lock = lock()?;
+        locked.set(true);
+        Ok(Some(lock))
+    };
     resolve_with(
         opts,
         &Sources {
             var: &var,
             load: &load,
             password: &credman::read,
+            lock: &take,
         },
     )
 }
 
+/// Why one reading of the profile didn't give settings.
+enum Attempt {
+    Failed(Failure),
+    /// The profile's stored password was stored for another identity than the file gives the
+    /// profile (R20): an edit is under way, or one was cut short.
+    Mismatch(String),
+}
+
+impl From<Failure> for Attempt {
+    fn from(failure: Failure) -> Self {
+        Attempt::Failed(failure)
+    }
+}
+
+/// Resolves the run's settings. The profiles file and the stored password are read without
+/// the profiles lock; `profile add` stores a password before it saves the file, so a run can
+/// read an old profile and the password an edit is storing for a new server or login. That
+/// password doesn't fit the profile (`fits`) and is never sent: the run takes the lock,
+/// which waits for the edit to finish, and reads both again (R20). If they still don't fit,
+/// an edit was cut short, and the run fails with how to repair it.
 pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure> {
+    let name = match attempt(opts, sources) {
+        Ok(settings) => return Ok(settings),
+        Err(Attempt::Failed(failure)) => return Err(failure),
+        Err(Attempt::Mismatch(name)) => name,
+    };
+    let _lock = (sources.lock)().map_err(|e| {
+        Failure::usage(format!(
+            "profile {name}'s stored password doesn't match its saved server, login and \
+             encryption, so it isn't sent: {e}"
+        ))
+    })?;
+    match attempt(opts, sources) {
+        Ok(settings) => Ok(settings),
+        Err(Attempt::Failed(failure)) => Err(failure),
+        Err(Attempt::Mismatch(name)) => Err(Failure::usage(format!(
+            "profile {name}'s stored password was stored for another server, login or \
+             encryption than the profile now has (an edit of it was cut short), so it isn't \
+             sent; run: sqlh profile add {name}"
+        ))),
+    }
+}
+
+fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
     let env = sources.var;
     let named = opts.profile.clone().or_else(|| env("SQLH_PROFILE"));
     let server_given = opts.server.is_some() || env("SQLCMDSERVER").is_some();
@@ -367,7 +523,8 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
         return Err(Failure::usage(format!(
             "profile {} has write_policy = \"deny\", so --allow-write is refused",
             p.name
-        )));
+        ))
+        .into());
     }
     let allow_write = opts.allow_write || policy == WritePolicy::Allow;
     let write_denied_by = (policy == WritePolicy::Deny).then(|| p.name.clone());
@@ -387,7 +544,8 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
                  write_policy is \"flag\" or \"deny\"",
                 p.name
             )
-        }));
+        })
+        .into());
     }
     let read_uncommitted = !allow_write
         && opts
@@ -436,13 +594,14 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
 }
 
 /// The profile's stored credential, else SQLCMDPASSWORD. A stored password is only ever sent
-/// to the profile's own server and login: `--profile x -S elsewhere` must not leak it.
+/// to the profile's own server and login: `--profile x -S elsewhere` must not leak it. And
+/// only when it was stored for the profile as the file has it (`fits`, R20).
 fn password(
     sources: &Sources,
     profile: Option<&Profile>,
     server: &str,
     user: &str,
-) -> Result<Secret, Failure> {
+) -> Result<Secret, Attempt> {
     let owns = |p: &Profile| {
         p.user.as_deref() == Some(user)
             && p.server
@@ -451,17 +610,20 @@ fn password(
     };
     if let Some(p) = profile.filter(|p| owns(p)) {
         match (sources.password)(&p.name) {
-            Ok(Some(password)) => return Ok(password),
+            Ok(Some(stored)) if fits(&stored.binding, p) => return Ok(stored.password),
+            Ok(Some(_)) => return Err(Attempt::Mismatch(p.name.clone())),
             Ok(None) => {}
             Err(e) => {
                 return Err(Failure::usage(format!(
                     "reading the password for profile {} from Credential Manager: {e}",
                     p.name
-                )));
+                ))
+                .into());
             }
         }
     }
-    (sources.var)("SQLCMDPASSWORD").map(Secret::new).ok_or_else(|| match profile {
+    let password = (sources.var)("SQLCMDPASSWORD").map(Secret::new);
+    password.ok_or_else(|| Attempt::Failed(match profile {
             Some(p) if owns(p) => Failure::usage(format!(
                 "no password stored for profile {0}; run: sqlh profile add {0}",
                 p.name
@@ -476,7 +638,7 @@ fn password(
             _ => Failure::usage(format!(
                 "SQL login {user} needs a password: save a profile (sqlh profile add NAME -S server -U {user}) or set SQLCMDPASSWORD"
             )),
-        })
+        }))
 }
 
 fn parse(text: &str) -> Result<Config, String> {
@@ -974,6 +1136,237 @@ mod tests {
         );
     }
 
+    // R21: the one-time migration and profile edits take the same lock, and the migration
+    // checks under it that it is still due, so it never overwrites an edit.
+    mod migration {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const OLD: &str = "default = \"dev\"\n\n[profiles.dev]\nserver = \"srv\"\nauth = \"sql\"\n\
+                           user = \"me\"\nwrite_policy = \"flag\"\n";
+
+        /// A fresh folder holding the old profiles file; the new file's path, and the old one's.
+        fn folder(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+            let dir =
+                std::env::temp_dir().join(format!("sqlh-migration-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let new = dir.join("sqlh").join("profiles.toml");
+            let old = dir.join("sqlharness").join("profiles.toml");
+            std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+            std::fs::write(&old, OLD).unwrap();
+            (dir, new, old)
+        }
+
+        fn add_qa(config: &mut Config) {
+            config.upsert(Profile {
+                name: "qa".into(),
+                server: Some("qa".into()),
+                ..Profile::default()
+            });
+        }
+        fn deny_dev(config: &mut Config) {
+            let mut dev = config.find("dev").cloned().unwrap();
+            dev.write_policy = Some(WritePolicy::Deny);
+            config.upsert(dev);
+        }
+        fn remove_dev(config: &mut Config) {
+            assert!(config.remove("dev"));
+        }
+        fn has_qa(config: &Config) -> bool {
+            config.find("qa").is_some() && config.find("dev").is_some()
+        }
+        fn dev_denied(config: &Config) -> bool {
+            config.find("dev").unwrap().write_policy == Some(WritePolicy::Deny)
+        }
+        fn dev_gone(config: &Config) -> bool {
+            config.find("dev").is_none()
+        }
+
+        type Change = fn(&mut Config);
+        type Kept = fn(&Config) -> bool;
+        const EDITS: [(&str, Change, Kept); 3] = [
+            ("addition", add_qa, has_qa),
+            ("policy", deny_dev, dev_denied),
+            ("removal", remove_dev, dev_gone),
+        ];
+
+        /// An edit as `profile add` and `rm` make it: under the lock, load (migrating first
+        /// if that is due), change, save.
+        fn edit(new: &Path, old: &Path, change: Change) {
+            let _lock = files::lock(new, LOCK_WAIT).unwrap();
+            let mut config = load_at(new, Some(old), true, &|_| Ok(())).unwrap();
+            change(&mut config);
+            save_at(new, &config).unwrap();
+        }
+
+        fn saved(new: &Path) -> Config {
+            parse(&std::fs::read_to_string(new).unwrap()).unwrap()
+        }
+
+        // The overwrite R21 found: a migration that saw the move due, then waited while
+        // another sqlh migrated and edited. Under the lock it checks again and leaves the
+        // edit alone.
+        #[test]
+        fn a_migration_that_finds_the_move_done_keeps_the_edit() {
+            for (what, change, kept) in EDITS {
+                let (dir, new, old) = folder(&format!("done-{what}"));
+                assert!(migration_due(&new, &old));
+                edit(&new, &old, change);
+                let lock = files::lock(&new, LOCK_WAIT).unwrap();
+                migrate_from_sqlharness(&new, &old, &|_| panic!("moved twice")).unwrap();
+                drop(lock);
+                assert!(kept(&saved(&new)), "{what}");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        // The other order: an edit that starts while a migration holds the lock waits for it,
+        // then loads the migrated file, so its change lands on top of the move.
+        #[test]
+        fn an_edit_during_a_migration_waits_and_lands_on_top() {
+            for (what, change, kept) in EDITS {
+                let (dir, new, old) = folder(&format!("during-{what}"));
+                let lock = files::lock(&new, LOCK_WAIT).unwrap();
+                std::thread::scope(|scope| {
+                    let editor = scope.spawn(|| edit(&new, &old, change));
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert!(!editor.is_finished(), "{what}: the edit didn't wait");
+                    migrate_from_sqlharness(&new, &old, &|_| Ok(())).unwrap();
+                    drop(lock);
+                    editor.join().unwrap();
+                });
+                assert!(kept(&saved(&new)), "{what}");
+                assert!(!old.exists(), "{what}: the old file is gone");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        // R21's race from the loading side: a first run that finds the move due while another
+        // sqlh holds the lock (migrating and editing) waits for it, then finds the move done
+        // and reads the edit, which stays in the file.
+        #[test]
+        fn a_first_load_waits_for_an_edit_under_way_and_keeps_it() {
+            for (what, change, kept) in EDITS {
+                let (dir, new, old) = folder(&format!("waits-{what}"));
+                let lock = files::lock(&new, LOCK_WAIT).unwrap();
+                std::thread::scope(|scope| {
+                    let first = scope.spawn(|| {
+                        load_at(&new, Some(&old), false, &|_| panic!("moved twice")).unwrap()
+                    });
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert!(!first.is_finished(), "{what}: the load didn't wait");
+                    // The other sqlh's edit, under the lock it holds.
+                    let mut config = load_at(&new, Some(&old), true, &|_| Ok(())).unwrap();
+                    change(&mut config);
+                    save_at(&new, &config).unwrap();
+                    drop(lock);
+                    assert!(kept(&first.join().unwrap()), "{what}: read");
+                });
+                assert!(kept(&saved(&new)), "{what}: saved");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        // Two first runs at once: one moves the profiles and the passwords, the other waits
+        // and finds it done; both read the same profiles.
+        #[test]
+        fn two_first_loads_at_once_move_once() {
+            let (dir, new, old) = folder("together");
+            let moved = AtomicUsize::new(0);
+            let mover = |_: &Profile| {
+                moved.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            };
+            let barrier = std::sync::Barrier::new(2);
+            let loaded: Vec<Config> = std::thread::scope(|scope| {
+                let load = || {
+                    barrier.wait();
+                    load_at(&new, Some(&old), false, &mover).unwrap()
+                };
+                let a = scope.spawn(load);
+                let b = scope.spawn(load);
+                vec![a.join().unwrap(), b.join().unwrap()]
+            });
+            assert_eq!(loaded[0], loaded[1]);
+            assert_eq!(loaded[0], parse(OLD).unwrap());
+            assert_eq!(moved.load(Ordering::SeqCst), 1, "dev's password moved once");
+            assert!(!old.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Unchanged: no old file, or a SQLH_CONFIG file (no old path), is just read.
+        #[test]
+        fn without_an_old_file_nothing_moves() {
+            let (dir, new, old) = folder("nothing");
+            std::fs::remove_file(&old).unwrap();
+            let none = load_at(&new, Some(&old), false, &|_| panic!("moved")).unwrap();
+            assert_eq!(none, Config::default());
+            std::fs::write(&old, OLD).unwrap();
+            let config = load_at(&new, None, false, &|_| panic!("moved")).unwrap();
+            assert_eq!(config, Config::default());
+            assert!(old.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    // R20, against the real Credential Manager (cleans up): cargo test -- --ignored credman.
+    // A password stored for another server than the saved profile, as an edit killed between
+    // its two writes leaves it, is refused by a run reading both from storage; once bound to
+    // the profile, it is used.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn credman_a_password_stored_for_another_server_is_not_sent() {
+        let name = "__sqlh_selftest_r20";
+        let saved = Profile {
+            name: name.into(),
+            server: Some("srv".into()),
+            auth: Some(AuthKind::Sql),
+            user: Some("me".into()),
+            ..Profile::default()
+        };
+        let elsewhere = Profile {
+            server: Some("other".into()),
+            ..saved.clone()
+        };
+        let bound = |p: &Profile| credman::Binding {
+            user: "me".into(),
+            identity: Some(identity(p)),
+        };
+        let config = Config {
+            default: None,
+            profiles: vec![saved.clone()],
+        };
+        let resolve = || {
+            resolve_with(
+                &Opts {
+                    profile: Some(name.into()),
+                    ..Opts::default()
+                },
+                &Sources {
+                    var: &|_| None,
+                    load: &|| Ok(config.clone()),
+                    password: &credman::read,
+                    lock: &|| Ok(None),
+                },
+            )
+        };
+        credman::write(name, &bound(&elsewhere), "new").unwrap();
+        let refused = resolve();
+        credman::write(name, &bound(&saved), "old").unwrap();
+        let used = resolve();
+        credman::delete(name).unwrap();
+        let message = refused.err().expect("refused").message;
+        assert!(message.contains("isn't sent"), "{message}");
+        let used = used.unwrap_or_else(|f| panic!("refused: {}", f.message));
+        match used.connect.auth {
+            Auth::Sql { password, .. } => assert_eq!(password.as_str(), "old"),
+            Auth::Integrated => panic!("SQL auth expected"),
+        }
+    }
+
     // F09: resolution precedence, with the machine's environment and stores injected.
     mod precedence {
         use super::*;
@@ -992,14 +1385,22 @@ mod tests {
                     profiles: config.profiles.clone(),
                 })
             };
-            let password =
-                |profile: &str| Ok((profile == "sqlp").then(|| Secret::new("stored".to_owned())));
+            let password = |profile: &str| {
+                Ok((profile == "sqlp").then(|| credman::Stored {
+                    password: Secret::new("stored".to_owned()),
+                    binding: credman::Binding {
+                        user: "tom".into(),
+                        identity: None,
+                    },
+                }))
+            };
             resolve_with(
                 opts,
                 &Sources {
                     var: &var,
                     load: &load,
                     password: &password,
+                    lock: &|| Ok(None),
                 },
             )
         }

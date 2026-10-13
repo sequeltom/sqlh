@@ -2,11 +2,20 @@
 //! `sqlh:<profile>`, protected by DPAPI for the current Windows user. Before the project was
 //! named sqlh they were `sqlharness:<profile>`; `move_legacy` moves one across (`config`'s
 //! one-time migration).
+//!
+//! Each credential is bound to what it was saved for (R20, DESIGN.md §8): its user name is
+//! the SQL login, and its comment carries the profile's connection identity
+//! (`config::identity`), so a run can tell a password that belongs to the profile it read
+//! from one an edit stored for another server.
 
 use crate::secret::Secret;
 
 const PREFIX: &str = "sqlh:";
 const LEGACY_PREFIX: &str = "sqlharness:";
+/// The comment of every credential sqlh writes; `; identity <hex>` follows it when the
+/// credential is bound to an identity.
+const COMMENT: &str = "sqlh connection profile password";
+const IDENTITY: &str = "; identity ";
 
 pub fn target(profile: &str) -> String {
     format!("{PREFIX}{profile}")
@@ -16,18 +25,72 @@ fn legacy_target(profile: &str) -> String {
     format!("{LEGACY_PREFIX}{profile}")
 }
 
-pub fn write(profile: &str, user: &str, password: &str) -> std::io::Result<()> {
-    imp::write(&target(profile), user, password)
+/// What a stored password was saved for: the SQL login and, for credentials written since
+/// R20, the profile's connection identity. `None` is a credential written before, or by
+/// another tool (`cmdkey`); only its login can be checked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub user: String,
+    pub identity: Option<String>,
 }
 
-/// The stored password, or `None` when the profile has no credential.
-pub fn read(profile: &str) -> std::io::Result<Option<Secret>> {
-    imp::read(&target(profile))
+/// A stored password with its binding.
+pub struct Stored {
+    pub password: Secret,
+    pub binding: Binding,
+}
+
+fn comment(identity: Option<&str>) -> String {
+    match identity {
+        Some(identity) => format!("{COMMENT}{IDENTITY}{identity}"),
+        None => COMMENT.to_owned(),
+    }
+}
+
+fn identity_in(comment: &str) -> Option<String> {
+    comment
+        .strip_prefix(COMMENT)?
+        .strip_prefix(IDENTITY)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+pub fn write(profile: &str, binding: &Binding, password: &str) -> std::io::Result<()> {
+    imp::write(
+        &target(profile),
+        &binding.user,
+        &comment(binding.identity.as_deref()),
+        password,
+    )
+}
+
+/// The stored password and its binding, or `None` when the profile has no credential.
+pub fn read(profile: &str) -> std::io::Result<Option<Stored>> {
+    imp::read(&target(profile), true).map(|found| {
+        found.map(|(password, user, comment)| Stored {
+            password: password.unwrap_or_default(),
+            binding: Binding {
+                user,
+                identity: identity_in(&comment),
+            },
+        })
+    })
+}
+
+/// The binding of the profile's stored password, without copying the password anywhere;
+/// `None` when the profile has no credential.
+pub fn binding(profile: &str) -> std::io::Result<Option<Binding>> {
+    imp::read(&target(profile), false).map(|found| {
+        found.map(|(_, user, comment)| Binding {
+            user,
+            identity: identity_in(&comment),
+        })
+    })
 }
 
 /// Whether the profile has a stored password, without copying the password anywhere.
 pub fn exists(profile: &str) -> std::io::Result<bool> {
-    imp::exists(&target(profile))
+    binding(profile).map(|b| b.is_some())
 }
 
 /// Removes the profile's credential. Returns false when there was none.
@@ -36,17 +99,18 @@ pub fn delete(profile: &str) -> std::io::Result<bool> {
 }
 
 /// Moves a password stored under the old name (`sqlharness:<profile>`) to `sqlh:<profile>`,
-/// for `user`. A credential already under the new name wins and is left alone. The old one is
-/// deleted only after the new one is written, so an interrupted move can be run again.
-/// Returns whether there was an old credential.
-pub fn move_legacy(profile: &str, user: &str) -> std::io::Result<bool> {
+/// bound to `identity`, the identity of the profile in the file being moved with it. It keeps
+/// the old credential's login, so a password the old file's profile no longer matches stays
+/// unusable rather than becoming usable (R20). The old file is the one that describes this
+/// profile, so its password replaces any under the new name. The old credential is deleted
+/// only after the new one is written, so an interrupted move can be run again. Returns
+/// whether there was an old credential.
+pub fn move_legacy(profile: &str, identity: &str) -> std::io::Result<bool> {
     let legacy = legacy_target(profile);
-    let Some(password) = imp::read(&legacy)? else {
+    let Some((Some(password), user, _)) = imp::read(&legacy, true)? else {
         return Ok(false);
     };
-    if !imp::exists(&target(profile))? {
-        imp::write(&target(profile), user, &password)?;
-    }
+    imp::write(&target(profile), &user, &comment(Some(identity)), &password)?;
     imp::delete(&legacy)?;
     Ok(true)
 }
@@ -66,10 +130,10 @@ mod imp {
         s.encode_utf16().chain(Some(0)).collect()
     }
 
-    pub fn write(target: &str, user: &str, password: &str) -> io::Result<()> {
+    pub fn write(target: &str, user: &str, comment: &str, password: &str) -> io::Result<()> {
         let mut target = wide(target);
         let mut user = wide(user);
-        let mut comment = wide("sqlh connection profile password");
+        let mut comment = wide(comment);
         let mut blob = password.as_bytes().to_vec();
         let credential = CREDENTIALW {
             Flags: 0,
@@ -99,7 +163,13 @@ mod imp {
         }
     }
 
-    pub fn read(target: &str) -> io::Result<Option<super::Secret>> {
+    /// The credential's password (only when `password` is true; otherwise the blob isn't
+    /// copied), user name and comment, or `None` when there is no such credential.
+    #[allow(clippy::type_complexity)]
+    pub fn read(
+        target: &str,
+        password: bool,
+    ) -> io::Result<Option<(Option<super::Secret>, String, String)>> {
         let target = wide(target);
         let mut credential: *mut CREDENTIALW = null_mut();
         // SAFETY: `target` is NUL-terminated; on success `credential` points to a buffer
@@ -112,21 +182,27 @@ mod imp {
                 _ => Err(error),
             };
         }
-        // SAFETY: CredReadW succeeded, so `credential` is valid and its blob holds
-        // CredentialBlobSize bytes (the blob pointer may be null when the size is 0).
-        let bytes = unsafe {
+        // SAFETY: CredReadW succeeded, so `credential` is valid: its blob holds
+        // CredentialBlobSize bytes (the pointer may be null when the size is 0), and its user
+        // name and comment are NUL-terminated or null. Everything is copied before CredFree.
+        let (bytes, user, comment) = unsafe {
             let c = &*credential;
-            let bytes = if c.CredentialBlobSize == 0 || c.CredentialBlob.is_null() {
+            let bytes = if !password || c.CredentialBlobSize == 0 || c.CredentialBlob.is_null() {
                 Vec::new()
             } else {
                 std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec()
             };
+            let user = from_wide(c.UserName);
+            let comment = from_wide(c.Comment);
             CredFree(credential as *const _);
-            bytes
+            (bytes, user, comment)
         };
+        if !password {
+            return Ok(Some((None, user, comment)));
+        }
         // `from_utf8` takes the bytes over without copying them; the `Secret` wipes them.
         String::from_utf8(bytes)
-            .map(|s| Some(super::Secret::new(s)))
+            .map(|s| Some((Some(super::Secret::new(s)), user, comment)))
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -135,22 +211,21 @@ mod imp {
             })
     }
 
-    pub fn exists(target: &str) -> io::Result<bool> {
-        let target = wide(target);
-        let mut credential: *mut CREDENTIALW = null_mut();
-        // SAFETY: `target` is NUL-terminated; on success `credential` points to a buffer
-        // owned by the system, released at once below without reading the blob.
-        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
-        if ok == 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(code) if code == ERROR_NOT_FOUND as i32 => Ok(false),
-                _ => Err(error),
-            };
+    /// A NUL-terminated UTF-16 string from the system, or "" for null.
+    ///
+    /// # Safety
+    /// `p` is null or points to a NUL-terminated UTF-16 string that stays valid for the call.
+    unsafe fn from_wide(p: *const u16) -> String {
+        if p.is_null() {
+            return String::new();
         }
-        // SAFETY: CredReadW succeeded, so `credential` is a valid buffer that must be freed.
-        unsafe { CredFree(credential as *const _) };
-        Ok(true)
+        let mut len = 0;
+        // SAFETY: the caller guarantees a NUL terminator, so every read up to it is in bounds.
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` u16s from `p` were just read, so the slice is valid.
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
     }
 
     pub fn delete(target: &str) -> io::Result<bool> {
@@ -179,19 +254,19 @@ mod imp {
 mod imp {
     use std::io;
 
-    pub fn write(_target: &str, _user: &str, _password: &str) -> io::Result<()> {
+    pub fn write(_target: &str, _user: &str, _comment: &str, _password: &str) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Credential Manager needs Windows",
         ))
     }
 
-    pub fn read(_target: &str) -> io::Result<Option<super::Secret>> {
+    #[allow(clippy::type_complexity)]
+    pub fn read(
+        _target: &str,
+        _password: bool,
+    ) -> io::Result<Option<(Option<super::Secret>, String, String)>> {
         Ok(None)
-    }
-
-    pub fn exists(_target: &str) -> io::Result<bool> {
-        Ok(false)
     }
 
     pub fn delete(_target: &str) -> io::Result<bool> {
@@ -207,15 +282,26 @@ mod tests {
     #[ignore]
     fn credman_round_trip() {
         let name = "__sqlh_selftest";
-        super::write(name, "someone", "pässwörd").unwrap();
+        let bound = super::Binding {
+            user: "someone".into(),
+            identity: Some("0123456789abcdef".into()),
+        };
+        super::write(name, &bound, "pässwörd").unwrap();
         assert!(super::exists(name).unwrap());
-        assert_eq!(
-            super::read(name).unwrap().as_deref().map(String::as_str),
-            Some("pässwörd")
-        );
+        assert_eq!(super::binding(name).unwrap().as_ref(), Some(&bound));
+        let stored = super::read(name).unwrap().unwrap();
+        assert_eq!(stored.password.as_str(), "pässwörd");
+        assert_eq!(stored.binding, bound);
+        // A credential without an identity, as sqlh wrote them before R20.
+        let unbound = super::Binding {
+            user: "someone".into(),
+            identity: None,
+        };
+        super::write(name, &unbound, "pässwörd").unwrap();
+        assert_eq!(super::binding(name).unwrap(), Some(unbound));
         assert!(super::delete(name).unwrap());
         assert!(!super::exists(name).unwrap());
-        assert_eq!(super::read(name).unwrap(), None);
+        assert!(super::read(name).unwrap().is_none());
         assert!(!super::delete(name).unwrap());
     }
 
@@ -227,25 +313,40 @@ mod tests {
         let name = "__sqlh_selftest_legacy";
         let legacy = super::legacy_target(name);
         let _ = super::delete(name);
-        super::imp::write(&legacy, "someone", "old-pässwörd").unwrap();
-        assert!(super::move_legacy(name, "someone").unwrap());
+        super::imp::write(&legacy, "someone", super::COMMENT, "old-pässwörd").unwrap();
+        assert!(super::move_legacy(name, "feedface").unwrap());
+        let stored = super::read(name).unwrap().unwrap();
+        assert_eq!(stored.password.as_str(), "old-pässwörd");
         assert_eq!(
-            super::read(name).unwrap().as_deref().map(String::as_str),
-            Some("old-pässwörd")
+            stored.binding,
+            super::Binding {
+                user: "someone".into(),
+                identity: Some("feedface".into())
+            }
         );
         assert!(
-            !super::imp::exists(&legacy).unwrap(),
+            super::imp::read(&legacy, false).unwrap().is_none(),
             "the old name is gone"
         );
-        // Nothing left to move; and a credential already under the new name wins.
-        assert!(!super::move_legacy(name, "someone").unwrap());
-        super::imp::write(&legacy, "someone", "older").unwrap();
-        assert!(super::move_legacy(name, "someone").unwrap());
+        // Nothing left to move; and the old file's password replaces one under the new name.
+        assert!(!super::move_legacy(name, "feedface").unwrap());
+        super::imp::write(&legacy, "someone", super::COMMENT, "older").unwrap();
+        assert!(super::move_legacy(name, "feedface").unwrap());
         assert_eq!(
-            super::read(name).unwrap().as_deref().map(String::as_str),
-            Some("old-pässwörd")
+            super::read(name).unwrap().unwrap().password.as_str(),
+            "older"
         );
-        assert!(!super::imp::exists(&legacy).unwrap());
+        assert!(super::imp::read(&legacy, false).unwrap().is_none());
         assert!(super::delete(name).unwrap());
+    }
+
+    #[test]
+    fn the_identity_is_read_back_from_the_comment() {
+        use super::{comment, identity_in};
+        assert_eq!(identity_in(&comment(Some("abc"))).as_deref(), Some("abc"));
+        assert_eq!(identity_in(&comment(None)), None);
+        assert_eq!(identity_in(""), None);
+        assert_eq!(identity_in("someone else's; identity abc"), None);
+        assert_eq!(identity_in(&format!("{}; identity ", super::COMMENT)), None);
     }
 }

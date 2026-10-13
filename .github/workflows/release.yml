@@ -4,11 +4,14 @@
 #   push a tag v<x.y.z>   a release build; the tag must match Cargo.toml's version
 #   run it by hand        a pre-release build, v<x.y.z>-dev.<run number>
 #
-# Two jobs, so that no third-party code runs where the signing identity can be reached:
-#   build  read-only; builds and checks (dependencies' build scripts, cargo-about) and uploads
-#          the unsigned exe and the notices
-#   sign   the only job that can request the Azure token or write releases; it runs only in
-#          tkwj's repository for a tag or main, in the GitHub environment "release"
+# Four jobs, so that no code from the build (dependencies, build scripts, the exe itself) runs
+# where the signing identity or write access can be reached (R22):
+#   build    read-only; builds and checks, runs the unsigned exe, uploads it with the notices
+#   sign     the only job that can request the Azure token; signs, verifies the signature and
+#            packages the exe as data, never running it
+#   verify   read-only; runs the signed exe and checks the sums
+#   publish  writes the draft release; no Azure access, and runs nothing it downloads
+# sign, verify and publish run only in tkwj's repository for a tag or main.
 name: Release
 
 on:
@@ -46,7 +49,7 @@ jobs:
         REF_NAME: ${{ github.ref_name }}
         RUN_NUMBER: ${{ github.run_number }}
       run: |
-        $cargo = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+        $cargo = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages |
           Where-Object name -eq 'sqlh' | Select-Object -ExpandProperty version
         if ($env:REF_TYPE -eq 'tag') {
           if ($env:REF_NAME -cne "v$cargo") {
@@ -66,6 +69,15 @@ jobs:
     - name: Check
       shell: pwsh
       run: pwsh -NoProfile -File scripts/check.ps1
+
+    # The exe reports this version; checked here, where running it can reach nothing.
+    - name: Version check
+      shell: pwsh
+      run: |
+        $reported = & target/release/sqlh.exe --version
+        if ($reported -notmatch "^sqlh $([regex]::Escape($env:SQLH_VERSION)) ") {
+          throw "the exe reports '$reported', not $env:SQLH_VERSION"
+        }
 
     - name: Third-party notices
       shell: pwsh
@@ -96,11 +108,10 @@ jobs:
     # for tag and dispatch runs. The environment allows only main and v* tags.
     environment: release
     permissions:
+      contents: read
       id-token: write # the federated credential for Azure Artifact Signing
-      contents: write # the draft release
     env:
       SQLH_VERSION: ${{ needs.build.outputs.version }}
-      PRERELEASE: ${{ needs.build.outputs.prerelease }}
 
     steps:
     - uses: actions/checkout@v7
@@ -131,18 +142,14 @@ jobs:
           --verbosity information
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-    # The signature must verify, and the signed exe must still run and report this version.
-    - name: Verify
+    # signtool reads the exe as data; nothing here runs it (R22).
+    - name: Verify signature
       shell: pwsh
       run: |
         $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
           Sort-Object FullName -Descending | Select-Object -First 1
         & $signtool.FullName verify /pa /v build/sqlh.exe
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
-        $reported = & build/sqlh.exe --version
-        if ($reported -notmatch "^sqlh $([regex]::Escape($env:SQLH_VERSION)) ") {
-          throw "the signed exe reports '$reported', not $env:SQLH_VERSION"
-        }
 
     - name: Package
       shell: pwsh
@@ -163,11 +170,61 @@ jobs:
         path: dist/
         if-no-files-found: error
 
+  verify:
+    needs: [build, sign]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      SQLH_VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+    - name: Download signed
+      uses: actions/download-artifact@v8
+      with:
+        name: sqlh-${{ env.SQLH_VERSION }}
+        path: dist
+
+    # The signed exe still verifies, matches its sums, runs, and reports this version.
+    - name: Verify
+      shell: pwsh
+      run: |
+        $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+          Sort-Object FullName -Descending | Select-Object -First 1
+        & $signtool.FullName verify /pa dist/sqlh.exe
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        foreach ($line in Get-Content dist/SHA256SUMS.txt) {
+          $hash, $name = $line -split '  ', 2
+          $actual = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $hash) { throw "$name doesn't match SHA256SUMS.txt" }
+        }
+        $reported = & dist/sqlh.exe --version
+        if ($reported -notmatch "^sqlh $([regex]::Escape($env:SQLH_VERSION)) ") {
+          throw "the signed exe reports '$reported', not $env:SQLH_VERSION"
+        }
+
+  publish:
+    needs: [build, verify]
+    runs-on: windows-latest
+    permissions:
+      contents: write # the draft release
+    env:
+      SQLH_VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+
+    steps:
+    - name: Download signed
+      uses: actions/download-artifact@v8
+      with:
+        name: sqlh-${{ env.SQLH_VERSION }}
+        path: dist
+
     # A draft: nothing is public until the owner reviews and publishes it.
     - name: Draft release
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
         SHA: ${{ github.sha }}
       run: |
         $flags = @('--draft', '--generate-notes', '--title', "sqlh $env:SQLH_VERSION")

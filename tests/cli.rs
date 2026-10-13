@@ -2951,6 +2951,9 @@ mod live {
     //! `dbo.sqlh_scratch` marker; it writes only to a table of its own, which it drops.
 
     use super::*;
+    use std::cell::RefCell;
+    use std::io::Write as _;
+    use std::rc::Rc;
 
     fn target() -> (String, String) {
         let profile = std::env::var("SQLH_TEST_PROFILE")
@@ -2971,55 +2974,177 @@ mod live {
         run(&mut command)
     }
 
-    /// A table for one test, in a database marked as scratch; dropped when it goes out of
-    /// scope, whether the test passed or not.
-    struct Probe {
+    /// Where the fixtures below run their SQL: the test profile (`Live`), or, in the
+    /// fixtures' own tests, a fake that records what it is asked and fails where told (R24).
+    trait Server {
+        fn profile(&self) -> &str;
+        fn database(&self) -> &str;
+        /// A query that writes nothing (`-Q`).
+        fn query(&self, sql: &str) -> Run;
+        /// SQL with writes allowed, given on stdin, so nothing in it reaches a command line.
+        /// Never panics: a cleanup calls it while a failed test unwinds.
+        fn write(&self, sql: &str) -> Run;
+        /// Reports what a cleanup left behind. Never panics.
+        fn report(&self, line: &str);
+    }
+
+    struct Live {
         profile: String,
         database: String,
+    }
+
+    impl Live {
+        fn server(profile: &str, database: &str) -> Rc<dyn Server> {
+            Rc::new(Live {
+                profile: profile.into(),
+                database: database.into(),
+            })
+        }
+    }
+
+    impl Server for Live {
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+        fn database(&self) -> &str {
+            &self.database
+        }
+        fn query(&self, sql: &str) -> Run {
+            live(&self.profile, &self.database, &["-Q", sql])
+        }
+        fn write(&self, sql: &str) -> Run {
+            let failed = |e: std::io::Error| Run {
+                code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            };
+            let child = Command::new(env!("CARGO_BIN_EXE_sqlh"))
+                .args(["--profile", &self.profile, "-d", &self.database])
+                .args(["--allow-write", "-i", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(child) => child,
+                Err(e) => return failed(e),
+            };
+            if let Some(mut stdin) = child.stdin.take()
+                && let Err(e) = std::io::Write::write_all(&mut stdin, sql.as_bytes())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return failed(e);
+            }
+            match child.wait_with_output() {
+                Ok(output) => Run {
+                    code: output.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                },
+                Err(e) => failed(e),
+            }
+        }
+        fn report(&self, line: &str) {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+    }
+
+    /// What a fixture made, undone when this is dropped, whether the test passed or not
+    /// (R24). Each step is armed before the SQL that makes its object runs, so a setup that
+    /// fails partway (or whose success can't be confirmed) is undone too; so every step must
+    /// be idempotent (`IF EXISTS`). Steps run in reverse order; one that fails is reported
+    /// with the SQL that finishes the job, and never panics, since a second panic while a
+    /// failed test unwinds would abort the whole run. Nothing is armed until the scratch
+    /// marker has been checked.
+    struct Cleanup {
+        server: Rc<dyn Server>,
+        steps: Vec<String>,
+    }
+
+    impl Cleanup {
+        fn new(server: Rc<dyn Server>) -> Cleanup {
+            Cleanup {
+                server,
+                steps: Vec::new(),
+            }
+        }
+
+        fn arm(&mut self, sql: String) {
+            self.steps.push(sql);
+        }
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            while let Some(sql) = self.steps.pop() {
+                let r = self.server.write(&sql);
+                if r.code != 0 {
+                    self.server.report(&format!(
+                        "live test cleanup failed in {} (exit {}); to finish it, run: {sql}",
+                        self.server.database(),
+                        r.code
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Asserts that the database is marked as scratch (`dbo.sqlh_scratch`): the check before
+    /// any fixture writes.
+    fn check_scratch(server: &dyn Server) {
+        let marker = server.query(
+            "SELECT CASE WHEN OBJECT_ID(N'dbo.sqlh_scratch', N'U') IS NULL \
+             THEN 0 ELSE 1 END AS scratch",
+        );
+        assert!(
+            marker.stdout.contains("scratch:int\n1\n"),
+            "{} has no dbo.sqlh_scratch marker, so the live tests won't write to it; \
+             create the scratch database with tests/fixtures/sqlh_test.sql\n{}",
+            server.database(),
+            marker.stdout
+        );
+    }
+
+    /// A table for one test, in a database marked as scratch; dropped when it goes out of
+    /// scope, whether the test passed or not, and even when its creation failed partway.
+    /// Fields drop in order, so `cleanup` (which also undoes `Objects`' and `Reader`'s steps)
+    /// runs before `server` goes.
+    struct Probe {
         name: String,
+        cleanup: Cleanup,
+        server: Rc<dyn Server>,
     }
 
     impl Probe {
         fn create(profile: &str, database: &str) -> Probe {
-            let marker = live(
-                profile,
-                database,
-                &[
-                    "-Q",
-                    "SELECT CASE WHEN OBJECT_ID(N'dbo.sqlh_scratch', N'U') IS NULL \
-                     THEN 0 ELSE 1 END AS scratch",
-                ],
-            );
-            assert!(
-                marker.stdout.contains("scratch:int\n1\n"),
-                "{database} has no dbo.sqlh_scratch marker, so the live tests won't write to it; \
-                 create the scratch database with tests/fixtures/sqlh_test.sql\n{}",
-                marker.stdout
-            );
+            Probe::on(Live::server(profile, database))
+        }
+
+        fn on(server: Rc<dyn Server>) -> Probe {
+            check_scratch(&*server);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let name = format!("dbo.probe_{}_{nanos}", std::process::id());
-            let sql = format!("CREATE TABLE {name} (id int NOT NULL)");
-            let r = live(profile, database, &["--allow-write", "-Q", &sql]);
+            let mut cleanup = Cleanup::new(server.clone());
+            cleanup.arm(format!("DROP TABLE IF EXISTS {name}"));
+            let r = server.write(&format!("CREATE TABLE {name} (id int NOT NULL)"));
             assert_eq!(r.code, 0, "{}", r.stdout);
             Probe {
-                profile: profile.into(),
-                database: database.into(),
                 name,
+                cleanup,
+                server,
             }
         }
-    }
 
-    impl Drop for Probe {
-        fn drop(&mut self) {
-            let sql = format!("DROP TABLE {}", self.name);
-            let _ = live(
-                &self.profile,
-                &self.database,
-                &["--allow-write", "-Q", &sql],
-            );
+        fn profile(&self) -> &str {
+            self.server.profile()
+        }
+
+        fn database(&self) -> &str {
+            self.server.database()
         }
     }
 
@@ -4919,7 +5044,9 @@ mod live {
     // wrapper gone. (Checked to fail with the OFF taken out of the setup: exit 1, `read-only
     // guard: an error rolled back the wrapper transaction`, for the first run below.)
 
-    /// Like `live`, with environment variables set for the run.
+    /// Like `live`, with environment variables set for the run. Only the debug-only seams'
+    /// tests use it.
+    #[cfg(debug_assertions)]
     fn live_with(profile: &str, database: &str, env: &[(&str, &str)], args: &[&str]) -> Run {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
         command
@@ -5375,19 +5502,16 @@ mod live {
     }
 
     /// Objects for one test, made after `Probe` has checked the scratch marker, each named with
-    /// the probe's unique name as a prefix; dropped in reverse order when this goes out of
-    /// scope, whether the test passed or not (PLAN.md 3.4).
+    /// the probe's unique name as a prefix; dropped in reverse order, before the probe's table,
+    /// when this goes out of scope, whether the test passed or not (PLAN.md 3.4).
     struct Objects {
         probe: Probe,
-        /// `DROP ...` statements, in the order the objects were made.
-        drops: Vec<String>,
     }
 
     impl Objects {
         fn new(profile: &str, database: &str) -> Objects {
             Objects {
                 probe: Probe::create(profile, database),
-                drops: Vec::new(),
             }
         }
 
@@ -5396,27 +5520,12 @@ mod live {
             format!("{}_{suffix}", self.probe.name)
         }
 
-        /// Runs `create` with writes allowed, and remembers `drop` for the end.
+        /// Arms `drop` (idempotent: `DROP ... IF EXISTS`), then runs `create` with writes
+        /// allowed, so an object whose creation fails after it committed is dropped too (R24).
         fn make(&mut self, create: &str, drop: String) {
-            let r = live(
-                &self.probe.profile,
-                &self.probe.database,
-                &["--allow-write", "-Q", create],
-            );
+            self.probe.cleanup.arm(drop);
+            let r = self.probe.server.write(create);
             assert_eq!(r.code, 0, "{create}\n{}", r.stdout);
-            self.drops.push(drop);
-        }
-    }
-
-    impl Drop for Objects {
-        fn drop(&mut self) {
-            for sql in self.drops.iter().rev() {
-                let _ = live(
-                    &self.probe.profile,
-                    &self.probe.database,
-                    &["--allow-write", "-Q", sql],
-                );
-            }
         }
     }
 
@@ -5432,7 +5541,7 @@ mod live {
         let seq = objects.name("seq");
         objects.make(
             &format!("CREATE SEQUENCE {seq} AS bigint START WITH 1"),
-            format!("DROP SEQUENCE {seq}"),
+            format!("DROP SEQUENCE IF EXISTS {seq}"),
         );
         let t = objects.probe.name.clone();
         for sql in [
@@ -5485,27 +5594,27 @@ mod live {
         let (ix, trg) = (objects.name("ix"), objects.name("trg"));
         objects.make(
             &format!("CREATE TABLE {log} (id int NOT NULL)"),
-            format!("DROP TABLE {log}"),
+            format!("DROP TABLE IF EXISTS {log}"),
         );
         objects.make(
             &format!("CREATE TABLE {parent} (id int NOT NULL PRIMARY KEY, active bit NOT NULL)"),
-            format!("DROP TABLE {parent}"),
+            format!("DROP TABLE IF EXISTS {parent}"),
         );
         objects.make(
             &format!("CREATE TABLE {child} (parent_id int NOT NULL REFERENCES {parent} (id))"),
-            format!("DROP TABLE {child}"),
+            format!("DROP TABLE IF EXISTS {child}"),
         );
         let ix_name = ix.trim_start_matches("dbo.");
         objects.make(
             &format!("CREATE INDEX {ix_name} ON {parent} (id) WHERE active = 1"),
-            format!("DROP INDEX {ix_name} ON {parent}"),
+            format!("DROP INDEX IF EXISTS {ix_name} ON {parent}"),
         );
         objects.make(
             &format!(
                 "CREATE TRIGGER {trg} ON {parent} AFTER INSERT AS \
                  INSERT {log} (id) SELECT id FROM inserted"
             ),
-            format!("DROP TRIGGER {trg}"),
+            format!("DROP TRIGGER IF EXISTS {trg}"),
         );
 
         let insert = format!("INSERT {parent} VALUES (1, 1)");
@@ -5544,7 +5653,7 @@ mod live {
         let proc = objects.name("rows");
         objects.make(
             &format!("CREATE PROCEDURE {proc} AS {}", votes(300_000)),
-            format!("DROP PROCEDURE {proc}"),
+            format!("DROP PROCEDURE IF EXISTS {proc}"),
         );
         let r = live(
             &p,
@@ -5620,7 +5729,8 @@ mod live {
     /// starts: the SQL that sets it reaches sqlh on stdin (never a command line or a file), and
     /// runs as the login get it from `SQLCMDPASSWORD` in their own environment (the test
     /// profile's stored password is for its own login only, so sqlh uses the variable). The
-    /// login and its user are dropped when this goes out of scope.
+    /// login and its user are dropped when this goes out of scope, and if its creation fails
+    /// partway (R24): the drop is armed before the login is made.
     struct Reader {
         probe: Probe,
         login: String,
@@ -5629,10 +5739,22 @@ mod live {
 
     impl Reader {
         fn create(profile: &str, database: &str) -> Reader {
+            Reader::on(Live::server(profile, database))
+        }
+
+        fn on(server: Rc<dyn Server>) -> Reader {
             // The probe checks the scratch marker before anything is written.
-            let probe = Probe::create(profile, database);
+            let mut probe = Probe::on(server);
             let login = format!("sqlh_reader_{}", std::process::id());
             let password = random_password();
+            let database = probe.database().to_owned();
+            // Holds no password, so a failure report can show it.
+            probe.cleanup.arm(format!(
+                "USE [{database}];\n\
+                 IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}];\n\
+                 USE master;\n\
+                 IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];"
+            ));
             let sql = format!(
                 "USE master;\n\
                  CREATE LOGIN [{login}] WITH PASSWORD = N'{password}';\n\
@@ -5641,7 +5763,8 @@ mod live {
                  ALTER ROLE db_datareader ADD MEMBER [{login}];\n\
                  GRANT VIEW DEFINITION TO [{login}];"
             );
-            let r = Reader::admin(profile, database, &sql);
+            let r = probe.server.write(&sql);
+            // The output can't hold the password: sqlh never echoes its input.
             assert_eq!(r.code, 0, "creating the reader login failed:\n{}", r.stdout);
             Reader {
                 probe,
@@ -5650,45 +5773,189 @@ mod live {
             }
         }
 
-        /// Runs `sql` through the test profile with writes allowed, the SQL on stdin.
-        fn admin(profile: &str, database: &str, sql: &str) -> Run {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
-            command.args([
-                "--profile",
-                profile,
-                "-d",
-                database,
-                "--allow-write",
-                "-i",
-                "-",
-            ]);
-            run_with_stdin(&mut command, sql.as_bytes())
-        }
-
         /// sqlh as the reader: the test profile's server, this login, `args`.
         fn run(&self, args: &[&str]) -> Run {
             let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
             command
                 .stdin(Stdio::null())
                 .env("SQLCMDPASSWORD", &self.password)
-                .args(["--profile", &self.probe.profile, "-d", &self.probe.database])
+                .args([
+                    "--profile",
+                    self.probe.profile(),
+                    "-d",
+                    self.probe.database(),
+                ])
                 .args(["-U", &self.login])
                 .args(args);
             run(&mut command)
         }
     }
 
-    impl Drop for Reader {
-        fn drop(&mut self) {
-            let (login, database) = (&self.login, &self.probe.database);
-            let sql = format!(
-                "USE [{database}];\n\
-                 IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}];\n\
-                 USE master;\n\
-                 IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];"
-            );
-            let _ = Reader::admin(&self.probe.profile, database, &sql);
+    /// A server for the fixtures' own tests (R24): records every query and write, and fails a
+    /// write that contains `fail_on` (exit 1, as a SQL error would end it).
+    struct Fake {
+        log: RefCell<Vec<String>>,
+        reports: RefCell<Vec<String>>,
+        fail_on: RefCell<Vec<String>>,
+    }
+
+    impl Fake {
+        fn new(fail_on: &[&str]) -> Rc<Fake> {
+            Rc::new(Fake {
+                log: RefCell::new(Vec::new()),
+                reports: RefCell::new(Vec::new()),
+                fail_on: RefCell::new(fail_on.iter().map(|s| s.to_string()).collect()),
+            })
         }
+
+        /// The log, each entry cut to its first line.
+        fn steps(&self) -> Vec<String> {
+            self.log
+                .borrow()
+                .iter()
+                .map(|sql| sql.lines().next().unwrap_or("").to_owned())
+                .collect()
+        }
+    }
+
+    impl Server for Fake {
+        fn profile(&self) -> &str {
+            "fake"
+        }
+        fn database(&self) -> &str {
+            "scratch"
+        }
+        fn query(&self, sql: &str) -> Run {
+            self.log.borrow_mut().push(format!("query: {sql}"));
+            Run {
+                code: 0,
+                stdout: "scratch:int\n1\n".into(),
+                stderr: String::new(),
+            }
+        }
+        fn write(&self, sql: &str) -> Run {
+            self.log.borrow_mut().push(sql.to_owned());
+            let fails = self
+                .fail_on
+                .borrow()
+                .iter()
+                .any(|f| sql.contains(f.as_str()));
+            Run {
+                code: if fails { 1 } else { 0 },
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+        fn report(&self, line: &str) {
+            self.reports.borrow_mut().push(line.to_owned());
+        }
+    }
+
+    // R24: a reader whose setup fails after its login was made (the batch fails at a later
+    // statement) is cleaned up: the drop was armed first, and runs before the probe's table
+    // goes. Nothing is written before the scratch check.
+    #[test]
+    fn a_reader_whose_setup_fails_is_cleaned_up() {
+        let fake = Fake::new(&["GRANT VIEW DEFINITION"]);
+        let server: Rc<dyn Server> = fake.clone();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Reader::on(server);
+        }));
+        assert!(failed.is_err(), "the setup's failure is the test's");
+        let steps = fake.steps();
+        assert!(steps[0].starts_with("query: SELECT CASE WHEN OBJECT_ID(N'dbo.sqlh_scratch'"));
+        assert!(steps[1].starts_with("CREATE TABLE dbo.probe_"), "{steps:?}");
+        assert_eq!(steps[2], "USE master;", "the login batch: {steps:?}");
+        assert_eq!(steps[3], "USE [scratch];", "the login's cleanup: {steps:?}");
+        assert!(
+            steps[4].starts_with("DROP TABLE IF EXISTS dbo.probe_"),
+            "{steps:?}"
+        );
+        assert_eq!(steps.len(), 5, "{steps:?}");
+        let log = fake.log.borrow();
+        assert!(log[3].contains("DROP LOGIN [sqlh_reader_"), "{}", log[3]);
+        assert!(!log[3].contains("PASSWORD"), "{}", log[3]);
+        assert!(fake.reports.borrow().is_empty());
+    }
+
+    // R24: an object whose CREATE fails after committing (or whose success can't be
+    // confirmed) is dropped with the rest, in reverse order; a cleanup that fails is reported
+    // with the SQL that finishes it, without a panic, and the others still run.
+    #[test]
+    fn objects_are_dropped_even_when_a_create_fails_and_failed_drops_are_reported() {
+        let fake = Fake::new(&["CREATE TRIGGER", "DROP SEQUENCE"]);
+        let server: Rc<dyn Server> = fake.clone();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut objects = Objects {
+                probe: Probe::on(server),
+            };
+            let (seq, trg) = (objects.name("seq"), objects.name("trg"));
+            objects.make(
+                &format!("CREATE SEQUENCE {seq}"),
+                format!("DROP SEQUENCE IF EXISTS {seq}"),
+            );
+            objects.make(
+                &format!("CREATE TRIGGER {trg} ON x AFTER INSERT AS RETURN"),
+                format!("DROP TRIGGER IF EXISTS {trg}"),
+            );
+        }));
+        assert!(failed.is_err());
+        let steps = fake.steps();
+        let tail: Vec<&str> = steps[4..]
+            .iter()
+            .map(|s| s.split(" dbo.").next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "DROP TRIGGER IF EXISTS",
+                "DROP SEQUENCE IF EXISTS",
+                "DROP TABLE IF EXISTS"
+            ],
+            "{steps:?}"
+        );
+        let reports = fake.reports.borrow();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(
+            reports[0].starts_with("live test cleanup failed in scratch (exit 1); to finish it, run: DROP SEQUENCE IF EXISTS dbo.probe_"),
+            "{}",
+            reports[0]
+        );
+    }
+
+    // R24: a failed scratch check writes nothing, and so arms nothing to undo.
+    #[test]
+    fn nothing_is_written_or_dropped_without_the_scratch_marker() {
+        struct Unmarked(Rc<Fake>);
+        impl Server for Unmarked {
+            fn profile(&self) -> &str {
+                "fake"
+            }
+            fn database(&self) -> &str {
+                "production"
+            }
+            fn query(&self, sql: &str) -> Run {
+                self.0.log.borrow_mut().push(format!("query: {sql}"));
+                Run {
+                    code: 0,
+                    stdout: "scratch:int\n0\n".into(),
+                    stderr: String::new(),
+                }
+            }
+            fn write(&self, sql: &str) -> Run {
+                self.0.write(sql)
+            }
+            fn report(&self, line: &str) {
+                self.0.report(line)
+            }
+        }
+        let fake = Fake::new(&[]);
+        let server: Rc<dyn Server> = Rc::new(Unmarked(fake.clone()));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Reader::on(server);
+        }));
+        assert!(failed.is_err());
+        assert_eq!(fake.log.borrow().len(), 1, "{:?}", fake.log.borrow());
     }
 
     /// 128 random bits as a password that meets SQL Server's complexity policy: the keys of

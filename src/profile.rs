@@ -4,11 +4,12 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::app::{Out, finish, finish_ok, run_command, stdout_sink};
 use crate::cli::{Opts, ProfileCommand};
 use crate::config::{self, AuthKind, Config, DEFAULT_LOCK_TIMEOUT, Profile, WritePolicy};
+use crate::credman::{Binding, Stored};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
@@ -27,19 +28,18 @@ const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
     CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
     SYSDATETIMEOFFSET() AS server_time;";
 
-/// How long `profile add` and `rm` wait for another sqlh's edit of the profiles to finish.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
-
 /// What `profile add` and `rm` read and change (F12): the profiles file, the stored passwords
 /// and the console. A trait so that tests can make any step fail.
 trait Store {
     /// Holds off other sqlh processes' edits of the profiles until the guard is dropped.
     fn lock(&self) -> Result<Option<files::Lock>, String>;
+    /// Loads the profiles file; the caller holds the lock.
     fn load(&self) -> Result<Config, String>;
     fn save(&self, config: &Config) -> Result<PathBuf, String>;
-    fn password_exists(&self, profile: &str) -> io::Result<bool>;
-    fn read_password(&self, profile: &str) -> io::Result<Option<Secret>>;
-    fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()>;
+    /// What the profile's stored password was stored for, without reading the password.
+    fn binding(&self, profile: &str) -> io::Result<Option<Binding>>;
+    fn read_password(&self, profile: &str) -> io::Result<Option<Stored>>;
+    fn write_password(&self, profile: &str, binding: &Binding, password: &str) -> io::Result<()>;
     fn delete_password(&self, profile: &str) -> io::Result<bool>;
     fn is_console(&self) -> bool;
     fn prompt(&self, prompt: &str) -> io::Result<Secret>;
@@ -50,25 +50,22 @@ struct System;
 
 impl Store for System {
     fn lock(&self) -> Result<Option<files::Lock>, String> {
-        let path = config::path()?;
-        files::lock(&path, LOCK_WAIT)
-            .map(Some)
-            .map_err(|e| e.to_string())
+        config::lock().map(Some)
     }
     fn load(&self) -> Result<Config, String> {
-        config::load()
+        config::load_locked()
     }
     fn save(&self, config: &Config) -> Result<PathBuf, String> {
         config::save(config)
     }
-    fn password_exists(&self, profile: &str) -> io::Result<bool> {
-        credman::exists(profile)
+    fn binding(&self, profile: &str) -> io::Result<Option<Binding>> {
+        credman::binding(profile)
     }
-    fn read_password(&self, profile: &str) -> io::Result<Option<Secret>> {
+    fn read_password(&self, profile: &str) -> io::Result<Option<Stored>> {
         credman::read(profile)
     }
-    fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()> {
-        credman::write(profile, user, password)
+    fn write_password(&self, profile: &str, binding: &Binding, password: &str) -> io::Result<()> {
+        credman::write(profile, binding, password)
     }
     fn delete_password(&self, profile: &str) -> io::Result<bool> {
         credman::delete(profile)
@@ -137,14 +134,21 @@ fn test(name: String, started: Instant) -> Exit {
 /// The edit holds the profiles lock from the read of the file to its write, so another sqlh's
 /// edit can't be lost in between (F12). The file and the stored password change together or
 /// not at all: a new password is stored first and, if the file then can't be saved, the
-/// previous one is put back (or the new one deleted); an old password is deleted only after
-/// the file no longer refers to it.
+/// previous one is put back as it was (or the new one deleted); an old password is deleted
+/// only after the file no longer refers to it.
+///
+/// The stored password is bound to the profile's identity (`config::identity`, R20), so a run
+/// that reads the file while this edit is between its two writes, or after it was killed
+/// there, finds a password that doesn't fit the profile and never sends it. A password is
+/// kept only when it fits the profile as saved: one an interrupted edit stored for another
+/// server is asked for again, never rebound to the old one. A kept password whose identity
+/// changes (encryption, certificate trust) is stored again with the new binding.
 fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
     let _lock = store.lock().map_err(Failure::usage)?;
     let mut config = store.load().map_err(Failure::usage)?;
     let existing = config.find(name).cloned();
     let new = existing.is_none();
-    let base = existing.unwrap_or_default();
+    let base = existing.clone().unwrap_or_default();
     let user = if opts.integrated {
         None
     } else {
@@ -190,38 +194,68 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
     // refused anyway (DESIGN.md §4.2).
     check_server(&server).map_err(|reason| Failure::usage(format!("-S {reason}")))?;
 
-    let stored = user.is_some() && matches!(store.password_exists(name), Ok(true));
-    let kept_password = stored && !login_changed && !opts.new_password;
+    // A stored password is kept only when it belongs to the profile as saved (R20).
+    let stored = match (&user, &existing) {
+        (Some(_), Some(saved)) => store
+            .binding(name)
+            .ok()
+            .flatten()
+            .filter(|binding| config::fits(binding, saved)),
+        _ => None,
+    };
+    let kept_password = stored.is_some() && !login_changed && !opts.new_password;
+    let binding = user.as_ref().map(|user| Binding {
+        user: user.clone(),
+        identity: Some(config::identity(&profile)),
+    });
     let target = credman::target(name);
-    // A new password: asked for, and stored, before the file is saved; what it replaces is
-    // kept in memory so that a failed save can put it back.
-    let replaced = match &user {
-        Some(user) if !kept_password => {
-            if !store.is_console() {
-                return Err(Failure::usage(
-                    "profile add needs to read a password from the console, but stdin is not a \
-                     console. Run it in a terminal; for automation set SQLCMDPASSWORD instead",
-                ));
-            }
-            let password = store
-                .prompt(&format!("Password for {user} on {server}: "))
-                .map_err(|e| Failure::usage(format!("reading the password: {e}")))?;
-            if password.is_empty() {
-                return Err(Failure::usage("empty password; nothing was saved"));
-            }
+    // A new password, or a kept one bound anew: stored before the file is saved; what it
+    // replaces is kept in memory so that a failed save can put it back as it was.
+    let replaced = match &binding {
+        Some(binding) if !kept_password || stored.as_ref() != Some(binding) => {
+            let typed = if kept_password {
+                None
+            } else {
+                if !store.is_console() {
+                    return Err(Failure::usage(
+                        "profile add needs to read a password from the console, but stdin is \
+                         not a console. Run it in a terminal; for automation set \
+                         SQLCMDPASSWORD instead",
+                    ));
+                }
+                let password = store
+                    .prompt(&format!("Password for {} on {server}: ", binding.user))
+                    .map_err(|e| Failure::usage(format!("reading the password: {e}")))?;
+                if password.is_empty() {
+                    return Err(Failure::usage("empty password; nothing was saved"));
+                }
+                Some(password)
+            };
             let previous = store.read_password(name).map_err(|e| {
                 Failure::new(
                     Exit::Internal,
                     format!("reading the stored password {target}: {e}; nothing was saved"),
                 )
             })?;
-            store.write_password(name, user, &password).map_err(|e| {
-                Failure::new(
-                    Exit::Internal,
-                    format!("saving to Credential Manager: {e}; nothing was saved"),
-                )
-            })?;
-            Some((previous, base.user.clone().unwrap_or_else(|| user.clone())))
+            let password = match (typed, &previous) {
+                (Some(typed), _) => typed,
+                (None, Some(previous)) => previous.password.clone(),
+                (None, None) => {
+                    return Err(Failure::usage(format!(
+                        "the stored password {target} is gone; nothing was saved. Rerun sqlh \
+                         profile add {name} --new-password"
+                    )));
+                }
+            };
+            store
+                .write_password(name, binding, &password)
+                .map_err(|e| {
+                    Failure::new(
+                        Exit::Internal,
+                        format!("saving to Credential Manager: {e}; nothing was saved"),
+                    )
+                })?;
+            Some(previous)
         }
         _ => None,
     };
@@ -236,8 +270,10 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
         Err(e) => {
             // The file still describes the profile as it was, so its password must be too.
             let undone = match &replaced {
-                Some((Some(previous), owner)) => store.write_password(name, owner, previous),
-                Some((None, _)) => store.delete_password(name).map(|_| ()),
+                Some(Some(previous)) => {
+                    store.write_password(name, &previous.binding, &previous.password)
+                }
+                Some(None) => store.delete_password(name).map(|_| ()),
                 None => Ok(()),
             };
             return Err(match undone {
@@ -378,7 +414,7 @@ fn remove(name: &str, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
     let _lock = store.lock().map_err(Failure::usage)?;
     let mut config = store.load().map_err(Failure::usage)?;
     if !config.remove(name) {
-        if matches!(store.password_exists(name), Ok(true)) {
+        if matches!(store.binding(name), Ok(Some(_))) {
             return delete_password(name, out, store).map(|_| {
                 let _ = out.note(&format!(
                     "there was no profile named {name}; its password left from an earlier \
@@ -431,16 +467,21 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         config: RefCell<Config>,
-        /// Profile name to (login, password).
-        passwords: RefCell<HashMap<String, (String, String)>>,
-        typed: String,
+        /// Profile name to (binding, password).
+        passwords: RefCell<HashMap<String, (Binding, String)>>,
+        /// What the password prompt answers.
+        typed: RefCell<String>,
         fail_lock: bool,
         fail_save: Cell<bool>,
         fail_write: Cell<bool>,
         fail_delete: Cell<bool>,
         /// Fail every password write after this many have succeeded.
         writes_left: Cell<Option<u32>>,
+        /// Runs at the start of each save: between the password's write and the file's.
+        on_save: RefCell<Option<Hook>>,
     }
+
+    type Hook = Box<dyn Fn(&Fake)>;
 
     impl Store for Fake {
         fn lock(&self) -> Result<Option<files::Lock>, String> {
@@ -454,23 +495,30 @@ mod tests {
             Ok(self.config.borrow().clone())
         }
         fn save(&self, config: &Config) -> Result<PathBuf, String> {
+            if let Some(hook) = self.on_save.borrow().as_ref() {
+                hook(self);
+            }
             if self.fail_save.get() {
                 return Err("disk full".into());
             }
             *self.config.borrow_mut() = config.clone();
             Ok(PathBuf::from("profiles.toml"))
         }
-        fn password_exists(&self, profile: &str) -> io::Result<bool> {
-            Ok(self.passwords.borrow().contains_key(profile))
+        fn binding(&self, profile: &str) -> io::Result<Option<Binding>> {
+            Ok(self.passwords.borrow().get(profile).map(|(b, _)| b.clone()))
         }
-        fn read_password(&self, profile: &str) -> io::Result<Option<Secret>> {
-            Ok(self
-                .passwords
-                .borrow()
-                .get(profile)
-                .map(|(_, p)| Secret::new(p.clone())))
+        fn read_password(&self, profile: &str) -> io::Result<Option<Stored>> {
+            Ok(self.passwords.borrow().get(profile).map(|(b, p)| Stored {
+                password: Secret::new(p.clone()),
+                binding: b.clone(),
+            }))
         }
-        fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()> {
+        fn write_password(
+            &self,
+            profile: &str,
+            binding: &Binding,
+            password: &str,
+        ) -> io::Result<()> {
             if let Some(left) = self.writes_left.get() {
                 if left == 0 {
                     return Err(io::Error::other("Credential Manager is unavailable"));
@@ -482,7 +530,7 @@ mod tests {
             }
             self.passwords
                 .borrow_mut()
-                .insert(profile.into(), (user.into(), password.into()));
+                .insert(profile.into(), (binding.clone(), password.into()));
             Ok(())
         }
         fn delete_password(&self, profile: &str) -> io::Result<bool> {
@@ -495,7 +543,7 @@ mod tests {
             true
         }
         fn prompt(&self, _prompt: &str) -> io::Result<Secret> {
-            Ok(Secret::new(self.typed.clone()))
+            Ok(Secret::new(self.typed.borrow().clone()))
         }
     }
 
@@ -507,20 +555,29 @@ mod tests {
     /// the prompt answers `typed`.
     fn with_dev(typed: &str) -> Fake {
         let fake = Fake {
-            typed: typed.into(),
+            typed: RefCell::new(typed.into()),
             ..Fake::default()
         };
-        fake.config.borrow_mut().upsert(Profile {
+        let dev = Profile {
             name: "dev".into(),
             server: Some("srv".into()),
             auth: Some(AuthKind::Sql),
             user: Some("me".into()),
             ..Profile::default()
-        });
+        };
         fake.passwords
             .borrow_mut()
-            .insert("dev".into(), ("me".into(), "old".into()));
+            .insert("dev".into(), (bound_to(&dev), "old".into()));
+        fake.config.borrow_mut().upsert(dev);
         fake
+    }
+
+    /// The binding `profile add` gives a password stored for `profile`.
+    fn bound_to(profile: &Profile) -> Binding {
+        Binding {
+            user: profile.user.clone().unwrap_or_default(),
+            identity: Some(config::identity(profile)),
+        }
     }
 
     fn password(fake: &Fake, name: &str) -> Option<String> {
@@ -564,7 +621,7 @@ mod tests {
     #[test]
     fn a_failed_save_of_a_new_profile_leaves_no_password() {
         let fake = Fake {
-            typed: "pw".into(),
+            typed: RefCell::new("pw".into()),
             ..Fake::default()
         };
         fake.fail_save.set(true);
@@ -690,5 +747,204 @@ mod tests {
         assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
         assert!(remove("dev", &mut out(), &fake).is_err());
         assert!(fake.config.borrow().find("dev").is_some());
+    }
+
+    /// What a run with `--profile dev` would connect with: the server and the password,
+    /// resolved by `config::resolve_with` from `load` and the fake's passwords. `lock_free`
+    /// says whether the run can take the profiles lock, or an edit holds it.
+    fn run_with(
+        fake: &Fake,
+        load: &dyn Fn() -> Result<Config, String>,
+        lock_free: bool,
+    ) -> Result<(String, String), String> {
+        let var = |_: &str| None;
+        let password = |name: &str| fake.read_password(name);
+        let lock = || {
+            if lock_free {
+                Ok(None)
+            } else {
+                Err("another sqlh is editing the profiles".to_owned())
+            }
+        };
+        let opts = Opts {
+            profile: Some("dev".into()),
+            ..Opts::default()
+        };
+        let sources = config::Sources {
+            var: &var,
+            load,
+            password: &password,
+            lock: &lock,
+        };
+        let settings = config::resolve_with(&opts, &sources).map_err(|f| f.message)?;
+        match settings.connect.auth {
+            crate::db::Auth::Sql { password, .. } => {
+                Ok((settings.connect.server, password.as_str().to_owned()))
+            }
+            crate::db::Auth::Integrated => Err("Windows auth".into()),
+        }
+    }
+
+    fn run(fake: &Fake, lock_free: bool) -> Result<(String, String), String> {
+        run_with(fake, &|| Ok(fake.config.borrow().clone()), lock_free)
+    }
+
+    fn pair(server: &str, password: &str) -> Result<(String, String), String> {
+        Ok((server.into(), password.into()))
+    }
+
+    // R20: a run between an edit's two writes (the password stored, the file not yet saved)
+    // never sends the new password to the old server, login or encryption. With the lock
+    // held by the edit, it fails safely; once the edit is done, it gets the new pair. A
+    // password-only change keeps the identity, so either password goes to the same login.
+    #[test]
+    fn a_run_during_an_edit_never_pairs_the_new_password_with_the_old_profile() {
+        use crate::db::Encrypt;
+        let edits = [
+            (
+                "server",
+                Opts {
+                    server: Some("other".into()),
+                    ..Opts::default()
+                },
+            ),
+            (
+                "login",
+                Opts {
+                    user: Some("you".into()),
+                    ..Opts::default()
+                },
+            ),
+            (
+                "encryption",
+                Opts {
+                    encrypt: Some(Encrypt::Strict),
+                    ..new_password()
+                },
+            ),
+            ("password", new_password()),
+        ];
+        for (what, opts) in edits {
+            let fake = with_dev("new");
+            let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let record = seen.clone();
+            *fake.on_save.borrow_mut() = Some(Box::new(move |fake: &Fake| {
+                record.borrow_mut().push(run(fake, false));
+            }));
+            add("dev", &opts, &mut out(), &fake).unwrap();
+            let during = seen.borrow()[0].clone();
+            if what == "password" {
+                assert_eq!(during, pair("srv", "new"), "{what}");
+            } else {
+                let message = during.expect_err(what);
+                assert!(
+                    message.contains("isn't sent") && message.contains("another sqlh"),
+                    "{what}: {message}"
+                );
+            }
+            let server = if what == "server" { "other" } else { "srv" };
+            *fake.on_save.borrow_mut() = None;
+            assert_eq!(run(&fake, true), pair(server, "new"), "{what}");
+        }
+    }
+
+    // R20: an edit that lands between a run's read of the file and its read of the password
+    // is caught: the password doesn't fit the profile the run read, so the run reads both
+    // again under the lock and gets the edit's pair.
+    #[test]
+    fn an_edit_between_a_runs_two_reads_is_read_again_under_the_lock() {
+        let fake = with_dev("new");
+        let before = fake.config.borrow().clone();
+        let loads = Cell::new(0);
+        let load = || {
+            loads.set(loads.get() + 1);
+            if loads.get() > 1 {
+                return Ok(fake.config.borrow().clone());
+            }
+            let opts = Opts {
+                server: Some("other".into()),
+                ..Opts::default()
+            };
+            add("dev", &opts, &mut out(), &fake).unwrap();
+            Ok(before.clone())
+        };
+        assert_eq!(run_with(&fake, &load, true), pair("other", "new"));
+        assert_eq!(loads.get(), 2);
+    }
+
+    // R20: an edit killed between its two writes leaves the new password bound to the new
+    // server and the file naming the old one. A fresh run refuses to send it and says how to
+    // repair; the repair asks for the password again rather than keeping the stored one.
+    #[test]
+    fn an_edit_killed_between_its_writes_fails_closed_until_the_profile_is_added_again() {
+        let fake = with_dev("new");
+        *fake.on_save.borrow_mut() = Some(Box::new(|_: &Fake| panic!("killed")));
+        let opts = Opts {
+            server: Some("other".into()),
+            ..Opts::default()
+        };
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add("dev", &opts, &mut out(), &fake)
+        }));
+        assert!(killed.is_err());
+        *fake.on_save.borrow_mut() = None;
+        assert_eq!(password(&fake, "dev").as_deref(), Some("new"));
+        assert_eq!(
+            fake.config.borrow().find("dev").unwrap().server.as_deref(),
+            Some("srv")
+        );
+
+        let message = run(&fake, true).unwrap_err();
+        assert!(
+            message.contains("was stored for another server")
+                && message.contains("run: sqlh profile add dev"),
+            "{message}"
+        );
+
+        *fake.typed.borrow_mut() = "again".into();
+        add("dev", &Opts::default(), &mut out(), &fake).unwrap();
+        assert_eq!(run(&fake, true), pair("srv", "again"));
+    }
+
+    // R20: an edit that changes only the encryption keeps the password, stored again with the
+    // profile's new identity (no prompt: it would answer an empty password and fail).
+    #[test]
+    fn a_kept_password_is_bound_to_the_new_encryption() {
+        let fake = with_dev("");
+        let opts = Opts {
+            trust_server_certificate: Some(true),
+            ..Opts::default()
+        };
+        add("dev", &opts, &mut out(), &fake).unwrap();
+        let saved = fake.config.borrow().find("dev").cloned().unwrap();
+        assert_eq!(
+            fake.binding("dev").unwrap(),
+            Some(bound_to(&saved)),
+            "rebound"
+        );
+        assert_eq!(run(&fake, true), pair("srv", "old"));
+    }
+
+    // R20: a password stored before bindings (no identity) is used when its login matches the
+    // profile, refused when it doesn't, and bound by the next edit that keeps it.
+    #[test]
+    fn a_password_without_an_identity_is_checked_by_its_login() {
+        let fake = with_dev("");
+        let legacy = |user: &str| Binding {
+            user: user.into(),
+            identity: None,
+        };
+        fake.passwords
+            .borrow_mut()
+            .insert("dev".into(), (legacy("me"), "old".into()));
+        assert_eq!(run(&fake, true), pair("srv", "old"));
+        add("dev", &Opts::default(), &mut out(), &fake).unwrap();
+        let saved = fake.config.borrow().find("dev").cloned().unwrap();
+        assert_eq!(fake.binding("dev").unwrap(), Some(bound_to(&saved)));
+
+        fake.passwords
+            .borrow_mut()
+            .insert("dev".into(), (legacy("someone_else"), "theirs".into()));
+        assert!(run(&fake, true).is_err());
     }
 }

@@ -4,13 +4,17 @@
 
 .DESCRIPTION
     Runs, in order, and stops at the first failure with a non-zero exit code:
-      1. cargo fmt --check
-      2. cargo clippy --all-targets -- -D warnings, without and with --features timing
-      3. cargo test (unit and process-level tests; no server needed)
-      4. cargo build --release --locked
-      5. cargo test --release --test cli (the process-level tests against the release exe)
-      6. the size budget: target\release\sqlh.exe at most 3 MB (owner, 2026-10-12)
-      7. the imports: dumpbin /dependents lists only DLLs that ship with Windows
+      1. Cargo.lock is current: cargo metadata --locked
+      2. cargo fmt --check
+      3. cargo clippy --all-targets -- -D warnings, without and with --features timing
+      4. cargo test (unit and process-level tests; no server needed)
+      5. cargo build --release
+      6. cargo test --release --test cli (the process-level tests against the release exe)
+      7. the size budget: target\release\sqlh.exe at most 3 MB (owner, 2026-10-12)
+      8. the imports: dumpbin /dependents lists only DLLs that ship with Windows
+    Every cargo command that resolves dependencies runs with --locked, so none of them can
+    update a stale Cargo.lock and let a later step pass on it (R23): a stale lockfile fails
+    step 1 and is left as it was.
     With -Live it then runs the live tests (debug and release) through the profile named in
     $env:SQLH_TEST_PROFILE, or "test". CI (PLAN.md 3.5) runs it without -Live: no server there.
 
@@ -61,12 +65,13 @@ function Fail([string]$message) {
     exit 1
 }
 
+Step 'Cargo.lock is current' { cargo metadata --locked --format-version 1 | Out-Null }
 Step 'cargo fmt --check' { cargo fmt --check }
-Step 'cargo clippy' { cargo clippy --all-targets -- -D warnings }
-Step 'cargo clippy --features timing' { cargo clippy --all-targets --features timing -- -D warnings }
-Step 'cargo test' { cargo test }
-Step 'cargo build --release --locked' { cargo build --release --locked }
-Step 'cargo test --release --test cli' { cargo test --release --test cli }
+Step 'cargo clippy' { cargo clippy --locked --all-targets -- -D warnings }
+Step 'cargo clippy --features timing' { cargo clippy --locked --all-targets --features timing -- -D warnings }
+Step 'cargo test' { cargo test --locked }
+Step 'cargo build --release' { cargo build --release --locked }
+Step 'cargo test --release --test cli' { cargo test --locked --release --test cli }
 
 $exe = Join-Path $root 'target\release\sqlh.exe'
 
@@ -107,8 +112,8 @@ if ($unexpected.Count -gt 0) {
 
 if ($Live) {
     if (-not $env:SQLH_TEST_PROFILE) { $env:SQLH_TEST_PROFILE = 'test' }
-    Step "live tests (debug, profile $env:SQLH_TEST_PROFILE)" { cargo test --test cli -- --ignored live }
-    Step "live tests (release, profile $env:SQLH_TEST_PROFILE)" { cargo test --release --test cli -- --ignored live }
+    Step "live tests (debug, profile $env:SQLH_TEST_PROFILE)" { cargo test --locked --test cli -- --ignored live }
+    Step "live tests (release, profile $env:SQLH_TEST_PROFILE)" { cargo test --locked --release --test cli -- --ignored live }
 }
 
 Write-Host ("check passed in {0:N0} s" -f ((Get-Date) - $started).TotalSeconds) -ForegroundColor Green

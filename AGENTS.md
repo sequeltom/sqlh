@@ -40,7 +40,8 @@ src/run.rs       the execution core: RunPolicy (guard, wrapper, --check), QueryO
                  cancellation, RunOutcome (exit code and counts, apart from the sink)
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
-src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW)
+src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW); each password is bound
+                 to its login and profile identity (R20)
 src/secret.rs    Secret: a password as sqlh holds it, wiped on drop (zeroize)
 src/profile.rs   sqlh profile add | list | test | rm
 src/help.txt     --help text (models read it)
@@ -61,9 +62,9 @@ tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ ho
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
                  size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
-.github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: a read-only
-                 build job (version, check, notices), then a sign job (Azure Artifact Signing,
-                 zip + SHA-256, draft release); PLAN.md 3.6)
+.github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
+                 read-only; sign, the only job with the Azure token, which never runs the exe;
+                 verify, read-only; publish, the draft release; PLAN.md 3.6, R22)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
@@ -135,7 +136,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - The guard, splitter, renderer and formatter get table-driven unit tests next to the code.
   - Every new output shape gets an exact-output test (see `output/text.rs`).
   - Process-level behavior (exit codes, files, crashes) gets a test in `tests/cli.rs`, isolated from the machine's profiles and `SQLCMD*` variables.
-  - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop.
+  - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop. A fixture arms its idempotent cleanup (`Cleanup`, `DROP ... IF EXISTS`) before the write that makes the object, never after (R24).
   - Test server details and credentials never go in the repo.
   - Live tests that need permissions short of sysadmin use `Reader`: a login made per test with only read rights, whose random password exists only in the test process and in the environment of the sqlh processes it starts (decision 5). That is the one password a test may put in an environment variable; the owner's never.
   - `SQLH_DEBUG_PANIC`, `SQLH_DEBUG_STOP_HOLD_MS`, `SQLH_DEBUG_SESSION_PREFIX` (SQL sent ahead of the session setup, in the same batch) and `SQLH_DEBUG_ROW_WORK_US` (work per row and per value chunk in the row loop) exist only when debug assertions are on, so a test that needs one is `#[cfg(debug_assertions)]`: a release run must not report it as passed.
