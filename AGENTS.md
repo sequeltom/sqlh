@@ -35,9 +35,11 @@ Don't trade these away.
 src/main.rs      the binary: calls sqlh::main; everything else is the library (src/lib.rs)
 src/app.rs       the command: arguments, output and its closing lines (Closing), -o publication,
                  the panic net and last-resort diagnostics; profile commands use it
-src/run.rs       the execution core: RunPolicy (guard, wrapper, --check), QueryOrigin (user SQL or
-                 sqlh's own), prepare (sources → batches → guard), the session and batch loop,
-                 cancellation, RunOutcome (exit code and counts, apart from the sink)
+src/run.rs       the execution core, free of the CLI and of delivery: Request (what to run, built by
+                 app from the flags), RunPolicy (guard, wrapper, --check), QueryOrigin (user SQL or
+                 sqlh's own, which is always read-only), prepare (sources → batches → guard), the
+                 session and batch loop into any Output, cancellation, Accounting (the run's own
+                 count of errors and stopped counts) and RunOutcome (exit code and counts)
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
 src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW); each password is bound

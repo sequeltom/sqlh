@@ -7,7 +7,7 @@
 //! after sqlh, with no way to put it back after a kill or an early Ctrl+C. Measured in
 //! docs/notes/windows-shells.md; DESIGN.md §4.1 has the rules for the bytes of a pipe or file.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use crate::secret::Secret;
 
@@ -74,15 +74,45 @@ pub fn read_password(prompt: &str) -> io::Result<Secret> {
     let mut stderr = io::stderr();
     write!(stderr, "{prompt}")?;
     stderr.flush()?;
-    // Room for any password up front, so that reading never reallocates and leaves a copy
-    // behind; the whole buffer is wiped when the `Secret` is dropped.
-    let mut line = Secret::new(String::with_capacity(1024));
-    let result = io::stdin().read_line(&mut line);
+    let line = read_line_within(io::stdin().lock(), PASSWORD_LINE_BYTES);
     let _ = writeln!(stderr);
-    result?;
-    let trimmed = line.trim_end_matches(['\r', '\n']).len();
-    line.truncate(trimmed);
-    Ok(line)
+    line
+}
+
+/// The longest line the password prompt reads, in bytes, its line break included. SQL Server
+/// allows passwords of up to 128 characters, at most 4 bytes each in UTF-8, so this is room
+/// for any of them.
+const PASSWORD_LINE_BYTES: usize = 1024;
+
+/// Reads one line of at most `limit` bytes, its line break included, into a buffer allocated
+/// once at that size: the read can't grow it, so it never reallocates and leaves a copy of
+/// the password behind in memory it gave up. A longer line is refused. The line break is
+/// dropped; the buffer, spare capacity included, is wiped when the `Secret` is dropped, and
+/// so is what was read when the line is refused.
+fn read_line_within(reader: impl BufRead, limit: usize) -> io::Result<Secret> {
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(limit));
+    reader.take(limit as u64).read_until(b'\n', &mut bytes)?;
+    if bytes.len() == limit && bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the password is longer than {limit} bytes; SQL Server allows 128 characters"),
+        ));
+    }
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    // `from_utf8` takes the buffer over without copying it; on failure it hands it back,
+    // to be wiped.
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(line) => Ok(Secret::new(line)),
+        Err(e) => {
+            drop(zeroize::Zeroizing::new(e.into_bytes()));
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the password is not valid UTF-8",
+            ))
+        }
+    }
 }
 
 pub fn stdin_is_console() -> bool {
@@ -257,5 +287,31 @@ mod tests {
         assert_eq!(path_error(message(), "/c/code/x.sql", &denied), message());
         assert_eq!(path_error(message(), "/tmp/x.sql", &missing), message());
         assert_eq!(path_error(message(), r"C:\x.sql", &missing), message());
+    }
+
+    // The Phase 3 review's design follow-up: the password's line is read into a buffer that
+    // never grows past the size it was allocated at, so no reallocation leaves a copy
+    // behind; a longer line is refused, and the line break is dropped.
+    #[test]
+    fn the_password_line_is_read_without_reallocating() {
+        let read = |input: &[u8], limit| read_line_within(io::Cursor::new(input.to_vec()), limit);
+        let line = read("pässwörd\r\nnext line".as_bytes(), 64).unwrap();
+        assert_eq!(line.as_str(), "pässwörd");
+        assert_eq!(line.capacity(), 64, "the buffer kept its size");
+        // Exactly the limit, line break included; and the last line, with no break.
+        assert_eq!(read(b"1234567\n", 8).unwrap().as_str(), "1234567");
+        assert_eq!(
+            read(b"12345678", 8).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(read(b"123", 8).unwrap().as_str(), "123");
+        assert_eq!(read(b"", 8).unwrap().as_str(), "");
+        let long = read(&[b'x'; 2000], PASSWORD_LINE_BYTES).unwrap_err();
+        assert!(
+            long.to_string().contains("longer than 1024 bytes"),
+            "{long}"
+        );
+        let bad = read(b"\xff\xfe\n", 8).unwrap_err();
+        assert_eq!(bad.kind(), io::ErrorKind::InvalidData);
     }
 }

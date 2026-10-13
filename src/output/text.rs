@@ -378,7 +378,6 @@ impl<W: Write> BatchSink for TextSink<W> {
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
         self.tally.outside_rows("an error")?;
         self.flush_affected()?;
-        self.tally.error(error.severity);
         let line = error_line(&self.tally, error);
         if !self.emit(&line)? {
             self.tally.withhold_error();
@@ -426,10 +425,6 @@ impl<W: Write> Output for TextSink<W> {
         let lines = closing_lines(&self.tally, summary, &self.ending, self.written);
         self.written += lines.len() as u64;
         self.out.write_all(lines.as_bytes())
-    }
-
-    fn tally(&self) -> &Tally {
-        &self.tally
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -834,7 +829,6 @@ pub(super) mod tests {
         out.end_rows().unwrap();
         out.rows_affected(3).unwrap();
         out.error(&error(2)).unwrap();
-        assert_eq!(out.tally().errors(), 1, "a refused error is not counted");
     }
 
     /// A text sink with a stream each for the main output and the diagnostics.
@@ -1707,7 +1701,6 @@ pub(super) mod tests {
         s.end_rows().unwrap();
         s.rows_affected(3).unwrap();
         s.rows_affected(4).unwrap();
-        assert_eq!(s.tally().errors(), 1, "a withheld error still counts");
         s.finish(&summary("failed (exit 1): 1 error, 3 ms"))
             .unwrap();
         assert_eq!(
@@ -1797,7 +1790,6 @@ pub(super) mod tests {
             ..error(3)
         };
         s.error(&in_proc).unwrap();
-        assert_eq!(s.tally().batch_max_severity(), 16);
         assert_eq!(
             text(s),
             "-- error 208 (severity 16, state 1, b.sql:12): Invalid object name 'dbo.Nope'.\n\

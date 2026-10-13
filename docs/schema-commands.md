@@ -224,8 +224,8 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
    - recognize commands as the first positional word, plus `find --text`
    - reject `-Q`/`-i` together with a command, and cross-database names
 4. **Runner refactor** (shared with MCP)
-   - pull the batch loop out of `main.rs` into a `Runner` that runs batches against a `Session` into an `Output`
-   - add a "trusted" flag that skips the classifier but keeps the wrapper transaction (done in PLAN.md 3.1: `QueryOrigin::Generated` in `src/run.rs`, which also skips `$(var)`)
+   - pull the batch loop out of `main.rs` into a `Runner` that runs batches against a `Session` into an `Output` (done: `src/run.rs`, PLAN.md 3.1 and the Phase 3 design follow-ups)
+   - add a "trusted" flag that skips the classifier but keeps the wrapper transaction (done in PLAN.md 3.1: `QueryOrigin::Generated` in `src/run.rs`, which also skips `$(var)`, and since the Phase 3 design follow-ups always runs as a read-only run, even under a profile that allows writes). `run::prepare` and `run::execute` take a `run::Request` and any `Output`, not the CLI's types, so a schema command builds its own request
    - support two-step flows: resolve, then describe
 5. **Defaults:** `describe` and `def` default to unlimited rows and cells unless flags say otherwise.
 6. **Docs:**

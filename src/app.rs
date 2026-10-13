@@ -14,7 +14,7 @@ use crate::cli::{self, Command, Opts};
 use crate::config::{self, Settings};
 use crate::error::{Exit, Failure};
 use crate::output::{self, Format, Limits, Summary};
-use crate::run::{self, Prepared, QueryOrigin, RunOutcome, output_failure};
+use crate::run::{self, Input, Prepared, QueryOrigin, Report, Request, RunOutcome, output_failure};
 use crate::script::Source;
 use crate::signals::{Signal, Signals};
 use crate::{console, files, profile};
@@ -130,7 +130,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     };
     // Everything that can fail before the run happens before `-o` is opened, so bad input
     // never truncates or replaces an existing output file.
-    let prepared = match run::prepare(&opts, &settings, origin) {
+    let prepared = match request(&opts).and_then(|r| run::prepare(&r, &settings, origin)) {
         Ok(prepared) => prepared,
         Err(failure) => return fail_within(failure, format, settings.limits, started),
     };
@@ -165,6 +165,31 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     ))
 }
 
+/// What the run core is asked to do (`run::Request`), from the command line.
+fn request(opts: &Opts) -> Result<Request, Failure> {
+    let input = match (&opts.query, opts.inputs.is_empty()) {
+        (Some(_), false) => return Err(Failure::usage("give SQL with -Q or with -i, not both")),
+        (Some(query), true) => Input::Query(query.clone()),
+        (None, false) => Input::Files(opts.inputs.clone()),
+        (None, true) => Input::Stdin,
+    };
+    let report = if opts.show_connection {
+        Report::Note
+    } else if opts.verbose {
+        Report::Diagnostic
+    } else {
+        Report::Off
+    };
+    Ok(Request {
+        input,
+        vars: (!opts.no_substitution).then(|| opts.vars.clone()),
+        terminator: opts.terminator.clone().unwrap_or_else(|| "GO".into()),
+        check: opts.check,
+        continue_on_error: opts.continue_on_error,
+        report,
+    })
+}
+
 /// The run, its closing lines and the publication of `-o`, on one runtime with the console
 /// event listeners alive throughout. Any earlier end for either one lets Ctrl+C and
 /// Ctrl+Break fall through to Windows' default handler, which ends the process with
@@ -190,8 +215,9 @@ async fn run_and_deliver(
         ))
         .map_err(output_failure)
     };
+    let gate = out.gate();
     let (outcome, late) = match noted {
-        Ok(()) => run::execute(opts, settings, prepared, &mut out, &mut signals, started).await,
+        Ok(()) => run::execute(settings, prepared, &mut *out, &gate, &mut signals, started).await,
         Err(failure) => (RunOutcome::new(Err(failure)), None),
     };
     let exit = finish_async(&mut out, outcome, late, started, signals.as_mut().ok()).await;
@@ -660,8 +686,6 @@ impl Destination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-    use crate::output::BatchInfo;
     use crate::run::Stats;
     use std::sync::Mutex;
 
@@ -702,57 +726,36 @@ mod tests {
 
     // PLAN.md 2.15: the status line says how many batches had a count stopped, in a run that
     // succeeded and in one that failed (with a SQL error or any other failure), and says
-    // nothing otherwise.
+    // nothing otherwise. The counts are the run's own (`run::Accounting`, whose agreement
+    // with the output's tally `run.rs` tests).
     #[test]
     fn the_status_line_says_where_counting_stopped() {
-        let mut o = out(usize::MAX, false);
-        let batch = |number| BatchInfo {
-            number,
-            total: 3,
-            source: "-Q",
-            multi_source: false,
-            line: 1,
-            line_map: &[],
-            run: 1,
-            runs: 1,
-            started_ms: 0,
-        };
         let stats = || Stats {
             batches_run: 3,
             ..Stats::default()
         };
-        o.begin_batch(&batch(1)).unwrap();
-        o.end_batch(1).unwrap();
-        let clean = Closing::of(RunOutcome::observed(Ok(stats()), o.tally()), Instant::now());
+        let outcome = |result, errors, stopped_batches| RunOutcome {
+            result,
+            errors,
+            stopped_batches,
+        };
+        let clean = Closing::of(outcome(Ok(stats()), 0, 0), Instant::now());
         assert!(
             clean.status.starts_with("ok: 3 batches, ") && !clean.status.contains("stopped"),
             "{}",
             clean.status
         );
         let timeout = || Failure::new(Exit::Timeout, "query timeout");
-        let clean = Closing::of(
-            RunOutcome::observed(Err(timeout()), o.tally()),
-            Instant::now(),
-        );
+        let clean = Closing::of(outcome(Err(timeout()), 0, 0), Instant::now());
         assert!(
             clean.status.starts_with("failed (exit 4): timeout, ")
                 && !clean.status.contains("stopped"),
             "{}",
             clean.status
         );
-        for (number, by) in [(2, db::Stop::Budget), (3, db::Stop::Timeout)] {
-            o.begin_batch(&batch(number)).unwrap();
-            o.columns(&[]).unwrap();
-            o.counting_stopped(by);
-            o.end_rows().unwrap();
-            o.end_batch(1).unwrap();
-        }
         // A failure that is not a SQL error keeps its exit code and first words, and adds the
         // same words, before the time.
-        let failed = Closing::of(
-            RunOutcome::observed(Err(timeout()), o.tally()),
-            Instant::now(),
-        );
+        let failed = Closing::of(outcome(Err(timeout()), 0, 2), Instant::now());
         assert_eq!(failed.exit, Exit::Timeout);
         assert!(
             failed
@@ -762,7 +765,7 @@ mod tests {
             failed.status
         );
         assert_eq!(failed.error.as_deref(), Some("query timeout"));
-        let stopped = Closing::of(RunOutcome::observed(Ok(stats()), o.tally()), Instant::now());
+        let stopped = Closing::of(outcome(Ok(stats()), 0, 2), Instant::now());
         assert!(
             stopped
                 .status
@@ -772,16 +775,7 @@ mod tests {
         );
         assert_eq!(stopped.exit, Exit::Ok);
         // A failure keeps its own exit code and first words, and adds the same words.
-        o.error(&db::ServerMessage {
-            number: 208,
-            severity: 16,
-            state: 1,
-            line: Some(1),
-            procedure: None,
-            text: "x".into(),
-        })
-        .unwrap();
-        let failed = Closing::of(RunOutcome::observed(Ok(stats()), o.tally()), Instant::now());
+        let failed = Closing::of(outcome(Ok(stats()), 1, 2), Instant::now());
         assert_eq!(failed.exit, Exit::SqlError);
         assert!(
             failed.status.starts_with("failed (exit 1): 1 error")

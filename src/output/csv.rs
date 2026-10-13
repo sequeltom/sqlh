@@ -259,7 +259,6 @@ impl<W: Write> BatchSink for CsvSink<W> {
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
         self.tally.outside_rows("an error")?;
         self.flush_affected()?;
-        self.tally.error(error.severity);
         let line = error_line(&self.tally, error);
         if !self.emit_meta(&line)? {
             self.tally.withhold_error();
@@ -310,10 +309,6 @@ impl<W: Write> Output for CsvSink<W> {
         let lines = closing_lines(&self.tally, summary, &self.ending, self.written);
         self.written += lines.len() as u64;
         self.meta.write_all(lines.as_bytes())
-    }
-
-    fn tally(&self) -> &Tally {
-        &self.tally
     }
 
     fn flush(&mut self) -> io::Result<()> {

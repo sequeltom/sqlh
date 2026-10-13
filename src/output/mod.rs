@@ -209,7 +209,6 @@ pub trait Output: BatchSink {
     /// open ended when the run did: at `summary.elapsed_ms` on the run clock. The status is
     /// never shortened; the error and notes are, to fit the budget.
     fn finish(&mut self, summary: &Summary) -> io::Result<()>;
-    fn tally(&self) -> &Tally;
     fn flush(&mut self) -> io::Result<()>;
 }
 
@@ -510,8 +509,6 @@ pub struct Tally {
     rows_shown: u64,
     cells_cut: u64,
     messages_seen: usize,
-    errors: u32,
-    batch_max_severity: i32,
     /// Bytes the end of the run needs on top of the two reserves: the tail of the status line
     /// that names the connection (`reserve_ending`). Zero in JSON, which has no such tail.
     ending: u64,
@@ -546,8 +543,6 @@ impl Tally {
             rows_shown: 0,
             cells_cut: 0,
             messages_seen: 0,
-            errors: 0,
-            batch_max_severity: 0,
             ending: 0,
             connection_told: false,
             batch_begun: false,
@@ -689,7 +684,6 @@ impl Tally {
         self.batch_line = batch.line;
         self.line_map.clear();
         self.line_map.extend_from_slice(batch.line_map);
-        self.batch_max_severity = 0;
         self.batch_number = batch.number;
         self.batch_stopped = false;
         // A batch starts with no result open. One that a failure cut short is closed by the
@@ -802,7 +796,9 @@ impl Tally {
         self.batch_stopped
     }
 
-    /// How many batches had a count stopped, for the status line.
+    /// How many batches had a count stopped. The status line takes the run's own count
+    /// (`run::Accounting`), not this.
+    #[cfg(test)]
     pub fn stopped_batches(&self) -> usize {
         self.stopped_batches.len()
     }
@@ -841,20 +837,6 @@ impl Tally {
         self.messages_seen += 1;
         let max = self.limits.max_messages;
         max == 0 || self.messages_seen <= max
-    }
-
-    pub fn error(&mut self, severity: i32) {
-        self.errors += 1;
-        self.batch_max_severity = self.batch_max_severity.max(severity);
-    }
-
-    pub fn errors(&self) -> u32 {
-        self.errors
-    }
-
-    /// Highest error severity in the current batch (0 if none).
-    pub fn batch_max_severity(&self) -> i32 {
-        self.batch_max_severity
     }
 
     /// The input line a server message points at. `None` inside procedures (their lines are

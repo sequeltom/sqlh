@@ -1,21 +1,63 @@
-//! The execution core (PLAN.md 3.1): from the input to the batches' results. `RunPolicy` says
-//! what applies to a run (the guard, the wrapper transaction, `--check`), `QueryOrigin` whether
-//! the SQL is the user's or sqlh's own, and `RunOutcome` how it ended, apart from any sink.
+//! The execution core (PLAN.md 3.1): from the input to the batches' results. A `Request` says
+//! what to run, `RunPolicy` what applies to it (the guard, the wrapper transaction, `--check`),
+//! `QueryOrigin` whether the SQL is the user's or sqlh's own, and `RunOutcome` how it ended.
+//! Nothing here depends on the command line or on how output is delivered: the CLI (`app`)
+//! builds the `Request`, and the run writes to any `Output`, waits on any `Backpressure`, and
+//! counts its errors itself (`Accounting`), so other callers (Phase 4's schema commands, Phase
+//! 5's connection reuse) can drive it the same way.
 
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::app::Out;
-use crate::cli::Opts;
 use crate::config::{self, Settings};
 use crate::console;
-use crate::db::{self, Cancel, Counting, DbError, Session};
+use crate::db::{
+    self, Backpressure, BatchSink, Cancel, Column, Counting, DbError, ServerMessage, Session, Stop,
+    Value,
+};
 use crate::error::{Exit, Failure};
 use crate::guard;
-use crate::output::{self, BatchInfo};
+use crate::output::{self, BatchInfo, Output};
 use crate::script::{self, Batch, Source};
 use crate::signals::{Signal, Signals};
+
+/// Where a run's SQL comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Input {
+    /// The SQL itself (`-Q`).
+    Query(String),
+    /// Files, in order (`-i`); `-` is stdin.
+    Files(Vec<String>),
+    /// Nothing named: stdin, unless it is a console.
+    Stdin,
+}
+
+/// Where the line about the connection goes: nowhere, to stderr as a diagnostic
+/// (`--verbose`), or into the output as a note (`profile test`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Report {
+    Off,
+    Diagnostic,
+    Note,
+}
+
+/// What to run and how, apart from the connection settings: everything the run core takes from
+/// the command line, which builds it (`app`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Request {
+    pub(crate) input: Input,
+    /// Values for `$(var)` (`-v`; environment variables resolve too). `None` turns substitution
+    /// off (`-x`). sqlh's own SQL is never substituted, whatever this says.
+    pub(crate) vars: Option<Vec<(String, String)>>,
+    /// The batch terminator (`-c`).
+    pub(crate) terminator: String,
+    /// `--check`: compile only.
+    pub(crate) check: bool,
+    /// `--continue-on-error`.
+    pub(crate) continue_on_error: bool,
+    pub(crate) report: Report,
+}
 
 /// Session options matching SSMS, so plans and filtered/computed-column indexes behave as
 /// people expect (DESIGN.md §4.3). `XACT_ABORT` is set OFF explicitly, as SSMS has it: a
@@ -93,11 +135,13 @@ pub(crate) struct RunPolicy {
 }
 
 impl RunPolicy {
-    pub(crate) fn of(opts: &Opts, settings: &Settings) -> RunPolicy {
+    pub(crate) fn of(request: &Request, settings: &Settings, origin: QueryOrigin) -> RunPolicy {
         RunPolicy {
-            allow_write: settings.allow_write,
-            check: opts.check,
-            continue_on_error: opts.continue_on_error,
+            // sqlh's own SQL only reads, so it never runs with writes allowed, whatever the
+            // profile's `write_policy`: it keeps the wrapper transaction even under `allow`.
+            allow_write: settings.allow_write && origin == QueryOrigin::User,
+            check: request.check,
+            continue_on_error: request.continue_on_error,
         }
     }
 
@@ -123,12 +167,13 @@ pub(crate) enum QueryOrigin {
     User,
     /// sqlh's own, written for a command (`sqlh profile test`, and Phase 4's schema
     /// commands): taken as it is, with no `$(var)` and no guard, since sqlh knows what it
-    /// wrote. It still runs inside the wrapper transaction, so a mistake in it can't write.
+    /// wrote. It always runs as a read-only run, inside the wrapper transaction, even under a
+    /// profile that allows writes (`RunPolicy::of`), so a mistake in it can't write.
     Generated,
 }
 
 /// How a run ended, apart from the sink that showed it: the run's own result, and the counts
-/// the closing lines need (DESIGN.md §5.1).
+/// the closing lines need (DESIGN.md §5.1), which the run kept itself (`Accounting`).
 pub(crate) struct RunOutcome {
     pub(crate) result: Result<Stats, Failure>,
     /// The SQL errors the batches reported.
@@ -147,15 +192,6 @@ impl RunOutcome {
         }
     }
 
-    /// The result of a run, with the counts its output's tally kept as the events went by.
-    pub(crate) fn observed(result: Result<Stats, Failure>, tally: &output::Tally) -> RunOutcome {
-        RunOutcome {
-            result,
-            errors: tally.errors(),
-            stopped_batches: tally.stopped_batches(),
-        }
-    }
-
     /// The exit code (DESIGN.md §6): the failure's, else 1 if a batch reported a SQL error.
     pub(crate) fn exit(&self) -> Exit {
         match &self.result {
@@ -166,26 +202,102 @@ impl RunOutcome {
     }
 }
 
+/// What the run counts for itself as its batches' events go by: the SQL errors, the worst
+/// severity in the batch being run (which decides whether it failed), and the batches whose
+/// count of hidden rows was stopped. The exit code and the closing lines come from these, so
+/// they don't depend on what the output kept.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Accounting {
+    errors: u32,
+    batch_max_severity: i32,
+    batch_stopped: bool,
+    stopped_batches: usize,
+}
+
+impl Accounting {
+    fn begin_batch(&mut self) {
+        self.batch_max_severity = 0;
+        self.batch_stopped = false;
+    }
+
+    /// Whether the batch being run reported an error (severity 11 or more).
+    fn batch_failed(&self) -> bool {
+        self.batch_max_severity >= 11
+    }
+}
+
+/// The sink the driver writes a batch to: the output, with the run's `Accounting` on the way.
+/// An event is counted once the output has taken it, as the output's own tally counts it: an
+/// error the output refused out of order (a bug, which ends the run) isn't counted, and one
+/// the output budget withheld is.
+struct Counted<'a> {
+    out: &'a mut dyn Output,
+    counts: &'a mut Accounting,
+}
+
+impl BatchSink for Counted<'_> {
+    fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+        self.out.columns(columns)
+    }
+    fn wants_values(&self) -> bool {
+        self.out.wants_values()
+    }
+    fn cell_limit(&self) -> usize {
+        self.out.cell_limit()
+    }
+    fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        self.out.row(values)
+    }
+    fn skipped_row(&mut self) {
+        self.out.skipped_row();
+    }
+    fn counting_stopped(&mut self, by: Stop) {
+        self.out.counting_stopped(by);
+        if !self.counts.batch_stopped {
+            self.counts.batch_stopped = true;
+            self.counts.stopped_batches += 1;
+        }
+    }
+    fn end_rows(&mut self) -> io::Result<()> {
+        self.out.end_rows()
+    }
+    fn end_rows_incomplete(&mut self) -> io::Result<()> {
+        self.out.end_rows_incomplete()
+    }
+    fn rows_affected(&mut self, count: u64) -> io::Result<()> {
+        self.out.rows_affected(count)
+    }
+    fn message(&mut self, message: &ServerMessage) -> io::Result<()> {
+        self.out.message(message)
+    }
+    fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        self.out.error(error)?;
+        self.counts.errors += 1;
+        self.counts.batch_max_severity = self.counts.batch_max_severity.max(error.severity);
+        Ok(())
+    }
+}
+
 /// Input, batches and the guard's verdict: everything decided before any output is written.
 pub(crate) struct Prepared {
     pub(crate) sources: Vec<Source>,
     batches: Vec<Batch>,
     policy: RunPolicy,
+    report: Report,
     /// Where and why the guard refused the input, if it did.
     blocked: Option<(String, guard::Blocked)>,
 }
 
 pub(crate) fn prepare(
-    opts: &Opts,
+    request: &Request,
     settings: &Settings,
     origin: QueryOrigin,
 ) -> Result<Prepared, Failure> {
-    let sources = load_sources(opts)?;
+    let sources = load_sources(&request.input)?;
     let user = origin == QueryOrigin::User;
-    let vars = (user && !opts.no_substitution).then_some(opts.vars.as_slice());
-    let terminator = opts.terminator.as_deref().unwrap_or("GO");
-    let batches = script::prepare(&sources, terminator, vars).map_err(Failure::usage)?;
-    let policy = RunPolicy::of(opts, settings);
+    let vars = request.vars.as_deref().filter(|_| user);
+    let batches = script::prepare(&sources, &request.terminator, vars).map_err(Failure::usage)?;
+    let policy = RunPolicy::of(request, settings, origin);
     let blocked = if user {
         batches.iter().find_map(|batch| {
             guard::check(&batch.sql, policy.guard())
@@ -202,31 +314,41 @@ pub(crate) fn prepare(
         sources,
         batches,
         policy,
+        report: request.report,
         blocked,
     })
 }
 
-/// Runs the input, or reports why it won't run. The signal, if any, is one that arrived
-/// while the last batches finished, too late to change the outcome (`run_cancellable`).
-/// `started` is the run clock: the batches are timed on it, as the closing lines are.
+/// Runs the input into `out`, or reports why it won't run. `gate` holds the run back while
+/// the output's reader is behind. The signal, if any, is one that arrived while the last
+/// batches finished, too late to change the outcome (`run_cancellable`). `started` is the run
+/// clock: the batches are timed on it, as the closing lines are.
 pub(crate) async fn execute(
-    opts: &Opts,
     settings: &Settings,
     prepared: &Prepared,
-    out: &mut Out,
+    out: &mut dyn Output,
+    gate: &dyn Backpressure,
     signals: &mut Result<Signals, String>,
     started: Instant,
 ) -> (RunOutcome, Option<Signal>) {
-    let (result, late) = execute_inner(opts, settings, prepared, out, signals, started).await;
-    (RunOutcome::observed(result, out.tally()), late)
+    let mut counts = Accounting::default();
+    let (result, late) =
+        execute_inner(settings, prepared, out, gate, signals, &mut counts, started).await;
+    let outcome = RunOutcome {
+        result,
+        errors: counts.errors,
+        stopped_batches: counts.stopped_batches,
+    };
+    (outcome, late)
 }
 
 async fn execute_inner(
-    opts: &Opts,
     settings: &Settings,
     prepared: &Prepared,
-    out: &mut Out,
+    out: &mut dyn Output,
+    gate: &dyn Backpressure,
     signals: &mut Result<Signals, String>,
+    counts: &mut Accounting,
     started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     if let Some((location, blocked)) = &prepared.blocked {
@@ -249,23 +371,24 @@ async fn execute_inner(
         Ok(signals) => signals,
         Err(message) => return (Err(Failure::new(Exit::Internal, message.clone())), None),
     };
-    run_cancellable(opts, settings, prepared, out, signals, started).await
+    run_cancellable(settings, prepared, out, gate, signals, counts, started).await
 }
 
-fn load_sources(opts: &Opts) -> Result<Vec<Source>, Failure> {
-    if opts.query.is_some() && !opts.inputs.is_empty() {
-        return Err(Failure::usage("give SQL with -Q or with -i, not both"));
-    }
-    if let Some(query) = &opts.query {
-        return Ok(vec![Source {
-            name: "-Q".into(),
-            path: None,
-            text: query.clone(),
-        }]);
-    }
+fn load_sources(input: &Input) -> Result<Vec<Source>, Failure> {
+    let files = match input {
+        Input::Query(query) => {
+            return Ok(vec![Source {
+                name: "-Q".into(),
+                path: None,
+                text: query.clone(),
+            }]);
+        }
+        Input::Files(files) => files.as_slice(),
+        Input::Stdin => &[],
+    };
     let mut sources = Vec::new();
     let mut left = script::MAX_INPUT_BYTES;
-    for input in &opts.inputs {
+    for input in files {
         let (name, path, bytes) = if input == "-" {
             let bytes = read_capped(io::stdin().lock(), "stdin", &mut left)?;
             ("stdin".to_owned(), None, bytes)
@@ -348,16 +471,17 @@ fn location(sources: &[Source], source: usize, line: u32) -> String {
 /// The second value is the signal when it came too late to change the outcome (every batch
 /// had run), so the caller can still hold the delivery to `DELIVERY_GRACE`.
 async fn run_cancellable(
-    opts: &Opts,
     settings: &Settings,
     prepared: &Prepared,
-    out: &mut Out,
+    out: &mut dyn Output,
+    gate: &dyn Backpressure,
     signals: &mut Signals,
+    counts: &mut Accounting,
     started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     let root = Cancel::new();
     let cancel = root.child();
-    let work = run_session(opts, settings, prepared, out, &cancel, started);
+    let work = run_session(settings, prepared, out, gate, &cancel, counts, started);
     tokio::pin!(work);
     tokio::select! {
         result = &mut work => (result, None),
@@ -409,17 +533,18 @@ fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> C
 }
 
 async fn run_session(
-    opts: &Opts,
     settings: &Settings,
     prepared: &Prepared,
-    out: &mut Out,
+    out: &mut dyn Output,
+    gate: &dyn Backpressure,
     cancel: &Cancel,
+    counts: &mut Accounting,
     started: Instant,
 ) -> Result<Stats, Failure> {
     let (sources, batches, policy) = (&prepared.sources, &prepared.batches, prepared.policy);
     let timeout = settings.query_timeout;
     // --verbose and `profile test` say where the time to the first batch went (PLAN.md 2.1).
-    let report = opts.verbose || opts.show_connection;
+    let report = prepared.report != Report::Off;
     let connect_started = Instant::now();
     if report {
         db::phases::start();
@@ -466,7 +591,7 @@ async fn run_session(
             setup_started.elapsed().as_millis(),
             session.describe()
         );
-        if opts.show_connection {
+        if prepared.report == Report::Note {
             out.note(&line).map_err(output_failure)?;
         } else {
             out.diagnostic(&line).map_err(output_failure)?;
@@ -478,7 +603,6 @@ async fn run_session(
         .any(|batch| guard::mentions_xact_abort(&batch.sql));
     let counting = counting_for(policy.allow_write, settings.exact_count, xact_abort);
     let mut stats = Stats::default();
-    let gate = out.gate();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
     let mut number = 0;
     'batches: for batch in batches {
@@ -517,15 +641,13 @@ async fn run_session(
                 started_ms: started.elapsed().as_millis(),
             })
             .map_err(output_failure)?;
+            counts.begin_batch();
+            let mut sink = Counted {
+                out: &mut *out,
+                counts: &mut *counts,
+            };
             session
-                .run(
-                    batch.sql.clone(),
-                    timeout,
-                    counting,
-                    cancel,
-                    &mut **out,
-                    &gate,
-                )
+                .run(batch.sql.clone(), timeout, counting, cancel, &mut sink, gate)
                 .await
                 .map_err(|e| match e {
                     DbError::Timeout(_) => Failure::new(
@@ -540,7 +662,7 @@ async fn run_session(
             out.end_batch(started.elapsed().as_millis())
                 .map_err(output_failure)?;
             out.flush().map_err(output_failure)?;
-            if out.tally().batch_max_severity() >= 11 {
+            if counts.batch_failed() {
                 stats.first_failed.get_or_insert(number);
                 if !policy.continue_on_error {
                     stats.batches_skipped = total - number;
@@ -739,11 +861,14 @@ mod tests {
         }
     }
 
-    fn query(sql: &str) -> Opts {
-        Opts {
-            query: Some(sql.into()),
-            vars: vec![("t".into(), "dbo.T".into())],
-            ..Opts::default()
+    fn query(sql: &str) -> Request {
+        Request {
+            input: Input::Query(sql.into()),
+            vars: Some(vec![("t".into(), "dbo.T".into())]),
+            terminator: "GO".into(),
+            check: false,
+            continue_on_error: false,
+            report: Report::Off,
         }
     }
 
@@ -768,23 +893,28 @@ mod tests {
             assert_eq!(p.guard().writes, allow_write, "{p:?}");
             assert_eq!(p.guard().compile_only, check, "{p:?}");
         }
-        let opts = Opts {
+        let request = Request {
             check: true,
             continue_on_error: true,
-            ..Opts::default()
+            ..query("SELECT 1")
         };
         assert_eq!(
-            RunPolicy::of(&opts, &settings(true)),
+            RunPolicy::of(&request, &settings(true), QueryOrigin::User),
             RunPolicy {
                 allow_write: true,
                 check: true,
                 continue_on_error: true,
             }
         );
+        // sqlh's own SQL never runs with writes allowed: the wrapper stays (the Phase 3
+        // review's design follow-up).
+        let generated = RunPolicy::of(&request, &settings(true), QueryOrigin::Generated);
+        assert!(!generated.allow_write && generated.wrap(), "{generated:?}");
     }
 
     // PLAN.md 3.1: the user's SQL gets $(var) and the guard; sqlh's own SQL (QueryOrigin::
-    // Generated) is taken as it is, and is still in the policy that puts it in the wrapper.
+    // Generated) is taken as it is, and always runs in the wrapper, even where the profile
+    // allows writes.
     #[test]
     fn generated_sql_skips_substitution_and_the_guard_but_not_the_wrapper() {
         let opts = query("UPDATE $(t) SET x = 1");
@@ -798,12 +928,137 @@ mod tests {
             blocked.reason
         );
 
-        let generated = prepare(&opts, &settings(false), QueryOrigin::Generated).unwrap();
-        assert_eq!(generated.batches[0].sql, "UPDATE $(t) SET x = 1");
-        assert!(generated.blocked.is_none());
+        for allow_write in [false, true] {
+            let generated = prepare(&opts, &settings(allow_write), QueryOrigin::Generated).unwrap();
+            assert_eq!(generated.batches[0].sql, "UPDATE $(t) SET x = 1");
+            assert!(generated.blocked.is_none());
+            assert!(
+                generated.policy.wrap() && !generated.policy.allow_write,
+                "generated SQL runs in the wrapper (profile allows writes: {allow_write})"
+            );
+        }
+        // The user's SQL under a profile that allows writes runs without it.
+        let user = prepare(&query("SELECT 1"), &settings(true), QueryOrigin::User).unwrap();
+        assert!(!user.policy.wrap());
+    }
+
+    // The Phase 3 review's design follow-up: the run counts SQL errors, each batch's worst
+    // severity and the stopped counts itself, as the events pass through to the output: an
+    // error is counted once the output has taken it (shown, or withheld by the output budget),
+    // not when the output refused it out of order; a batch with two stops is one stopped batch.
+    #[test]
+    fn the_run_counts_its_errors_and_stops_itself() {
+        use crate::output::{Format, Limits};
+        let mut out = output::create(Format::Text, Box::new(io::sink()), Limits::default());
+        let mut counts = Accounting::default();
+        let batch = |number| BatchInfo {
+            number,
+            total: 3,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+        };
+        let message = |severity| ServerMessage {
+            number: if severity > 10 { 208 } else { 0 },
+            severity,
+            state: 1,
+            line: Some(1),
+            procedure: None,
+            text: "x".into(),
+        };
+        let mut failed = Vec::new();
+        for number in 1..=3 {
+            out.begin_batch(&batch(number)).unwrap();
+            counts.begin_batch();
+            let mut sink = Counted {
+                out: &mut *out,
+                counts: &mut counts,
+            };
+            sink.columns(&[]).unwrap();
+            if number > 1 {
+                // Stopped twice in one batch: it is still one batch.
+                sink.counting_stopped(Stop::Budget);
+                sink.counting_stopped(Stop::Timeout);
+            }
+            sink.end_rows().unwrap();
+            sink.message(&message(0)).unwrap();
+            if number != 2 {
+                sink.error(&message(16)).unwrap();
+                sink.error(&message(11)).unwrap();
+            }
+            // An error in the middle of a result is out of order: refused, and not counted.
+            sink.columns(&[]).unwrap();
+            assert!(sink.error(&message(16)).is_err());
+            sink.end_rows().unwrap();
+            failed.push(counts.batch_failed());
+            out.end_batch(1).unwrap();
+        }
+        assert_eq!(failed, [true, false, true]);
+        assert_eq!(counts.errors, 4);
+        assert_eq!(counts.stopped_batches, 2);
+
+        // An error the output budget withholds still counts: it happened.
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Shared::default();
+        let limits = Limits {
+            max_rows: 0,
+            max_cell: 0,
+            max_results: 0,
+            max_messages: 0,
+            max_output: output::OUTPUT_RESERVE + 50,
+            stall_secs: 0,
+        };
+        let mut out = output::create(Format::Text, Box::new(written.clone()), limits);
+        let mut counts = Accounting::default();
+        counts.begin_batch();
+        let mut sink = Counted {
+            out: &mut *out,
+            counts: &mut counts,
+        };
+        let column = Column {
+            name: "v".into(),
+            type_name: "varchar(9)".into(),
+            nullable: true,
+        };
+        sink.columns(&[column]).unwrap();
+        for _ in 0..5 {
+            if sink.wants_values() {
+                sink.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+            } else {
+                sink.skipped_row();
+            }
+        }
+        sink.end_rows().unwrap();
+        sink.error(&message(16)).unwrap();
+        assert_eq!(counts.errors, 1);
+        assert!(counts.batch_failed());
+        let summary = output::Summary {
+            exit: 1,
+            status: "failed (exit 1): 1 error, 3 ms",
+            error: None,
+            elapsed_ms: 3,
+        };
+        out.finish(&summary).unwrap();
+        out.flush().unwrap();
+        out.wait_delivered(None).unwrap();
+        let text = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
         assert!(
-            generated.policy.wrap(),
-            "generated SQL still runs in the wrapper"
+            !text.contains("error 208"),
+            "the error was withheld: {text}"
         );
     }
 

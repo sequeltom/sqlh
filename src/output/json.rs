@@ -487,7 +487,6 @@ impl<W: Write> BatchSink for JsonSink<W> {
     fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
         self.tally.outside_rows("an error")?;
         self.flush_affected()?;
-        self.tally.error(error.severity);
         let mark = self.mark();
         self.start_event();
         let _ = write!(
@@ -679,10 +678,6 @@ impl<W: Write> Output for JsonSink<W> {
         let tail = layout.fit(room, push_char).unwrap_or(closing);
         self.buf.push_str(&tail);
         self.drain(true)
-    }
-
-    fn tally(&self) -> &Tally {
-        &self.tally
     }
 
     fn flush(&mut self) -> io::Result<()> {
