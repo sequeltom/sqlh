@@ -5,6 +5,82 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// An exclusive hold on `<path>.lock`, for one edit of the file at `path` (F12: `profile add`
+/// and `rm` read, change and write the profiles file, and two at once would lose one's
+/// change). The lock file is opened with no sharing, so a second holder can't open it until
+/// the first one's handle closes, which Windows also does when a holder is killed.
+pub struct Lock {
+    _file: File,
+}
+
+/// Takes the lock for `path`, waiting up to `wait` for another holder to finish. The lock
+/// file's folder is created if it doesn't exist yet.
+pub fn lock(path: &Path, wait: Duration) -> io::Result<Lock> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    if let Some(dir) = lock_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let started = Instant::now();
+    loop {
+        match open_lock(&lock_path) {
+            Ok(file) => return Ok(Lock { _file: file }),
+            // ERROR_SHARING_VIOLATION: someone else holds it.
+            Err(e) if e.raw_os_error() == Some(32) && started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) if e.raw_os_error() == Some(32) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another sqlh is editing the profiles ({} is held); try again when it \
+                         has finished",
+                        lock_path.display()
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_lock(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Writes `contents` to `target` whole or not at all, through a `.partial` file of this run's
+/// own (unique, so two runs never share one, and deleted if anything fails). The profiles
+/// file is written this way (F12).
+pub fn replace(target: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let partial = Partial::create(target)?;
+    let mut writer = partial.writer()?;
+    writer.write_all(contents)?;
+    writer.flush()?;
+    drop(writer);
+    partial.publish(target)
+}
 
 /// True when both paths exist and are the same file.
 pub fn same_file(a: &Path, b: &Path) -> bool {
@@ -221,6 +297,42 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    // F12: one profile edit at a time. A second holder waits, then gives up with a message
+    // that says why; once the first lets go, the lock is free again.
+    #[test]
+    fn the_profiles_lock_is_held_by_one_edit_at_a_time() {
+        let dir = dir("lock");
+        let profiles = dir.join("sub").join("profiles.toml");
+        let first = lock(&profiles, Duration::ZERO).expect("the first edit takes it");
+        let started = Instant::now();
+        let second = lock(&profiles, Duration::from_millis(300))
+            .err()
+            .expect("held");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(second.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            second
+                .to_string()
+                .starts_with("another sqlh is editing the profiles ("),
+            "{second}"
+        );
+        drop(first);
+        assert!(lock(&profiles, Duration::ZERO).is_ok());
+        assert_eq!(names(&dir.join("sub")), ["profiles.toml.lock"]);
+    }
+
+    // F12: the profiles file is replaced whole through a `.partial` file of this run's own,
+    // which leaves nothing behind.
+    #[test]
+    fn replace_writes_the_whole_file_and_leaves_nothing_else() {
+        let dir = dir("replace");
+        let target = dir.join("profiles.toml");
+        std::fs::write(&target, "old").unwrap();
+        replace(&target, b"new contents").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new contents");
+        assert_eq!(names(&dir), ["profiles.toml"]);
     }
 
     #[test]

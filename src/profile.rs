@@ -2,16 +2,19 @@
 //! interactive command: it reads the password with echo off and stores it in Credential
 //! Manager, so agents can use the profile without ever seeing the password.
 
-use std::time::Instant;
+use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::app::{Out, finish, finish_ok, run_command, stdout_sink};
 use crate::cli::{Opts, ProfileCommand};
-use crate::config::{self, AuthKind, DEFAULT_LOCK_TIMEOUT, Profile, WritePolicy};
+use crate::config::{self, AuthKind, Config, DEFAULT_LOCK_TIMEOUT, Profile, WritePolicy};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
 use crate::run::{QueryOrigin, RunOutcome};
-use crate::{console, credman};
+use crate::secret::Secret;
+use crate::{console, credman, files};
 
 /// Connection facts for `profile test`. Runs on SQL Server 2012+ and Azure SQL DB without
 /// extra permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a
@@ -24,12 +27,66 @@ const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
     CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
     SYSDATETIMEOFFSET() AS server_time;";
 
+/// How long `profile add` and `rm` wait for another sqlh's edit of the profiles to finish.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// What `profile add` and `rm` read and change (F12): the profiles file, the stored passwords
+/// and the console. A trait so that tests can make any step fail.
+trait Store {
+    /// Holds off other sqlh processes' edits of the profiles until the guard is dropped.
+    fn lock(&self) -> Result<Option<files::Lock>, String>;
+    fn load(&self) -> Result<Config, String>;
+    fn save(&self, config: &Config) -> Result<PathBuf, String>;
+    fn password_exists(&self, profile: &str) -> io::Result<bool>;
+    fn read_password(&self, profile: &str) -> io::Result<Option<Secret>>;
+    fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()>;
+    fn delete_password(&self, profile: &str) -> io::Result<bool>;
+    fn is_console(&self) -> bool;
+    fn prompt(&self, prompt: &str) -> io::Result<Secret>;
+}
+
+/// The real profiles file, Credential Manager and console.
+struct System;
+
+impl Store for System {
+    fn lock(&self) -> Result<Option<files::Lock>, String> {
+        let path = config::path()?;
+        files::lock(&path, LOCK_WAIT)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    fn load(&self) -> Result<Config, String> {
+        config::load()
+    }
+    fn save(&self, config: &Config) -> Result<PathBuf, String> {
+        config::save(config)
+    }
+    fn password_exists(&self, profile: &str) -> io::Result<bool> {
+        credman::exists(profile)
+    }
+    fn read_password(&self, profile: &str) -> io::Result<Option<Secret>> {
+        credman::read(profile)
+    }
+    fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()> {
+        credman::write(profile, user, password)
+    }
+    fn delete_password(&self, profile: &str) -> io::Result<bool> {
+        credman::delete(profile)
+    }
+    fn is_console(&self) -> bool {
+        console::stdin_is_console()
+    }
+    fn prompt(&self, prompt: &str) -> io::Result<Secret> {
+        console::read_password(prompt)
+    }
+}
+
 pub fn run(command: ProfileCommand, started: Instant) -> Exit {
     match command {
         ProfileCommand::Test { name } => test(name, started),
         ProfileCommand::Add { name, opts } => {
             let mut out = stdout_sink(Limits::default());
-            match add(&name, &opts, &mut out) {
+            match add(&name, &opts, &mut out, &System) {
                 Ok(()) => {
                     let _ = out.flush();
                     drop(out);
@@ -53,7 +110,7 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
         }
         ProfileCommand::Remove { name } => {
             let mut out = stdout_sink(Limits::default());
-            match remove(&name, &mut out) {
+            match remove(&name, &mut out, &System) {
                 Ok(()) => finish_ok(&mut out, &format!("removed profile {name}"), started),
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
@@ -76,8 +133,15 @@ fn test(name: String, started: Instant) -> Exit {
 /// given `--allow-write` in `--help` used it on its own (agent trial 2, owner decision 12). The password is
 /// asked for only when none is stored, when the server or login changes (so a profile can't
 /// be repointed at another server and handed the stored password), or with --new-password.
-fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
-    let mut config = config::load().map_err(Failure::usage)?;
+///
+/// The edit holds the profiles lock from the read of the file to its write, so another sqlh's
+/// edit can't be lost in between (F12). The file and the stored password change together or
+/// not at all: a new password is stored first and, if the file then can't be saved, the
+/// previous one is put back (or the new one deleted); an old password is deleted only after
+/// the file no longer refers to it.
+fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
+    let _lock = store.lock().map_err(Failure::usage)?;
+    let mut config = store.load().map_err(Failure::usage)?;
     let existing = config.find(name).cloned();
     let new = existing.is_none();
     let base = existing.unwrap_or_default();
@@ -126,46 +190,85 @@ fn add(name: &str, opts: &Opts, out: &mut Out) -> Result<(), Failure> {
     // refused anyway (DESIGN.md §4.2).
     check_server(&server).map_err(|reason| Failure::usage(format!("-S {reason}")))?;
 
-    let stored = user.is_some() && matches!(credman::exists(name), Ok(true));
-    let mut kept_password = false;
-    match &user {
-        Some(_) if stored && !login_changed && !opts.new_password => kept_password = true,
-        Some(user) => {
-            if !console::stdin_is_console() {
+    let stored = user.is_some() && matches!(store.password_exists(name), Ok(true));
+    let kept_password = stored && !login_changed && !opts.new_password;
+    let target = credman::target(name);
+    // A new password: asked for, and stored, before the file is saved; what it replaces is
+    // kept in memory so that a failed save can put it back.
+    let replaced = match &user {
+        Some(user) if !kept_password => {
+            if !store.is_console() {
                 return Err(Failure::usage(
                     "profile add needs to read a password from the console, but stdin is not a \
                      console. Run it in a terminal; for automation set SQLCMDPASSWORD instead",
                 ));
             }
-            let password = console::read_password(&format!("Password for {user} on {server}: "))
+            let password = store
+                .prompt(&format!("Password for {user} on {server}: "))
                 .map_err(|e| Failure::usage(format!("reading the password: {e}")))?;
             if password.is_empty() {
                 return Err(Failure::usage("empty password; nothing was saved"));
             }
-            credman::write(name, user, &password).map_err(|e| {
-                Failure::new(Exit::Internal, format!("saving to Credential Manager: {e}"))
-            })?;
-        }
-        // Windows auth: drop any password left from an earlier SQL-auth version of the profile.
-        None => {
-            credman::delete(name).map_err(|e| {
+            let previous = store.read_password(name).map_err(|e| {
                 Failure::new(
                     Exit::Internal,
-                    format!(
-                        "removing the old password {} from Credential Manager: {e}; nothing was saved",
-                        credman::target(name)
-                    ),
+                    format!("reading the stored password {target}: {e}; nothing was saved"),
                 )
             })?;
+            store.write_password(name, user, &password).map_err(|e| {
+                Failure::new(
+                    Exit::Internal,
+                    format!("saving to Credential Manager: {e}; nothing was saved"),
+                )
+            })?;
+            Some((previous, base.user.clone().unwrap_or_else(|| user.clone())))
         }
-    }
+        _ => None,
+    };
 
     config.upsert(profile);
     let became_default = config.default.is_none();
     if became_default {
         config.default = Some(name.to_owned());
     }
-    let path = config::save(&config).map_err(Failure::usage)?;
+    let path = match store.save(&config) {
+        Ok(path) => path,
+        Err(e) => {
+            // The file still describes the profile as it was, so its password must be too.
+            let undone = match &replaced {
+                Some((Some(previous), owner)) => store.write_password(name, owner, previous),
+                Some((None, _)) => store.delete_password(name).map(|_| ()),
+                None => Ok(()),
+            };
+            return Err(match undone {
+                Ok(()) => Failure::usage(format!(
+                    "saving the profiles file failed: {e}; nothing was changed"
+                )),
+                Err(undo) => Failure::new(
+                    Exit::Internal,
+                    format!(
+                        "saving the profiles file failed: {e}; and putting back the password \
+                         {target} as it was failed too: {undo}; rerun sqlh profile add {name} \
+                         --new-password, or remove it with: cmdkey /delete:{target}"
+                    ),
+                ),
+            });
+        }
+    };
+    // Windows auth: a password left from an earlier SQL-auth version of the profile goes,
+    // now that the file no longer refers to it.
+    if user.is_none() {
+        store.delete_password(name).map_err(|e| {
+            Failure::new(
+                Exit::Internal,
+                format!(
+                    "saved profile {name}, but deleting its old password {target} from \
+                     Credential Manager failed: {e}; rerun sqlh profile add {name} -E, or remove \
+                     it with: cmdkey /delete:{target}"
+                ),
+            )
+        })?;
+    }
     let _ = out.note(&format!("saved profile {name} in {}", path.display()));
     if user.is_some() {
         let how = if kept_password {
@@ -268,34 +371,324 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
     Ok(config.profiles.len())
 }
 
-fn remove(name: &str, out: &mut Out) -> Result<(), Failure> {
-    let mut config = config::load().map_err(Failure::usage)?;
+/// Removes a profile: the file first, then its stored password, under the profiles lock. A
+/// removal whose password couldn't be deleted can be finished by running it again: a profile
+/// that is gone but left its password behind gets the password deleted (F12).
+fn remove(name: &str, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
+    let _lock = store.lock().map_err(Failure::usage)?;
+    let mut config = store.load().map_err(Failure::usage)?;
     if !config.remove(name) {
+        if matches!(store.password_exists(name), Ok(true)) {
+            return delete_password(name, out, store).map(|_| {
+                let _ = out.note(&format!(
+                    "there was no profile named {name}; its password left from an earlier \
+                     removal is deleted"
+                ));
+            });
+        }
         return Err(Failure::usage(format!(
             "no profile named {name:?}; see sqlh profile list"
         )));
     }
-    config::save(&config).map_err(Failure::usage)?;
-    match credman::delete(name) {
-        Ok(true) => {
-            let _ = out.note(&format!(
-                "deleted {} from Credential Manager",
-                credman::target(name)
-            ));
+    store.save(&config).map_err(Failure::usage)?;
+    delete_password(name, out, store).map_err(|failure| {
+        Failure::new(
+            failure.exit,
+            format!("removed profile {name}, but {}", failure.message),
+        )
+    })?;
+    Ok(())
+}
+
+/// Deletes a profile's stored password, saying so; an error says how to finish the job.
+fn delete_password(name: &str, out: &mut Out, store: &dyn Store) -> Result<bool, Failure> {
+    let target = credman::target(name);
+    match store.delete_password(name) {
+        Ok(deleted) => {
+            if deleted {
+                let _ = out.note(&format!("deleted {target} from Credential Manager"));
+            }
+            Ok(deleted)
         }
-        Ok(false) => {}
-        // The profile is gone; say so, and that rerunning `rm` won't help but cmdkey will.
-        Err(e) => {
-            return Err(Failure::new(
-                Exit::Internal,
-                format!(
-                    "removed profile {name}, but deleting {} from Credential Manager failed: {e}; \
-                     remove it with: cmdkey /delete:{}",
-                    credman::target(name),
-                    credman::target(name)
-                ),
-            ));
+        Err(e) => Err(Failure::new(
+            Exit::Internal,
+            format!(
+                "deleting {target} from Credential Manager failed: {e}; rerun sqlh profile rm \
+                 {name}, or remove it with: cmdkey /delete:{target}"
+            ),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{self, Format};
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    /// A store in memory whose steps can be made to fail (F12, PLAN.md 3.2).
+    #[derive(Default)]
+    struct Fake {
+        config: RefCell<Config>,
+        /// Profile name to (login, password).
+        passwords: RefCell<HashMap<String, (String, String)>>,
+        typed: String,
+        fail_lock: bool,
+        fail_save: Cell<bool>,
+        fail_write: Cell<bool>,
+        fail_delete: Cell<bool>,
+        /// Fail every password write after this many have succeeded.
+        writes_left: Cell<Option<u32>>,
+    }
+
+    impl Store for Fake {
+        fn lock(&self) -> Result<Option<files::Lock>, String> {
+            if self.fail_lock {
+                Err("another sqlh is editing the profiles".into())
+            } else {
+                Ok(None)
+            }
+        }
+        fn load(&self) -> Result<Config, String> {
+            Ok(self.config.borrow().clone())
+        }
+        fn save(&self, config: &Config) -> Result<PathBuf, String> {
+            if self.fail_save.get() {
+                return Err("disk full".into());
+            }
+            *self.config.borrow_mut() = config.clone();
+            Ok(PathBuf::from("profiles.toml"))
+        }
+        fn password_exists(&self, profile: &str) -> io::Result<bool> {
+            Ok(self.passwords.borrow().contains_key(profile))
+        }
+        fn read_password(&self, profile: &str) -> io::Result<Option<Secret>> {
+            Ok(self
+                .passwords
+                .borrow()
+                .get(profile)
+                .map(|(_, p)| Secret::new(p.clone())))
+        }
+        fn write_password(&self, profile: &str, user: &str, password: &str) -> io::Result<()> {
+            if let Some(left) = self.writes_left.get() {
+                if left == 0 {
+                    return Err(io::Error::other("Credential Manager is unavailable"));
+                }
+                self.writes_left.set(Some(left - 1));
+            }
+            if self.fail_write.get() {
+                return Err(io::Error::other("Credential Manager is unavailable"));
+            }
+            self.passwords
+                .borrow_mut()
+                .insert(profile.into(), (user.into(), password.into()));
+            Ok(())
+        }
+        fn delete_password(&self, profile: &str) -> io::Result<bool> {
+            if self.fail_delete.get() {
+                return Err(io::Error::other("access denied"));
+            }
+            Ok(self.passwords.borrow_mut().remove(profile).is_some())
+        }
+        fn is_console(&self) -> bool {
+            true
+        }
+        fn prompt(&self, _prompt: &str) -> io::Result<Secret> {
+            Ok(Secret::new(self.typed.clone()))
         }
     }
-    Ok(())
+
+    fn out() -> Out {
+        output::create(Format::Text, Box::new(io::sink()), Limits::default())
+    }
+
+    /// A store holding profile `dev` (SQL login `me` on `srv`) with the password `old`, where
+    /// the prompt answers `typed`.
+    fn with_dev(typed: &str) -> Fake {
+        let fake = Fake {
+            typed: typed.into(),
+            ..Fake::default()
+        };
+        fake.config.borrow_mut().upsert(Profile {
+            name: "dev".into(),
+            server: Some("srv".into()),
+            auth: Some(AuthKind::Sql),
+            user: Some("me".into()),
+            ..Profile::default()
+        });
+        fake.passwords
+            .borrow_mut()
+            .insert("dev".into(), ("me".into(), "old".into()));
+        fake
+    }
+
+    fn password(fake: &Fake, name: &str) -> Option<String> {
+        fake.passwords.borrow().get(name).map(|(_, p)| p.clone())
+    }
+
+    fn new_password() -> Opts {
+        Opts {
+            new_password: true,
+            ..Opts::default()
+        }
+    }
+
+    fn windows() -> Opts {
+        Opts {
+            integrated: true,
+            ..Opts::default()
+        }
+    }
+
+    // F12: a new password is stored before the file is saved; when the save fails, the
+    // previous password is put back, so the file and Credential Manager still agree.
+    #[test]
+    fn a_failed_save_puts_the_previous_password_back() {
+        let fake = with_dev("new");
+        fake.fail_save.set(true);
+        let failure = add("dev", &new_password(), &mut out(), &fake).unwrap_err();
+        assert!(
+            failure.message.contains("nothing was changed"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
+        // The same edit, saved: the new password stays.
+        fake.fail_save.set(false);
+        add("dev", &new_password(), &mut out(), &fake).unwrap();
+        assert_eq!(password(&fake, "dev").as_deref(), Some("new"));
+    }
+
+    // F12: a new profile whose save fails leaves no password behind.
+    #[test]
+    fn a_failed_save_of_a_new_profile_leaves_no_password() {
+        let fake = Fake {
+            typed: "pw".into(),
+            ..Fake::default()
+        };
+        fake.fail_save.set(true);
+        let opts = Opts {
+            server: Some("srv".into()),
+            user: Some("me".into()),
+            ..Opts::default()
+        };
+        let failure = add("qa", &opts, &mut out(), &fake).unwrap_err();
+        assert_eq!(failure.exit, Exit::Usage, "{}", failure.message);
+        assert_eq!(password(&fake, "qa"), None);
+        assert!(fake.config.borrow().find("qa").is_none());
+    }
+
+    // F12: when putting the old password back fails too, the error says what state is left
+    // and how to repair it.
+    #[test]
+    fn a_failed_undo_says_how_to_repair() {
+        let fake = with_dev("new");
+        fake.fail_save.set(true);
+        // The new password is written; the write that would put `old` back fails.
+        fake.writes_left.set(Some(1));
+        let failure = add("dev", &new_password(), &mut out(), &fake).unwrap_err();
+        assert_eq!(failure.exit, Exit::Internal);
+        assert!(
+            failure
+                .message
+                .contains("putting back the password sqlh:dev as it was failed too")
+                && failure.message.contains("cmdkey /delete:sqlh:dev"),
+            "{}",
+            failure.message
+        );
+    }
+
+    // F12: a password that can't be stored leaves everything as it was.
+    #[test]
+    fn a_password_that_cannot_be_stored_changes_nothing() {
+        let fake = with_dev("new");
+        fake.fail_write.set(true);
+        let failure = add("dev", &new_password(), &mut out(), &fake).unwrap_err();
+        assert!(
+            failure.message.contains("nothing was saved"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
+    }
+
+    // F12: switching to Windows auth deletes the old password only after the file is saved.
+    // A failed save keeps it (the file still says SQL login); a failed delete after the save
+    // says how to finish.
+    #[test]
+    fn windows_auth_deletes_the_old_password_only_after_the_save() {
+        let fake = with_dev("");
+        fake.fail_save.set(true);
+        assert!(add("dev", &windows(), &mut out(), &fake).is_err());
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
+
+        fake.fail_save.set(false);
+        fake.fail_delete.set(true);
+        let failure = add("dev", &windows(), &mut out(), &fake).unwrap_err();
+        assert_eq!(failure.exit, Exit::Internal);
+        assert!(
+            failure
+                .message
+                .starts_with("saved profile dev, but deleting its old password")
+                && failure.message.contains("rerun sqlh profile add dev -E"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            fake.config.borrow().find("dev").unwrap().auth,
+            Some(AuthKind::Windows)
+        );
+
+        fake.fail_delete.set(false);
+        add("dev", &windows(), &mut out(), &fake).unwrap();
+        assert_eq!(password(&fake, "dev"), None);
+    }
+
+    // F12: a removal whose password delete failed can be finished by running it again.
+    #[test]
+    fn a_failed_removal_can_be_finished_by_running_it_again() {
+        let fake = with_dev("");
+        fake.fail_delete.set(true);
+        let failure = remove("dev", &mut out(), &fake).unwrap_err();
+        assert!(
+            failure
+                .message
+                .starts_with("removed profile dev, but deleting sqlh:dev")
+                && failure.message.contains("rerun sqlh profile rm dev"),
+            "{}",
+            failure.message
+        );
+        assert!(fake.config.borrow().find("dev").is_none());
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
+
+        fake.fail_delete.set(false);
+        remove("dev", &mut out(), &fake).unwrap();
+        assert_eq!(password(&fake, "dev"), None);
+        // Nothing left: an ordinary "no profile" error.
+        let failure = remove("dev", &mut out(), &fake).unwrap_err();
+        assert!(
+            failure.message.starts_with("no profile named"),
+            "{}",
+            failure.message
+        );
+    }
+
+    // F12: an edit that can't take the profiles lock changes nothing.
+    #[test]
+    fn an_edit_that_cannot_take_the_lock_changes_nothing() {
+        let fake = Fake {
+            fail_lock: true,
+            ..with_dev("new")
+        };
+        let failure = add("dev", &new_password(), &mut out(), &fake).unwrap_err();
+        assert!(
+            failure.message.contains("another sqlh"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
+        assert!(remove("dev", &mut out(), &fake).is_err());
+        assert!(fake.config.borrow().find("dev").is_some());
+    }
 }

@@ -15,6 +15,7 @@ mod output;
 mod profile;
 mod run;
 mod script;
+mod secret;
 mod signals;
 
 /// The `sqlh` command: parses the arguments, runs the command and returns its exit code.

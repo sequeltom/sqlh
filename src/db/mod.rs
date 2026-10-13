@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::secret::Secret;
+
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{
     BatchErrorMode, CursorColumn, CursorPoll, ExecuteOptions, ResultSet, StatementResult, TdsClient,
@@ -35,7 +37,7 @@ pub enum Encrypt {
 
 pub enum Auth {
     Integrated,
-    Sql { user: String, password: String },
+    Sql { user: String, password: Secret },
 }
 
 impl Auth {
@@ -628,7 +630,9 @@ impl Session {
             Auth::Sql { user, password } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::Password;
                 context.user_name = user.clone();
-                context.password = password.clone();
+                // The driver keeps its own `String` for the connection's life (it may log in
+                // again); sqlh can't wipe that copy (DESIGN.md §8).
+                context.password = password.to_string();
             }
         }
         context.encryption_options = EncryptionOptions {
@@ -2267,7 +2271,7 @@ pub(crate) mod fake_server {
                 // Synthetic strings for the fake server, unrelated to any real account.
                 auth: Auth::Sql {
                     user: "fake".into(),
-                    password: "fake".into(),
+                    password: crate::secret::Secret::new("fake".into()),
                 },
                 encrypt: Encrypt::Optional,
                 trust_server_certificate: false,

@@ -15,7 +15,9 @@ use crate::console;
 use crate::credman;
 use crate::db::{Auth, ConnectOptions, Encrypt, check_server};
 use crate::error::Failure;
+use crate::files;
 use crate::output::Limits;
+use crate::secret::Secret;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -115,7 +117,7 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     pub default: Option<String>,
     pub profiles: Vec<Profile>,
@@ -234,9 +236,7 @@ fn migrate_from_sqlharness(new: &Path, old: &Path) -> Result<(), String> {
     if let Some(dir) = new.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let temp = new.with_extension("toml.tmp");
-    std::fs::write(&temp, &text).map_err(|e| format!("{}: {e}", temp.display()))?;
-    std::fs::rename(&temp, new).map_err(|e| format!("{}: {e}", new.display()))?;
+    files::replace(new, text.as_bytes()).map_err(|e| format!("{}: {e}", new.display()))?;
     // The copy is in place; the old file, and its folder if that leaves it empty, can go.
     let _ = std::fs::remove_file(old);
     if let Some(dir) = old.parent() {
@@ -250,9 +250,8 @@ pub fn save(config: &Config) -> Result<PathBuf, String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let temp = path.with_extension("toml.tmp");
-    std::fs::write(&temp, render(config)).map_err(|e| format!("{}: {e}", temp.display()))?;
-    std::fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    files::replace(&path, render(config).as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -283,7 +282,7 @@ pub struct Sources<'a> {
     /// The profiles file.
     pub load: &'a dyn Fn() -> Result<Config, String>,
     /// A profile's stored password.
-    pub password: &'a dyn Fn(&str) -> std::io::Result<Option<String>>,
+    pub password: &'a dyn Fn(&str) -> std::io::Result<Option<Secret>>,
 }
 
 pub fn resolve(opts: &Opts) -> Result<Settings, Failure> {
@@ -443,7 +442,7 @@ fn password(
     profile: Option<&Profile>,
     server: &str,
     user: &str,
-) -> Result<String, Failure> {
+) -> Result<Secret, Failure> {
     let owns = |p: &Profile| {
         p.user.as_deref() == Some(user)
             && p.server
@@ -462,7 +461,7 @@ fn password(
             }
         }
     }
-    (sources.var)("SQLCMDPASSWORD").ok_or_else(|| match profile {
+    (sources.var)("SQLCMDPASSWORD").map(Secret::new).ok_or_else(|| match profile {
             Some(p) if owns(p) => Failure::usage(format!(
                 "no password stored for profile {0}; run: sqlh profile add {0}",
                 p.name
@@ -993,7 +992,8 @@ mod tests {
                     profiles: config.profiles.clone(),
                 })
             };
-            let password = |profile: &str| Ok((profile == "sqlp").then(|| "stored".to_owned()));
+            let password =
+                |profile: &str| Ok((profile == "sqlp").then(|| Secret::new("stored".to_owned())));
             resolve_with(
                 opts,
                 &Sources {

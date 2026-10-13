@@ -3,6 +3,8 @@
 //! named sqlh they were `sqlharness:<profile>`; `move_legacy` moves one across (`config`'s
 //! one-time migration).
 
+use crate::secret::Secret;
+
 const PREFIX: &str = "sqlh:";
 const LEGACY_PREFIX: &str = "sqlharness:";
 
@@ -19,7 +21,7 @@ pub fn write(profile: &str, user: &str, password: &str) -> std::io::Result<()> {
 }
 
 /// The stored password, or `None` when the profile has no credential.
-pub fn read(profile: &str) -> std::io::Result<Option<String>> {
+pub fn read(profile: &str) -> std::io::Result<Option<Secret>> {
     imp::read(&target(profile))
 }
 
@@ -39,16 +41,12 @@ pub fn delete(profile: &str) -> std::io::Result<bool> {
 /// Returns whether there was an old credential.
 pub fn move_legacy(profile: &str, user: &str) -> std::io::Result<bool> {
     let legacy = legacy_target(profile);
-    let Some(mut password) = imp::read(&legacy)? else {
+    let Some(password) = imp::read(&legacy)? else {
         return Ok(false);
     };
-    let written = if imp::exists(&target(profile))? {
-        Ok(())
-    } else {
-        imp::write(&target(profile), user, &password)
-    };
-    imp::wipe_string(&mut password);
-    written?;
+    if !imp::exists(&target(profile))? {
+        imp::write(&target(profile), user, &password)?;
+    }
     imp::delete(&legacy)?;
     Ok(true)
 }
@@ -101,7 +99,7 @@ mod imp {
         }
     }
 
-    pub fn read(target: &str) -> io::Result<Option<String>> {
+    pub fn read(target: &str) -> io::Result<Option<super::Secret>> {
         let target = wide(target);
         let mut credential: *mut CREDENTIALW = null_mut();
         // SAFETY: `target` is NUL-terminated; on success `credential` points to a buffer
@@ -126,12 +124,15 @@ mod imp {
             CredFree(credential as *const _);
             bytes
         };
-        String::from_utf8(bytes).map(Some).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the stored password is not UTF-8",
-            )
-        })
+        // `from_utf8` takes the bytes over without copying them; the `Secret` wipes them.
+        String::from_utf8(bytes)
+            .map(|s| Some(super::Secret::new(s)))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the stored password is not UTF-8",
+                )
+            })
     }
 
     pub fn exists(target: &str) -> io::Result<bool> {
@@ -172,12 +173,6 @@ mod imp {
             unsafe { std::ptr::write_volatile(b, 0) };
         }
     }
-
-    /// Zeroes a password copy before it is dropped.
-    pub fn wipe_string(text: &mut String) {
-        let mut bytes = std::mem::take(text).into_bytes();
-        wipe(&mut bytes);
-    }
 }
 
 #[cfg(not(windows))]
@@ -191,7 +186,7 @@ mod imp {
         ))
     }
 
-    pub fn read(_target: &str) -> io::Result<Option<String>> {
+    pub fn read(_target: &str) -> io::Result<Option<super::Secret>> {
         Ok(None)
     }
 
@@ -201,10 +196,6 @@ mod imp {
 
     pub fn delete(_target: &str) -> io::Result<bool> {
         Ok(false)
-    }
-
-    pub fn wipe_string(text: &mut String) {
-        text.clear();
     }
 }
 
@@ -218,7 +209,10 @@ mod tests {
         let name = "__sqlh_selftest";
         super::write(name, "someone", "pässwörd").unwrap();
         assert!(super::exists(name).unwrap());
-        assert_eq!(super::read(name).unwrap().as_deref(), Some("pässwörd"));
+        assert_eq!(
+            super::read(name).unwrap().as_deref().map(String::as_str),
+            Some("pässwörd")
+        );
         assert!(super::delete(name).unwrap());
         assert!(!super::exists(name).unwrap());
         assert_eq!(super::read(name).unwrap(), None);
@@ -235,7 +229,10 @@ mod tests {
         let _ = super::delete(name);
         super::imp::write(&legacy, "someone", "old-pässwörd").unwrap();
         assert!(super::move_legacy(name, "someone").unwrap());
-        assert_eq!(super::read(name).unwrap().as_deref(), Some("old-pässwörd"));
+        assert_eq!(
+            super::read(name).unwrap().as_deref().map(String::as_str),
+            Some("old-pässwörd")
+        );
         assert!(
             !super::imp::exists(&legacy).unwrap(),
             "the old name is gone"
@@ -244,7 +241,10 @@ mod tests {
         assert!(!super::move_legacy(name, "someone").unwrap());
         super::imp::write(&legacy, "someone", "older").unwrap();
         assert!(super::move_legacy(name, "someone").unwrap());
-        assert_eq!(super::read(name).unwrap().as_deref(), Some("old-pässwörd"));
+        assert_eq!(
+            super::read(name).unwrap().as_deref().map(String::as_str),
+            Some("old-pässwörd")
+        );
         assert!(!super::imp::exists(&legacy).unwrap());
         assert!(super::delete(name).unwrap());
     }

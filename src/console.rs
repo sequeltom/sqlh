@@ -9,6 +9,8 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use crate::secret::Secret;
+
 /// The Windows spelling of a path written the way Git Bash writes drive paths: `/c/code/x.sql`
 /// is `C:\code\x.sql`. Git Bash converts such arguments before a program sees them; cmd.exe
 /// and PowerShell don't, and Windows reads them as paths on the current drive
@@ -57,7 +59,7 @@ pub fn path_error(message: String, path: &str, error: &io::Error) -> String {
 /// back on Ctrl+C, Ctrl+Break or a close is in place. Terminals such as Git Bash's mintty
 /// look like a console to `IsTerminal` but have no console mode, so the password would be
 /// shown as it's typed.
-pub fn read_password(prompt: &str) -> io::Result<String> {
+pub fn read_password(prompt: &str) -> io::Result<Secret> {
     let _echo = EchoOff::new().map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -72,7 +74,9 @@ pub fn read_password(prompt: &str) -> io::Result<String> {
     let mut stderr = io::stderr();
     write!(stderr, "{prompt}")?;
     stderr.flush()?;
-    let mut line = String::new();
+    // Room for any password up front, so that reading never reallocates and leaves a copy
+    // behind; the whole buffer is wiped when the `Secret` is dropped.
+    let mut line = Secret::new(String::with_capacity(1024));
     let result = io::stdin().read_line(&mut line);
     let _ = writeln!(stderr);
     result?;

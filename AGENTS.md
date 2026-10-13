@@ -41,6 +41,7 @@ src/run.rs       the execution core: RunPolicy (guard, wrapper, --check), QueryO
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
 src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW)
+src/secret.rs    Secret: a password as sqlh holds it, wiped on drop (zeroize)
 src/profile.rs   sqlh profile add | list | test | rm
 src/help.txt     --help text (models read it)
 src/error.rs     exit codes (DESIGN.md §6) and Failure

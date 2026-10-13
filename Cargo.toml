@@ -14,6 +14,9 @@ mssql-tds = "=0.2.0"
 # mssql-tds already pulls tokio with "full"; we name only what we use.
 tokio = { version = "1", default-features = false, features = ["rt", "time", "signal", "macros", "sync"] }
 lexopt = "0.3"
+# Wipes sqlh's own copies of a password when they are dropped (F14, src/secret.rs). Already
+# in the tree through mssql-tds, so it costs no build time and next to no size.
+zeroize = "1"
 # Feature `timing` only. Already in the tree through mssql-tds's tracing.
 log = { version = "0.4", optional = true }
 
