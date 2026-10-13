@@ -61,6 +61,9 @@ tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ ho
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
                  size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
+.github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: version,
+                 check, notices, Azure Artifact Signing, zip + SHA-256, draft release; PLAN.md 3.6)
+about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
@@ -71,7 +74,9 @@ archive/         git-ignored, never pushed: archive/reviews/ holds the external 
                  (findings F.., R01–R19; PLAN.md records each one and its fix)
 ```
 
-Planned, not built: `src/schema.rs` (subcommands), an md format in `src/output/`, and `.github/workflows/` (`ci.yml` and a signed `release.yml`, modeled on the owner's ssms-executor repo; PLAN.md 3.5 and 3.6).
+Planned, not built: `src/schema.rs` (subcommands) and an md format in `src/output/`. The workflows are written but have never run: there is no remote yet (PLAN.md 3.5, 3.6).
+
+The exe's version is `SQLH_VERSION` at build time if set (the release workflow sets it), else `Cargo.toml`'s. A release tag must match `Cargo.toml`, so bump the version there before tagging.
 
 ## Commands
 
@@ -145,5 +150,5 @@ Profiles and Credential Manager are built, and so are the json and csv formats. 
 The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md](docs/VISION.md) and the triage of the architecture review (archive/reviews/, local only). Owner decisions are recorded in its §6. Work in order:
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review (PLAN.md, Phase 1 follow-up).
 2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is the login step, which the measurements attribute to SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done, and so are the fixes the Phase 2 review asked for (PLAN.md, Phase 2 follow-up). 2.5 (harness kill), 2.6 (the drain experiment; the default is owner decision 6), 2.7 (memory), 2.12 (where messages land), 2.13 (Windows shells and paths) and 2.11 (provenance in every format) are done too. Owner decisions 6, 7, 10 and 11 (2026-10-11, PLAN.md §6) are built: 2.8 (agent session defaults: lock timeout, deadlock priority, opt-in READ UNCOMMITTED), 2.15 (the bounded count of hidden rows; its `-t` rule under `--allow-write` and `XACT_ABORT` is confirmed, §6.6), the text part of 2.11 and 2.13's follow-up; so is 2.14 (the guard's memory). The completion review of Phase 2 (R14–R18: `XACT_ABORT OFF` in the session setup, sqlh's own elapsed `-t`, JSON contract 2.0, incomplete closure after a SQL error, the guard's work bound) is fixed; the verification closed all but R15, whose follow-ups are fixed too: the settlement bound was accepted, and the late-finish rule now goes by the phase the deadline passed in (the row that fills `--max-rows` is a row to show); that awaits verification (PLAN.md, Phase 2 follow-up). Agent trial 2 (2.10) ran on 2026-10-12 ([docs/notes/agent-trial-2.md](docs/notes/agent-trial-2.md)); task 2.16 and owner decision 12 (new profiles refuse writes) followed from it. Phase 2 is done, apart from decision 12's open question: whether `profile list` should show the server and login to an agent.
-3. Phase 3, execution core, release checks, live fixtures, and GitHub Actions CI plus a signed release workflow (3.5, 3.6).
+3. Phase 3, execution core, release checks, live fixtures, and GitHub Actions CI plus a signed release workflow: 3.1–3.4 are done; 3.5 and 3.6 are written and locally tested in part, and run for the first time once the owner creates the remote and the Azure and environment setup (PLAN.md 3.6). Phase 3 awaits review.
 4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin).

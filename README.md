@@ -19,7 +19,10 @@ You need Rust (via `rustup`; the toolchain is pinned in `rust-toolchain.toml`) a
 ```powershell
 cargo build --release      # target\release\sqlh.exe, about 2 MB
 cargo test                 # no server needed
+pwsh scripts/check.ps1     # everything a change must pass; CI runs the same script
 ```
+
+Releases will be built by GitHub Actions: a signed `sqlh.exe` in a zip with this licence and the third-party notices, plus SHA-256 sums.
 
 ## Quick start
 

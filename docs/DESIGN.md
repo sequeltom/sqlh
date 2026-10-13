@@ -143,7 +143,7 @@ These long flags are our own:
 | `--continue-on-error` | Keep running later batches after a failed one. |
 | `--stats` | Turn on `SET STATISTICS IO, TIME` and print a summary instead of the raw messages (M3). |
 | `--verbose` | Diagnostics to stderr. Never includes secrets. One line after connecting: the profile, how long the connect and the session setup took, and the server, version, database and encryption. A build with `--features timing` also splits the connect into steps: `connected in 194 ms (tcp 5, prelogin 9, tls 29, login 150)`. |
-| `--help`, `--version` | `--help` is read by models: example-first and under about 60 lines (a test holds it to 62). Its examples run unchanged in cmd.exe, Windows PowerShell 5.1, PowerShell 7 and Git Bash (§4.1). |
+| `--help`, `--version` | `--help` is read by models: example-first and under about 60 lines (a test holds it to 62). Its examples run unchanged in cmd.exe, Windows PowerShell 5.1, PowerShell 7 and Git Bash (§4.1). `--version` prints `sqlh <version> (json contract <major.minor>)`. The version is `SQLH_VERSION` at build time when it is set, otherwise `Cargo.toml`'s. The release workflow sets it (PLAN.md 3.6): `0.1.0` for the tag `v0.1.0`, which must match `Cargo.toml`, or `0.1.0-dev.<run>` for a dispatch build, which is a pre-release. |
 
 ### 4.3 Execution semantics
 

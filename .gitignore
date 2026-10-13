@@ -22,6 +22,9 @@ profiles.toml.*.partial
 # Durable examples and test fixtures belong in docs/ or tests/, with synthetic data.
 /scratch/
 /artifacts/
+# Release workflow output (PLAN.md 3.6), if it is run locally.
+/dist/
+/THIRD-PARTY-NOTICES.html
 
 # Local-only material that is never pushed: the external code reviews (archive/reviews/).
 /archive/

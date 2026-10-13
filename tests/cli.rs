@@ -1479,16 +1479,19 @@ fn verbose_runs_stay_within_max_output() {
     }
 }
 
+/// The version the binary under test was built with (`SQLH_VERSION`, else Cargo.toml's), as
+/// `src/app.rs` picks it.
+fn sqlh_version() -> &'static str {
+    option_env!("SQLH_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 2.0)`.
 fn contract_version() -> String {
     let r = sqlh_args(&["--version"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     let line = r.stdout.trim_end();
     let contract = line
-        .strip_prefix(&format!(
-            "sqlh {} (json contract ",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .strip_prefix(&format!("sqlh {} (json contract ", sqlh_version()))
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or_else(|| panic!("unexpected --version output: {line:?}"));
     let digits = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
@@ -1544,7 +1547,7 @@ fn version_reports_the_json_contract() {
     assert_eq!(r.stderr, "");
     assert_eq!(
         r.stdout,
-        format!("sqlh {} (json contract 2.0)\n", env!("CARGO_PKG_VERSION"))
+        format!("sqlh {} (json contract 2.0)\n", sqlh_version())
     );
     assert_eq!(contract_version(), "2.0");
 }

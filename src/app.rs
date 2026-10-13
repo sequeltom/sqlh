@@ -57,11 +57,18 @@ pub(crate) fn main() -> ExitCode {
 /// version of their own, so a tool that wants to know what to expect asks here.
 fn version_line() -> String {
     format!(
-        "sqlh {} (json contract {})\n",
-        env!("CARGO_PKG_VERSION"),
+        "sqlh {VERSION} (json contract {})\n",
         output::json::CONTRACT_VERSION
     )
 }
+
+/// sqlh's version: the release's, given at build time by the release workflow (`SQLH_VERSION`,
+/// PLAN.md 3.6: `0.1.0` from the tag `v0.1.0`, or `0.1.0-dev.<run>` for a build without a
+/// tag), else `Cargo.toml`'s.
+const VERSION: &str = match option_env!("SQLH_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// A panic is a bug, but it must still end with the documented exit code 10 rather than an
 /// abort (0xC0000409). The rest is best effort: a stderr line, and a status line on stdout

@@ -1,0 +1,31 @@
+# CI (PLAN.md 3.5): every push to main and every pull request runs the same checks as
+# scripts/check.ps1 locally, so the two can't drift. No live tests (there is no server here)
+# and no secrets, so forks and pull requests can run it.
+name: CI
+
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    branches:
+      - 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    # The toolchain, components and target come from rust-toolchain.toml; rustup installs
+    # them on the first cargo call.
+    - name: Toolchain
+      run: rustup show
+
+    - name: Check
+      run: pwsh -NoProfile -File scripts/check.ps1
+      shell: pwsh
