@@ -1904,7 +1904,7 @@ mod tests {
 
     // The refusal for a TOP clause that is not closed yet when a later keyword refuses, and the
     // nested clauses among themselves, come out as when each clause's target was looked up at
-    // its keyword: the earliest keyword's. (The expected values are what the guard of `6ad9c14`,
+    // its keyword: the earliest keyword's. (The expected values are what the guard of `3ef8f3c`,
     // which scanned ahead from every keyword, gave for these inputs.)
     #[test]
     fn open_top_clauses_refuse_in_the_order_of_their_keywords() {

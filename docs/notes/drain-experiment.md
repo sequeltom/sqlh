@@ -1,6 +1,6 @@
 # Drain policy experiment (PLAN.md 2.6)
 
-Measured 2026-10-11, on a working tree based on `f4a6610`; the prototype is `9626674` on branch `worktree-wf_3b570b22-04a-2`. The question: what does it cost to keep reading and counting rows after `--max-rows` (DESIGN.md §4.4), and what would a bounded drain look like? This is the evidence for owner decision 6 (PLAN.md §6.6). It does not make the decision.
+Measured 2026-10-11, on a working tree based on `f12b041`; the prototype is `f4a9c78` on branch `worktree-wf_3b570b22-04a-2`. The question: what does it cost to keep reading and counting rows after `--max-rows` (DESIGN.md §4.4), and what would a bounded drain look like? This is the evidence for owner decision 6 (PLAN.md §6.6). It does not make the decision.
 
 ## Summary
 
@@ -15,7 +15,7 @@ Measured 2026-10-11, on a working tree based on `f4a6610`; the prototype is `962
 - **Client:** the dev workstation (Windows 11 Pro; Core i7-8850H, 6 cores; 31 GB), on Wi-Fi 802.11ac (link rate 867 Mbit/s). Over this link the server delivered about 57 to 65 MB/s of result data (roughly 500 Mbit/s).
 - **Server:** the owner's dev/test SQL Server 2025 (17.0.1000.7, Standard Developer) on Windows Server 2025 in a VM: 15 GB of RAM, 4 CPUs. About 8.4 GB of the StackOverflow2010 database was in the buffer pool during the runs, so scans read memory, not disk, apart from the first scan of `Votes` (9.3 s, against 3.6 to 4.3 s afterwards).
 - **Connection:** SQL login through the `test` profile, encryption mandatory with `-C`, database `StackOverflow2010`, read-only (the default). Every query is a plain `SELECT`.
-- **Builds:** the baseline is the release build of `f4a6610` (2,285,568 bytes). The prototype build is the same tree plus the prototype commit, built optimized but with debug assertions on, because the switch exists only in debug builds (2.5 MB; see "Reproduce"). The timing tables below come from a build made before the `trace` setting was added to the same commit (2,534,400 bytes); the acknowledgement times, the output shapes and the caveat runs come from the final one (2,535,424 bytes). Run without the switch it matches the baseline: the fastest runs agree (`Votes` 3.50 s against 3.65 s, `Posts` integers 1.85 s against 1.91 s, `Users` 1.04 s against 1.03 s) and the medians differ by less than the spread of either.
+- **Builds:** the baseline is the release build of `f12b041` (2,285,568 bytes). The prototype build is the same tree plus the prototype commit, built optimized but with debug assertions on, because the switch exists only in debug builds (2.5 MB; see "Reproduce"). The timing tables below come from a build made before the `trace` setting was added to the same commit (2,534,400 bytes); the acknowledgement times, the output shapes and the caveat runs come from the final one (2,535,424 bytes). Run without the switch it matches the baseline: the fastest runs agree (`Votes` 3.50 s against 3.65 s, `Posts` integers 1.85 s against 1.91 s, `Users` 1.04 s against 1.03 s) and the medians differ by less than the spread of either.
 - **Not a quiet machine.** Other agents built, tested and queried on the same workstation and server during the runs (another session's `SELECT`s showed up in `sys.dm_exec_requests` during several). Single runs vary by up to 3 times. So the tables give medians of interleaved rounds (every variant of one query runs in turn; three to seven rounds, fewer for the slow queries) with the minimum and maximum, and conclusions rest on differences far larger than that noise.
 
 ## Method
@@ -93,7 +93,7 @@ For the two that never finish, sampled while they streamed: `Comments *` was sus
 
 ## The bounded-drain prototype
 
-The prototype is the commit `9626674` ("Prototype a bounded drain behind SQLH_DEBUG_DRAIN") on this branch. It stays there until the owner decides (PLAN.md §6.6). It changes no default and no release build: the switch is read only when `debug_assertions` are on.
+The prototype is the commit `f4a9c78` ("Prototype a bounded drain behind SQLH_DEBUG_DRAIN") on this branch. It stays there until the owner decides (PLAN.md §6.6). It changes no default and no release build: the switch is read only when `debug_assertions` are on.
 
 ### The switch
 

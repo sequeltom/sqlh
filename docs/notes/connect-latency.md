@@ -1,6 +1,6 @@
 # Connect latency (PLAN.md 2.1)
 
-Measured 2026-10-10, on a working tree based on `a133ede`. This was a time-boxed investigation: where the time before the first batch goes, and whether sqlh or the driver can win it back.
+Measured 2026-10-10, on a working tree based on `061ef26`. This was a time-boxed investigation: where the time before the first batch goes, and whether sqlh or the driver can win it back.
 
 ## Summary
 
@@ -64,7 +64,7 @@ Not measured:
 
 mssql-tds 0.2.0's debug events dump every TDS packet before encryption. That includes the login packet, whose password field is only obfuscated, and the obfuscation is reversible. The targets are `mssql_tds::io::packet_writer` and `mssql_tds::connection::transport::network_transport`. An application that turns on debug logging for the driver writes the password to its logs.
 
-sqlh never installs a general logger. `db::phases`, which only the `timing` feature builds, watches three targets and keeps timestamps, never text. The scramble itself is required by the TDS protocol; the gap is that the dump happens before TLS encrypts the packet, and other drivers' traces usually mask the password. It's a logging-hygiene issue (CWE-532), not a remote vulnerability: nothing leaks unless an application enables debug logging for the driver. Asking upstream to redact the password field is PLAN.md decision 9.
+sqlh never installs a general logger. `db::phases`, which only the `timing` feature builds, watches three targets and keeps timestamps, never text. The scramble itself is required by the TDS protocol; the gap is that the dump happens before TLS encrypts the packet, and other drivers' traces usually mask the password. It's a logging-hygiene issue (CWE-532), not a remote vulnerability: nothing leaks unless an application enables debug logging for the driver. Whether to ask upstream to redact the password field was PLAN.md decision 9; the owner decided not to (2026-10-12), so sqlh's own rule against installing a logger stays the defense.
 
 ## Reproduce
 

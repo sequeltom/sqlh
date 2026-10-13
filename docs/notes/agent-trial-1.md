@@ -1,6 +1,6 @@
 # Agent trial 1: OpenCode with a local model
 
-Run 2026-10-10 against `0fa9319`. OpenCode drove `sqlh.exe` with a local model (Qwen 3.8 via Ollama), through the `test` profile, read-only. The prompt gave the exe path and a few rules (run `--help` first, use the profile, check exit codes and status lines). The task: "Which 5 tables in StackOverflow2010 use the most space?"
+Run 2026-10-10 against `fdefab9`. OpenCode drove `sqlh.exe` with a local model (Qwen 3.8 via Ollama), through the `test` profile, read-only. The prompt gave the exe path and a few rules (run `--help` first, use the profile, check exit codes and status lines). The task: "Which 5 tables in StackOverflow2010 use the most space?"
 
 ## What happened
 

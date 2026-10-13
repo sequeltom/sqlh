@@ -1,6 +1,6 @@
 # Windows shells and paths (PLAN.md 2.13)
 
-Measured 2026-10-11 on the dev machine: Windows 11 Pro 10.0.26200 (en-US, OEM code page 437, ANSI 1252), cmd.exe, Windows PowerShell 5.1.26100.9444, PowerShell 7.6.6 and Git for Windows 2.55.0 (bash 5.3.15), against sqlh at `f4a6610` plus this change. The server was the dev server through the `test` profile, for the runs that needed one.
+Measured 2026-10-11 on the dev machine: Windows 11 Pro 10.0.26200 (en-US, OEM code page 437, ANSI 1252), cmd.exe, Windows PowerShell 5.1.26100.9444, PowerShell 7.6.6 and Git for Windows 2.55.0 (bash 5.3.15), against sqlh at `f12b041` plus this change. The server was the dev server through the `test` profile, for the runs that needed one.
 
 ## What came out of it
 

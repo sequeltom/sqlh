@@ -1,6 +1,6 @@
 # Harness kill (PLAN.md 2.5)
 
-Measured 2026-10-11 on the dev workstation (Windows 11) against the dev/test SQL Server 2025 (17.0.1000.7, Standard Developer, 4 logical CPUs, same LAN), with the release build of `f4a6610` (mssql-tds 0.2.0). The question: when a harness ends sqlh outright, does the server stop the work, and how soon? DESIGN.md §4.3 had one measurement, a 20 s `WAITFOR` that was gone "within about 200 ms", which was the observer's own connect time. This note adds a CPU-bound query, a lock-blocked query and a large rollback, and a finer clock.
+Measured 2026-10-11 on the dev workstation (Windows 11) against the dev/test SQL Server 2025 (17.0.1000.7, Standard Developer, 4 logical CPUs, same LAN), with the release build of `f12b041` (mssql-tds 0.2.0). The question: when a harness ends sqlh outright, does the server stop the work, and how soon? DESIGN.md §4.3 had one measurement, a 20 s `WAITFOR` that was gone "within about 200 ms", which was the observer's own connect time. This note adds a CPU-bound query, a lock-blocked query and a large rollback, and a finer clock.
 
 ## Summary
 
