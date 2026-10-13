@@ -52,6 +52,8 @@ src/output/      Output trait + Tally (shared limits/counts); text.rs (default),
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
 tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server (manual)
+scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
+                 size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
@@ -70,7 +72,7 @@ Planned, not built: `src/schema.rs` (subcommands), an md format in `src/output/`
 - Rust comes from rustup (`winget install Rustlang.Rustup`) and lives in `%USERPROFILE%\.cargo\bin`. Shells started before the install need that on PATH.
 - Linking needs two VS 2026 components: "MSVC x64/x86 build tools" (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`) and "Windows 11 SDK" (`Microsoft.VisualStudio.Component.Windows11SDK.26100`).
 
-**Day to day:**
+**Day to day:** `pwsh scripts/check.ps1` runs every check below that needs no server and stops at the first failure; `pwsh scripts/check.ps1 -Live` adds the live tests. Run it before every commit that touches code. The individual commands:
 
 ```powershell
 cargo build --release                               # ~2 MB exe; full LTO takes ~1–2 min
