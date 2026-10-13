@@ -2662,7 +2662,8 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
         let header = lines.next().expect("a header").to_owned();
         assert!(
             header.ends_with(
-                "\twrite_policy:text\tlock_timeout:int\tread_uncommitted:bit\texact_count:bit"
+                "\twrite_policy:text\tlock_timeout:int\tread_uncommitted:bit\texact_count:bit\
+                 \tdescription:text"
             ),
             "{header}"
         );
@@ -2703,7 +2704,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     let rows = listed();
     assert_eq!(rows.len(), 1, "{rows:?}");
     // A new profile refuses writes unless told otherwise (owner decision 12).
-    assert!(rows[0].ends_with("\tdeny\t5\t1\t1"), "{}", rows[0]);
+    assert!(rows[0].ends_with("\tdeny\t5\t1\t1\tNULL"), "{}", rows[0]);
 
     // Left out, they stay.
     let r = profiles(&["profile", "add", "sqlh-ut-locks", "-d", "AppDb"]);
@@ -2733,7 +2734,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
         "{file}"
     );
     let rows = listed();
-    assert!(rows[0].ends_with("\tdeny\t0\t0\t0"), "{}", rows[0]);
+    assert!(rows[0].ends_with("\tdeny\t0\t0\t0\tNULL"), "{}", rows[0]);
 
     // A profile that never mentioned them shows what its runs get.
     let r = profiles(&[
@@ -2760,7 +2761,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     let rows = listed();
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows[1].starts_with("sqlh-ut-plain\t"), "{}", rows[1]);
-    assert!(rows[1].ends_with("\tdeny\t10\t0\t0"), "{}", rows[1]);
+    assert!(rows[1].ends_with("\tdeny\t10\t0\t0\tNULL"), "{}", rows[1]);
 
     // The out-of-range value is refused before anything is saved.
     let before = saved();
@@ -2773,6 +2774,191 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     ]);
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert_eq!(saved(), before);
+}
+
+// PLAN.md 4.1 and 4.2: `profile list` shows each profile's description as its last column, in
+// every format, and `--search` keeps the profiles whose name or description contains the text,
+// in any case. A hostile description stays one field: text doubles its backslash and leaves the
+// rest, `-- ` included, inside the row; json escapes it as a string. No match is an empty list,
+// not an error. Windows-auth profiles, so Credential Manager is never consulted.
+#[test]
+fn profile_list_shows_descriptions_and_searches_them() {
+    let dir = scratch("profile_descriptions");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "default = \"sqlh-ut-a\"\n\n\
+         [profiles.sqlh-ut-a]\n\
+         description = \"prod \\\"reporting\\\" replica on C:\\\\data -- note: not a note | 100% ✓\"\n\
+         server = \"127.0.0.1,1\"\nauth = \"windows\"\n\n\
+         [profiles.sqlh-ut-b]\nserver = \"127.0.0.1,2\"\nauth = \"windows\"\nwrite_policy = \"deny\"\n",
+    )
+    .unwrap();
+    let list = |args: &[&str]| {
+        run(sqlh()
+            .args(["profile", "list"])
+            .args(args)
+            .env("SQLH_CONFIG", &config))
+    };
+    // The status line's time varies.
+    let timeless = |text: &str| -> String {
+        text.lines()
+            .map(|line| match line.rfind(", ") {
+                Some(at) if line.starts_with("-- ok: ") && line.ends_with(" ms") => {
+                    format!("{}, N ms", &line[..at])
+                }
+                _ => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let note = format!(
+        "-- note: profiles file: {}",
+        text_escaped(&config.display().to_string())
+    );
+    let header = "name:text\tdefault:bit\tserver:text\tdatabase:text\tauth:text\tuser:text\t\
+                  password:text\twrite_policy:text\tlock_timeout:int\tread_uncommitted:bit\t\
+                  exact_count:bit\tdescription:text";
+    let a = "sqlh-ut-a\t1\t127.0.0.1,1\tNULL\twindows\tNULL\t-\tflag\t10\t0\t0\t\
+             prod \"reporting\" replica on C:\\\\data -- note: not a note | 100% ✓";
+    let b = "sqlh-ut-b\t0\t127.0.0.1,2\tNULL\twindows\tNULL\t-\tdeny\t10\t0\t0\tNULL";
+
+    let r = list(&[]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert_eq!(
+        timeless(&r.stdout),
+        format!("{note}\n-- result 1\n{header}\n{a}\n{b}\n-- 2 rows\n-- ok: 2 profiles, N ms")
+    );
+
+    // The search matches only the description here, in another case.
+    let r = list(&["--search", "REPORTING"]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert_eq!(
+        timeless(&r.stdout),
+        format!(
+            "{note}\n-- result 1\n{header}\n{a}\n-- 1 row\n-- ok: 1 of 2 profiles matches, N ms"
+        )
+    );
+    // And a name.
+    let r = list(&["--search", "UT-B"]);
+    assert!(
+        r.stdout.contains(&format!("\n{b}\n-- 1 row\n")),
+        "{}",
+        r.stdout
+    );
+
+    // No match: an empty list, exit 0.
+    let r = list(&["--search", "nothing like it"]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert_eq!(
+        timeless(&r.stdout),
+        format!("{note}\n-- result 1\n{header}\n-- 0 rows\n-- ok: 0 of 2 profiles match, N ms")
+    );
+
+    // JSON: the same rows, the description a JSON string.
+    let r = list(&["--format", "json", "--search", "replica"]);
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    let mut doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("one JSON document");
+    assert!(doc["elapsed_ms"].take().is_u64());
+    let summary = doc["summary"].take();
+    assert!(
+        summary
+            .as_str()
+            .is_some_and(|s| s.starts_with("ok: 1 of 2 profiles matches, ")),
+        "{summary}"
+    );
+    let columns: Vec<serde_json::Value> = header
+        .split('\t')
+        .map(|column| {
+            let (name, kind) = column.split_once(':').unwrap();
+            let nullable = !matches!(
+                name,
+                "default" | "lock_timeout" | "read_uncommitted" | "exact_count"
+            );
+            serde_json::json!({"name": name, "type": kind, "nullable": nullable})
+        })
+        .collect();
+    assert_eq!(
+        doc,
+        serde_json::json!({
+            "contract_version": "2.0",
+            "batches": [{
+                "events": [{
+                    "type": "result",
+                    "columns": columns,
+                    "rows": [[
+                        "sqlh-ut-a", 1, "127.0.0.1,1", null, "windows", null, "-", "flag",
+                        10, 0, 0,
+                        "prod \"reporting\" replica on C:\\data -- note: not a note | 100% ✓"
+                    ]],
+                    "row_count": 1,
+                    "row_count_exact": true,
+                    "truncated": false,
+                    "cells_cut": 0
+                }],
+                "counting_stopped": false
+            }],
+            "notes": [format!("profiles file: {}", config.display())],
+            "ok": true,
+            "exit_code": 0,
+            "summary": null,
+            "elapsed_ms": null
+        })
+    );
+    assert!(
+        r.stdout
+            .contains(r#""prod \"reporting\" replica on C:\\data -- note"#),
+        "{}",
+        r.stdout
+    );
+
+    // --description is for profile add only; profile add saves it, and refuses one that
+    // isn't a single line.
+    let r = run(sqlh()
+        .args(["--description", "x", "-Q", "SELECT 1"])
+        .env("SQLH_CONFIG", &config));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "--write-policy, --new-password and --description only apply to sqlh profile add"
+        ),
+        "{}",
+        r.stdout
+    );
+    let r = run(sqlh()
+        .args([
+            "profile",
+            "add",
+            "sqlh-ut-b",
+            "--description",
+            "QA box, disposable",
+            "-l",
+            "1",
+        ])
+        .env("SQLH_CONFIG", &config));
+    assert_eq!(
+        r.code, 2,
+        "saved, then the connection test failed: {}",
+        r.stdout
+    );
+    let saved = fs::read_to_string(&config).unwrap();
+    assert!(
+        saved.contains("[profiles.sqlh-ut-b]\ndescription = \"QA box, disposable\"\n"),
+        "{saved}"
+    );
+    let r = run(sqlh()
+        .args(["profile", "add", "sqlh-ut-b", "--description", "two\tlines"])
+        .env("SQLH_CONFIG", &config));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "--description: description must be one line of text, without control characters \
+             or line separators (it has U+0009)"
+        ),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), saved);
 }
 
 // Owner decision 12 and PLAN.md 2.16 (agent trial 2): a new profile refuses writes unless

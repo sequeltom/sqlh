@@ -116,9 +116,11 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     // A failure before the settings are resolved still keeps to the flags' own limits, and
     // one after keeps to the run's (R08: the cap covers the whole response).
     let flagged = flag_limits(&opts);
-    if opts.write_policy.is_some() || opts.new_password {
+    if opts.write_policy.is_some() || opts.new_password || opts.description.is_some() {
         return fail_within(
-            Failure::usage("--write-policy and --new-password only apply to sqlh profile add"),
+            Failure::usage(
+                "--write-policy, --new-password and --description only apply to sqlh profile add",
+            ),
             format,
             flagged,
             started,
@@ -230,9 +232,9 @@ fn stdout_output(format: Format, limits: Limits) -> Out {
     output::create(format, Box::new(io::stdout()), limits)
 }
 
-/// Text output on stdout, for commands that have no --format (`sqlh profile ...`).
-pub(crate) fn stdout_sink(limits: Limits) -> Out {
-    stdout_output(Format::Text, limits)
+/// Output on stdout, for commands that run without the async runtime (`sqlh profile ...`).
+pub(crate) fn stdout_sink(format: Format, limits: Limits) -> Out {
+    stdout_output(format, limits)
 }
 
 /// Reports a failure that happened before any output was set up, before even the options

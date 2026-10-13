@@ -17,10 +17,22 @@ pub enum Command {
 }
 
 pub enum ProfileCommand {
-    Add { name: String, opts: Box<Opts> },
-    List,
-    Test { name: String },
-    Remove { name: String },
+    Add {
+        name: String,
+        opts: Box<Opts>,
+    },
+    /// `profile list [--search TEXT] [--format F]`: the profiles whose name or description
+    /// contains `search` (any case), or all of them.
+    List {
+        search: Option<String>,
+        format: Format,
+    },
+    Test {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Default)]
@@ -65,6 +77,8 @@ pub struct Opts {
     pub format: Option<Format>,
     /// Only for `sqlh profile add`: prompt for a new password even if one is stored.
     pub new_password: bool,
+    /// Only for `sqlh profile add`: the profile's description; `""` removes it.
+    pub description: Option<String>,
     /// Internal (set by `profile test`): print a `-- note:` describing the connection.
     pub show_connection: bool,
     /// sqlcmd flags accepted for compatibility but without effect.
@@ -87,7 +101,7 @@ fn parse_args(args: &[&str]) -> Result<Command, String> {
     parse_all(args.iter().map(OsString::from).collect())
 }
 
-const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list | test NAME | rm NAME";
+const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] [--format F] | test NAME | rm NAME";
 
 fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
@@ -121,7 +135,10 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
             }
             ProfileCommand::Add { name, opts }
         }
-        "list" | "ls" => ProfileCommand::List,
+        "list" | "ls" => {
+            let rest: Vec<OsString> = args.by_ref().collect();
+            parse_list(lexopt::Parser::from_args(rest))?
+        }
         "test" => ProfileCommand::Test { name: name()? },
         "rm" | "remove" => ProfileCommand::Remove { name: name()? },
         _ => {
@@ -134,6 +151,32 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
         return Err(format!("unexpected argument {extra:?}; {PROFILE_USAGE}"));
     }
     Ok(Command::Profile(command))
+}
+
+/// `profile list`'s options: `--search TEXT` and `--format F` (PLAN.md 4.2).
+fn parse_list(mut p: lexopt::Parser) -> Result<ProfileCommand, String> {
+    use lexopt::prelude::*;
+    let (mut search, mut format) = (None, Format::Text);
+    while let Some(arg) = p.next().map_err(|e| e.to_string())? {
+        match arg {
+            Long("search") => search = Some(string(p.value())?),
+            Long("format") => format = output_format(&string(p.value())?)?,
+            _ => {
+                return Err(format!(
+                    "profile list takes --search TEXT and --format F, not {}; {PROFILE_USAGE}",
+                    arg.unexpected()
+                ));
+            }
+        }
+    }
+    Ok(ProfileCommand::List { search, format })
+}
+
+fn output_format(text: &str) -> Result<Format, String> {
+    Format::parse(text).ok_or_else(|| match text {
+        "md" => "--format md is not implemented yet; use text, json or csv".to_owned(),
+        _ => format!("--format {text}: expected text, json or csv"),
+    })
 }
 
 fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
@@ -230,13 +273,8 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
                     format!("--write-policy {text}: expected deny, flag or allow")
                 })?);
             }
-            Long("format") => {
-                let format = string(p.value())?;
-                o.format = Some(Format::parse(&format).ok_or_else(|| match format.as_str() {
-                    "md" => "--format md is not implemented yet; use text, json or csv".to_owned(),
-                    _ => format!("--format {format}: expected text, json or csv"),
-                })?);
-            }
+            Long("format") => o.format = Some(output_format(&string(p.value())?)?),
+            Long("description") => o.description = Some(string(p.value())?),
             // sqlcmd flags with no effect here (output is always compact UTF-8).
             Short(c @ ('h' | 's' | 'w' | 'y' | 'Y' | 'm' | 'a' | 'f' | 'H')) => {
                 let _ = p.value();
@@ -496,7 +534,10 @@ mod tests {
         }
         assert!(matches!(
             parse_args(&["profile", "list"]),
-            Ok(Command::Profile(ProfileCommand::List))
+            Ok(Command::Profile(ProfileCommand::List {
+                search: None,
+                format: Format::Text
+            }))
         ));
         assert!(matches!(
             parse_args(&["profile", "test", "dev"]),
@@ -506,5 +547,48 @@ mod tests {
         assert!(parse_args(&["profile", "add", "x", "-Q", "SELECT 1"]).is_err());
         assert!(parse_args(&["profile", "test", "dev", "extra"]).is_err());
         assert!(parse_args(&["profile"]).is_err());
+    }
+
+    // PLAN.md 4.1 and 4.2: `profile add` takes --description; `profile list` takes --search
+    // and --format, and nothing else.
+    #[test]
+    fn profile_descriptions_and_search() {
+        match parse_args(&[
+            "profile",
+            "add",
+            "dev",
+            "--description",
+            "prod replica, read-only",
+        ]) {
+            Ok(Command::Profile(ProfileCommand::Add { opts, .. })) => {
+                assert_eq!(opts.description.as_deref(), Some("prod replica, read-only"));
+            }
+            _ => panic!("expected profile add"),
+        }
+        match parse_args(&["profile", "ls", "--search", "Prod", "--format", "json"]) {
+            Ok(Command::Profile(ProfileCommand::List { search, format })) => {
+                assert_eq!(search.as_deref(), Some("Prod"));
+                assert!(format == Format::Json);
+            }
+            _ => panic!("expected profile list"),
+        }
+        for (args, wanted) in [
+            (
+                vec!["profile", "list", "-S", "srv"],
+                "profile list takes --search TEXT and --format F",
+            ),
+            (
+                vec!["profile", "list", "prod"],
+                "profile list takes --search TEXT and --format F",
+            ),
+            (
+                vec!["profile", "list", "--format", "xml"],
+                "--format xml: expected text, json or csv",
+            ),
+            (vec!["profile", "list", "--search"], "missing argument"),
+        ] {
+            let error = parse_args(&args).err().expect("refused");
+            assert!(error.contains(wanted), "{args:?}: {error}");
+        }
     }
 }

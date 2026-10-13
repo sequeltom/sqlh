@@ -12,7 +12,7 @@ use crate::config::{self, AuthKind, Config, DEFAULT_LOCK_TIMEOUT, Profile, Write
 use crate::credman::{Binding, Stored};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
-use crate::output::Limits;
+use crate::output::{Format, Limits};
 use crate::run::{QueryOrigin, RunOutcome};
 use crate::secret::Secret;
 use crate::{console, credman, files};
@@ -82,7 +82,7 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
     match command {
         ProfileCommand::Test { name } => test(name, started),
         ProfileCommand::Add { name, opts } => {
-            let mut out = stdout_sink(Limits::default());
+            let mut out = stdout_sink(Format::Text, Limits::default());
             match add(&name, &opts, &mut out, &System) {
                 Ok(()) => {
                     let _ = out.flush();
@@ -92,21 +92,31 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
-        ProfileCommand::List => {
-            let mut out = stdout_sink(Limits {
-                max_rows: 0,
-                ..Limits::default()
-            });
-            match list(&mut out) {
-                Ok(count) => {
-                    let s = if count == 1 { "" } else { "s" };
-                    finish_ok(&mut out, &format!("{count} profile{s}"), started)
+        ProfileCommand::List { search, format } => {
+            let mut out = stdout_sink(
+                format,
+                Limits {
+                    max_rows: 0,
+                    ..Limits::default()
+                },
+            );
+            match list(&mut out, search.as_deref()) {
+                Ok((shown, total)) => {
+                    let s = if total == 1 { "" } else { "s" };
+                    let detail = match search {
+                        None => format!("{total} profile{s}"),
+                        Some(_) => {
+                            let verb = if shown == 1 { "matches" } else { "match" };
+                            format!("{shown} of {total} profile{s} {verb}")
+                        }
+                    };
+                    finish_ok(&mut out, &detail, started)
                 }
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
         ProfileCommand::Remove { name } => {
-            let mut out = stdout_sink(Limits::default());
+            let mut out = stdout_sink(Format::Text, Limits::default());
             match remove(&name, &mut out, &System) {
                 Ok(()) => finish_ok(&mut out, &format!("removed profile {name}"), started),
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
@@ -144,6 +154,10 @@ fn test(name: String, started: Instant) -> Exit {
 /// server is asked for again, never rebound to the old one. A kept password whose identity
 /// changes (encryption, certificate trust) is stored again with the new binding.
 fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
+    if let Some(description) = opts.description.as_deref().filter(|d| !d.is_empty()) {
+        config::check_description(description)
+            .map_err(|e| Failure::usage(format!("--description: {e}")))?;
+    }
     let _lock = store.lock().map_err(Failure::usage)?;
     let mut config = store.load().map_err(Failure::usage)?;
     let existing = config.find(name).cloned();
@@ -162,6 +176,12 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
         || !same(&opts.server.clone().or(base.server.clone()), &base.server);
     let profile = Profile {
         name: name.to_owned(),
+        // Given, it replaces the saved one, and an empty one removes it; left out, it stays.
+        description: match opts.description.as_deref() {
+            Some("") => None,
+            Some(description) => Some(description.to_owned()),
+            None => base.description,
+        },
         server: opts.server.clone().or(base.server),
         database: opts.database.clone().or(base.database),
         auth: Some(if user.is_some() {
@@ -332,10 +352,24 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
     Ok(())
 }
 
-fn list(out: &mut Out) -> Result<usize, Failure> {
+/// Lists the profiles, or with `search` those whose name or description contains it, in any
+/// case (PLAN.md 4.2). Returns how many were listed, and how many there are. Never reads a
+/// password: a credential's existence is all it checks.
+fn list(out: &mut Out, search: Option<&str>) -> Result<(usize, usize), Failure> {
     let config = config::load().map_err(Failure::usage)?;
     let path = config::path().map_err(Failure::usage)?;
     let _ = out.note(&format!("profiles file: {}", path.display()));
+    let needle = search.map(str::to_lowercase);
+    let matches = |p: &Profile| match &needle {
+        None => true,
+        Some(needle) => {
+            p.name.to_lowercase().contains(needle)
+                || p.description
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(needle))
+        }
+    };
+    let listed: Vec<&Profile> = config.profiles.iter().filter(|p| matches(p)).collect();
     let column = |name: &str| Column {
         name: name.into(),
         type_name: "text".into(),
@@ -369,11 +403,12 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
             type_name: "bit".into(),
             nullable: false,
         },
+        column("description"),
     ];
     let text = |v: &Option<String>| v.clone().map_or(Value::Null, Value::Text);
     let write = |out: &mut Out| -> std::io::Result<()> {
         out.columns(&columns)?;
-        for p in &config.profiles {
+        for p in &listed {
             let is_default = config
                 .default
                 .as_deref()
@@ -398,13 +433,14 @@ fn list(out: &mut Out) -> Result<usize, Failure> {
                 Value::Int(p.lock_timeout.unwrap_or(DEFAULT_LOCK_TIMEOUT).into()),
                 Value::Int(p.read_uncommitted.unwrap_or(false).into()),
                 Value::Int(p.exact_count.unwrap_or(false).into()),
+                text(&p.description),
             ])?;
         }
         out.end_rows()
     };
     write(out)
         .map_err(|e| Failure::new(Exit::Undelivered, format!("writing output failed: {e}")))?;
-    Ok(config.profiles.len())
+    Ok((listed.len(), config.profiles.len()))
 }
 
 /// Removes a profile: the file first, then its stored password, under the profiles lock. A
@@ -923,6 +959,58 @@ mod tests {
             "rebound"
         );
         assert_eq!(run(&fake, true), pair("srv", "old"));
+    }
+
+    // PLAN.md 4.1: --description replaces the saved description, an edit without it keeps it,
+    // and an empty one removes it. One that isn't a single line, or is too long, is refused
+    // before anything is read or written.
+    #[test]
+    fn add_keeps_replaces_and_removes_the_description() {
+        let fake = with_dev("");
+        let described = |text: &str| Opts {
+            description: Some(text.into()),
+            ..Opts::default()
+        };
+        let saved = |fake: &Fake| {
+            fake.config
+                .borrow()
+                .find("dev")
+                .unwrap()
+                .description
+                .clone()
+        };
+        add(
+            "dev",
+            &described("prod reporting replica"),
+            &mut out(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(saved(&fake).as_deref(), Some("prod reporting replica"));
+        let policy = Opts {
+            write_policy: Some(WritePolicy::Flag),
+            ..Opts::default()
+        };
+        add("dev", &policy, &mut out(), &fake).unwrap();
+        assert_eq!(saved(&fake).as_deref(), Some("prod reporting replica"));
+        add("dev", &described("dev box"), &mut out(), &fake).unwrap();
+        assert_eq!(saved(&fake).as_deref(), Some("dev box"));
+        add("dev", &described(""), &mut out(), &fake).unwrap();
+        assert_eq!(saved(&fake), None);
+
+        let refused = Fake {
+            fail_lock: true,
+            ..with_dev("")
+        };
+        for bad in ["two\nlines", &"x".repeat(301)] {
+            let failure = add("dev", &described(bad), &mut out(), &refused).unwrap_err();
+            assert_eq!(failure.exit, Exit::Usage);
+            assert!(
+                failure.message.starts_with("--description: description "),
+                "{}",
+                failure.message
+            );
+        }
     }
 
     // R20: a password stored before bindings (no identity) is used when its login matches the

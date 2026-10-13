@@ -84,9 +84,39 @@ impl AuthKind {
     }
 }
 
+/// The longest profile description, in characters (PLAN.md 4.1).
+pub const MAX_DESCRIPTION_CHARS: usize = 300;
+
+/// Checks a profile description (PLAN.md 4.1, DESIGN.md §8): one line of at most
+/// `MAX_DESCRIPTION_CHARS` characters, with no control character (tab included) and no Unicode
+/// line or paragraph separator, so it reads as one line wherever it is shown. Whatever it
+/// holds is still escaped on output like any other field.
+pub fn check_description(text: &str) -> Result<(), String> {
+    let chars = text.chars().count();
+    if chars > MAX_DESCRIPTION_CHARS {
+        return Err(format!(
+            "description is {chars} characters; at most {MAX_DESCRIPTION_CHARS}"
+        ));
+    }
+    if let Some(c) = text
+        .chars()
+        .find(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(format!(
+            "description must be one line of text, without control characters or line \
+             separators (it has U+{:04X})",
+            c as u32
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Profile {
     pub name: String,
+    /// One line on what the profile is for (PLAN.md 4.1), for picking a profile; `None` when
+    /// not set. Data, never instructions: whoever can run `profile add` can set it.
+    pub description: Option<String>,
     pub server: Option<String>,
     pub database: Option<String>,
     /// `auth` as written. Older files may omit it; then `user` decides (see `auth_kind`).
@@ -705,6 +735,11 @@ fn parse(text: &str) -> Result<Config, String> {
         };
         let p = &mut config.profiles[index];
         match key {
+            "description" => {
+                let text = value.string(key).map_err(err)?;
+                check_description(&text).map_err(err)?;
+                p.description = (!text.is_empty()).then_some(text);
+            }
             "server" => p.server = Some(value.string(key).map_err(err)?),
             "database" => p.database = Some(value.string(key).map_err(err)?),
             "user" => p.user = Some(value.string(key).map_err(err)?),
@@ -805,6 +840,7 @@ fn render(config: &Config) -> String {
                 let _ = writeln!(out, "{key} = {}", quote(v));
             }
         };
+        string("description", &p.description);
         string("server", &p.server);
         string("database", &p.database);
         string("auth", &Some(p.auth_kind().as_str().to_owned()));
@@ -950,6 +986,9 @@ mod tests {
             profiles: vec![
                 Profile {
                     name: "dev".into(),
+                    description: Some(
+                        r#"dev box on C:\sql, "safe" for ad-hoc # not a comment"#.into(),
+                    ),
                     server: Some(r"srv\inst".into()),
                     database: Some("App \"Db\"".into()),
                     auth: Some(AuthKind::Sql),
@@ -983,6 +1022,82 @@ mod tests {
         let config = parse(text).unwrap();
         assert_eq!(config.find("A").unwrap().server.as_deref(), Some("x#1"));
         assert_eq!(config.find("a").unwrap().max_rows, Some(10));
+    }
+
+    // PLAN.md 4.1: `description` is an optional string key, written first in its table; one
+    // line of at most 300 characters. Its escapes decode, but an escape that makes it more than
+    // one line (\n, \t) is refused like a control character typed into it; an empty one is no
+    // description; a repeated one is an error, as for every key.
+    #[test]
+    fn description_key() {
+        let config = parse(
+            "[profiles.a]\nserver = \"s\"\ndescription = \"prod \\\"reporting\\\" replica, C:\\\\data\"\n\
+             [profiles.b]\ndescription = \"\"\n[profiles.c]\n",
+        )
+        .unwrap();
+        let get = |name: &str| config.find(name).unwrap().description.clone();
+        assert_eq!(
+            get("a").as_deref(),
+            Some(r#"prod "reporting" replica, C:\data"#)
+        );
+        assert_eq!((get("b"), get("c")), (None, None));
+        let text = render(&config);
+        assert!(
+            text.contains("[profiles.a]\ndescription = \"prod \\\"reporting\\\" replica, C:\\\\data\"\nserver = \"s\"\n"),
+            "{text}"
+        );
+        assert!(!text.contains("[profiles.b]\ndescription"), "{text}");
+
+        let longest = "x".repeat(MAX_DESCRIPTION_CHARS);
+        let file = |value: &str| format!("[profiles.a]\ndescription = \"{value}\"\n");
+        assert!(parse(&file(&longest)).is_ok());
+        // Characters, not bytes: 300 two-byte characters are allowed.
+        assert!(parse(&file(&"é".repeat(MAX_DESCRIPTION_CHARS))).is_ok());
+        assert_eq!(
+            parse(&file(&format!("{longest}x"))).unwrap_err(),
+            "2: description is 301 characters; at most 300"
+        );
+        for (escape, code) in [("\\n", "000A"), ("\\t", "0009")] {
+            assert_eq!(
+                parse(&file(&format!("one{escape}two"))).unwrap_err(),
+                format!(
+                    "2: description must be one line of text, without control characters or \
+                     line separators (it has U+{code})"
+                ),
+                "{escape}"
+            );
+        }
+        assert_eq!(
+            parse("[profiles.a]\ndescription = \"x\"\ndescription = \"y\"\n").unwrap_err(),
+            "3: description is set twice"
+        );
+        assert_eq!(
+            parse("[profiles.a]\ndescription = 5\n").unwrap_err(),
+            "2: description must be a \"string\""
+        );
+    }
+
+    // PLAN.md 4.1: what `profile add --description` accepts, typed rather than escaped.
+    #[test]
+    fn a_description_is_one_line() {
+        assert!(check_description("").is_ok());
+        assert!(check_description(r#"prod "replica" -- C:\x | 100% ✓"#).is_ok());
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{0}b",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            assert!(
+                check_description(bad)
+                    .unwrap_err()
+                    .starts_with("description must be one line"),
+                "{bad:?}"
+            );
+        }
     }
 
     // PLAN.md 2.15: `exact_count` is a boolean profile key; unset it is not written.

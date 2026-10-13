@@ -53,7 +53,7 @@ Orders	2026-09-30T14:02:11.483
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 36 built, 5 planned.**
+**Tally: 37 built, 4 planned.**
 
 ### Built
 
@@ -100,13 +100,13 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Works the same in cmd.exe, PowerShell and Git Bash.** The `--help` examples run unchanged in each, and a test runs them. A Git Bash path (`/c/dir/f.sql`) that cmd.exe or PowerShell can't find is answered with the Windows spelling to use, and sqlh leaves the console's code page as it found it. A path from Explorer's "Copy as path" works as is after `-i` or `-o`. *(Phase 2.13)*
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. *(Phase 2.13)*
 - **The same answers as SSMS.** Session `SET` options match SSMS, so plans and filtered-index behavior match what the DBA sees. *(MVP)*
+- **Profiles say what they're for, and can be searched.** Each profile can carry a one-line description (`sqlh profile add dev --description "prod reporting replica, read-only"`), and `sqlh profile list --search reporting` lists the profiles whose name or description matches, so an agent picks the right server in one call. `--format json` lists them as a document. *(Phase 4.1–4.2)*
 - **One exe, no dependencies.** About 2 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
 - **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, a runaway `$(var)` expansion is refused at 10 MB before it is built, and the read-only guard checks a 10 MB script in under 60 MB whatever it holds, so one careless query can't exhaust the machine the agent runs on. The old `text`, `ntext` and `image` types are the exception: those values are still read whole. *(Phase 2.7; the guard in 2.14)*
 
 ### Planned
 
 - **Schema discovery commands.** `tables`, `describe`, `find`, `def`, `dbs` and `info`: focused answers instead of catalog queries. *(Phase 4)*
-- **Profile descriptions and search**, so an agent can pick the right server in one call. *(Phase 4)*
 - **Connection reuse.** An MCP server or a local daemon, so repeated calls skip the connect, with native tools and read/write permissions the harness can gate. *(Phase 5)*
 - **A wider read-only allowlist** for DBA workflows (`xp_readerrorlog`, `xp_instance_regread`, showplans) from a categorization of commands, not a longer blocklist. *(Phase 6)*
 - **A skill and a plugin** that teach agents the investigation workflow and install it in one step. *(Phase 8)*
