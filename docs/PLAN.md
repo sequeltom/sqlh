@@ -293,13 +293,25 @@ Optional display-hygiene follow-up: the validator permits bidi controls such as 
 
 Independent `scripts/check.ps1` passed in about 72 seconds: fmt, Clippy with both feature sets, 298 unit tests (four ignored), 61 debug process tests (48 ignored), 58 release process tests (42 ignored), a 2,420,224-byte exe, and the expected ten in-box DLLs. The watched delivery tests and R15 regressions passed. Synthetic-profile probes passed matches/no matches in text/JSON/CSV, character limits, and a 3,500-profile list within 1 MiB in every format; JSON retained its exact total while marking truncation. Live and ignored Credential Manager tests were not independently rerun; the developer reports 48 debug and 42 release live tests. No owner's profile, credential, or database was used by the probes. Hosted acceptance remains pending, and no remote action was taken.
 
-The fixes, 2026-10-13 (awaiting verification):
+The fixes, 2026-10-13 (verified below):
 
 | # | Fix | Tests |
 |---|---|---|
 | R25 | Owner decision 13: `profile list` is text only. `--format` is refused there (exit 3, `profile list takes --search TEXT only (its output is text)`), so no 2.0 document without batch metadata exists; DESIGN.md §5.2's exception for commands that run no SQL is removed and the contract is as before. | `cli.rs`: `--format json` refused like any other flag; process: `profile list --format json` exits 3 with a text report. The text exact-output test is unchanged. |
 | R26 | With no structured profile output left, every profile command writes text: `app::stdout_sink` takes no format again, so the panic hook's text status line (`TEXT_ON_STDOUT`, true outside a run) is right for them. | Covered by R25's refusal; no other command bypasses `run_command` with a format. |
 | Bidi controls (optional) | `config::check_description` also refuses Unicode's twelve Bidi_Control characters, in the file and in `profile add`; right-to-left text and other format characters stay allowed. | `config.rs`: each of the twelve refused with its code point; Hebrew text and an emoji with a zero-width joiner accepted. |
+
+#### Phase 4.1–4.3 fix verification, 2026-10-13
+
+Reviewed `bebd1e6..bfe854e` independently. **R25 and R26 are closed; Phase 4.1–4.3 is accepted. No new actionable code finding.** Owner decision 13 removes the structured profile-list interface that introduced both defects. The initial acceptance tests for a structured list and its panic no longer apply because that command cannot select JSON or CSV. This accepts the profile-discovery increment, not the remaining schema commands in Phase 4.
+
+| Area | Verification |
+|---|---|
+| R25, JSON contract | `List` has only `search`; its parser refuses `--format`. Release-exe probes refused text, JSON and CSV selections, with separate or `=` values, before or after `--search`, for both `list` and `ls` (24 cases). All returned exit 3 and text diagnostics. Ordinary lists, searches by name and description, and no matches succeeded. Production JSON result events still come through the SQL run loop, which calls `begin_batch` with provenance before `Session::run`; early SQL failures retain a 2.0 document with `batches: []`. No remaining production command was found that emits a JSON result outside that batch boundary. Contract 2.0 needs no version change. |
+| R26, panic context | Add, list and remove use `stdout_sink(limits)`, which always creates text output. Test, and add's connection test, call `run_command` with default text options; SQL runs set `TEXT_ON_STDOUT` before creating the selected sink. No other command selects structured output outside `run_command`. Existing SQL panic tests passed. No forced profile panic was injected; the structured profile-list case has been removed. |
+| Optional bidi follow-up | The twelve constants match Unicode UAX #9 §2: U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069. An independently enumerated executable probe refused every one in a profiles file with its code point and line 4, and in `profile add` before even creating the scratch config parent. Hebrew text, a joined emoji, soft hyphens and zero-width non-joiners remained accepted. The 300/301-character boundary and Unicode line-separator refusals remained correct. |
+
+Independent `pwsh -NoProfile -File scripts/check.ps1` passed in about 70 seconds: locked metadata, fmt, Clippy with both feature sets, 298 unit tests (four ignored), 61 debug process tests (48 ignored), 58 release process tests (42 ignored), a 2,420,224-byte exe and the expected ten in-box DLLs. All 49 isolated executable probes passed; their profiles were synthetic and used `SQLH_CONFIG`. No owner's profile, password or database was used. Live and ignored Credential Manager tests were not independently rerun; the developer reports the full `-Live` check passed. Hosted CI and signing remain unrun as previously recorded. The review also restored the newline separating the `result` bullet in DESIGN.md §5.2, which the exception removal had joined to `counting_stopped`; no contract content changed.
 
 ### Phase 5: connection reuse (VISION priority 3b)
 
