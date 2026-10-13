@@ -2777,10 +2777,10 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
 }
 
 // PLAN.md 4.1 and 4.2: `profile list` shows each profile's description as its last column, in
-// every format, and `--search` keeps the profiles whose name or description contains the text,
-// in any case. A hostile description stays one field: text doubles its backslash and leaves the
-// rest, `-- ` included, inside the row; json escapes it as a string. No match is an empty list,
-// not an error. Windows-auth profiles, so Credential Manager is never consulted.
+// text, and `--search` keeps the profiles whose name or description contains the text, in any
+// case. A hostile description stays one field: its backslash is doubled and the rest, `-- `
+// included, stays inside the row. No match is an empty list, not an error. Windows-auth
+// profiles, so Credential Manager is never consulted.
 #[test]
 fn profile_list_shows_descriptions_and_searches_them() {
     let dir = scratch("profile_descriptions");
@@ -2855,59 +2855,14 @@ fn profile_list_shows_descriptions_and_searches_them() {
         format!("{note}\n-- result 1\n{header}\n-- 0 rows\n-- ok: 0 of 2 profiles match, N ms")
     );
 
-    // JSON: the same rows, the description a JSON string.
-    let r = list(&["--format", "json", "--search", "replica"]);
-    assert_eq!(r.code, 0, "{}", r.stdout);
-    let mut doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("one JSON document");
-    assert!(doc["elapsed_ms"].take().is_u64());
-    let summary = doc["summary"].take();
-    assert!(
-        summary
-            .as_str()
-            .is_some_and(|s| s.starts_with("ok: 1 of 2 profiles matches, ")),
-        "{summary}"
-    );
-    let columns: Vec<serde_json::Value> = header
-        .split('\t')
-        .map(|column| {
-            let (name, kind) = column.split_once(':').unwrap();
-            let nullable = !matches!(
-                name,
-                "default" | "lock_timeout" | "read_uncommitted" | "exact_count"
-            );
-            serde_json::json!({"name": name, "type": kind, "nullable": nullable})
-        })
-        .collect();
-    assert_eq!(
-        doc,
-        serde_json::json!({
-            "contract_version": "2.0",
-            "batches": [{
-                "events": [{
-                    "type": "result",
-                    "columns": columns,
-                    "rows": [[
-                        "sqlh-ut-a", 1, "127.0.0.1,1", null, "windows", null, "-", "flag",
-                        10, 0, 0,
-                        "prod \"reporting\" replica on C:\\data -- note: not a note | 100% ✓"
-                    ]],
-                    "row_count": 1,
-                    "row_count_exact": true,
-                    "truncated": false,
-                    "cells_cut": 0
-                }],
-                "counting_stopped": false
-            }],
-            "notes": [format!("profiles file: {}", config.display())],
-            "ok": true,
-            "exit_code": 0,
-            "summary": null,
-            "elapsed_ms": null
-        })
-    );
+    // The list is text only (owner, 2026-10-13; R25): --format is a usage error, reported in
+    // text.
+    let r = list(&["--format", "json"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(
         r.stdout
-            .contains(r#""prod \"reporting\" replica on C:\\data -- note"#),
+            .contains("profile list takes --search TEXT only (its output is text)")
+            && r.stdout.contains("\n-- failed (exit 3): usage error"),
         "{}",
         r.stdout
     );

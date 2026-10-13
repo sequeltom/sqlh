@@ -21,11 +21,10 @@ pub enum ProfileCommand {
         name: String,
         opts: Box<Opts>,
     },
-    /// `profile list [--search TEXT] [--format F]`: the profiles whose name or description
-    /// contains `search` (any case), or all of them.
+    /// `profile list [--search TEXT]`: the profiles whose name or description contains
+    /// `search` (any case), or all of them.
     List {
         search: Option<String>,
-        format: Format,
     },
     Test {
         name: String,
@@ -101,7 +100,7 @@ fn parse_args(args: &[&str]) -> Result<Command, String> {
     parse_all(args.iter().map(OsString::from).collect())
 }
 
-const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] [--format F] | test NAME | rm NAME";
+const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] | test NAME | rm NAME";
 
 fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
@@ -153,23 +152,24 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     Ok(Command::Profile(command))
 }
 
-/// `profile list`'s options: `--search TEXT` and `--format F` (PLAN.md 4.2).
+/// `profile list`'s one option, `--search TEXT` (PLAN.md 4.2). The list is text only (owner,
+/// 2026-10-13): it is setup an agent reads once, and text is the cheapest format to read.
 fn parse_list(mut p: lexopt::Parser) -> Result<ProfileCommand, String> {
     use lexopt::prelude::*;
-    let (mut search, mut format) = (None, Format::Text);
+    let mut search = None;
     while let Some(arg) = p.next().map_err(|e| e.to_string())? {
         match arg {
             Long("search") => search = Some(string(p.value())?),
-            Long("format") => format = output_format(&string(p.value())?)?,
             _ => {
                 return Err(format!(
-                    "profile list takes --search TEXT and --format F, not {}; {PROFILE_USAGE}",
+                    "profile list takes --search TEXT only (its output is text), not {}; \
+                     {PROFILE_USAGE}",
                     arg.unexpected()
                 ));
             }
         }
     }
-    Ok(ProfileCommand::List { search, format })
+    Ok(ProfileCommand::List { search })
 }
 
 fn output_format(text: &str) -> Result<Format, String> {
@@ -534,10 +534,7 @@ mod tests {
         }
         assert!(matches!(
             parse_args(&["profile", "list"]),
-            Ok(Command::Profile(ProfileCommand::List {
-                search: None,
-                format: Format::Text
-            }))
+            Ok(Command::Profile(ProfileCommand::List { search: None }))
         ));
         assert!(matches!(
             parse_args(&["profile", "test", "dev"]),
@@ -549,8 +546,8 @@ mod tests {
         assert!(parse_args(&["profile"]).is_err());
     }
 
-    // PLAN.md 4.1 and 4.2: `profile add` takes --description; `profile list` takes --search
-    // and --format, and nothing else.
+    // PLAN.md 4.1 and 4.2: `profile add` takes --description; `profile list` takes --search,
+    // and nothing else.
     #[test]
     fn profile_descriptions_and_search() {
         match parse_args(&[
@@ -565,26 +562,18 @@ mod tests {
             }
             _ => panic!("expected profile add"),
         }
-        match parse_args(&["profile", "ls", "--search", "Prod", "--format", "json"]) {
-            Ok(Command::Profile(ProfileCommand::List { search, format })) => {
+        match parse_args(&["profile", "ls", "--search", "Prod"]) {
+            Ok(Command::Profile(ProfileCommand::List { search })) => {
                 assert_eq!(search.as_deref(), Some("Prod"));
-                assert!(format == Format::Json);
             }
             _ => panic!("expected profile list"),
         }
+        // The list is text only (owner, 2026-10-13): --format is refused like any other flag.
+        let only = "profile list takes --search TEXT only (its output is text)";
         for (args, wanted) in [
-            (
-                vec!["profile", "list", "-S", "srv"],
-                "profile list takes --search TEXT and --format F",
-            ),
-            (
-                vec!["profile", "list", "prod"],
-                "profile list takes --search TEXT and --format F",
-            ),
-            (
-                vec!["profile", "list", "--format", "xml"],
-                "--format xml: expected text, json or csv",
-            ),
+            (vec!["profile", "list", "-S", "srv"], only),
+            (vec!["profile", "list", "prod"], only),
+            (vec!["profile", "list", "--format", "json"], only),
             (vec!["profile", "list", "--search"], "missing argument"),
         ] {
             let error = parse_args(&args).err().expect("refused");

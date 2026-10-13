@@ -87,10 +87,18 @@ impl AuthKind {
 /// The longest profile description, in characters (PLAN.md 4.1).
 pub const MAX_DESCRIPTION_CHARS: usize = 300;
 
+/// Unicode's Bidi_Control characters (UAX #9): marks, embeddings, overrides and isolates,
+/// which change the order text is displayed in, beyond their own place in it.
+const BIDI_CONTROLS: [char; 12] = [
+    '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+];
+
 /// Checks a profile description (PLAN.md 4.1, DESIGN.md §8): one line of at most
 /// `MAX_DESCRIPTION_CHARS` characters, with no control character (tab included) and no Unicode
-/// line or paragraph separator, so it reads as one line wherever it is shown. Whatever it
-/// holds is still escaped on output like any other field.
+/// line or paragraph separator, so it reads as one line wherever it is shown, and no
+/// bidirectional control character, so it shows in the order it was written (right-to-left
+/// text itself is fine). Whatever it holds is still escaped on output like any other field.
 pub fn check_description(text: &str) -> Result<(), String> {
     let chars = text.chars().count();
     if chars > MAX_DESCRIPTION_CHARS {
@@ -105,6 +113,13 @@ pub fn check_description(text: &str) -> Result<(), String> {
         return Err(format!(
             "description must be one line of text, without control characters or line \
              separators (it has U+{:04X})",
+            c as u32
+        ));
+    }
+    if let Some(c) = text.chars().find(|c| BIDI_CONTROLS.contains(c)) {
+        return Err(format!(
+            "description must not hold bidirectional control characters, which reorder how \
+             text is shown (it has U+{:04X})",
             c as u32
         ));
     }
@@ -1098,6 +1113,20 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // Bidirectional controls reorder what is shown; right-to-left text itself is fine,
+        // and so are other format characters (a zero-width joiner in an emoji).
+        for c in BIDI_CONTROLS {
+            assert_eq!(
+                check_description(&format!("prod {c}replica")).unwrap_err(),
+                format!(
+                    "description must not hold bidirectional control characters, which \
+                     reorder how text is shown (it has U+{:04X})",
+                    c as u32
+                )
+            );
+        }
+        assert!(check_description("שרת ייצור, prod replica").is_ok());
+        assert!(check_description("owner 👩\u{200D}💻").is_ok());
     }
 
     // PLAN.md 2.15: `exact_count` is a boolean profile key; unset it is not written.

@@ -12,7 +12,7 @@ use crate::config::{self, AuthKind, Config, DEFAULT_LOCK_TIMEOUT, Profile, Write
 use crate::credman::{Binding, Stored};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
-use crate::output::{Format, Limits};
+use crate::output::Limits;
 use crate::run::{QueryOrigin, RunOutcome};
 use crate::secret::Secret;
 use crate::{console, credman, files};
@@ -82,7 +82,7 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
     match command {
         ProfileCommand::Test { name } => test(name, started),
         ProfileCommand::Add { name, opts } => {
-            let mut out = stdout_sink(Format::Text, Limits::default());
+            let mut out = stdout_sink(Limits::default());
             match add(&name, &opts, &mut out, &System) {
                 Ok(()) => {
                     let _ = out.flush();
@@ -92,14 +92,11 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
-        ProfileCommand::List { search, format } => {
-            let mut out = stdout_sink(
-                format,
-                Limits {
-                    max_rows: 0,
-                    ..Limits::default()
-                },
-            );
+        ProfileCommand::List { search } => {
+            let mut out = stdout_sink(Limits {
+                max_rows: 0,
+                ..Limits::default()
+            });
             match list(&mut out, search.as_deref()) {
                 Ok((shown, total)) => {
                     let s = if total == 1 { "" } else { "s" };
@@ -116,7 +113,7 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
             }
         }
         ProfileCommand::Remove { name } => {
-            let mut out = stdout_sink(Format::Text, Limits::default());
+            let mut out = stdout_sink(Limits::default());
             match remove(&name, &mut out, &System) {
                 Ok(()) => finish_ok(&mut out, &format!("removed profile {name}"), started),
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),

@@ -232,9 +232,11 @@ fn stdout_output(format: Format, limits: Limits) -> Out {
     output::create(format, Box::new(io::stdout()), limits)
 }
 
-/// Output on stdout, for commands that run without the async runtime (`sqlh profile ...`).
-pub(crate) fn stdout_sink(format: Format, limits: Limits) -> Out {
-    stdout_output(format, limits)
+/// Text output on stdout, for commands that have no --format (`sqlh profile ...`), so the
+/// panic hook's text status line (`TEXT_ON_STDOUT`, true unless a run says otherwise) is right
+/// for them.
+pub(crate) fn stdout_sink(limits: Limits) -> Out {
+    stdout_output(Format::Text, limits)
 }
 
 /// Reports a failure that happened before any output was set up, before even the options
