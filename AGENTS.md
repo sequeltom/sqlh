@@ -61,8 +61,9 @@ tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ ho
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
                  size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
-.github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: version,
-                 check, notices, Azure Artifact Signing, zip + SHA-256, draft release; PLAN.md 3.6)
+.github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: a read-only
+                 build job (version, check, notices), then a sign job (Azure Artifact Signing,
+                 zip + SHA-256, draft release); PLAN.md 3.6)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans

@@ -24,6 +24,8 @@ profiles.toml.*.partial
 /artifacts/
 # Release workflow output (PLAN.md 3.6), if it is run locally.
 /dist/
+/unsigned/
+/build/
 /THIRD-PARTY-NOTICES.html
 
 # Local-only material that is never pushed: the external code reviews (archive/reviews/).

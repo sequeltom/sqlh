@@ -4,8 +4,11 @@
 #   push a tag v<x.y.z>   a release build; the tag must match Cargo.toml's version
 #   run it by hand        a pre-release build, v<x.y.z>-dev.<run number>
 #
-# Signing and publishing run only in tkwj's repository, and only for a tag or for main; a fork,
-# or a run on another branch, still builds and checks, and stops there.
+# Two jobs, so that no third-party code runs where the signing identity can be reached:
+#   build  read-only; builds and checks (dependencies' build scripts, cargo-about) and uploads
+#          the unsigned exe and the notices
+#   sign   the only job that can request the Azure token or write releases; it runs only in
+#          tkwj's repository for a tag or main, in the GitHub environment "release"
 name: Release
 
 on:
@@ -15,22 +18,20 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # the federated credential for Azure Artifact Signing
-  contents: write # the draft release
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  PUBLISH: ${{ github.repository_owner == 'tkwj' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main') }}
-
 jobs:
-  release:
+  build:
     runs-on: windows-latest
-    # The Azure federated credential's subject is repo:tkwj/sqlh:environment:release, the same
-    # for tag and dispatch runs. The environment allows only main and v* tags.
-    environment: release
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
 
     steps:
     - uses: actions/checkout@v7
@@ -38,6 +39,7 @@ jobs:
     # SQLH_VERSION is what `sqlh --version` reports (DESIGN.md §4); tests read it too.
     # Context values reach scripts through env, never pasted into the script text.
     - name: Version
+      id: version
       shell: pwsh
       env:
         REF_TYPE: ${{ github.ref_type }}
@@ -57,7 +59,8 @@ jobs:
           $prerelease = 'true'
         }
         "SQLH_VERSION=$version" >> $env:GITHUB_ENV
-        "PRERELEASE=$prerelease" >> $env:GITHUB_ENV
+        "version=$version" >> $env:GITHUB_OUTPUT
+        "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
         "sqlh $version (pre-release: $prerelease)"
 
     - name: Check
@@ -70,8 +73,45 @@ jobs:
         cargo install cargo-about --version 0.9.2 --locked --features cli
         cargo about generate --locked --fail about.hbs -o THIRD-PARTY-NOTICES.html
 
+    # One flat folder, so the sign job finds build/sqlh.exe (an artifact of several paths
+    # keeps their layout).
+    - name: Stage
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force unsigned | Out-Null
+        Copy-Item target/release/sqlh.exe, THIRD-PARTY-NOTICES.html unsigned/
+
+    - name: Upload unsigned
+      uses: actions/upload-artifact@v7
+      with:
+        name: unsigned
+        path: unsigned/
+        if-no-files-found: error
+
+  sign:
+    needs: build
+    if: github.repository_owner == 'tkwj' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    # The Azure federated credential's subject is repo:tkwj/sqlh:environment:release, the same
+    # for tag and dispatch runs. The environment allows only main and v* tags.
+    environment: release
+    permissions:
+      id-token: write # the federated credential for Azure Artifact Signing
+      contents: write # the draft release
+    env:
+      SQLH_VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Download unsigned
+      uses: actions/download-artifact@v8
+      with:
+        name: unsigned
+        path: build
+
     - name: Azure login
-      if: env.PUBLISH == 'true'
       uses: azure/login@v3
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -79,14 +119,12 @@ jobs:
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Install sign
-      if: env.PUBLISH == 'true'
       run: dotnet tool install --global sign --prerelease
 
     - name: Sign
-      if: env.PUBLISH == 'true'
       shell: pwsh
       run: |
-        sign code artifact-signing target/release/sqlh.exe `
+        sign code artifact-signing build/sqlh.exe `
           --artifact-signing-account tkwj `
           --artifact-signing-certificate-profile tkwj-github `
           --artifact-signing-endpoint https://eus.codesigning.azure.net `
@@ -95,14 +133,13 @@ jobs:
 
     # The signature must verify, and the signed exe must still run and report this version.
     - name: Verify
-      if: env.PUBLISH == 'true'
       shell: pwsh
       run: |
         $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
           Sort-Object FullName -Descending | Select-Object -First 1
-        & $signtool.FullName verify /pa /v target/release/sqlh.exe
+        & $signtool.FullName verify /pa /v build/sqlh.exe
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
-        $reported = & target/release/sqlh.exe --version
+        $reported = & build/sqlh.exe --version
         if ($reported -notmatch "^sqlh $([regex]::Escape($env:SQLH_VERSION)) ") {
           throw "the signed exe reports '$reported', not $env:SQLH_VERSION"
         }
@@ -111,23 +148,23 @@ jobs:
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force dist | Out-Null
-        Copy-Item target/release/sqlh.exe dist/
+        Copy-Item build/sqlh.exe dist/
         $zip = "dist/sqlh-$env:SQLH_VERSION-windows-x64.zip"
-        Compress-Archive -Path dist/sqlh.exe, LICENSE, THIRD-PARTY-NOTICES.html -DestinationPath $zip
+        Compress-Archive -Path dist/sqlh.exe, LICENSE, build/THIRD-PARTY-NOTICES.html -DestinationPath $zip
         Get-ChildItem dist -File | ForEach-Object {
           "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
         } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
         Get-Content dist/SHA256SUMS.txt
 
-    - name: Upload
+    - name: Upload signed
       uses: actions/upload-artifact@v7
       with:
         name: sqlh-${{ env.SQLH_VERSION }}
         path: dist/
+        if-no-files-found: error
 
     # A draft: nothing is public until the owner reviews and publishes it.
     - name: Draft release
-      if: env.PUBLISH == 'true'
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
