@@ -166,7 +166,7 @@ Database permissions are expected to be configured appropriately. The tool's che
 Prerequisites: fix the execution correctness findings in the architecture review, make output and cancellation dependable, and validate response budgets plus connection cleanup. Product priority is fast, context-efficient investigation; the mechanisms below remain proposals until tested against that workflow. Bounded output must cover the collected MCP response as well as streamed rows.
 
 1. **Runner refactor** (shared with the schema commands)
-   - pull the batch loop out of `main.rs` into `Runner::run(&mut Session, &[Batch], &mut dyn Output, &RunOptions) -> RunResult`
+   - pull the batch loop out of `main.rs` into `Runner::run(&mut Session, &[Batch], &mut dyn Output, &RunOptions) -> RunResult` (done in PLAN.md 3.1 as `src/run.rs`: `prepare`, `execute`, `RunPolicy`, `RunOutcome`)
    - the CLI and MCP both call it; MCP renders into a `TextSink<Vec<u8>>` and returns the bytes as the tool text
 2. **`src/mcp/`**
    - `mod.rs`:

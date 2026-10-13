@@ -225,7 +225,7 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
    - reject `-Q`/`-i` together with a command, and cross-database names
 4. **Runner refactor** (shared with MCP)
    - pull the batch loop out of `main.rs` into a `Runner` that runs batches against a `Session` into an `Output`
-   - add a "trusted" flag that skips the classifier but keeps the wrapper transaction
+   - add a "trusted" flag that skips the classifier but keeps the wrapper transaction (done in PLAN.md 3.1: `QueryOrigin::Generated` in `src/run.rs`, which also skips `$(var)`)
    - support two-step flows: resolve, then describe
 5. **Defaults:** `describe` and `def` default to unlimited rows and cells unless flags say otherwise.
 6. **Docs:**

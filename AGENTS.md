@@ -32,7 +32,12 @@ Don't trade these away.
 ## Layout
 
 ```
-src/main.rs      orchestration: sources → batches → guard → connect → run → summary line
+src/main.rs      the binary: calls sqlh::main; everything else is the library (src/lib.rs)
+src/app.rs       the command: arguments, output and its closing lines (Closing), -o publication,
+                 the panic net and last-resort diagnostics; profile commands use it
+src/run.rs       the execution core: RunPolicy (guard, wrapper, --check), QueryOrigin (user SQL or
+                 sqlh's own), prepare (sources → batches → guard), the session and batch loop,
+                 cancellation, RunOutcome (exit code and counts, apart from the sink)
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
 src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW)

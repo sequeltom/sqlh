@@ -4,12 +4,14 @@
 
 use std::time::Instant;
 
+use crate::app::{Out, finish, finish_ok, run_command, stdout_sink};
 use crate::cli::{Opts, ProfileCommand};
 use crate::config::{self, AuthKind, DEFAULT_LOCK_TIMEOUT, Profile, WritePolicy};
 use crate::db::{Column, Value, check_server};
 use crate::error::{Exit, Failure};
 use crate::output::Limits;
-use crate::{Out, console, credman, finish, finish_ok, run_command, stdout_sink};
+use crate::run::{QueryOrigin, RunOutcome};
+use crate::{console, credman};
 
 /// Connection facts for `profile test`. Runs on SQL Server 2012+ and Azure SQL DB without
 /// extra permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a
@@ -33,7 +35,7 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
                     drop(out);
                     test(name, started)
                 }
-                Err(failure) => finish(&mut out, Err(failure), started),
+                Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
         ProfileCommand::List => {
@@ -46,14 +48,14 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
                     let s = if count == 1 { "" } else { "s" };
                     finish_ok(&mut out, &format!("{count} profile{s}"), started)
                 }
-                Err(failure) => finish(&mut out, Err(failure), started),
+                Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
         ProfileCommand::Remove { name } => {
             let mut out = stdout_sink(Limits::default());
             match remove(&name, &mut out) {
                 Ok(()) => finish_ok(&mut out, &format!("removed profile {name}"), started),
-                Err(failure) => finish(&mut out, Err(failure), started),
+                Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }
         }
     }
@@ -66,7 +68,7 @@ fn test(name: String, started: Instant) -> Exit {
         show_connection: true,
         ..Opts::default()
     };
-    run_command(opts, started)
+    run_command(opts, QueryOrigin::Generated, started)
 }
 
 /// Creates or updates a profile. Options not given keep their saved values. A new profile
