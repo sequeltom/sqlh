@@ -5373,4 +5373,244 @@ mod live {
             doc["summary"] = Value::from(summary);
         }
     }
+
+    /// Objects for one test, made after `Probe` has checked the scratch marker, each named with
+    /// the probe's unique name as a prefix; dropped in reverse order when this goes out of
+    /// scope, whether the test passed or not (PLAN.md 3.4).
+    struct Objects {
+        probe: Probe,
+        /// `DROP ...` statements, in the order the objects were made.
+        drops: Vec<String>,
+    }
+
+    impl Objects {
+        fn new(profile: &str, database: &str) -> Objects {
+            Objects {
+                probe: Probe::create(profile, database),
+                drops: Vec::new(),
+            }
+        }
+
+        /// A name for a new object: the probe's, plus `suffix`.
+        fn name(&self, suffix: &str) -> String {
+            format!("{}_{suffix}", self.probe.name)
+        }
+
+        /// Runs `create` with writes allowed, and remembers `drop` for the end.
+        fn make(&mut self, create: &str, drop: String) {
+            let r = live(
+                &self.probe.profile,
+                &self.probe.database,
+                &["--allow-write", "-Q", create],
+            );
+            assert_eq!(r.code, 0, "{create}\n{}", r.stdout);
+            self.drops.push(drop);
+        }
+    }
+
+    impl Drop for Objects {
+        fn drop(&mut self) {
+            for sql in self.drops.iter().rev() {
+                let _ = live(
+                    &self.probe.profile,
+                    &self.probe.database,
+                    &["--allow-write", "-Q", sql],
+                );
+            }
+        }
+    }
+
+    // F03 (PLAN.md 1.5), end to end: every shape the review got past the guard is refused by
+    // the real binary before anything runs, and a sequence it would have advanced is where it
+    // was. (Unit tests in src/guard.rs cover the classifier; this is the regression against a
+    // server.)
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_guard_refuses_what_the_review_got_past_it() {
+        let (p, db) = target();
+        let mut objects = Objects::new(&p, &db);
+        let seq = objects.name("seq");
+        objects.make(
+            &format!("CREATE SEQUENCE {seq} AS bigint START WITH 1"),
+            format!("DROP SEQUENCE {seq}"),
+        );
+        let t = objects.probe.name.clone();
+        for sql in [
+            format!("SELECT NEXT VALUE FOR {seq} AS n"),
+            format!("EXEC sys.sp_spaceused N'{t}', N'true'"),
+            "EXEC Lnk.master.sys.sp_who".to_owned(),
+            "EXEC sales.sp_who".to_owned(),
+            "INSERT ##shared_sqlh VALUES (1)".to_owned(),
+        ] {
+            let r = live(&p, &db, &["-Q", &sql]);
+            assert_eq!(r.code, 5, "{sql}\n{}", r.stdout);
+            assert!(
+                r.stdout.contains("; nothing was run. "),
+                "{sql}\n{}",
+                r.stdout
+            );
+        }
+        let current = live(
+            &p,
+            &db,
+            &[
+                "-Q",
+                &format!(
+                    "SELECT CAST(current_value AS bigint) AS v FROM sys.sequences \
+                     WHERE object_id = OBJECT_ID(N'{seq}')"
+                ),
+            ],
+        );
+        assert!(
+            current.stdout.contains("v:bigint\n1\n"),
+            "{}",
+            current.stdout
+        );
+    }
+
+    // PLAN.md 3.4: a write reaches a table with a filtered index (which refuses writes from a
+    // session whose SET options are wrong, error 1934) and fires its trigger; a foreign key's
+    // refusal is an ordinary SQL error mapped to its line; without --allow-write none of it
+    // runs.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn writes_reach_filtered_indexes_triggers_and_foreign_keys() {
+        let (p, db) = target();
+        let mut objects = Objects::new(&p, &db);
+        let (parent, child, log) = (
+            objects.name("parent"),
+            objects.name("child"),
+            objects.name("log"),
+        );
+        let (ix, trg) = (objects.name("ix"), objects.name("trg"));
+        objects.make(
+            &format!("CREATE TABLE {log} (id int NOT NULL)"),
+            format!("DROP TABLE {log}"),
+        );
+        objects.make(
+            &format!("CREATE TABLE {parent} (id int NOT NULL PRIMARY KEY, active bit NOT NULL)"),
+            format!("DROP TABLE {parent}"),
+        );
+        objects.make(
+            &format!("CREATE TABLE {child} (parent_id int NOT NULL REFERENCES {parent} (id))"),
+            format!("DROP TABLE {child}"),
+        );
+        let ix_name = ix.trim_start_matches("dbo.");
+        objects.make(
+            &format!("CREATE INDEX {ix_name} ON {parent} (id) WHERE active = 1"),
+            format!("DROP INDEX {ix_name} ON {parent}"),
+        );
+        objects.make(
+            &format!(
+                "CREATE TRIGGER {trg} ON {parent} AFTER INSERT AS \
+                 INSERT {log} (id) SELECT id FROM inserted"
+            ),
+            format!("DROP TRIGGER {trg}"),
+        );
+
+        let insert = format!("INSERT {parent} VALUES (1, 1)");
+        let refused = live(&p, &db, &["-Q", &insert]);
+        assert_eq!(refused.code, 5, "{}", refused.stdout);
+
+        let written = live(&p, &db, &["--allow-write", "-Q", &insert]);
+        assert_eq!(written.code, 0, "{}", written.stdout);
+        let logged = live(
+            &p,
+            &db,
+            &["-Q", &format!("SELECT COUNT(*) AS n FROM {log}")],
+        );
+        assert!(logged.stdout.contains("n:int\n1\n"), "{}", logged.stdout);
+
+        let orphan = format!("PRINT 'first'\nINSERT {child} VALUES (99)");
+        let failed = live(&p, &db, &["--allow-write", "-Q", &orphan]);
+        assert_eq!(failed.code, 1, "{}", failed.stdout);
+        assert!(
+            failed
+                .stdout
+                .contains("-- error 547 (severity 16, state 0, line 2): "),
+            "{}",
+            failed.stdout
+        );
+    }
+
+    // The review's open item (Phase 2 completion review): a procedure's large result. Under
+    // --allow-write a count is exact, inside a procedure as anywhere, and the statement after
+    // the procedure runs.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_procedures_large_result_is_counted_exactly_with_writes_allowed() {
+        let (p, db) = target();
+        let mut objects = Objects::new(&p, &db);
+        let proc = objects.name("rows");
+        objects.make(
+            &format!("CREATE PROCEDURE {proc} AS {}", votes(300_000)),
+            format!("DROP PROCEDURE {proc}"),
+        );
+        let r = live(
+            &p,
+            &db,
+            &[
+                "--allow-write",
+                "-Q",
+                &format!("EXEC {proc}; PRINT 'after'"),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout
+                .contains("-- 100 of 300000 rows shown (--max-rows 100)\n-- msg: after\n"),
+            "{}",
+            r.stdout
+        );
+        // Read-only, the guard refuses a procedure of the user's before anything runs.
+        let r = live(&p, &db, &["-Q", &format!("EXEC {proc}")]);
+        assert_eq!(r.code, 5, "{}", r.stdout);
+    }
+
+    // The review's open item: a cursor's FETCHes are result sets of one row each; past
+    // --max-results they are hidden and counted, and the run ends normally.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_cursors_fetches_past_max_results_are_counted() {
+        let (p, db) = target();
+        let sql = format!(
+            "DECLARE c CURSOR LOCAL FAST_FORWARD FOR {};\n\
+             OPEN c;\n\
+             DECLARE @i int = 0;\n\
+             WHILE @i < 30 BEGIN FETCH NEXT FROM c; SET @i += 1; END\n\
+             CLOSE c; DEALLOCATE c;\n\
+             PRINT 'after'",
+            votes(1_000)
+        );
+        let r = live(&p, &db, &["--max-results", "5", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert_eq!(r.stdout.matches("-- 1 row\n").count(), 5, "{}", r.stdout);
+        assert!(r.stdout.contains("-- msg: after\n"), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "-- note: 25 more result sets not shown (--max-results 5)
+"
+            ),
+            "{}",
+            r.stdout
+        );
+    }
+
+    // The review's open item: SET ROWCOUNT ends a result early on the server's side, so the
+    // count is the server's, exact, and the footer says how many rows the limit showed.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn set_rowcount_gives_an_exact_count() {
+        let (p, db) = target();
+        let sql = format!("SET ROWCOUNT 500;\n{};\nSET ROWCOUNT 0;", votes(5_000_000));
+        let r = live(&p, &db, &["--max-rows", "10", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout
+                .contains("-- 10 of 500 rows shown (--max-rows 10)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+    }
 }
