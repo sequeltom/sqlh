@@ -209,7 +209,7 @@ Reviewed `51eeb3a..633b4fc` at `633b4fcb8263da7ca1bca764ced6f06c4d09efa5`. Phase
 
 R19's documentation fix in `51eeb3a` is verified and closed: DESIGN sections 7 and 8, decision 12, and help state that password prompting is conditional and policy changes can run unattended. The existing R15 regression tests passed; its previously accepted closure and limitations remain in force.
 
-The following findings are open. These entries contain the required work and verification without depending on the local-only review files.
+The following findings were raised by the initial review. Their fixes and verification are recorded below, without depending on the local-only review files.
 
 | # | Finding and evidence | Required change | Acceptance |
 |---|---|---|---|
@@ -221,7 +221,7 @@ The following findings are open. These entries contain the required work and ver
 
 Design follow-ups before Phases 4 and 5: `run` still depends on `app::Out`/CLI input and sink-owned accounting; generated SQL retains the normal wrapper policy, so an `allow` profile removes the wrapper despite the stronger comment; the unbounded password `read_line` can exceed its 1,024-byte initial capacity despite the no-reallocation claim; Phase 4's “Human-set only” description premise must reflect R19. These are recorded scope/wording debts, not additional reproduced query regressions.
 
-The fixes, awaiting verification (the design follow-ups above are not taken up here):
+The fixes in `65fb50c`, verified below (the design follow-ups above are not taken up here):
 
 | # | Fix | Tests |
 |---|---|---|
@@ -230,6 +230,20 @@ The fixes, awaiting verification (the design follow-ups above are not taken up h
 | R22 | `release.yml` has four jobs. `build` (read-only) builds, checks and runs the unsigned exe's `--version`. `sign` (`id-token: write`, `contents: read`, environment `release`) signs, verifies the signature with `signtool` and packages the exe as data; it runs nothing it downloaded. `verify` (read-only) runs the signed exe's `--version`, verifies the signature again and checks `SHA256SUMS.txt`. `publish` (`contents: write`, no Azure) creates the draft release from the verified artifact, running nothing from it. | Source; the verify step's sum check run locally against a packaged `dist/`. Hosted signing and the draft release still need the remote and the owner setup. |
 | R23 | `check.ps1` starts with `cargo metadata --locked` and passes `--locked` to every cargo command that resolves dependencies (clippy, tests, the release build, the live tests); the release workflow's `cargo metadata` too. | A scratch copy with `Cargo.toml` at 0.1.1 and the committed `Cargo.lock`: the check fails at step 1 (exit 1) and the lockfile's hash is unchanged. The full check passes on the current lockfile. |
 | R24 | The fixtures run their SQL through a `Server` (the test profile, `Live`, or a fake). A `Cleanup` holds idempotent steps (`DROP ... IF EXISTS`, `IF SUSER_ID(...) IS NOT NULL DROP LOGIN`), each armed before the SQL that makes its object, and only after the scratch-marker check; it runs them in reverse order when dropped, and reports a failed step with the SQL that finishes it (never a password, never a panic). `Probe`, `Objects` and `Reader` all use it; `Live::write` can't panic. | Against the fake server: a reader whose login batch fails after the login exists is cleaned up (the login's drop, then the probe's table, no password in it); an object whose CREATE fails is dropped with the rest in reverse order, and a failed drop is reported while the others still run; without the scratch marker nothing is written or dropped. The live tests pass with the new fixtures. |
+
+### Phase 3 fix verification, October 12, 2026
+
+Reviewed `b11ccfe..65fb50c` at `65fb50cda2df9175a1ed37f2831a0f3d91ba3b8f`. **R20-R24 are verified and closed; Phase 3's local code-review gate is accepted.** No new actionable finding was identified in the fix. Hosted acceptance for 3.5 and 3.6 still needs the remote and owner setup. The initial review's recorded design debts remain.
+
+| # | Verification and verdict |
+|---|---|
+| R20 | Closed. Production edit/resolution tests cover reads during and across an edit, interruption before file publication, repair prompting, rebinding, and save-error compensation. An independent fresh-process probe used the real exe, an isolated profile file, a unique synthetic Credential Manager entry, and a loopback listener. A credential bound to another server, and a legacy credential with another login, each failed with exit 3 before any connection; matching bound and legacy credentials reached the listener. The synthetic entry was deleted. No real editor was killed or password prompt automated. The documented legacy same-login/different-server limitation remains. |
+| R21 | Closed. Real-file/lock tests cover additions, policy changes, removals, and simultaneous first loads. The original real-executable scheduling probe was repeated: migration paused before publication, a second process's profile edit waited, then migration resumed and both profiles remained. The old file was removed. The probe used only synthetic Windows-auth profiles and an isolated APPDATA folder. |
+| R22 | Closed for the reviewed source. Artifact execution is confined to read-only jobs without signing access. Signing treats the exe as data; publication runs no downloaded code and depends on successful verification of the same uploaded artifact. The actual workflow checksum loop accepted an unchanged unsigned local package and rejected tampering with either the exe or zip. Hosted signature verification, Azure signing, and draft publication remain pending. |
+| R23 | Closed. The full check on a scratch copy with manifest version 0.1.1 and the committed lockfile failed at step 1 with exit 1 and left the lockfile's hash unchanged. The current lockfile passed the full check. All resolving cargo commands in the check and workflow preparation use `--locked`. |
+| R24 | Closed. Early cleanup registration, reverse ordering, continuation after cleanup failure, password-free repair diagnostics, and marker-before-write behavior were inspected and their three ordinary process tests passed. No deliberate partial setup failure was injected into the owner's server. |
+
+Independent `pwsh -NoProfile -File scripts/check.ps1` passed in about 71 seconds: fmt and Clippy with both feature sets; 292 unit tests (four ignored), 60 debug process tests (48 ignored), and 57 release process tests (42 ignored). The release exe is 2,429,440 bytes and imports the expected ten in-box Windows DLLs. Both watched delivery timing tests and the R15 unit regressions passed. Live SQL Server tests and the ignored Credential Manager suite were not independently rerun; the developer reports 48 debug and 42 release live tests passed. The fresh-process synthetic Credential Manager probe above is independent evidence, distinct from that suite. Production source and Cargo.lock were unchanged; no remote or hosted action was taken.
 
 ### Phase 4: focused schema discovery (VISION priority 3a)
 
