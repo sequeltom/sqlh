@@ -2016,9 +2016,15 @@ pub(crate) mod fake_server {
     }
 
     fn send(s: &mut TcpStream, payload: &[u8]) {
+        send_packet(s, payload, true);
+    }
+
+    /// One packet of a server message; `last` marks the end of the message (EOM).
+    fn send_packet(s: &mut TcpStream, payload: &[u8], last: bool) {
         let length = u16::try_from(payload.len() + 8).unwrap();
         let [high, low] = length.to_be_bytes();
-        s.write_all(&[4, 1, high, low, 0, 0, 1, 0]).unwrap();
+        s.write_all(&[4, u8::from(last), high, low, 0, 0, 1, 0])
+            .unwrap();
         s.write_all(payload).unwrap();
     }
 
@@ -2068,6 +2074,9 @@ pub(crate) mod fake_server {
         Reply(Vec<u8>),
         /// Read it, and everything after it (the attention), and never answer.
         Silent,
+        /// Answer it with an `int` column and `rows` rows but no DONE, as a server does while
+        /// it is still producing a result; then read on (the attention) and never answer again.
+        RowsThenSilent { rows: u64 },
         /// Read `bytes` of it, then stop reading altogether and never answer, so the client's
         /// writes block part way through a request of several packets.
         StopReading { bytes: usize },
@@ -2100,6 +2109,20 @@ pub(crate) mod fake_server {
                     while receive(&mut s).is_some() {}
                 }
                 Script::Silent => while receive(&mut s).is_some() {},
+                Script::RowsThenSilent { rows } => {
+                    if receive(&mut s) == Some(1) {
+                        let mut reply = vec![0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, b'x', 0];
+                        for _ in 0..rows {
+                            reply.extend([0xd1, 1, 0, 0, 0]);
+                        }
+                        // In packets of at most 4,096 bytes, as negotiated, none of them the
+                        // message's last: the result is still being produced.
+                        for chunk in reply.chunks(4088) {
+                            send_packet(&mut s, chunk, false);
+                        }
+                    }
+                    while receive(&mut s).is_some() {}
+                }
                 Script::StopReading { bytes } => {
                     let mut taken = vec![0; bytes];
                     let _ = s.read_exact(&mut taken);
@@ -2219,6 +2242,17 @@ pub(crate) mod fake_server {
         server: String,
         sql: String,
         counting: Counting,
+        sink: S,
+    ) -> Ran<S> {
+        run_with(server, sql, 1, counting, sink)
+    }
+
+    /// `run_once` with `-t timeout` (0: no deadline).
+    fn run_with<S: BatchSink>(
+        server: String,
+        sql: String,
+        timeout: u32,
+        counting: Counting,
         mut sink: S,
     ) -> Ran<S> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2246,7 +2280,7 @@ pub(crate) mod fake_server {
                 .expect("connected to the fake server");
             let started = Instant::now();
             let outcome = session
-                .run(sql, 1, counting, &cancel, &mut sink, &Open)
+                .run(sql, timeout, counting, &cancel, &mut sink, &Open)
                 .await;
             let elapsed = started.elapsed();
             let after = if session.retired {
@@ -2363,6 +2397,32 @@ pub(crate) mod fake_server {
             hidden_work(),
         );
         assert!(timed_out(&ran.outcome), "{:?}", ran.outcome);
+    }
+
+    // The review's open item (Phase 2 completion review): sqlh's own stop of a count, which the
+    // server never acknowledges. The rows arrive, the 250 ms budget sends the attention, and
+    // the server, mid-result, goes silent. The driver gives up after its 5 s and closes the
+    // connection, and the run says it was sqlh's stop that went unconfirmed, not a cancel from
+    // outside (DESIGN.md §6, exit 6). Before this, only the message had a test.
+    #[test]
+    fn a_count_stop_the_server_never_confirms_closes_the_connection_and_says_so() {
+        let ran = run_with(
+            serve(Script::RowsThenSilent { rows: 2_000 }),
+            "SELECT x".into(),
+            0,
+            Counting::BOUNDED,
+            Sink::new(false, Duration::ZERO),
+        );
+        match &ran.outcome {
+            Err(DbError::Cancelled(message)) => assert_eq!(message, super::COUNT_STOP_UNCONFIRMED),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            ran.elapsed >= Duration::from_secs(5) && ran.elapsed < Duration::from_secs(8),
+            "{:?}",
+            ran.elapsed
+        );
+        assert!(!ran.sink.complete);
     }
 
     // The owner's hidden-row exception is kept: in a read-only run, a result whose shown rows
