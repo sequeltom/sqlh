@@ -56,7 +56,8 @@ src/output/      Output trait + Tally (shared limits/counts); text.rs (default),
                  delivery.rs (the writer thread and its bounded queue)
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
 tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
-tests/smoke.sql  read-only end-to-end script for a real server (manual)
+tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
+                 output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
                  size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features

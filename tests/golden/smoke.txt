@@ -1,0 +1,150 @@
+-- batch 1 (line 1)
+-- msg: batch 1: data types
+-- result 1
+ti:tinyint	si:smallint	i:int	bi:bigint	b:bit	r:real	f:float	f_big:float	d:decimal(18,2)	n:numeric(10,4)	m:money	sm:smallmoney
+1	-2	3	9223372036854775807	1	0.1	0.1	1e20	12.50	-1.2345	12.5000	-0.0001
+-- 1 row
+-- result 2
+dt:date	tm:time(7)	dtm:datetime	sdt:smalldatetime	dt2:datetime2(7)	dt2_2:datetime2(2)	dto:datetimeoffset(7)	dto_neg:datetimeoffset(0)
+2024-01-05	09:12:00.1234567	2024-01-05T09:12:00.123	2024-01-05T09:12:00	2024-01-05T09:12:00.1234567	2024-01-05T09:12:00.12	2024-01-05T09:12:00.1234567+01:00	2024-01-05T23:30:00-05:30
+-- 1 row
+-- result 3
+nv:nvarchar(13)	v:varchar(5)	c:char(10)	nc:nchar(3)	escapes:varchar(10)	null_string:varchar(4)	null_int:int	dashes:varchar(21)	long_text:varchar(max)	vb:varbinary(4)	long_bin:varbinary(max)	guid:uniqueidentifier	x:xml	sv:sql_variant
+héllo wörld ✓	plain	fixed     	x  	tab\tnl\nend	\NULL	NULL	--looks like metadata	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…[+1500]	0xDEADBEEF	0xABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB…[+750 bytes]	6F9619FF-8B86-D011-B42D-00C04FC964FF	<a b="1"/>	42
+-- 1 row; 2 values cut (--max-cell 500)
+-- result 4
+n:bigint
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+-- 100 of 150 rows shown (--max-rows 100)
+-- msg: a severity-10 message
+-- batch 2 (line 30, run 1 of 2)
+-- msg: batch 2: temp table writes are allowed in read-only mode; runs twice
+-- 2 statements, 3 rows affected
+-- result 5
+id:int	v:nvarchar(20)
+1	a
+2	c
+-- 2 rows
+-- batch 3 (line 30, run 2 of 2)
+-- msg: batch 2: temp table writes are allowed in read-only mode; runs twice
+-- 2 statements, 3 rows affected
+-- result 6
+id:int	v:nvarchar(20)
+1	a
+2	c
+-- 2 rows
+-- batch 4 (line 37)
+-- msg: batch 3: errors
+-- result 7
+before_error:int
+1
+-- 1 row
+-- result 8
+div_by_zero:int
+-- 0 rows so far (interrupted)
+-- error 8134 (severity 16, state 1, line 39): Divide by zero error encountered.
+-- result 9
+after_error:varchar(34)
+still runs after a statement error
+-- 1 row
+-- error 208 (severity 16, state 1, line 41): Invalid object name 'dbo.sqlh_no_such_table'.
+-- failed (exit 1): 2 errors, first in batch 4, N ms; <server>/<database>, connect N ms

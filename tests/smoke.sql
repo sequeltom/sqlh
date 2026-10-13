@@ -23,7 +23,8 @@ SELECT N'héllo wörld ✓' AS nv, 'plain' AS v, CAST('fixed' AS char(10)) AS c,
        CAST(REPLICATE(CAST(0xAB AS varbinary(max)), 1000) AS varbinary(max)) AS long_bin,
        CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier) AS guid,
        CAST('<a b="1"/>' AS xml) AS x, CAST(42 AS sql_variant) AS sv;
-SELECT name, object_id, type_desc FROM sys.all_objects ORDER BY object_id;  -- hits --max-rows
+SELECT TOP (150) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+FROM sys.all_columns;  -- 150 rows on any server: hits --max-rows
 RAISERROR('a severity-10 message', 10, 1);
 GO
 PRINT 'batch 2: temp table writes are allowed in read-only mode; runs twice';

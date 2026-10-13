@@ -5245,4 +5245,132 @@ mod live {
             assert!(r.stdout.contains(TIMEOUT_1), "{flags:?}: {}", r.stdout);
         }
     }
+
+    // PLAN.md 3.4: tests/smoke.sql against the server, compared whole with the expected output
+    // in tests/golden/: every data type's rendering, escapes, cut values, the row limit, temp
+    // tables in read-only mode, `GO n`, messages, a result an error cut short, errors mapped to
+    // their lines and the status line. Only what changes from run to run is normalized: the
+    // times, the server's name and version, and the database's name. After a deliberate change
+    // to the output, rerun with SQLH_BLESS=1 to rewrite the golden files, and review the diff.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_smoke_script_matches_its_golden_output() {
+        let (p, db) = target();
+        let smoke = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/smoke.sql");
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let bless = std::env::var_os("SQLH_BLESS").is_some();
+
+        let r = live(&p, &db, &["-i", smoke, "--continue-on-error"]);
+        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+        let text = normalize_status(&r.stdout, &db);
+        let r = live(
+            &p,
+            &db,
+            &["-i", smoke, "--continue-on-error", "--format", "json"],
+        );
+        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+        let mut doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
+        normalize_json(&mut doc, &db);
+        let json = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+
+        for (name, actual) in [("smoke.txt", &text), ("smoke.json", &json)] {
+            let path = golden.join(name);
+            if bless {
+                fs::create_dir_all(&golden).unwrap();
+                fs::write(&path, actual).unwrap();
+                continue;
+            }
+            let expected = fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e}; run with SQLH_BLESS=1 to create it",
+                    path.display()
+                )
+            });
+            // A checkout may have turned the golden file's line ends into CRLF.
+            let expected = expected.replace("\r\n", "\n");
+            if &expected != actual {
+                let line = expected
+                    .lines()
+                    .zip(actual.lines())
+                    .position(|(e, a)| e != a)
+                    .map_or_else(
+                        || expected.lines().count().min(actual.lines().count()),
+                        |i| i,
+                    );
+                panic!(
+                    "{name} differs from {} from line {}:\n  expected: {:?}\n  actual:   {:?}\n\
+                     (after a deliberate change, rerun with SQLH_BLESS=1 and review the diff)",
+                    path.display(),
+                    line + 1,
+                    expected.lines().nth(line),
+                    actual.lines().nth(line)
+                );
+            }
+        }
+    }
+
+    /// The text output with the status line's volatile parts replaced: `, 273 ms; db01/sqlh_test,
+    /// connect 216 ms` becomes `, N ms; <server>/<database>, connect N ms`.
+    fn normalize_status(text: &str, db: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            let line = if line.starts_with("-- ok: ") || line.starts_with("-- failed (") {
+                let (status, tail) = line
+                    .split_once("; ")
+                    .map_or((line, None), |(s, t)| (s, Some(t)));
+                let tail_db = format!("/{db}, connect ");
+                let tail = tail.map(|t| {
+                    assert!(t.contains(&tail_db), "{t}");
+                    "<server>/<database>, connect N ms".to_owned()
+                });
+                let status = match status.rsplit_once(", ") {
+                    Some((head, ms)) if ms.ends_with(" ms") => format!("{head}, N ms"),
+                    _ => status.to_owned(),
+                };
+                match tail {
+                    Some(tail) => format!("{status}; {tail}"),
+                    None => status,
+                }
+            } else {
+                line.to_owned()
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The JSON document with its volatile values replaced: times, and the connection's
+    /// server, version and database.
+    fn normalize_json(doc: &mut serde_json::Value, db: &str) {
+        use serde_json::Value;
+        fn walk(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    for (key, v) in map.iter_mut() {
+                        if key.ends_with("_ms") && v.is_u64() {
+                            *v = Value::from("N");
+                        } else {
+                            walk(v);
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(doc);
+        let connection = &mut doc["connection"];
+        assert_eq!(connection["database"], db, "{connection}");
+        connection["database"] = Value::from("<database>");
+        connection["server"] = Value::from("<server>");
+        connection["server_version"] = Value::from("<version>");
+        if let Some(summary) = doc["summary"].as_str() {
+            let summary = match summary.rsplit_once(", ") {
+                Some((head, ms)) if ms.ends_with(" ms") => format!("{head}, N ms"),
+                _ => summary.to_owned(),
+            };
+            doc["summary"] = Value::from(summary);
+        }
+    }
 }
