@@ -5293,10 +5293,7 @@ mod live {
                     .lines()
                     .zip(actual.lines())
                     .position(|(e, a)| e != a)
-                    .map_or_else(
-                        || expected.lines().count().min(actual.lines().count()),
-                        |i| i,
-                    );
+                    .unwrap_or_else(|| expected.lines().count().min(actual.lines().count()));
                 panic!(
                     "{name} differs from {} from line {}:\n  expected: {:?}\n  actual:   {:?}\n\
                      (after a deliberate change, rerun with SQLH_BLESS=1 and review the diff)",
@@ -5612,5 +5609,125 @@ mod live {
             r.stdout
         );
         assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+    }
+
+    /// A low-privilege login for one test (owner decision 5, PLAN.md 3.4): `db_datareader` in
+    /// the scratch database and `VIEW DEFINITION`, nothing else. It is made through the test
+    /// profile with a random password that never leaves this process and the sqlh processes it
+    /// starts: the SQL that sets it reaches sqlh on stdin (never a command line or a file), and
+    /// runs as the login get it from `SQLCMDPASSWORD` in their own environment (the test
+    /// profile's stored password is for its own login only, so sqlh uses the variable). The
+    /// login and its user are dropped when this goes out of scope.
+    struct Reader {
+        probe: Probe,
+        login: String,
+        password: String,
+    }
+
+    impl Reader {
+        fn create(profile: &str, database: &str) -> Reader {
+            // The probe checks the scratch marker before anything is written.
+            let probe = Probe::create(profile, database);
+            let login = format!("sqlh_reader_{}", std::process::id());
+            let password = random_password();
+            let sql = format!(
+                "USE master;\n\
+                 CREATE LOGIN [{login}] WITH PASSWORD = N'{password}';\n\
+                 USE [{database}];\n\
+                 CREATE USER [{login}] FOR LOGIN [{login}];\n\
+                 ALTER ROLE db_datareader ADD MEMBER [{login}];\n\
+                 GRANT VIEW DEFINITION TO [{login}];"
+            );
+            let r = Reader::admin(profile, database, &sql);
+            assert_eq!(r.code, 0, "creating the reader login failed:\n{}", r.stdout);
+            Reader {
+                probe,
+                login,
+                password,
+            }
+        }
+
+        /// Runs `sql` through the test profile with writes allowed, the SQL on stdin.
+        fn admin(profile: &str, database: &str, sql: &str) -> Run {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command.args([
+                "--profile",
+                profile,
+                "-d",
+                database,
+                "--allow-write",
+                "-i",
+                "-",
+            ]);
+            run_with_stdin(&mut command, sql.as_bytes())
+        }
+
+        /// sqlh as the reader: the test profile's server, this login, `args`.
+        fn run(&self, args: &[&str]) -> Run {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command
+                .stdin(Stdio::null())
+                .env("SQLCMDPASSWORD", &self.password)
+                .args(["--profile", &self.probe.profile, "-d", &self.probe.database])
+                .args(["-U", &self.login])
+                .args(args);
+            run(&mut command)
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let (login, database) = (&self.login, &self.probe.database);
+            let sql = format!(
+                "USE [{database}];\n\
+                 IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}];\n\
+                 USE master;\n\
+                 IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];"
+            );
+            let _ = Reader::admin(&self.probe.profile, database, &sql);
+        }
+    }
+
+    /// 128 random bits as a password that meets SQL Server's complexity policy: the keys of
+    /// std's `RandomState` come from the operating system's random source.
+    fn random_password() -> String {
+        use std::hash::BuildHasher;
+        let state = std::collections::hash_map::RandomState::new();
+        let (a, b) = (state.hash_one(1u8), state.hash_one(2u8));
+        format!("Aa1!{a:016x}{b:016x}")
+    }
+
+    // Owner decision 5 (PLAN.md 3.4): the database's permissions are the boundary, as DESIGN.md
+    // §7 says. A login with only read rights reads; asked to write, with --allow-write getting
+    // past sqlh's guard, the server refuses (error 229) and nothing changes; without
+    // --allow-write, sqlh's guard refuses first.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_read_only_login_reads_and_the_server_refuses_its_writes() {
+        let (p, db) = target();
+        let reader = Reader::create(&p, &db);
+        let t = reader.probe.name.clone();
+
+        let r = reader.run(&["-Q", &format!("SELECT COUNT(*) AS n FROM {t}")]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("n:int\n0\n"), "{}", r.stdout);
+
+        let insert = format!("INSERT {t} VALUES (1)");
+        let refused = reader.run(&["-Q", &insert]);
+        assert_eq!(refused.code, 5, "{}", refused.stdout);
+
+        let denied = reader.run(&["--allow-write", "-Q", &insert]);
+        assert_eq!(denied.code, 1, "{}", denied.stdout);
+        assert!(
+            denied.stdout.contains("-- error 229 (severity 14, "),
+            "{}",
+            denied.stdout
+        );
+        let count = live(&p, &db, &["-Q", &format!("SELECT COUNT(*) AS n FROM {t}")]);
+        assert!(count.stdout.contains("n:int\n0\n"), "{}", count.stdout);
+        assert!(
+            !denied.stdout.contains(&reader.password) && !denied.stderr.contains(&reader.password),
+            "the password never appears in the output"
+        );
     }
 }

@@ -6,6 +6,11 @@
 IF DB_ID(N'sqlh_test') IS NULL
     CREATE DATABASE sqlh_test;
 GO
+-- No point-in-time recovery for scratch data: the log is reused after each checkpoint
+-- (tests/fixtures/shrink_sqlh_test.sql gives back space a big experiment took).
+IF (SELECT recovery_model_desc FROM sys.databases WHERE name = N'sqlh_test') <> N'SIMPLE'
+    ALTER DATABASE sqlh_test SET RECOVERY SIMPLE;
+GO
 USE sqlh_test;
 GO
 -- The scratch marker: the live tests write only to a database that has this table, and

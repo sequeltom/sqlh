@@ -55,7 +55,7 @@ src/db/          the only mssql-tds user: connect, run a batch into a BatchSink,
 src/output/      Output trait + Tally (shared limits/counts); text.rs (default), json.rs, csv.rs;
                  delivery.rs (the writer thread and its bounded queue)
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
-tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
+tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use; shrinks it
 tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
@@ -130,6 +130,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - Process-level behavior (exit codes, files, crashes) gets a test in `tests/cli.rs`, isolated from the machine's profiles and `SQLCMD*` variables.
   - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop.
   - Test server details and credentials never go in the repo.
+  - Live tests that need permissions short of sysadmin use `Reader`: a login made per test with only read rights, whose random password exists only in the test process and in the environment of the sqlh processes it starts (decision 5). That is the one password a test may put in an environment variable; the owner's never.
   - `SQLH_DEBUG_PANIC`, `SQLH_DEBUG_STOP_HOLD_MS`, `SQLH_DEBUG_SESSION_PREFIX` (SQL sent ahead of the session setup, in the same batch) and `SQLH_DEBUG_ROW_WORK_US` (work per row and per value chunk in the row loop) exist only when debug assertions are on, so a test that needs one is `#[cfg(debug_assertions)]`: a release run must not report it as passed.
 - **`--help`:** models read it, so keep it example-first and under about 60 lines.
 - **README's "Built for agents" is a running tally.** When a change adds, alters or removes something made for agents (output shape, limits, errors, exit codes, guard behavior, safeguards, `--help` content), update that list in the same change: the entry, its `*(since ...)*` tag and the tally line. A planned item moves to Built only when its code and tests are committed; until then it stays under Planned with its PLAN.md task number. The README has a human reader (see "Documents and their readers"), so write each entry as what an agent gains and why it matters, in one or two plain lines; the exact behavior belongs in DESIGN.md.
