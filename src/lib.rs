@@ -14,6 +14,7 @@ mod guard;
 mod output;
 mod profile;
 mod run;
+mod schema;
 mod script;
 mod secret;
 mod signals;

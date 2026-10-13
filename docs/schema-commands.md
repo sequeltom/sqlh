@@ -1,6 +1,17 @@
 # Schema commands: design and plan
 
-Status: proposed (2026-10-09). This doc expands DESIGN.md §9 and becomes the spec once built. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
+Status: built 2026-10-13 (`src/schema.rs`; PLAN.md Phase 4), except `deps`, which stays phase 2. This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
+
+**As built, where it differs from the proposal below** (the sections below are corrected too):
+- **The lookup is not a batch.** `describe` and `def` look the name up first on the run's own connection (`run::Plan::Lookup`), inside the read-only wrapper; the lookup shows nothing, and its rows decide the one batch that follows. So a `describe` is `ok: 1 batch`. An error in the lookup ends the run as a failure quoting the server's message.
+- **`def` is escaped, not raw**, framed by its line count (the review's correction: framing that survives control characters): DESIGN.md §5.1 "Sections".
+- **Limits:** `describe` defaults to 2,000 rows a section and 4,000 characters a value; `def` to no cell limit, so `--max-output` bounds it. A flag wins; a profile's `max_rows`/`max_cell` don't apply to these two (they were chosen for queries). `tables` and `find` keep the run's limits.
+- **Resolution** (§5): an explicit schema is never set aside, and the fallback is case-insensitive, so it is defined for case-sensitive databases (the review's corrections). Name errors are exit 1; another database or a linked server is a usage error (exit 3).
+- **`tables`** matches the pattern against the bare name or `schema.name`, so `Ord*` and `sales.*` both work.
+- **Patterns** are bracket-escaped (`[%]`, `[_]`, `[[]`), not `ESCAPE N'\'`, so the same pattern works in `PATINDEX` for `find --text`.
+- **Hidden metadata is marked:** a default, computed column or check constraint whose definition the login can't see shows `(hidden)`, not NULL. Parameters show `output` and `readonly`, not `has_default`, which the catalog only keeps for CLR objects.
+- **Synonyms:** `describe` shows the `object` section with `base_object`; it doesn't describe the target (run `describe` on it). `def` of a synonym says what it points at.
+- **Temporary tables** are refused before connecting: each run is a new session, so `#t` is never visible (§8).
 
 Product direction updated 2026-10-10: [VISION.md](VISION.md) prioritizes concise schema discovery for agents with limited context working through human-led DBA/developer questions. The first release targets SQL Server 2025 Standard on Windows Server 2025 Standard. A 2016 floor is a candidate expansion, conditional on acceptable technical debt.
 
@@ -40,7 +51,7 @@ Each command is canned T-SQL that goes through the normal pipeline: the session 
 
 - **Trusted SQL skips the classifier.** The SQL is written by the tool, not the agent, so the keyword classifier (guard layer 1) is skipped for it. The rolled-back wrapper transaction (layer 2) still applies.
 - **Arguments are bound as literals, never spliced into identifiers.** User arguments become `DECLARE @name nvarchar(776) = N'...';` at the top of the batch, with single quotes doubled. That is the only escaping an `N'...'` literal needs, and it is unit-tested with hostile names.
-- **Two steps for object commands.** `describe`, `def` and `deps` first resolve the name in a small batch that returns `object_id`, the schema-qualified name and the type, or raises an error (§5). The second batch is chosen by type, so its sections are known in advance. That costs one extra round trip, about 1–5 ms on a LAN.
+- **Two steps for object commands.** `describe`, `def` and `deps` first look the name up (a lookup on the same connection that shows nothing) returning `object_id`, the schema-qualified name and the type; sqlh, not the SQL, raises the name errors (§5). The batch that follows is chosen by type, so its sections are known in advance. That costs one extra round trip, about 1–5 ms on a LAN.
 - **Compatibility is deliberate.** The sketches use property functions for some metadata and `FOR XML PATH` for aggregation to retain inexpensive portability. They are proposals, not a requirement to maintain one query across every historical SQL Server version. Validate first-release metadata semantics and assess any added complexity against the candidate 2016 floor.
 - **Aggregation sketch.** Lists such as index key columns use `STUFF((SELECT N', ' + ... FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')`. The `TYPE`/`.value()` form avoids XML entity escaping; a different implementation can be selected when its maintainability and target compatibility justify it.
 
@@ -51,24 +62,26 @@ A command returns several result sets, and each gets a **label** in place of a n
 - `-- <label>` replaces `-- result N`.
 - The header has **column names only**. The types would be the catalog query's own (`nvarchar(4000)` everywhere), which is noise.
 - **Empty sections print nothing.** One closing line lists them: `-- no rows: referenced_by, check_constraints, triggers`. The header is held back until the first row arrives, so an empty section costs nothing.
-- `def` prints its definition **raw**, framed by a count: `-- definition: dbo.usp_GetUser (SQL_STORED_PROCEDURE), 42 lines`, then exactly 42 lines as written. The count tells a reader where the block ends, even though T-SQL comments inside it start with `-- `.
+- `def` prints its definition framed by a count: `-- definition: dbo.usp_GetUser (SQL_STORED_PROCEDURE), 42 lines`, then exactly 42 lines, each escaped like a value except that a tab stays a tab (DESIGN.md §5.1). The count tells a reader where the block ends, even though T-SQL comments inside it start with `-- `.
+- A section's footer is written only when it didn't show everything (rows hidden, values cut).
 
 In the other formats:
 - **json:** result events gain `"label"`. Empty sections are kept, with `"rows":[]`, so the schema is stable. A `def` definition is a normal string value that is never cut.
 - **csv:** the label appears in the stderr marker (`-- columns: column, type, ...`), empty sections are skipped, and a definition is one quoted field.
 
-The mechanism is `Output::set_sections(&[Section])`, called before a canned batch runs. `Tally::start_result` takes the next section and its rendering hints: names-only header, collapse when empty, raw.
+The mechanism is `Output::set_sections(&[Section])`, called before a command's batch begins. `Tally::start_result` takes the next section (`Section { label, definition }`); every section has a names-only header and collapses when empty, and a `definition` one prints as a counted block.
 
-**Limits.** `describe` and `def` default to no row or cell limit (`--max-rows 0 --max-cell 0`), because a 150-column table or a long procedure is the answer, not noise. Explicit flags still apply. `tables` and `find` keep the normal limits, and the footer tells the agent to narrow the pattern.
+**Limits.** `describe` defaults to 2,000 rows a section and 4,000 characters a value, and `def` to no cell limit, because a 150-column table or a long procedure is the answer, not noise; `--max-output` still bounds the whole response (the review's correction: a high default under the response budget, not unlimited). Explicit flags still apply. `tables` and `find` keep the normal limits, and the footer tells the agent to narrow the pattern.
 
 ## 5. Name resolution (`describe`, `def`, `deps`)
 
-1. Try `OBJECT_ID(@name)`. It handles 1- and 2-part names, brackets and quoted names, and unqualified names in the user's default schema.
-2. If that fails, look for objects with that name in any schema (`PARSENAME(@name, 1)`, case-insensitive). If exactly one exists, use it. Agents often write `Users` when the table is `sales.Users`.
-3. If several exist, raise error 50000: `ambiguous name 'Users': sales.Users, archive.Users; qualify it with the schema`.
-4. If none exist, raise: `no object named 'Usrs' in database StackOverflow2010; try: sqlh find Usrs`.
+1. A linked-server name is refused, and a name in another database is refused with `run with -d Other` (exit 3). `PARSENAME` splits the name; a name it can't split is a usage error.
+2. Try `OBJECT_ID(@name)`. It handles 1- and 2-part names, brackets and quoted names, and unqualified names in the user's default schema, in the database's own collation. System objects resolve too (`sys.objects`).
+3. If that fails, look for top-level objects with that name (compared with `COLLATE Latin1_General_100_CI_AS`): in any schema for an unqualified name, and only in the schema given for a qualified one, compared the same way. An explicit schema is never set aside. If exactly one exists, use it: agents often write `Users` when the table is `sales.Users`, and in a case-sensitive database `users` still finds `Users`.
+4. If several exist (two schemas, or two names that differ only in case), the run fails: `ambiguous name Users: archive.Users, sales.Users; qualify it with the schema` (ten names at most, then `and N more`).
+5. If none exist: `no object named Usrs in database AppDb; try: sqlh find Usrs`.
 
-Errors come through the normal error path (exit 1, `-- error ...` in text, an error event in JSON).
+Name errors end the run as a failure (exit 1, `-- error: ...` in text, the document's `error` in JSON).
 
 ## 6. Command details
 
@@ -140,15 +153,15 @@ What each section contains:
 - **referenced_by:** the same, from the referencing side.
 - **check_constraints:** `name, definition, trusted`.
 - **triggers:** `name, events, instead_of, disabled`.
-- **parameters:** `name, type, output, has_default`. The default value itself isn't in the catalog, so `def` is the way to see it.
+- **parameters:** `name, type, output, readonly`. Whether a T-SQL parameter has a default isn't in the catalog (`has_default_value` is only kept for CLR objects), so `def` is the way to see it. A scalar function's return type is `(return)`, which the catalog marks as an output.
 
 Example of the intended text output:
 
 ```
 $ sqlh --profile test describe Users
 -- object
-name	type	rows	created	modified	description
-dbo.Users	USER_TABLE	299398	2018-06-01T11:02:44.137	2018-06-01T11:02:44.137	NULL
+name	type	rows	flags	created	modified	description
+dbo.Users	USER_TABLE	299398	NULL	2018-06-01T11:02:44.137	2018-06-01T11:02:44.137	NULL
 -- columns
 column	type	null	identity	default	computed	description
 Id	int	0	1	NULL	NULL	NULL
@@ -161,7 +174,7 @@ DisplayName	nvarchar(40)	0	0	NULL	NULL	NULL
 name	type	unique	pk	keys	includes	filter	disabled
 PK_Users_Id	CLUSTERED	1	1	Id	NULL	NULL	0
 -- no rows: foreign_keys, referenced_by, check_constraints, triggers
--- ok: 2 batches, 31 ms
+-- ok: 1 batch, 31 ms; db01/StackOverflow2010, connect 25 ms
 ```
 
 ### 6.5 `find <pattern> [--text]`
@@ -180,8 +193,9 @@ SELECT @qualified AS name, o.type_desc AS type, OBJECT_DEFINITION(@id) AS defini
 FROM sys.objects AS o WHERE o.object_id = @id;
 ```
 
-- **NULL definition:** error 50000, `definition of dbo.p is not visible: it is encrypted, or the login lacks VIEW DEFINITION`.
-- **Tables:** error, `def shows views, procedures, functions and triggers; for tables use: sqlh describe dbo.Users`. Scripting `CREATE TABLE` is out of scope.
+- **NULL definition:** the run fails (exit 1), `the definition of dbo.p (SQL_STORED_PROCEDURE) is not visible: it is encrypted, it has none (a constraint, a CLR or extended procedure), or the login lacks VIEW DEFINITION`. The lookup checks this, so no batch runs.
+- **Tables:** the run fails, `def shows views, procedures, functions and triggers; for a table use: sqlh describe dbo.Users`. Scripting `CREATE TABLE` is out of scope.
+- **Synonyms:** the run fails, `dbo.s is a synonym for [dbo].[t]; run: sqlh def [dbo].[t]`.
 
 ### 6.7 `deps <object>` (phase 2)
 
@@ -204,9 +218,9 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
 - **Candidate floor:** SQL Server 2016 / Windows Server 2016, subject to acceptable technical debt. Prefer inexpensive portability; do not add speculative fallback paths or retain an unconditional SQL Server 2012 restriction.
 - **Azure SQL DB:** a future compatibility consideration, not a first-release gate. The scope restrictions and limited `dbs` behavior described above remain constraints if Azure support is pursued.
 - **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed. No command needs `VIEW SERVER STATE`.
-- **Temp tables:** `describe #t` works only on the session that created the table. That means MCP sessions (`docs/mcp-mode.md`), not one-shot CLI calls, so the help text says so.
+- **Temp tables:** `describe #t` works only on the session that created the table. That means MCP sessions (`docs/mcp-mode.md`), not one-shot CLI calls, so the CLI refuses `#` names before connecting (exit 1, `#t is a temporary table, which only the session that made it can see; each sqlh run is a new session`).
 
-## 9. Implementation plan
+## 9. Implementation plan (done 2026-10-13, except `deps`; as built above)
 
 1. **Output sections** (`src/output/`)
    - `Section { label, names_only, collapse_empty, raw }` and `Output::set_sections`
@@ -232,10 +246,9 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
    - `--help`: a SCHEMA section, under 8 lines
    - DESIGN.md §5.1: labeled sections
    - §9: points here
-7. **Live checks:**
-   - against StackOverflow2010: users, posts, votes and their keys
+7. **Live checks** (as built: `schema_commands_describe_what_the_catalog_holds` in `tests/cli.rs`, with no one-time setup and no StackOverflow2010):
    - against system objects: `describe sys.objects` works, because catalog views are views
-   - against a fixture schema: a view, a procedure with output parameters, a scalar function and a TVF, a filtered and an included-column index, foreign keys both ways, a computed column, a check constraint, a trigger, a synonym, and an alias type. This lives in `tests/fixtures/schema.sql`, which creates schema `sqlh_test`. It needs `--allow-write`, so it is an opt-in, one-time setup on the test server, and it comes with a drop script.
+   - against a fixture each run makes in the scratch database and drops (`Schema`, on the `Objects` fixture): a view, a procedure with an output parameter and a `--` comment line, a scalar function and a TVF, a filtered index with a descending key and an include, foreign keys both ways, a computed column, a default, a check constraint, a trigger, a synonym, an alias type, descriptions, and two tables with one name in two schemas for the ambiguity
 
 ## 10. Open questions
 

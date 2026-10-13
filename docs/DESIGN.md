@@ -265,6 +265,11 @@ id:int	name:nvarchar(50)	created:datetime2(7)
   - The status before the tail can hold `; ` itself (`...; 3 later batches not run (...)`), but never a `/`. So a program that splits the line takes the first `/` as the end of the server, the last `; ` before it as the start of the tail, and `, connect N ms` at the end as the time.
   - In csv the line is on stderr with the rest of the metadata (§5.3). In JSON, `summary` is the status without the tail, because `connection` and `connect_ms` carry it (§5.2).
 - **Diagnostics:** `--verbose` writes `sqlh: <text>` lines to stderr, the one thing text and json put there. They are escaped like a note, counted in `--max-output` and shortened like a note; if stderr is closed they are lost and nothing else changes (§6).
+- **Sections** (schema commands, §9 and schema-commands.md §4): each result set of a schema command fills a labeled section, written differently from a query's result set.
+  - `-- <label>` (`-- columns`, `-- indexes`, ...) replaces `-- result N`, and the header is the column names only, tab-separated, without types (they would be the catalog query's own). Both come with the section's first row.
+  - **A section with no rows writes nothing.** The batch's empty sections are listed on one line after it: `-- no rows: foreign_keys, referenced_by`.
+  - **A footer only for what wasn't shown:** a section that showed all its rows has no footer; one with rows hidden or values cut has the usual one (`-- 100 of 4000 rows shown (--max-rows 100)`).
+  - **A definition** (`def`) is a block framed by its line count: `-- definition: dbo.usp_Get (SQL_STORED_PROCEDURE), 42 lines`, then exactly 42 lines. A reader skips that many lines, so a line inside that starts with `--` (a T-SQL comment) is never metadata. Each line is escaped like a value (a backslash doubled, a control character `\xNN`, U+2028 ` `), except that a tab stays a tab: nothing in a line can break it. A trailing line break doesn't make an empty last line. Lines that don't fit `--max-output` are left out whole; the header then says `first 30 of 42 lines shown (--max-output)` (`≥42` when the definition was longer than the budget could read), and the closing note counts the definition lines not shown.
 
 **Order of events**
 
@@ -312,7 +317,7 @@ The output is not in the order of the server's bytes ("wire order"). It is in th
 `--format json` writes one JSON document. It is streamed, so memory stays flat. The head (the contract version, and once sqlh has connected, the connection and how long that took) comes first because it is known before anything runs, and the outcome fields come last because they are only known at the end.
 
 ```json
-{"contract_version":"2.0",
+{"contract_version":"2.1",
  "connection":{"server":"SQL01","database":"AppDb","auth":"sql","encrypted":true,"server_version":"17.0.1000"},
  "connect_ms":31,
  "batches":[
@@ -331,13 +336,14 @@ The output is not in the order of the server's bytes ("wire order"). It is in th
 ```
 
 **Contract version**
-- `contract_version` is the document's first field: `major.minor`, `"2.0"` here. `sqlh --version` reports it too, as `sqlh 0.1.0 (json contract 2.0)`, so a tool can see what to expect before it runs anything. Text and csv carry no version, because it would cost tokens on every call.
+- `contract_version` is the document's first field: `major.minor`, `"2.1"` here. `sqlh --version` reports it too, as `sqlh 0.1.0 (json contract 2.1)`, so a tool can see what to expect before it runs anything. Text and csv carry no version, because it would cost tokens on every call.
 - The major version changes only for an incompatible change: a field or an event type removed or renamed, or its type or meaning changed. A minor version may add optional fields, event types and enum values (the `type` of an event, the `auth` words). So a reader written for N.x ignores fields and event types it doesn't know, and doesn't treat the values of an enumeration as a closed list.
 - **A reader must check the major version first and reject a document whose major it doesn't support**, without reading further: it stops, or tells its user that the contract is newer than it handles. A reader that skips this check can misread a document whose meaning changed (the history below is the example). The minor version is never a reason to reject.
 - **Version history.**
   - 1.0: `contract_version`, `connection` and `connect_ms` in the head, and `elapsed_ms` on every batch.
   - 1.1: added `row_count_exact` to every result and `counting_stopped` to every batch (the bounded count of hidden rows, §4.4). It was built during development and never released as a stable contract.
-  - 2.0, the document described here: the same fields and shapes as 1.1, under a new major version because a result's `row_count` can now be a lower bound (when `row_count_exact` is `false`, §4.4). A reader following the 1.0 rules ignores `row_count_exact` and `counting_stopped`, sees `ok: true` and no `interrupted`, and would take the bound for the exact total, and take a batch whose later statements were cancelled for one that completed. Adding a qualifier that an old reader may ignore does not keep the old meaning, so the major version changed: that reader sees `"2.0"`, fails its major check and rejects the document, rather than misreading it (a unit test in `output/json.rs` applies this check to a stopped-count document). In 2.0 `row_count` is the exact total only when `row_count_exact` is `true`, and a reader tests that field before it uses the count.
+  - 2.1, the document described here: 2.0 with `label` on the result events of a schema command (below), an optional field a 2.0 reader ignores. Nothing else changed.
+  - 2.0: the same fields and shapes as 1.1, under a new major version because a result's `row_count` can now be a lower bound (when `row_count_exact` is `false`, §4.4). A reader following the 1.0 rules ignores `row_count_exact` and `counting_stopped`, sees `ok: true` and no `interrupted`, and would take the bound for the exact total, and take a batch whose later statements were cancelled for one that completed. Adding a qualifier that an old reader may ignore does not keep the old meaning, so the major version changed: that reader sees `"2.0"`, fails its major check and rejects the document, rather than misreading it (a unit test in `output/json.rs` applies this check to a stopped-count document). In 2.0 `row_count` is the exact total only when `row_count_exact` is `true`, and a reader tests that field before it uses the count.
 
 **Connection**
 - `connection` and `connect_ms` follow the version once sqlh has connected. They are written as soon as the login is done, before the first batch, from facts the login already gave, so they cost no round trip. When nothing connected (a usage error, a guard refusal, a failed connect, an input with no SQL) both are left out.
@@ -361,6 +367,7 @@ The output is not in the order of the server's bytes ("wire order"). It is in th
   - `truncated` means rows were hidden: a row past the shown ones was counted, so it is true whenever `row_count` is above the number of rows in `rows`. In a stopped count it is `false` only when `-t` ended the wait for the first hidden row, so none was counted; `row_count` is then the rows shown and `row_count_exact` is `false`, which is how a reader knows that more rows may exist.
   - `cells_cut` counts values cut by `--max-cell` (they end in `…[+N]`).
   - Result sets hidden by `--max-results` emit no event; a note counts them.
+  - `label` (2.1): on a schema command's results only, after `type`, the section the result fills (`"object"`, `"columns"`, ...; §5.1 "Sections"). A section with no rows is kept, with `"rows":[]`, so the document's shape doesn't depend on the data. A definition is an ordinary value, cut only by `--max-output`. The batch's `source` is the command's name (`"describe"`), and `line` is 1.
 - **rows_affected:** `count` is the number of rows. A run of consecutive statements is one event, which then also carries `statements`: `{"type":"rows_affected","count":300,"statements":300}`.
 - **error:**
   - `line` is mapped to the input, as in the text format. `source` is added when there are several inputs.
@@ -391,6 +398,7 @@ The output is not in the order of the server's bytes ("wire order"). It is in th
   - Limits apply as everywhere; for a full export pass `--max-rows 0 --max-cell 0`. A stopped count (§4.4) is on stderr: the footer `-- 100 of ≥800000 rows shown (--max-rows 100; counting stopped)`, the note, and `counting stopped in N` in the status line (§5.1).
   - A result a SQL error ended has the incomplete footer on stderr (`-- 2 rows so far (interrupted)`, §5.1); the data stream holds the rows that arrived, with nothing to tell it apart, so a reader of csv checks stderr or the exit code (1).
   - Known ambiguity: a one-column row holding NULL is an empty line, the same as the separator between result sets.
+  - A schema command's section (§5.1 "Sections") writes its header row and a `-- <label>: name, name` marker on stderr with its first row, no types; a section with no rows writes nothing and is listed on stderr's `-- no rows:` line. A definition is one quoted field.
 - **md (not built yet):** unpadded GitHub tables. `|` is written as `\|` and newlines as `<br>`. Messages are plain lines.
 
 Usage errors found while parsing the arguments happen before `--format` is known, so they always use the text format.
@@ -425,7 +433,7 @@ Diagnostics on stderr are best effort and bounded: one that can't be delivered n
 
 Text in a diagnostic that comes from elsewhere, such as the run's own error message or a path, is cut after 1,000 characters with a `…[+N]` marker and escaped like metadata, so a file name holding U+2028 or U+2029 shows them as `\u2028` and `\u2029`, and a backslash is doubled.
 
-In the text, json and md formats, everything goes to stdout in order: results, messages, SQL errors, connection and usage errors, and the summary. That gives agents one stream to read. stderr carries only `--verbose` diagnostics, delivery failures (exit 7) and internal errors (exit 10), except in csv mode (§5.3). The order is the one in §5.1, "Order of events". `--help` and `--version` print to stdout, with no status line. `--version` prints the program's version and the version of the JSON contract (§5.2): `sqlh 0.1.0 (json contract 2.0)`.
+In the text, json and md formats, everything goes to stdout in order: results, messages, SQL errors, connection and usage errors, and the summary. That gives agents one stream to read. stderr carries only `--verbose` diagnostics, delivery failures (exit 7) and internal errors (exit 10), except in csv mode (§5.3). The order is the one in §5.1, "Order of events". `--help` and `--version` print to stdout, with no status line. `--version` prints the program's version and the version of the JSON contract (§5.2): `sqlh 0.1.0 (json contract 2.1)`.
 
 Connection errors must be actionable. They name the server, port, auth method and encryption mode, give the underlying error, and add a hint where one applies, such as:
 - a named instance with SQL Browser unreachable: try `host,port`
@@ -565,18 +573,20 @@ write_policy = "deny"
   - **The output** is text only (owner, 2026-10-13, PLAN.md §6.13): a result set like a query's text output, with the profiles file's path as a note. Every field is escaped as in any result (§5.1), so a description's backslash is doubled and nothing in it can start a line. `--format` is a usage error here: listing profiles is setup an agent does once, text is the cheapest format to read, and a json listing would need a document shape of its own (R25).
 - `sqlh profile rm NAME` removes the profile from the file, then its credential. If the credential can't be deleted, the error says so; running `rm` again finishes the job, deleting a password a removed profile left behind.
 
-## 9. Agent subcommands (M2)
+## 9. Schema commands (built 2026-10-13, PLAN.md Phase 4)
 
-The detailed design and plan is [schema-commands.md](schema-commands.md). It covers labeled output sections, name resolution, patterns, the per-command SQL, and the implementation plan. Summary:
+The spec is [schema-commands.md](schema-commands.md): invocation, labeled output sections (§5.1 "Sections"), name resolution, patterns, and each command's SQL. A command is the first word that isn't an option (`sqlh --profile dev describe dbo.Orders`), runs its own SQL in the current database as a read-only run, and takes `--format`, `-o` and the limits like any run. Summary:
 
-| Subcommand | Output |
+| Command | Output |
 |---|---|
-| `info` | Server version and edition, current database, login and user, encryption, auth scheme, server time. |
-| `dbs` | Databases with state, compatibility level and recovery model. On Azure SQL DB, just the current database. |
-| `tables [pattern]` | Schema-qualified tables and views with an estimated row count. |
-| `describe <object>` | Columns (type, nullability, identity, computed, default), primary key, indexes (keys, includes, filter), FKs both ways, triggers, and estimated rows. Parameters for procedures and functions. |
-| `find <pattern> [--text]` | Objects and columns whose names match (substring, or a `*`/`?` glob; case-insensitive). `--text` also searches module bodies. |
-| `def <object>` | `OBJECT_DEFINITION`, printed raw and exempt from `--max-cell`. |
+| `info` | Server, version, edition, database, login, user, transport, auth scheme, server time; the connection as a note. |
+| `dbs` | Databases with state, access, compatibility level, recovery model, read-only and collation. |
+| `tables [pattern]` | Tables and views (name, type, estimated rows, modified) whose name or `schema.name` matches. |
+| `describe <object>` | Tables: `object` (rows, flags, description), `columns`, `indexes`, `foreign_keys`, `referenced_by`, `check_constraints`, `triggers`. Views: `object`, `columns`, `indexes`. Procedures and functions: `object`, `parameters` (and `columns` for table-valued functions). System objects too (`describe sys.dm_exec_requests`). |
+| `find <pattern> [--text]` | `objects` and `columns` whose names match (substring, or a `*`/`?` glob; case-insensitive); `--text` adds `definitions`, the first matching line of each module body. |
+| `def <object>` | The source of a view, procedure, function or trigger, as a block framed by its line count (§5.1). |
+
+Name errors (an unknown or ambiguous name, a table given to `def`, a temporary table) end the run with exit 1 and say what to do; a name in another database or on a linked server is a usage error (exit 3). `--check` and `-Q`/`-i` don't combine with a command (exit 3).
 
 Catalog SQL must be validated on SQL Server 2025 Standard for the first release. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but evaluate compatibility costs rather than enforcing the earlier SQL Server 2012 restriction. Azure-specific constraints remain relevant to future expansion and are not first-release gates.
 

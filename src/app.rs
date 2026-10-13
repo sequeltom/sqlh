@@ -126,13 +126,33 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
             started,
         );
     }
-    let settings = match config::resolve(&opts) {
+    if opts.command.is_some() && opts.check {
+        return fail_within(
+            Failure::usage("--check compiles your SQL; a schema command runs its own"),
+            format,
+            flagged,
+            started,
+        );
+    }
+    let mut settings = match config::resolve(&opts) {
         Ok(settings) => settings,
         Err(failure) => return fail_within(failure, format, flagged, started),
     };
+    // A schema command's SQL is sqlh's own (read-only, unguarded), with its own default limits.
+    let origin = match &opts.command {
+        Some(command) => {
+            command.limits(
+                &mut settings.limits,
+                opts.max_rows.is_some(),
+                opts.max_cell.is_some(),
+            );
+            QueryOrigin::Generated
+        }
+        None => origin,
+    };
     // Everything that can fail before the run happens before `-o` is opened, so bad input
     // never truncates or replaces an existing output file.
-    let prepared = match request(&opts).and_then(|r| run::prepare(&r, &settings, origin)) {
+    let prepared = match request(&opts).and_then(|r| run::prepare(r, &settings, origin)) {
         Ok(prepared) => prepared,
         Err(failure) => return fail_within(failure, format, settings.limits, started),
     };
@@ -169,6 +189,20 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
 
 /// What the run core is asked to do (`run::Request`), from the command line.
 fn request(opts: &Opts) -> Result<Request, Failure> {
+    if let Some(command) = &opts.command {
+        return Ok(Request {
+            input: command.input()?,
+            vars: None,
+            terminator: "GO".into(),
+            check: false,
+            continue_on_error: false,
+            report: if opts.verbose && command.report() == Report::Off {
+                Report::Diagnostic
+            } else {
+                command.report()
+            },
+        });
+    }
     let input = match (&opts.query, opts.inputs.is_empty()) {
         (Some(_), false) => return Err(Failure::usage("give SQL with -Q or with -i, not both")),
         (Some(query), true) => Input::Query(query.clone()),

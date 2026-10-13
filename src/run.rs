@@ -18,12 +18,11 @@ use crate::db::{
 };
 use crate::error::{Exit, Failure};
 use crate::guard;
-use crate::output::{self, BatchInfo, Output};
+use crate::output::{self, BatchInfo, Output, Section};
 use crate::script::{self, Batch, Source};
 use crate::signals::{Signal, Signals};
 
 /// Where a run's SQL comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Input {
     /// The SQL itself (`-Q`).
     Query(String),
@@ -31,6 +30,31 @@ pub(crate) enum Input {
     Files(Vec<String>),
     /// Nothing named: stdin, unless it is a console.
     Stdin,
+    /// A schema command's own SQL (schema-commands.md); `name` is what errors and the batch
+    /// lines call its source.
+    Command { name: &'static str, plan: Plan },
+}
+
+/// One batch of sqlh's own SQL, and the sections its result sets fill, in order.
+#[derive(Debug)]
+pub(crate) struct Step {
+    pub(crate) sql: String,
+    pub(crate) sections: Vec<Section>,
+}
+
+/// The rows a lookup returned: for each of its result sets, its rows.
+pub(crate) type Found = Vec<Vec<Vec<Value>>>;
+
+/// What decides a lookup's steps from its rows, or why there are none.
+pub(crate) type Then = Box<dyn Fn(&Found) -> Result<Vec<Step>, Failure>>;
+
+/// A command's SQL: steps known in advance (`tables`), or a lookup whose rows decide them
+/// (`describe` resolves a name first, and what it describes depends on the object's type).
+/// The lookup runs on the run's own connection, inside its wrapper transaction, and shows
+/// nothing: its rows go to `then`, and an error in it ends the run as a failure.
+pub(crate) enum Plan {
+    Steps(Vec<Step>),
+    Lookup { sql: String, then: Then },
 }
 
 /// Where the line about the connection goes: nowhere, to stderr as a diagnostic
@@ -44,7 +68,6 @@ pub(crate) enum Report {
 
 /// What to run and how, apart from the connection settings: everything the run core takes from
 /// the command line, which builds it (`app`).
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Request {
     pub(crate) input: Input,
     /// Values for `$(var)` (`-v`; environment variables resolve too). `None` turns substitution
@@ -282,22 +305,66 @@ impl BatchSink for Counted<'_> {
 pub(crate) struct Prepared {
     pub(crate) sources: Vec<Source>,
     batches: Vec<Batch>,
+    /// The sections each batch's result sets fill; empty for the user's SQL.
+    sections: Vec<Vec<Section>>,
+    /// A command's lookup (`Plan::Lookup`): its SQL, and what makes the batches of its rows.
+    lookup: Option<(String, Then)>,
     policy: RunPolicy,
     report: Report,
     /// Where and why the guard refused the input, if it did.
     blocked: Option<(String, guard::Blocked)>,
 }
 
+/// A command's steps as batches of its one source, with their sections.
+fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Vec<Section>>) {
+    steps
+        .into_iter()
+        .map(|step| {
+            let batch = Batch {
+                sql: step.sql,
+                source: 0,
+                line: 1,
+                repeat: 1,
+                line_map: Vec::new(),
+            };
+            (batch, step.sections)
+        })
+        .unzip()
+}
+
 pub(crate) fn prepare(
-    request: &Request,
+    request: Request,
     settings: &Settings,
     origin: QueryOrigin,
 ) -> Result<Prepared, Failure> {
+    let policy = RunPolicy::of(&request, settings, origin);
+    if let Input::Command { name, plan } = request.input {
+        let sources = vec![Source {
+            name: name.into(),
+            path: None,
+            text: String::new(),
+        }];
+        let (batches, sections, lookup) = match plan {
+            Plan::Steps(steps) => {
+                let (batches, sections) = step_batches(steps);
+                (batches, sections, None)
+            }
+            Plan::Lookup { sql, then } => (Vec::new(), Vec::new(), Some((sql, then))),
+        };
+        return Ok(Prepared {
+            sources,
+            batches,
+            sections,
+            lookup,
+            policy,
+            report: request.report,
+            blocked: None,
+        });
+    }
     let sources = load_sources(&request.input)?;
     let user = origin == QueryOrigin::User;
     let vars = request.vars.as_deref().filter(|_| user);
     let batches = script::prepare(&sources, &request.terminator, vars).map_err(Failure::usage)?;
-    let policy = RunPolicy::of(request, settings, origin);
     let blocked = if user {
         batches.iter().find_map(|batch| {
             guard::check(&batch.sql, policy.guard())
@@ -312,7 +379,9 @@ pub(crate) fn prepare(
     };
     Ok(Prepared {
         sources,
+        sections: Vec::new(),
         batches,
+        lookup: None,
         policy,
         report: request.report,
         blocked,
@@ -358,7 +427,7 @@ async fn execute_inner(
         }
         return (Err(Failure::new(Exit::Blocked, "")), None);
     }
-    if prepared.batches.is_empty() {
+    if prepared.batches.is_empty() && prepared.lookup.is_none() {
         let noted = out
             .note("no SQL to run")
             .map(|()| Stats::default())
@@ -385,6 +454,8 @@ fn load_sources(input: &Input) -> Result<Vec<Source>, Failure> {
         }
         Input::Files(files) => files.as_slice(),
         Input::Stdin => &[],
+        // A command's SQL is its plan's (`prepare`); it has no sources to read.
+        Input::Command { .. } => return Ok(Vec::new()),
     };
     let mut sources = Vec::new();
     let mut left = script::MAX_INPUT_BYTES;
@@ -481,8 +552,11 @@ async fn run_cancellable(
 ) -> (Result<Stats, Failure>, Option<Signal>) {
     let root = Cancel::new();
     let cancel = root.child();
-    let work = run_session(settings, prepared, out, gate, &cancel, counts, started);
-    tokio::pin!(work);
+    // On the heap: the session's future is large, the more so in a debug build, and the main
+    // thread's stack is 1 MB.
+    let mut work = Box::pin(run_session(
+        settings, prepared, out, gate, &cancel, counts, started,
+    ));
     tokio::select! {
         result = &mut work => (result, None),
         signal = signals.recv() => {
@@ -598,6 +672,18 @@ async fn run_session(
         }
     }
 
+    // A command's lookup decides its batches; it shows nothing (`Plan::Lookup`).
+    let looked_up;
+    let (batches, sections) = match &prepared.lookup {
+        None => (batches, &prepared.sections),
+        Some((sql, then)) => {
+            // Boxed: its state would otherwise add to the session's future, which a debug
+            // build lays out big enough to overflow the main thread's stack.
+            let found = Box::pin(look_up(&mut session, sql, timeout, cancel, gate)).await?;
+            looked_up = step_batches(then(&found)?);
+            (&looked_up.0, &looked_up.1)
+        }
+    };
     let xact_abort = batches
         .iter()
         .any(|batch| guard::mentions_xact_abort(&batch.sql));
@@ -605,7 +691,8 @@ async fn run_session(
     let mut stats = Stats::default();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
     let mut number = 0;
-    'batches: for batch in batches {
+    'batches: for (index, batch) in batches.iter().enumerate() {
+        out.set_sections(sections.get(index).map_or(&[], Vec::as_slice));
         for run in 1..=batch.repeat {
             number += 1;
             // A cancel ends the batch it reaches; this makes sure no later one starts.
@@ -699,6 +786,89 @@ async fn run_session(
     }
     session.close().await;
     Ok(stats)
+}
+
+/// Runs a command's lookup (`Plan::Lookup`) and returns its rows. It shows nothing: an error
+/// in it ends the run as a failure that quotes the server's message, and its messages are
+/// dropped, so no event reaches the output outside a batch.
+async fn look_up(
+    session: &mut Session,
+    sql: &str,
+    timeout: u32,
+    cancel: &Cancel,
+    gate: &dyn Backpressure,
+) -> Result<Found, Failure> {
+    let mut capture = Capture::default();
+    session
+        .run(
+            sql.to_owned(),
+            timeout,
+            Counting::EXACT,
+            cancel,
+            &mut capture,
+            gate,
+        )
+        .await
+        .map_err(|e| match e {
+            DbError::Timeout(_) => Failure::new(
+                Exit::Timeout,
+                format!("query timeout after {timeout} s while looking the name up; raise -t"),
+            ),
+            e => db_failure(e),
+        })?;
+    match capture.error {
+        Some((number, text)) => Err(Failure::new(
+            Exit::SqlError,
+            format!("looking the name up failed: error {number}: {text}"),
+        )),
+        None => Ok(capture.found),
+    }
+}
+
+/// The sink of a lookup: keeps every row of every result set, and its first error.
+#[derive(Default)]
+struct Capture {
+    found: Found,
+    error: Option<(u32, String)>,
+}
+
+impl BatchSink for Capture {
+    fn columns(&mut self, _columns: &[Column]) -> io::Result<()> {
+        self.found.push(Vec::new());
+        Ok(())
+    }
+    fn wants_values(&self) -> bool {
+        true
+    }
+    fn cell_limit(&self) -> usize {
+        0
+    }
+    fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        if let Some(rows) = self.found.last_mut() {
+            rows.push(values.to_vec());
+        }
+        Ok(())
+    }
+    fn skipped_row(&mut self) {}
+    fn counting_stopped(&mut self, _by: Stop) {}
+    fn end_rows(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn end_rows_incomplete(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn rows_affected(&mut self, _count: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn message(&mut self, _message: &ServerMessage) -> io::Result<()> {
+        Ok(())
+    }
+    fn error(&mut self, error: &ServerMessage) -> io::Result<()> {
+        if self.error.is_none() {
+            self.error = Some((error.number, error.text.clone()));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn db_failure(error: DbError) -> Failure {
@@ -917,8 +1087,8 @@ mod tests {
     // allows writes.
     #[test]
     fn generated_sql_skips_substitution_and_the_guard_but_not_the_wrapper() {
-        let opts = query("UPDATE $(t) SET x = 1");
-        let user = prepare(&opts, &settings(false), QueryOrigin::User).unwrap();
+        let opts = || query("UPDATE $(t) SET x = 1");
+        let user = prepare(opts(), &settings(false), QueryOrigin::User).unwrap();
         assert_eq!(user.batches[0].sql, "UPDATE dbo.T SET x = 1");
         let (location, blocked) = user.blocked.as_ref().expect("the guard refuses it");
         assert_eq!(location, "line 1");
@@ -929,7 +1099,8 @@ mod tests {
         );
 
         for allow_write in [false, true] {
-            let generated = prepare(&opts, &settings(allow_write), QueryOrigin::Generated).unwrap();
+            let generated =
+                prepare(opts(), &settings(allow_write), QueryOrigin::Generated).unwrap();
             assert_eq!(generated.batches[0].sql, "UPDATE $(t) SET x = 1");
             assert!(generated.blocked.is_none());
             assert!(
@@ -938,7 +1109,7 @@ mod tests {
             );
         }
         // The user's SQL under a profile that allows writes runs without it.
-        let user = prepare(&query("SELECT 1"), &settings(true), QueryOrigin::User).unwrap();
+        let user = prepare(query("SELECT 1"), &settings(true), QueryOrigin::User).unwrap();
         assert!(!user.policy.wrap());
     }
 

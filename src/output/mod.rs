@@ -17,6 +17,7 @@ pub mod delivery;
 pub mod json;
 pub mod text;
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
@@ -210,6 +211,36 @@ pub trait Output: BatchSink {
     /// never shortened; the error and notes are, to fit the budget.
     fn finish(&mut self, summary: &Summary) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
+    /// The sections the next result sets fill, in order (schema commands, schema-commands.md
+    /// §4): each takes the next label. Called before the batch that returns them begins.
+    fn set_sections(&mut self, sections: &[Section]);
+}
+
+/// A labeled result set of a schema command (schema-commands.md §4). In text and csv its
+/// header is the column names only and comes with its first row, and one with no rows is
+/// listed on a `-- no rows: ...` line instead; JSON gives its result event a `label`. A
+/// `definition` section is one row (name, type, definition) whose definition text prints
+/// as a block framed by its line count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Section {
+    pub label: &'static str,
+    pub definition: bool,
+}
+
+impl Section {
+    pub const fn rows(label: &'static str) -> Section {
+        Section {
+            label,
+            definition: false,
+        }
+    }
+
+    pub const fn definition(label: &'static str) -> Section {
+        Section {
+            label,
+            definition: true,
+        }
+    }
 }
 
 /// The output for `format`. CSV keeps stdout (or `-o`) for data only, so its metadata goes
@@ -471,6 +502,8 @@ struct Withheld {
     /// The description of the connection, when the budget was already used up: JSON's head, or
     /// the tail of the status line in text and csv.
     connection: u64,
+    /// Lines of a definition block (`def`) that didn't fit.
+    definition_lines: u64,
 }
 
 /// Limits and counts shared by all formats.
@@ -516,6 +549,12 @@ pub struct Tally {
     connection_told: bool,
     /// A batch has begun, so the connection can no longer be described.
     batch_begun: bool,
+    /// The sections the next result sets fill (`Output::set_sections`).
+    sections: VecDeque<Section>,
+    /// The section the current result set fills, if any.
+    section: Option<Section>,
+    /// Sections of the current batch that ended with no rows, for its `-- no rows:` line.
+    empty_sections: Vec<&'static str>,
 }
 
 impl Tally {
@@ -546,7 +585,36 @@ impl Tally {
             ending: 0,
             connection_told: false,
             batch_begun: false,
+            sections: VecDeque::new(),
+            section: None,
+            empty_sections: Vec::new(),
         }
+    }
+
+    /// The sections the next result sets fill, in order (`Output::set_sections`).
+    pub fn set_sections(&mut self, sections: &[Section]) {
+        self.sections = sections.iter().copied().collect();
+    }
+
+    /// The section the current result set fills.
+    pub fn section(&self) -> Option<Section> {
+        self.section
+    }
+
+    /// The current section ended with no rows.
+    pub fn empty_section(&mut self, label: &'static str) {
+        self.empty_sections.push(label);
+    }
+
+    /// The batch's sections that had no rows, for its `-- no rows:` line; clears them.
+    pub fn take_empty_sections(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.empty_sections)
+    }
+
+    /// `lines` lines of a definition block didn't fit the budget, which is then used up.
+    pub fn withhold_definition_lines(&mut self, lines: u64) {
+        self.exhausted = true;
+        self.withheld.definition_lines += lines;
     }
 
     /// Whether `bytes` more of the body fit in the output budget, given the `used` bytes
@@ -601,6 +669,16 @@ impl Tally {
         self.exhausted = true;
         self.withhold_connection();
         Ok(false)
+    }
+
+    /// Bytes more of the body may take, by `admit`'s rule: what the budget has left before the
+    /// end-of-run reserve and the status line's tail; 0 once the budget is used up
+    /// (`usize::MAX`: no limit).
+    pub fn body_room(&self, used: u64) -> usize {
+        if self.exhausted {
+            return 0;
+        }
+        self.room(used, OUTPUT_RESERVE + self.ending)
     }
 
     /// Bytes the closing lines may take: what the budget has left (`usize::MAX`: no limit).
@@ -693,6 +771,7 @@ impl Tally {
 
     /// Starts a result set. Returns its number, or `None` when `--max-results` hides it.
     pub fn start_result(&mut self) -> Option<usize> {
+        self.section = self.sections.pop_front();
         self.rows_open = true;
         self.results_seen += 1;
         self.rows_total = 0;
@@ -953,6 +1032,7 @@ impl Tally {
                     "connection description",
                     "connection descriptions",
                 ),
+                (w.definition_lines, "definition line", "definition lines"),
             ]
             .iter()
             .filter(|(n, _, _)| *n > 0)

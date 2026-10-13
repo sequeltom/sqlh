@@ -15,8 +15,8 @@ use std::io::{self, Write};
 
 use super::text::write_diagnostic;
 use super::{
-    BatchInfo, Layout, Limits, NAME_CHARS, OutOfOrder, Output, Summary, Tally, cut, cut_marker,
-    hex, push_blocked, push_within,
+    BatchInfo, Layout, Limits, NAME_CHARS, OutOfOrder, Output, Section, Summary, Tally, cut,
+    cut_marker, hex, push_blocked, push_within,
 };
 use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
@@ -30,8 +30,9 @@ use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 /// PLAN.md 2.15) but was never released as a stable contract. 2.0 is the major bump it
 /// needed: a result's `row_count` may now be a lower bound, which a reader of 1.x would take
 /// for the exact total, so that reader must reject the document at its major version (code
-/// review R16). 2.0 keeps 1.1's fields.
-pub const CONTRACT_VERSION: &str = "2.0";
+/// review R16). 2.0 keeps 1.1's fields. 2.1 adds `label` to the result events of a schema
+/// command (schema-commands.md §4), an optional field.
+pub const CONTRACT_VERSION: &str = "2.1";
 
 /// Integers beyond ±2^53 lose precision as JSON numbers in most parsers, so they become strings.
 const MAX_SAFE_INTEGER: i64 = 1 << 53;
@@ -150,7 +151,7 @@ impl<W: Write> JsonSink<W> {
         self.drain(false)
     }
 
-    /// Writes the document head once, if nothing has: `{"contract_version":"2.0","batches":[`.
+    /// Writes the document head once, if nothing has: `{"contract_version":"2.1","batches":[`.
     fn open(&mut self) {
         if !self.opened {
             self.push_head(None);
@@ -386,7 +387,11 @@ impl<W: Write> BatchSink for JsonSink<W> {
         }
         let mark = self.mark();
         self.start_event();
-        self.buf.push_str("{\"type\":\"result\",\"columns\":[");
+        self.buf.push_str("{\"type\":\"result\",");
+        if let Some(section) = self.tally.section() {
+            let _ = write!(self.buf, "\"label\":\"{}\",", section.label);
+        }
+        self.buf.push_str("\"columns\":[");
         for (i, column) in columns.iter().enumerate() {
             if i > 0 {
                 self.buf.push(',');
@@ -685,6 +690,10 @@ impl<W: Write> Output for JsonSink<W> {
         self.out.flush()?;
         self.meta.flush()
     }
+
+    fn set_sections(&mut self, sections: &[Section]) {
+        self.tally.set_sections(sections);
+    }
 }
 
 #[cfg(test)]
@@ -700,6 +709,36 @@ mod tests {
     fn parse(sink: JsonSink<Vec<u8>>) -> Json {
         let text = String::from_utf8(sink.out).unwrap();
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    // schema-commands.md §4, contract 2.1: a section's result event has its `label`; one with
+    // no rows is kept, with `rows: []`, so the document's shape doesn't depend on the data.
+    #[test]
+    fn sections_give_results_a_label() {
+        let mut s = JsonSink::new(Vec::new(), Limits::default());
+        super::super::text::tests::sectioned_run(&mut s);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        let doc = parse(s);
+        assert_eq!(doc["contract_version"], json!("2.1"));
+        let events = doc["batches"][0]["events"].as_array().unwrap();
+        let labels: Vec<&Json> = events.iter().map(|e| &e["label"]).collect();
+        assert_eq!(
+            labels,
+            [&json!("object"), &json!("indexes"), &json!("columns")]
+        );
+        assert_eq!(events[1]["rows"], json!([]));
+        assert_eq!(events[1]["row_count"], json!(0));
+        assert_eq!(
+            events[2]["rows"],
+            json!([["id", "int"], ["--x", "varchar(5)"]])
+        );
+        // A result outside a section has no label.
+        let mut s = JsonSink::new(Vec::new(), Limits::default());
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("x", "int")]).unwrap();
+        s.end_rows().unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert!(parse(s)["batches"][0]["events"][0].get("label").is_none());
     }
 
     #[test]
@@ -741,7 +780,7 @@ mod tests {
         assert_eq!(
             parse(s),
             json!({
-                "contract_version": "2.0",
+                "contract_version": "2.1",
                 "batches": [{
                     "batch": 1, "source": "q.sql", "line": 1,
                     "events": [
@@ -925,7 +964,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"2.0","batches":["#,
+                r#"{"contract_version":"2.1","batches":["#,
                 r#"{"batch":1,"source":"-Q","line":1,"events":["#,
                 r#"{"type":"rows_affected","count":2},"#,
                 r#"{"type":"result","columns":[{"name":"id","type":"int","nullable":true},"#,
@@ -1031,7 +1070,7 @@ mod tests {
             main.text(),
             format!(
                 concat!(
-                    r#"{{"contract_version":"2.0","batches":["#,
+                    r#"{{"contract_version":"2.1","batches":["#,
                     r#"{{"batch":1,"source":"-Q","line":1,"events":[{}],"#,
                     r#""elapsed_ms":5,"counting_stopped":true}},"#,
                     r#"{{"batch":2,"source":"-Q","line":6,"events":[{}],"#,
@@ -1177,7 +1216,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"2.0","batches":[{"batch":1,"source":"-Q","line":1,"#,
+                r#"{"contract_version":"2.1","batches":[{"batch":1,"source":"-Q","line":1,"#,
                 r#""events":[{"type":"result","columns":[{"name":"x","type":"int","nullable":true}],"#,
                 r#""rows":[[1],[2]],"row_count":3,"row_count_exact":false,"truncated":true,"#,
                 r#""cells_cut":0,"interrupted":true}],"elapsed_ms":2000,"counting_stopped":false}],"#,
@@ -1341,7 +1380,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"2.0","#,
+                r#"{"contract_version":"2.1","#,
                 r#""connection":{"server":"SQL01","database":"master","auth":"sql","#,
                 r#""encrypted":true,"server_version":"17.0.1000"},"connect_ms":195,"#,
                 r#""batches":[{"batch":1,"source":"-Q","line":1,"events":["#,
@@ -1364,7 +1403,7 @@ mod tests {
         assert_eq!(
             main.text(),
             concat!(
-                r#"{"contract_version":"2.0","batches":[],"ok":false,"exit_code":3,"#,
+                r#"{"contract_version":"2.1","batches":[],"ok":false,"exit_code":3,"#,
                 r#""summary":"failed (exit 3): usage error, 0 ms","elapsed_ms":0}"#,
                 "\n"
             )
@@ -1705,7 +1744,7 @@ mod tests {
         assert_eq!(
             document(&main),
             json!({
-                "contract_version": "2.0",
+                "contract_version": "2.1",
                 "batches": [{"events": [
                     {"type": "result",
                      "columns": [{"name": "v", "type": "int", "nullable": true}],
@@ -1803,7 +1842,7 @@ mod tests {
     // Exact output: the arithmetic of a tight cap. A note may use what the cap has left less
     // the 640-byte status reserve, 728 - 640 = 88 bytes, 13 of them for the array and quotes
     // around the first note: 66 characters and "…[+134]". The document head
-    // (`{"contract_version":"2.0","batches":[`) and `]` take 38, and what the notes array,
+    // (`{"contract_version":"2.1","batches":[`) and `]` take 38, and what the notes array,
     // the error's wrapper and the outcome leave of the other 690 goes to the error: 507
     // characters and "…[+493]".
     #[test]
@@ -1821,7 +1860,7 @@ mod tests {
         assert_eq!(
             main.text(),
             format!(
-                "{{\"contract_version\":\"2.0\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
+                "{{\"contract_version\":\"2.1\",\"batches\":[],\"notes\":[\"{}…[+134]\"],\
                  \"error\":\"{}…[+493]\",\"ok\":false,\"exit_code\":1,\
                  \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":3}}\n",
                 "x".repeat(66),
@@ -2002,7 +2041,7 @@ mod tests {
         s.finish(&refused(0, "ok: 0 batches, 3 ms")).unwrap();
         assert_eq!(
             main.text(),
-            "{\"contract_version\":\"2.0\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
+            "{\"contract_version\":\"2.1\",\"batches\":[],\"ok\":true,\"exit_code\":0,\
              \"summary\":\"ok: 0 batches, 3 ms\",\"elapsed_ms\":0}\n"
         );
     }

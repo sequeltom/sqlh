@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::{
-    BatchInfo, Layout, Limits, NAME_CHARS, Output, Summary, Tally, escaped, hex, push_blocked,
-    push_char, push_escaped, push_type,
+    BatchInfo, Layout, Limits, NAME_CHARS, Output, Section, Summary, Tally, escaped, hex,
+    push_blocked, push_char, push_escaped, push_type,
 };
 use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
@@ -22,6 +22,9 @@ pub struct TextSink<W: Write> {
     /// The tail of the status line that says where the run went (`status_ending`); empty
     /// until the connection is described, and when nothing connected.
     ending: String,
+    /// A section's `-- label` line and names-only header, held back until its first row, so a
+    /// section with no rows prints nothing (schema-commands.md §4).
+    held: Option<String>,
 }
 
 impl<W: Write> TextSink<W> {
@@ -39,7 +42,86 @@ impl<W: Write> TextSink<W> {
             line: String::with_capacity(1024),
             written: 0,
             ending: String::new(),
+            held: None,
         }
+    }
+
+    /// A definition section's row (name, type, definition): the definition as a block,
+    /// `-- definition: dbo.p (SQL_STORED_PROCEDURE), 42 lines` and then exactly that many
+    /// lines (schema-commands.md §4). Each line is escaped like a value, except that a tab
+    /// stays a tab, so nothing in it can break a line; the count tells a reader where the
+    /// block ends, so a line that starts with `--` (a T-SQL comment) can't pass for metadata.
+    /// Lines that don't fit the output budget are left out, and the header says so.
+    fn definition(&mut self, values: &[Value]) -> io::Result<()> {
+        fn text(value: Option<&Value>) -> &str {
+            match value {
+                Some(Value::Text(s)) => s,
+                _ => "?",
+            }
+        }
+        let (name, kind) = (escaped(text(values.first())), escaped(text(values.get(1))));
+        let (body, cut) = match values.get(2) {
+            Some(Value::Text(s)) => (s.as_str(), false),
+            Some(Value::TextCut(s, _)) => (s.as_str(), true),
+            _ => ("", false),
+        };
+        let mut lines: Vec<String> = body
+            .split('\n')
+            .map(|line| {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let mut out = String::with_capacity(line.len());
+                for ch in line.chars() {
+                    if ch == '\t' {
+                        out.push('\t');
+                    } else {
+                        push_char(&mut out, ch);
+                    }
+                }
+                out
+            })
+            .collect();
+        if body.ends_with('\n') {
+            lines.pop();
+        }
+        let total = lines.len();
+        let header = |shown: usize| {
+            let s = if total == 1 { "" } else { "s" };
+            if shown == total && !cut {
+                format!("-- definition: {name} ({kind}), {total} line{s}")
+            } else {
+                let at_least = if cut { "≥" } else { "" };
+                format!(
+                    "-- definition: {name} ({kind}), first {shown} of {at_least}{total} line{s} \
+                     shown (--max-output)"
+                )
+            }
+        };
+        // The longest the header can be, so the lines counted in it are sure to fit after it.
+        let room = self.tally.body_room(self.written);
+        let mut used = header(0).len() + 1;
+        let mut shown = 0;
+        if used > room {
+            self.tally.withhold_result();
+            self.tally.row_withheld();
+            return Ok(());
+        }
+        for line in &lines {
+            used += line.len() + 1;
+            if used > room {
+                break;
+            }
+            shown += 1;
+        }
+        self.write_line(&header(shown))?;
+        for line in &lines[..shown] {
+            self.write_line(line)?;
+        }
+        self.tally.row_shown();
+        if shown < total || cut {
+            self.tally
+                .withhold_definition_lines((total - shown) as u64 + u64::from(cut));
+        }
+        Ok(())
     }
 
     /// Writes `text` (whole lines, without the last newline) if the output budget admits
@@ -274,6 +356,22 @@ impl<W: Write> BatchSink for TextSink<W> {
         let Some(number) = self.tally.start_result() else {
             return Ok(());
         };
+        if let Some(section) = self.tally.section() {
+            if !section.definition {
+                let mut held = format!("-- {}\n", section.label);
+                for (i, column) in columns.iter().enumerate() {
+                    if i > 0 {
+                        held.push('\t');
+                    }
+                    if i == 0 && column.name.starts_with("--") {
+                        held.push('\\');
+                    }
+                    push_escaped(&mut held, &column.name, 0);
+                }
+                self.held = Some(held);
+            }
+            return Ok(());
+        }
         let mut line = std::mem::take(&mut self.line);
         line.clear();
         let _ = writeln!(line, "-- result {number}");
@@ -306,6 +404,16 @@ impl<W: Write> BatchSink for TextSink<W> {
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        if self.tally.section().is_some_and(|s| s.definition) {
+            return self.definition(values);
+        }
+        if let Some(held) = self.held.take()
+            && !self.emit(&held)?
+        {
+            self.tally.withhold_result();
+            self.tally.row_withheld();
+            return Ok(());
+        }
         let max = self.tally.limits().max_cell;
         let mut line = std::mem::take(&mut self.line);
         line.clear();
@@ -341,6 +449,25 @@ impl<W: Write> BatchSink for TextSink<W> {
 
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
+        if let Some(section) = self.tally.section() {
+            let held = self.held.take();
+            if self.tally.result_hidden() || section.definition {
+                return Ok(());
+            }
+            if self.tally.rows_total() == 0 && self.tally.rows_exact() {
+                self.tally.empty_section(section.label);
+                return Ok(());
+            }
+            if held.is_some() {
+                // Rows came, but the budget ran out before the first could be shown.
+                self.tally.withhold_result();
+                return Ok(());
+            }
+            // A section's footer is only for what it didn't show.
+            if self.tally.rows_exact() && !self.tally.rows_hidden() && self.tally.cells_cut() == 0 {
+                return Ok(());
+            }
+        }
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -350,6 +477,12 @@ impl<W: Write> BatchSink for TextSink<W> {
 
     fn end_rows_incomplete(&mut self) -> io::Result<()> {
         self.tally.end_rows();
+        if let Some(held) = self.held.take()
+            && !self.tally.result_hidden()
+            && !self.emit(&held)?
+        {
+            self.tally.withhold_result();
+        }
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -402,7 +535,14 @@ impl<W: Write> Output for TextSink<W> {
     }
 
     fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
-        self.flush_affected()
+        self.flush_affected()?;
+        let empty = self.tally.take_empty_sections();
+        if let Some(line) = no_rows_line(&empty)
+            && !self.emit(&line)?
+        {
+            self.tally.withhold_note();
+        }
+        Ok(())
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
@@ -431,6 +571,16 @@ impl<W: Write> Output for TextSink<W> {
         self.out.flush()?;
         self.meta.flush()
     }
+
+    fn set_sections(&mut self, sections: &[Section]) {
+        self.tally.set_sections(sections);
+    }
+}
+
+/// `-- no rows: foreign_keys, triggers`: a batch's sections that had no rows (text and csv);
+/// `None` when every section had some.
+pub fn no_rows_line(empty: &[&str]) -> Option<String> {
+    (!empty.is_empty()).then(|| format!("-- no rows: {}", empty.join(", ")))
 }
 
 #[cfg(test)]
@@ -525,6 +675,143 @@ pub(super) mod tests {
 
     fn text(sink: TextSink<Vec<u8>>) -> String {
         String::from_utf8(sink.out).unwrap()
+    }
+
+    /// A schema command's batch (schema-commands.md §4), shared by the three formats' tests:
+    /// three sections, the middle one with no rows; the last one's second row starts with `--`.
+    pub fn sectioned_run(s: &mut dyn Output) {
+        s.set_sections(&[
+            Section::rows("object"),
+            Section::rows("indexes"),
+            Section::rows("columns"),
+        ]);
+        s.begin_batch(&batch("describe", false, 1)).unwrap();
+        s.columns(&[col("name", "nvarchar(257)"), col("type", "nvarchar(60)")])
+            .unwrap();
+        s.row(&[
+            Value::Text("dbo.T".into()),
+            Value::Text("USER_TABLE".into()),
+        ])
+        .unwrap();
+        s.end_rows().unwrap();
+        s.columns(&[col("name", "sysname")]).unwrap();
+        s.end_rows().unwrap();
+        s.columns(&[col("column", "sysname"), col("type", "nvarchar(271)")])
+            .unwrap();
+        for (column, kind) in [("id", "int"), ("--x", "varchar(5)")] {
+            s.row(&[Value::Text(column.into()), Value::Text(kind.into())])
+                .unwrap();
+        }
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+    }
+
+    // schema-commands.md §4: a section is `-- label` and a header of names only, written with
+    // its first row; one with no rows is listed on the batch's `-- no rows:` line; a section
+    // that showed all its rows has no footer.
+    #[test]
+    fn sections_are_labeled_and_empty_ones_collapse() {
+        let mut s = TextSink::new(Vec::new(), Limits::default());
+        sectioned_run(&mut s);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- object\nname\ttype\ndbo.T\tUSER_TABLE\n\
+             -- columns\ncolumn\ttype\nid\tint\n\\--x\tvarchar(5)\n\
+             -- no rows: indexes\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+    }
+
+    // A section keeps its footer when it didn't show everything.
+    #[test]
+    fn a_section_says_what_it_did_not_show() {
+        let mut s = TextSink::new(
+            Vec::new(),
+            Limits {
+                max_rows: 1,
+                ..Limits::default()
+            },
+        );
+        s.set_sections(&[Section::rows("columns")]);
+        s.columns(&[col("column", "sysname")]).unwrap();
+        for name in ["a", "b"] {
+            if s.wants_values() {
+                s.row(&[Value::Text(name.into())]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        assert_eq!(
+            text(s),
+            "-- columns\ncolumn\na\n-- 1 of 2 rows shown (--max-rows 1)\n"
+        );
+    }
+
+    fn definition_row(body: &str) -> Vec<Value> {
+        vec![
+            Value::Text("dbo.p".into()),
+            Value::Text("SQL_STORED_PROCEDURE".into()),
+            Value::Text(body.into()),
+        ]
+    }
+
+    // schema-commands.md §4, with the review's correction: a definition is a block framed by
+    // its line count. Its lines are escaped like values (a backslash doubled, a control
+    // character as `\xNN`) except that a tab stays a tab, so nothing breaks a line; a line
+    // that starts with `--`, as T-SQL comments do, stays inside the counted block.
+    #[test]
+    fn a_definition_is_a_counted_block() {
+        let mut s = TextSink::new(Vec::new(), Limits::default());
+        s.set_sections(&[Section::definition("definition")]);
+        s.columns(&[col("name", "nvarchar(257)")]).unwrap();
+        s.row(&definition_row(
+            "CREATE PROC dbo.p AS\r\n-- ok: 1 batch, 3 ms\r\n\tSELECT 'a\\b\x07'\u{2028};\r\n",
+        ))
+        .unwrap();
+        s.end_rows().unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), 3 lines\n\
+             CREATE PROC dbo.p AS\n\
+             -- ok: 1 batch, 3 ms\n\
+             \tSELECT 'a\\\\b\\x07'\\u2028;\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+    }
+
+    // A definition longer than the output budget shows the lines that fit, and its header and
+    // the closing note say how many there were.
+    #[test]
+    fn a_definition_is_cut_at_whole_lines_and_says_so() {
+        let mut s = TextSink::new(
+            Vec::new(),
+            Limits {
+                max_output: crate::output::OUTPUT_RESERVE + 120,
+                ..Limits::default()
+            },
+        );
+        s.set_sections(&[Section::definition("definition")]);
+        s.columns(&[col("name", "nvarchar(257)")]).unwrap();
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        s.row(&definition_row(&body)).unwrap();
+        s.end_rows().unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        let out = text(s);
+        assert!(
+            out.starts_with(
+                "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 4 of 20 lines shown \
+                 (--max-output)\nline 1\nline 2\nline 3\nline 4\n\
+                 -- note: output stopped at the --max-output"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("these weren't shown: 16 definition lines"),
+            "{out}"
+        );
     }
 
     // Helpers for the tests of the whole-response budget, shared by all three formats.

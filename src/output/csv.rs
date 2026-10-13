@@ -6,12 +6,12 @@
 use std::io::{self, Write};
 
 use super::text::{
-    batch_line, blocked_layout, closing_lines, error_line, message_line, note_layout,
+    batch_line, blocked_layout, closing_lines, error_line, message_line, no_rows_line, note_layout,
     rows_affected_line, status_ending, write_diagnostic,
 };
 use super::{
-    BatchInfo, Layout, Limits, Output, Summary, Tally, cut, cut_marker, escaped, hex, push_char,
-    push_type,
+    BatchInfo, Layout, Limits, Output, Section, Summary, Tally, cut, cut_marker, escaped, hex,
+    push_char, push_type,
 };
 use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
@@ -25,6 +25,9 @@ pub struct CsvSink<W: Write> {
     written: u64,
     /// The tail of the status line, as in the text format (`text::status_ending`).
     ending: String,
+    /// A section's header row and its `-- label: names` marker, held back until its first
+    /// row, so a section with no rows writes nothing (schema-commands.md §4).
+    held: Option<(String, String)>,
 }
 
 impl<W: Write> CsvSink<W> {
@@ -37,7 +40,25 @@ impl<W: Write> CsvSink<W> {
             results_written: 0,
             written: 0,
             ending: String::new(),
+            held: None,
         }
+    }
+
+    /// Writes a section's held header row and marker before its first row, if the budget
+    /// admits both; otherwise the section is withheld.
+    fn write_held(&mut self, (header, marker): (String, String)) -> io::Result<bool> {
+        if !self
+            .tally
+            .admit(self.written, header.len() + marker.len() + 1)
+        {
+            self.tally.withhold_result();
+            return Ok(false);
+        }
+        self.results_written += 1;
+        self.written += header.len() as u64;
+        self.data.write_all(header.as_bytes())?;
+        self.meta_line(&marker)?;
+        Ok(true)
     }
 
     /// Writes a metadata line whatever the budget: the marker of a result the budget
@@ -109,6 +130,24 @@ impl<W: Write> BatchSink for CsvSink<W> {
         let Some(number) = self.tally.start_result() else {
             return Ok(());
         };
+        if let Some(section) = self.tally.section() {
+            let mut header = String::new();
+            if self.results_written > 0 {
+                header.push('\n');
+            }
+            let mut names = String::new();
+            for (i, column) in columns.iter().enumerate() {
+                if i > 0 {
+                    header.push(',');
+                    names.push_str(", ");
+                }
+                push_field(&mut header, &column.name);
+                names.push_str(&escaped(&column.name));
+            }
+            header.push('\n');
+            self.held = Some((header, format!("-- {}: {names}", section.label)));
+            return Ok(());
+        }
         let mut line = std::mem::take(&mut self.line);
         line.clear();
         if self.results_written > 0 {
@@ -152,6 +191,12 @@ impl<W: Write> BatchSink for CsvSink<W> {
     }
 
     fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        if let Some(held) = self.held.take()
+            && !self.write_held(held)?
+        {
+            self.tally.row_withheld();
+            return Ok(());
+        }
         let max = self.tally.limits().max_cell;
         let mut line = std::mem::take(&mut self.line);
         line.clear();
@@ -222,6 +267,23 @@ impl<W: Write> BatchSink for CsvSink<W> {
 
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
+        if let Some(section) = self.tally.section() {
+            let held = self.held.take();
+            if self.tally.result_hidden() {
+                return Ok(());
+            }
+            if self.tally.rows_total() == 0 && self.tally.rows_exact() {
+                self.tally.empty_section(section.label);
+                return Ok(());
+            }
+            if held.is_some() {
+                self.tally.withhold_result();
+                return Ok(());
+            }
+            if self.tally.rows_exact() && !self.tally.rows_hidden() && self.tally.cells_cut() == 0 {
+                return Ok(());
+            }
+        }
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -231,6 +293,11 @@ impl<W: Write> BatchSink for CsvSink<W> {
 
     fn end_rows_incomplete(&mut self) -> io::Result<()> {
         self.tally.end_rows();
+        if let Some(held) = self.held.take()
+            && !self.tally.result_hidden()
+        {
+            self.write_held(held)?;
+        }
         if self.tally.result_hidden() {
             return Ok(());
         }
@@ -285,7 +352,14 @@ impl<W: Write> Output for CsvSink<W> {
     }
 
     fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
-        self.flush_affected()
+        self.flush_affected()?;
+        let empty = self.tally.take_empty_sections();
+        if let Some(line) = no_rows_line(&empty)
+            && !self.emit_meta(&line)?
+        {
+            self.tally.withhold_note();
+        }
+        Ok(())
     }
 
     fn note(&mut self, text: &str) -> io::Result<()> {
@@ -315,6 +389,10 @@ impl<W: Write> Output for CsvSink<W> {
         self.data.flush()?;
         self.meta.flush()
     }
+
+    fn set_sections(&mut self, sections: &[Section]) {
+        self.tally.set_sections(sections);
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +403,26 @@ mod tests {
         mid_result_events_are_refused, msg, quoting, ragged_run, summary, widest_names,
     };
     use super::*;
+
+    // schema-commands.md §4: a section's header row and its `-- label: names` marker come with
+    // its first row; one with no rows writes nothing to the data stream and is listed on the
+    // metadata stream's `-- no rows:` line.
+    #[test]
+    fn sections_are_labeled_on_the_metadata_stream() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), Limits::default());
+        super::super::text::tests::sectioned_run(&mut s);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            data.text(),
+            "name,type\ndbo.T,USER_TABLE\n\ncolumn,type\nid,int\n--x,varchar(5)\n"
+        );
+        assert_eq!(
+            meta.text(),
+            "-- object: name, type\n-- columns: column, type\n-- no rows: indexes\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+    }
 
     // PLAN.md 2.12, DESIGN.md §5.1 and §5.3: nothing but rows arrives inside a result set.
     // The data stream holds the rows only; a message the server sent during the result is on

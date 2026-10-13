@@ -17,16 +17,8 @@ use crate::run::{QueryOrigin, RunOutcome};
 use crate::secret::Secret;
 use crate::{console, credman, files};
 
-/// Connection facts for `profile test`. Runs on SQL Server 2012+ and Azure SQL DB without
-/// extra permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a
-/// client-side fact, printed as a note by `show_connection`.
-const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
-    CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS version, \
-    CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition, \
-    DB_NAME() AS [database], SUSER_SNAME() AS login, USER_NAME() AS [user], \
-    CAST(CONNECTIONPROPERTY('net_transport') AS nvarchar(40)) AS transport, \
-    CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
-    SYSDATETIMEOFFSET() AS server_time;";
+/// Connection facts for `profile test`: the `info` command's query.
+use crate::schema::INFO_SQL;
 
 /// What `profile add` and `rm` read and change (F12): the profiles file, the stored passwords
 /// and the console. A trait so that tests can make any step fail.

@@ -9,6 +9,8 @@ use crate::config::{MAX_LOCK_TIMEOUT, WritePolicy, valid_name};
 use crate::db::Encrypt;
 use crate::output::{Format, MIN_MAX_OUTPUT};
 
+pub use crate::schema::Command as SchemaCommand;
+
 pub enum Command {
     Run(Box<Opts>),
     Profile(ProfileCommand),
@@ -78,6 +80,8 @@ pub struct Opts {
     pub new_password: bool,
     /// Only for `sqlh profile add`: the profile's description; `""` removes it.
     pub description: Option<String>,
+    /// A schema command (`sqlh describe dbo.T`), named by the first positional word.
+    pub command: Option<SchemaCommand>,
     /// Internal (set by `profile test`): print a `-- note:` describing the connection.
     pub show_connection: bool,
     /// sqlcmd flags accepted for compatibility but without effect.
@@ -129,7 +133,7 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
                 Command::Run(opts) => opts,
                 _ => return Err(PROFILE_USAGE.into()),
             };
-            if opts.query.is_some() || !opts.inputs.is_empty() {
+            if opts.query.is_some() || !opts.inputs.is_empty() || opts.command.is_some() {
                 return Err("profile add takes connection options only, not SQL".into());
             }
             ProfileCommand::Add { name, opts }
@@ -182,6 +186,9 @@ fn output_format(text: &str) -> Result<Format, String> {
 fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
     use lexopt::prelude::*;
     let mut o = Opts::default();
+    // Words that aren't options: the SQL, or a schema command and its argument.
+    let mut words: Vec<String> = Vec::new();
+    let mut text = false;
     while let Some(arg) = p.next().map_err(|e| e.to_string())? {
         match arg {
             Long("help") | Short('?') => return Ok(Command::Help),
@@ -208,7 +215,7 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
                         Some((name, v)) if is_var_name(name) => {
                             o.vars.push((name.to_owned(), v.to_owned()))
                         }
-                        _ => set_query(&mut o, value)?,
+                        _ => words.push(value),
                     }
                 }
             }
@@ -285,8 +292,25 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
                 o.ignored.push(format!("-{c}"));
             }
             Short(c @ ('W' | 'e' | 'I' | 'u' | 'p' | 'R')) => o.ignored.push(format!("-{c}")),
-            Value(value) => set_query(&mut o, string(Ok(value))?)?,
+            Long("text") => text = true,
+            Value(value) => words.push(string(Ok(value))?),
             _ => return Err(arg.unexpected().to_string()),
+        }
+    }
+    match SchemaCommand::parse(&words, text) {
+        Some(command) => {
+            if o.query.is_some() || !o.inputs.is_empty() {
+                return Err(
+                    "a schema command runs its own SQL; give it without -Q or -i".to_owned(),
+                );
+            }
+            o.command = Some(command?);
+        }
+        None if text => return Err("--text only applies to sqlh find".to_owned()),
+        None => {
+            for word in words {
+                set_query(&mut o, word)?;
+            }
         }
     }
     Ok(Command::Run(Box::new(o)))
@@ -544,6 +568,52 @@ mod tests {
         assert!(parse_args(&["profile", "add", "x", "-Q", "SELECT 1"]).is_err());
         assert!(parse_args(&["profile", "test", "dev", "extra"]).is_err());
         assert!(parse_args(&["profile"]).is_err());
+    }
+
+    // schema-commands.md §2: the first positional word names a schema command, wherever the
+    // options are; anything else is SQL, as before. A command can't come with -Q or -i, and
+    // --text is for find only.
+    #[test]
+    fn schema_commands_are_the_first_word() {
+        let o = opts(&["--profile", "dev", "describe", "dbo.Orders", "-d", "AppDb"]);
+        assert_eq!(
+            o.command,
+            Some(SchemaCommand::Describe("dbo.Orders".into()))
+        );
+        assert_eq!((o.query, o.database.as_deref()), (None, Some("AppDb")));
+        let o = opts(&["-v", "a=1", "find", "Id", "--text"]);
+        assert_eq!(
+            o.command,
+            Some(SchemaCommand::Find {
+                pattern: "Id".into(),
+                text: true
+            })
+        );
+        assert_eq!(o.vars, vec![("a".into(), "1".into())]);
+        // Not a command: SQL.
+        let o = opts(&["SELECT 1"]);
+        assert_eq!((o.command, o.query.as_deref()), (None, Some("SELECT 1")));
+        for (args, wanted) in [
+            (
+                &["-Q", "SELECT 1", "tables"][..],
+                "give it without -Q or -i",
+            ),
+            (&["-i", "x.sql", "dbs"][..], "give it without -Q or -i"),
+            (
+                &["--text", "SELECT 1"][..],
+                "--text only applies to sqlh find",
+            ),
+            (&["describe"][..], "describe needs NAME"),
+            (&["tables", "a", "b"][..], "tables takes one pattern"),
+            (&["SELECT 1", "SELECT 2"][..], "SQL was already given"),
+            (
+                &["profile", "add", "x", "describe", "y"][..],
+                "connection options only",
+            ),
+        ] {
+            let error = parse_args(args).err().expect("refused");
+            assert!(error.contains(wanted), "{args:?}: {error}");
+        }
     }
 
     // PLAN.md 4.1 and 4.2: `profile add` takes --description; `profile list` takes --search,

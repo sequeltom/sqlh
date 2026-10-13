@@ -7,12 +7,11 @@ USAGE
 EXAMPLES  (same in cmd.exe, PowerShell and Git Bash)
   sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders WHERE Status = 'Open' ORDER BY Id DESC"
   sqlh -S myserver,1433 -U reader -d AppDb -i report.sql   (password: env SQLCMDPASSWORD)
-  sqlh --profile dev -Q "SELECT TOP 0 * FROM sys.dm_exec_requests"   (columns and types only)
+  sqlh --profile dev describe sys.dm_exec_requests   (its columns and types: see SCHEMA)
   sqlh --profile dev -i "my queries\report.sql" -o report.txt
   SQL with " $ % ` or several lines goes in a file (-i). Quote -S "host\inst" and paths with spaces.
   Paths: C:/dir/f.sql works everywhere; C:\dir\f.sql needs quotes in Git Bash; /c/dir/f.sql is Git Bash only.
-  Piped non-ASCII text becomes "?" or an error unless the shell sends UTF-8: cmd.exe needs chcp 65001
-  first, Windows PowerShell 5.1 needs $OutputEncoding = [Text.Encoding]::UTF8 first. -Q and -i don't.
+  Piped non-ASCII must be UTF-8: chcp 65001 (cmd.exe), $OutputEncoding = [Text.Encoding]::UTF8 (PS 5.1)
 
 CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
@@ -22,8 +21,7 @@ CONNECTION
   -C              trust the server certificate (self-signed servers); profile add NAME -C saves it
   -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
   -Ns | -Nm | -No encryption strict | mandatory (default) | optional
-  -K ReadOnly     read-only application intent      -M  multi-subnet failover
-  -l seconds      login timeout (default 15; 0 = none); one attempt, no retries
+  -l seconds      login timeout (default 15; 0 = none), one attempt   -K ReadOnly   -M multi-subnet failover
 
 EXECUTION
   -i file         input file, repeatable; "-i -" reads stdin. UTF-8, or UTF-16 with a BOM
@@ -32,9 +30,8 @@ EXECUTION
   -t seconds      per-batch query timeout, also for a stalled reader (default 60; 0 = none)
   --lock-timeout S      seconds a statement waits for a lock, then error 1222 (default 10; 0 = none)
   --read-uncommitted    read-only runs only: read without waiting for writers; rows may be dirty
-  --allow-write   permit writes. Without it, writes other than to #temp/@table are refused
-                  before anything runs, and all batches run in a transaction that is rolled back.
-                  This guards against accidents; it is not security. Use a read-only login.
+  --allow-write   permit writes. Without it, writes other than to #temp/@table are refused before anything
+                  runs; every batch runs in a rolled-back transaction. Not security: use a read-only login.
   --check         compile only (SET NOEXEC ON): finds syntax errors and unknown columns, not missing tables
   --continue-on-error   run later batches after one fails (default: stop)
 
@@ -46,6 +43,9 @@ OUTPUT
   --max-output N  total output bytes (default 1000000; 0 = no limit); the run still finishes
   -o file         write output to a file (replaced whole when the run ends; never an input)
   --verbose       connection diagnostics on stderr
+
+SCHEMA  describe NAME | def NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
+  describe: columns, keys, indexes, FKs both ways, parameters. def: the source. PATTERN: Ord, Ord*, dbo.?rd*
 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
   sqlh profile add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]

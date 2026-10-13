@@ -1485,7 +1485,7 @@ fn sqlh_version() -> &'static str {
     option_env!("SQLH_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
-/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 2.0)`.
+/// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 2.1)`.
 fn contract_version() -> String {
     let r = sqlh_args(&["--version"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -1538,7 +1538,7 @@ fn json_documents_start_with_the_contract_version() {
 }
 
 // PLAN.md 2.11: `--version` names the JSON contract version after the program's own, in
-// `sqlh 0.1.0 (json contract 2.0)` form, and nothing else. The contract is pinned here: a
+// `sqlh 0.1.0 (json contract 2.1)` form, and nothing else. The contract is pinned here: a
 // new version is an updated DESIGN.md §5.2 and an updated test.
 #[test]
 fn version_reports_the_json_contract() {
@@ -1547,9 +1547,9 @@ fn version_reports_the_json_contract() {
     assert_eq!(r.stderr, "");
     assert_eq!(
         r.stdout,
-        format!("sqlh {} (json contract 2.0)\n", sqlh_version())
+        format!("sqlh {} (json contract 2.1)\n", sqlh_version())
     );
-    assert_eq!(contract_version(), "2.0");
+    assert_eq!(contract_version(), "2.1");
 }
 
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
@@ -2164,6 +2164,47 @@ fn piped_text_in_another_encoding_is_refused_and_utf8_is_read_as_it_is() {
             r.stdout
         );
     }
+}
+
+// schema-commands.md: what a schema command refuses before connecting. A temporary table is
+// another session's (exit 1, like an unknown name); --check, and SQL given with -Q, have no
+// meaning for a command that runs its own SQL (exit 3). Nothing connects: the server named is
+// a closed port, which would be exit 2.
+#[test]
+fn schema_commands_refuse_what_they_cannot_answer_before_connecting() {
+    let closed = ["-S", "127.0.0.1,1", "-l", "1"];
+    let run = |args: &[&str]| run(sqlh().args(closed).args(args));
+    let r = run(&["describe", "#orders"]);
+    assert_eq!(r.code, 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains(
+            "-- error: #orders is a temporary table, which only the session that made it can see"
+        ),
+        "{}",
+        r.stdout
+    );
+    let r = run(&["--check", "tables"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("--check compiles your SQL; a schema command runs its own"),
+        "{}",
+        r.stdout
+    );
+    let r = run(&["-Q", "SELECT 1", "dbs"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("give it without -Q or -i"),
+        "{}",
+        r.stdout
+    );
+    let r = run(&["describe", "a", "--text"]);
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("--text only applies to sqlh find"),
+        "{}",
+        r.stdout
+    );
 }
 
 // AGENTS.md: models read --help, so it stays short. PLAN.md 2.13 holds it at 62 lines.
@@ -5668,6 +5709,390 @@ mod live {
             let r = self.probe.server.write(create);
             assert_eq!(r.code, 0, "{create}\n{}", r.stdout);
         }
+    }
+
+    /// The schema commands' fixture: a table with every feature `describe` reports (an
+    /// identity, a default, a check, a persisted computed column, an alias type, a filtered
+    /// index with a descending key and an include, a foreign key, a trigger, descriptions), the
+    /// table it references, a view, a procedure with an output parameter and a comment line, a
+    /// scalar and a table-valued function, a synonym, and two tables with one name in two
+    /// schemas. Every name starts with the probe's, so the test's own objects are easy to find.
+    struct Schema {
+        objects: Objects,
+    }
+
+    impl Schema {
+        fn create(profile: &str, database: &str) -> Schema {
+            let mut objects = Objects::new(profile, database);
+            let n = |suffix: &str| objects.name(suffix);
+            let (phone, parent, orders, ix) = (n("phone"), n("parent"), n("orders"), n("open"));
+            let (trg, view, get, double, by_status, alias) = (
+                n("audit"),
+                n("v"),
+                n("get"),
+                n("double"),
+                n("by_status"),
+                n("alias"),
+            );
+            let bare = |name: &str| name.trim_start_matches("dbo.").to_owned();
+            let (s1, s2) = (bare(&n("s1")), bare(&n("s2")));
+            let steps: Vec<(String, String)> = vec![
+                (
+                    format!("CREATE TYPE {phone} FROM varchar(20) NOT NULL"),
+                    format!("DROP TYPE IF EXISTS {phone}"),
+                ),
+                (
+                    format!(
+                        "CREATE TABLE {parent} (id int NOT NULL CONSTRAINT {pk} PRIMARY KEY, \
+                         code nchar(4) NOT NULL)",
+                        pk = bare(&n("parent_pk"))
+                    ),
+                    format!("DROP TABLE IF EXISTS {parent}"),
+                ),
+                (
+                    format!(
+                        "CREATE TABLE {orders} (\
+                         id int IDENTITY(1, 1) NOT NULL CONSTRAINT {pk} PRIMARY KEY, \
+                         parent_id int NOT NULL CONSTRAINT {fk} REFERENCES {parent} (id) \
+                         ON DELETE CASCADE, \
+                         status nvarchar(20) NOT NULL CONSTRAINT {df} DEFAULT (N'open'), \
+                         amount decimal(10, 2) NULL CONSTRAINT {ck} CHECK (amount >= 0), \
+                         total AS (amount * 2) PERSISTED, \
+                         phone {phone}, \
+                         created datetime2(3) NOT NULL, \
+                         note nvarchar(max) NULL);\n\
+                         EXEC sys.sp_addextendedproperty N'MS_Description', N'Orders, one row \
+                         each', N'SCHEMA', N'dbo', N'TABLE', N'{t}';\n\
+                         EXEC sys.sp_addextendedproperty N'MS_Description', N'Open, paid or \
+                         void', N'SCHEMA', N'dbo', N'TABLE', N'{t}', N'COLUMN', N'status';",
+                        pk = bare(&n("orders_pk")),
+                        fk = bare(&n("orders_fk")),
+                        df = bare(&n("orders_df")),
+                        ck = bare(&n("orders_ck")),
+                        t = bare(&orders),
+                    ),
+                    format!("DROP TABLE IF EXISTS {orders}"),
+                ),
+                (
+                    format!(
+                        "CREATE INDEX {ix} ON {orders} (status, created DESC) INCLUDE (amount) \
+                         WHERE status = N'open'",
+                        ix = bare(&ix)
+                    ),
+                    format!("DROP INDEX IF EXISTS {} ON {orders}", bare(&ix)),
+                ),
+                (
+                    format!(
+                        "CREATE TRIGGER {trg} ON {orders} AFTER INSERT, UPDATE AS SET NOCOUNT ON"
+                    ),
+                    format!("DROP TRIGGER IF EXISTS {trg}"),
+                ),
+                (
+                    format!(
+                        "CREATE VIEW {view} AS SELECT id, amount FROM {orders} \
+                         WHERE status = N'open'"
+                    ),
+                    format!("DROP VIEW IF EXISTS {view}"),
+                ),
+                (
+                    format!(
+                        "CREATE PROCEDURE {get} @id int, @status nvarchar(20) = N'open', \
+                         @count int OUTPUT AS\n\
+                         -- ok: a comment line that reads like a status line\n\
+                         SELECT @count = COUNT(*) FROM {orders} WHERE id = @id AND status = @status;"
+                    ),
+                    format!("DROP PROCEDURE IF EXISTS {get}"),
+                ),
+                (
+                    format!(
+                        "CREATE FUNCTION {double} (@x decimal(10, 2)) RETURNS decimal(12, 2) AS \
+                         BEGIN RETURN @x * 2; END"
+                    ),
+                    format!("DROP FUNCTION IF EXISTS {double}"),
+                ),
+                (
+                    format!(
+                        "CREATE FUNCTION {by_status} (@status nvarchar(20)) RETURNS TABLE AS \
+                         RETURN SELECT id, amount FROM {orders} WHERE status = @status"
+                    ),
+                    format!("DROP FUNCTION IF EXISTS {by_status}"),
+                ),
+                (
+                    format!("CREATE SYNONYM {alias} FOR {orders}"),
+                    format!("DROP SYNONYM IF EXISTS {alias}"),
+                ),
+                (
+                    format!("CREATE SCHEMA {s1}"),
+                    format!("DROP SCHEMA IF EXISTS {s1}"),
+                ),
+                (
+                    format!("CREATE SCHEMA {s2}"),
+                    format!("DROP SCHEMA IF EXISTS {s2}"),
+                ),
+                (
+                    format!("CREATE TABLE {s1}.twin (id int NOT NULL)"),
+                    format!("DROP TABLE IF EXISTS {s1}.twin"),
+                ),
+                (
+                    format!("CREATE TABLE {s2}.twin (id int NOT NULL)"),
+                    format!("DROP TABLE IF EXISTS {s2}.twin"),
+                ),
+            ];
+            for (create, drop) in steps {
+                objects.make(&create, drop);
+            }
+            Schema { objects }
+        }
+
+        /// A fixture object's schema-qualified name.
+        fn name(&self, suffix: &str) -> String {
+            self.objects.name(suffix)
+        }
+
+        /// The same, without `dbo.`.
+        fn bare(&self, suffix: &str) -> String {
+            self.name(suffix).trim_start_matches("dbo.").to_owned()
+        }
+    }
+
+    // schema-commands.md and PLAN.md Phase 4, against SQL Server: `describe` reports every
+    // section for a table, and what applies to views, procedures, functions and synonyms; `def`
+    // prints a counted block; `find`, `find --text` and `tables` match names and bodies; a name
+    // resolves case-insensitively but never outside an explicit schema; an ambiguous or unknown
+    // name, and another database, are refused with what to do. All read-only.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn schema_commands_describe_what_the_catalog_holds() {
+        let (p, db) = target();
+        let schema = Schema::create(&p, &db);
+        let run = |args: &[&str]| live(&p, &db, args);
+        let ok = |args: &[&str]| {
+            let r = run(args);
+            assert_eq!(r.code, 0, "{args:?}\n{}", r.stdout);
+            r.stdout
+        };
+        let has = |out: &str, line: &str| {
+            assert!(
+                out.lines().any(|l| l == line),
+                "no line {line:?} in:\n{out}"
+            );
+        };
+        let (orders, parent) = (schema.name("orders"), schema.name("parent"));
+
+        // A table: every section, and the empty one on the `no rows` line.
+        let out = ok(&["describe", &orders]);
+        assert!(
+            out.starts_with("-- object\nname\ttype\trows\tflags\tcreated\tmodified\tdescription\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("\n{orders}\tUSER_TABLE\t0\tNULL\t")),
+            "{out}"
+        );
+        assert!(
+            out.contains("\tOrders, one row each\n-- columns\n"),
+            "{out}"
+        );
+        has(
+            &out,
+            "column\ttype\tnull\tidentity\tdefault\tcomputed\tdescription",
+        );
+        has(&out, "id\tint\t0\t1\tNULL\tNULL\tNULL");
+        has(
+            &out,
+            "status\tnvarchar(20)\t0\t0\t(N'open')\tNULL\tOpen, paid or void",
+        );
+        has(
+            &out,
+            "total\tdecimal(12,2)\t1\t0\tNULL\t([amount]*(2)) PERSISTED\tNULL",
+        );
+        has(
+            &out,
+            &format!(
+                "phone\t{} (varchar(20))\t0\t0\tNULL\tNULL\tNULL",
+                schema.bare("phone")
+            ),
+        );
+        has(&out, "created\tdatetime2(3)\t0\t0\tNULL\tNULL\tNULL");
+        has(&out, "note\tnvarchar(max)\t1\t0\tNULL\tNULL\tNULL");
+        has(
+            &out,
+            &format!(
+                "{}\tCLUSTERED\t1\t1\tid\tNULL\tNULL\t0",
+                schema.bare("orders_pk")
+            ),
+        );
+        has(
+            &out,
+            &format!(
+                "{}\tNONCLUSTERED\t0\t0\tstatus, created DESC\tamount\t([status]=N'open')\t0",
+                schema.bare("open")
+            ),
+        );
+        has(
+            &out,
+            &format!(
+                "{}\tparent_id\t{parent}\tid\tCASCADE\tNO_ACTION\t1",
+                schema.bare("orders_fk")
+            ),
+        );
+        has(
+            &out,
+            &format!("{}\t([amount]>=(0))\t1", schema.bare("orders_ck")),
+        );
+        has(
+            &out,
+            &format!("{}\tINSERT, UPDATE\t0\t0", schema.bare("audit")),
+        );
+        has(&out, "-- no rows: referenced_by");
+
+        // What points at a table.
+        let out = ok(&["describe", &parent]);
+        has(
+            &out,
+            &format!(
+                "{}\t{orders}\tparent_id\tid\tCASCADE\tNO_ACTION\t1",
+                schema.bare("orders_fk")
+            ),
+        );
+        has(
+            &out,
+            "-- no rows: foreign_keys, check_constraints, triggers",
+        );
+
+        // A view, a procedure, the functions, a synonym.
+        let out = ok(&["describe", &schema.name("v")]);
+        assert!(
+            out.contains("\tVIEW\t") && out.contains("\n-- columns\n"),
+            "{out}"
+        );
+        has(&out, "-- no rows: indexes");
+        let out = ok(&["describe", &schema.name("get")]);
+        has(&out, "name\ttype\toutput\treadonly");
+        has(&out, "@status\tnvarchar(20)\t0\t0");
+        has(&out, "@count\tint\t1\t0");
+        let out = ok(&["describe", &schema.name("double")]);
+        has(&out, "(return)\tdecimal(12,2)\t1\t0");
+        let out = ok(&["describe", &schema.name("by_status")]);
+        assert!(
+            out.contains("-- parameters\n") && out.contains("-- columns\n"),
+            "{out}"
+        );
+        has(&out, "amount\tdecimal(10,2)\t1\t0\tNULL\tNULL\tNULL");
+        let out = ok(&["describe", &schema.name("alias")]);
+        assert!(
+            out.contains(&format!("\tSYNONYM\t[dbo].[{}]\t", schema.bare("orders"))),
+            "{out}"
+        );
+
+        // A system view, as agent trial 1 needed.
+        let out = ok(&["describe", "sys.objects"]);
+        has(&out, "name\tsysname\t0\t0\tNULL\tNULL\tNULL");
+
+        // `def`: a block of exactly as many lines as it says; a `--` line inside it.
+        let out = ok(&["def", &schema.name("get")]);
+        assert!(
+            out.starts_with(&format!(
+                "-- definition: {} (SQL_STORED_PROCEDURE), 3 lines\nCREATE PROCEDURE {} @id int",
+                schema.name("get"),
+                schema.name("get")
+            )),
+            "{out}"
+        );
+        has(&out, "-- ok: a comment line that reads like a status line");
+        let r = run(&["def", &orders]);
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        assert!(
+            r.stdout
+                .contains(&format!("for a table use: sqlh describe {orders}")),
+            "{}",
+            r.stdout
+        );
+
+        // Name resolution: any case, any schema for an unqualified name; an explicit schema
+        // is kept; ambiguous and unknown names say what to do; another database is refused.
+        let out = ok(&["describe", &schema.bare("parent").to_uppercase()]);
+        assert!(out.contains(&format!("\n{parent}\tUSER_TABLE\t")), "{out}");
+        let r = run(&["describe", "twin"]);
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!(
+                "-- error: ambiguous name twin: {}.twin, {}.twin; qualify it with the schema",
+                schema.bare("s1"),
+                schema.bare("s2")
+            )),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            ok(&["describe", &format!("{}.twin", schema.bare("s2"))]).contains("\tUSER_TABLE\t")
+        );
+        let r = run(&[
+            "describe",
+            &format!("{}.{}", schema.bare("s1"), schema.bare("parent")),
+        ]);
+        assert_eq!(
+            r.code, 1,
+            "an explicit schema is never set aside: {}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("-- error: no object named "),
+            "{}",
+            r.stdout
+        );
+        let r = run(&["describe", "master.dbo.spt_values"]);
+        assert_eq!(r.code, 3, "{}", r.stdout);
+        assert!(r.stdout.contains("run with -d master"), "{}", r.stdout);
+
+        // `find`, by name and in bodies; `tables` by pattern.
+        let stem = schema.bare("orders");
+        let out = ok(&["find", &stem]);
+        has(&out, &format!("{orders}\tUSER_TABLE"));
+        let out = ok(&["find", "@count", "--text"]);
+        assert!(
+            out.contains(&format!(
+                "{}\tSQL_STORED_PROCEDURE\t1\tCREATE PROCEDURE",
+                schema.name("get")
+            )),
+            "{out}"
+        );
+        let probe = schema
+            .objects
+            .probe
+            .name
+            .trim_start_matches("dbo.")
+            .to_owned();
+        let out = ok(&["tables", &format!("{probe}*")]);
+        assert!(out.contains(&format!("\n{orders}\ttable\t0\t")), "{out}");
+        assert!(out.contains(&format!("\n{parent}\ttable\t0\t")), "{out}");
+        assert!(
+            out.contains(&format!("\n{}\tview\tNULL\t", schema.name("v"))),
+            "{out}"
+        );
+
+        // JSON: each section's result is labeled; an empty one is kept.
+        let r = run(&["--format", "json", "describe", &parent]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("one document");
+        let labels: Vec<&str> = doc["batches"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["label"].as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "object",
+                "columns",
+                "indexes",
+                "foreign_keys",
+                "referenced_by",
+                "check_constraints",
+                "triggers"
+            ]
+        );
     }
 
     // F03 (PLAN.md 1.5), end to end: every shape the review got past the guard is refused by
