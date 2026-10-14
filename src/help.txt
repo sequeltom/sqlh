@@ -44,8 +44,8 @@ OUTPUT
   -o file         write output to a file (replaced whole when the run ends; never an input)
   --verbose       connection diagnostics on stderr
 
-SCHEMA  describe NAME | def NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
-  describe: columns, keys, indexes, FKs both ways, parameters. def: the source. PATTERN: Ord, Ord*, dbo.?rd*
+SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
+  describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
   sqlh profile add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]

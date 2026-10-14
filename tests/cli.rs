@@ -5910,6 +5910,31 @@ mod live {
                     astral_line(&n("astral")),
                     format!("DROP PROCEDURE IF EXISTS {}", n("astral")),
                 ),
+                // For deps: a constraint that calls a function, and a procedure whose
+                // references are caller-dependent, missing and in another database.
+                (
+                    format!(
+                        "ALTER TABLE {orders} ADD CONSTRAINT {ck2} CHECK ({double}(amount) >= 0)",
+                        ck2 = bare(&n("orders_ck2"))
+                    ),
+                    format!(
+                        "IF OBJECT_ID(N'{orders}') IS NOT NULL \
+                         ALTER TABLE {orders} DROP CONSTRAINT IF EXISTS {}",
+                        bare(&n("orders_ck2"))
+                    ),
+                ),
+                (
+                    format!(
+                        "CREATE PROCEDURE {caller} AS\n\
+                         EXEC {get} 1, N'open', NULL;\n\
+                         SELECT number FROM master.dbo.spt_values WHERE 1 = 0;\n\
+                         SELECT * FROM {missing};",
+                        caller = n("caller"),
+                        get = bare(&get),
+                        missing = n("missing")
+                    ),
+                    format!("DROP PROCEDURE IF EXISTS {}", n("caller")),
+                ),
             ];
             for (create, drop) in steps {
                 objects.make(&create, drop);
@@ -6225,6 +6250,67 @@ mod live {
             r.stdout
         );
 
+        // deps (schema-commands.md §6.7): both directions, with the part of an object that
+        // holds a reference (`via`) and what SQL Server says about it (`note`).
+        let fk = schema.bare("orders_fk");
+        let ck2 = schema.bare("orders_ck2");
+        let (double, get, alias) = (
+            schema.name("double"),
+            schema.name("get"),
+            schema.name("alias"),
+        );
+        let out = ok(&["deps", &orders]);
+        assert!(out.starts_with("-- uses\nname\ttype\tvia\tnote\n"), "{out}");
+        has(
+            &out,
+            &format!("{parent}\tUSER_TABLE\tforeign key {fk}\tNULL"),
+        );
+        has(
+            &out,
+            &format!("{double}\tSQL_SCALAR_FUNCTION\tcheck {ck2}\tschema-bound"),
+        );
+        has(&out, "-- used_by");
+        has(&out, &format!("{get}\tSQL_STORED_PROCEDURE\tNULL\tNULL"));
+        has(&out, &format!("{}\tVIEW\tNULL\tNULL", schema.name("v")));
+        has(
+            &out,
+            &format!(
+                "{}\tSQL_INLINE_TABLE_VALUED_FUNCTION\tNULL\tNULL",
+                schema.name("by_status")
+            ),
+        );
+        has(&out, &format!("{alias}\tSYNONYM\tNULL\tNULL"));
+        let out = ok(&["deps", &parent]);
+        has(
+            &out,
+            &format!("{orders}\tUSER_TABLE\tforeign key {fk}\tNULL"),
+        );
+        has(&out, "-- no rows: uses");
+        let out = ok(&["deps", &double]);
+        has(
+            &out,
+            &format!("{orders}\tUSER_TABLE\tcheck {ck2}\tschema-bound"),
+        );
+        let out = ok(&["deps", &alias]);
+        has(&out, &format!("{orders}\tUSER_TABLE\tNULL\tNULL"));
+        let caller = schema.name("caller");
+        let out = ok(&["deps", &caller]);
+        has(
+            &out,
+            &format!("{}\tNULL\tNULL\tcaller-dependent", schema.bare("get")),
+        );
+        has(&out, "master.dbo.spt_values\tNULL\tNULL\tother database");
+        has(
+            &out,
+            &format!("{}\tNULL\tNULL\tnot found", schema.name("missing")),
+        );
+        let out = ok(&["deps", &get]);
+        has(&out, &format!("{orders}\tUSER_TABLE\tNULL\tNULL"));
+        has(
+            &out,
+            &format!("{caller}\tSQL_STORED_PROCEDURE\tNULL\tcaller-dependent"),
+        );
+
         // R33: a body nobody can see (an encrypted procedure) isn't searched, and doesn't fail
         // the search; its name is still found.
         let secret = schema.name("secret");
@@ -6260,6 +6346,16 @@ mod live {
             login = reader.login
         ));
         assert_eq!(r.code, 0, "{}", r.stdout);
+        // Without VIEW DEFINITION on the database, SQL Server shows no dependencies at all, so
+        // deps refuses rather than answer "none".
+        let r = reader.run(&["deps", &orders]);
+        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("-- error: deps needs VIEW DEFINITION on the database"),
+            "{}",
+            r.stdout
+        );
         let r = reader.run(&["find", &probe, "--text"]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         has(&r.stdout, &format!("{view}\tVIEW"));

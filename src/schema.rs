@@ -45,6 +45,7 @@ pub enum Command {
     Describe(String),
     Find { pattern: String, text: bool },
     Def(String),
+    Deps(String),
 }
 
 impl Command {
@@ -55,7 +56,7 @@ impl Command {
         let name = first.as_str();
         if !matches!(
             name,
-            "info" | "dbs" | "tables" | "describe" | "find" | "def"
+            "info" | "dbs" | "tables" | "describe" | "find" | "def" | "deps"
         ) {
             return None;
         }
@@ -83,6 +84,7 @@ impl Command {
             },
             "describe" => one("NAME").map(Command::Describe),
             "find" => one("PATTERN").map(|pattern| Command::Find { pattern, text }),
+            "deps" => one("NAME").map(Command::Deps),
             _ => one("NAME").map(Command::Def),
         };
         Some(command.and_then(|command| {
@@ -102,6 +104,7 @@ impl Command {
             Command::Describe(_) => "describe",
             Command::Find { .. } => "find",
             Command::Def(_) => "def",
+            Command::Deps(_) => "deps",
         }
     }
 
@@ -115,12 +118,12 @@ impl Command {
 
     /// The command's own default limits (schema-commands.md §4): `describe` shows up to 2,000
     /// rows a section and 4,000 characters a value, since a wide table or a long check
-    /// constraint is the answer, not noise; `def` shows its definition whole, as far as
+    /// constraint is the answer, not noise (and so are `deps`'s lists); `def` shows its definition whole, as far as
     /// `--max-output` allows. A flag still wins; a profile's setting doesn't, since it was
     /// chosen for queries.
     pub fn limits(&self, limits: &mut Limits, rows_given: bool, cell_given: bool) {
         let (rows, cell) = match self {
-            Command::Describe(_) => (2000, 4000),
+            Command::Describe(_) | Command::Deps(_) => (2000, 4000),
             Command::Def(_) => (2000, 0),
             _ => return,
         };
@@ -149,8 +152,9 @@ impl Command {
                 }
                 steps(find_sql(&pattern, *text), &sections)
             }
-            Command::Describe(name) => lookup(name, false)?,
-            Command::Def(name) => lookup(name, true)?,
+            Command::Describe(name) => lookup(name, Shows::Describe)?,
+            Command::Def(name) => lookup(name, Shows::Def)?,
+            Command::Deps(name) => lookup(name, Shows::Deps)?,
         };
         Ok(Input::Command {
             name: self.name(),
@@ -491,7 +495,15 @@ fn literal_or_null(s: Option<&str>) -> String {
 /// know there are more; the total comes with them (R31).
 const CANDIDATES: usize = AMBIGUOUS_SHOWN + 1;
 
-/// Looks `asked` up for `describe` (or `def`, with `definition`): the objects it can mean
+/// What a looked-up object is for: the command that looked it up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shows {
+    Describe,
+    Def,
+    Deps,
+}
+
+/// Looks `asked` up for `describe`, `def` or `deps` (`shows`): the objects it can mean
 /// (schema-commands.md §5, with the reviews' corrections):
 /// 0. The name is parsed here (`parse_name`); a server part is refused.
 /// 1. Whether its database part is the current database is SQL Server's decision, made once
@@ -503,7 +515,7 @@ const CANDIDATES: usize = AMBIGUOUS_SHOWN + 1;
 ///    explicit schema is never set aside), compared case-insensitively, so a case-sensitive
 ///    database still finds `Users` for `users`, and two that differ only in case are
 ///    ambiguous.
-fn lookup(asked: &str, definition: bool) -> Result<Plan, Failure> {
+fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
     let name = parse_name(asked)?;
     if name.object.starts_with('#') {
         return Err(name_error(format!(
@@ -523,7 +535,8 @@ fn lookup(asked: &str, definition: bool) -> Result<Plan, Failure> {
          WHEN DB_ID(@db) IS NULL THEN 2 ELSE 0 END;\n\
          DECLARE @id int = CASE WHEN @scope = 1 \
          THEN OBJECT_ID(ISNULL(QUOTENAME(@schema) + N'.', N'') + QUOTENAME(@object)) END;\n\
-         SELECT @scope AS scope, DB_NAME() AS db;\n\
+         SELECT @scope AS scope, DB_NAME() AS db, \
+         HAS_PERMS_BY_NAME(NULL, N'DATABASE', N'VIEW DEFINITION') AS view_definition;\n\
          SELECT TOP ({CANDIDATES}) o.object_id, s.name AS [schema], o.name, \
          RTRIM(o.type) AS type, o.type_desc, \
          CASE WHEN OBJECT_DEFINITION(o.object_id) IS NULL THEN 0 ELSE 1 END AS visible, \
@@ -543,10 +556,10 @@ fn lookup(asked: &str, definition: bool) -> Result<Plan, Failure> {
     let asked = asked.to_owned();
     let then = move |found: &Found| -> Result<Vec<Step>, Failure> {
         let object = resolve(&asked, &name, found)?;
-        if definition {
-            def_steps(&object)
-        } else {
-            Ok(describe_steps(&object))
+        match shows {
+            Shows::Describe => Ok(describe_steps(&object)),
+            Shows::Def => def_steps(&object),
+            Shows::Deps => deps_steps(&object, view_definition(found)),
         }
     };
     Ok(Plan::Lookup {
@@ -911,6 +924,183 @@ fn def_steps(object: &Object) -> Result<Vec<Step>, Failure> {
     }])
 }
 
+/// Whether the login has VIEW DEFINITION on the database (the lookup's first row). Without it
+/// `sys.sql_expression_dependencies` returns no rows at all, not even for the objects the
+/// login can see, so `deps` would look like an object nothing uses.
+fn view_definition(found: &Found) -> bool {
+    found
+        .first()
+        .and_then(|rows| rows.first())
+        .and_then(|row| int(row.get(2)))
+        == Some(1)
+}
+
+/// A name as a reference wrote it, from four part expressions (any of them NULL), each part
+/// `shown`: the parts before the first one given are left out, and an empty one in between
+/// stays empty (`db..t`).
+fn written(server: &str, db: &str, schema: &str, entity: &str) -> String {
+    let (sv, d, sc, e) = (shown(server), shown(db), shown(schema), shown(entity));
+    format!(
+        "CASE WHEN {server} IS NOT NULL THEN CONCAT({sv}, N'.', {d}, N'.', {sc}, N'.', {e}) \
+         WHEN {db} IS NOT NULL THEN CONCAT({d}, N'.', {sc}, N'.', {e}) \
+         WHEN {schema} IS NOT NULL THEN CONCAT({sc}, N'.', {e}) ELSE {e} END"
+    )
+}
+
+/// The part of an object that holds a reference (`via`), for the referencing entity `r`
+/// (a module, a table, or a check or default constraint), the object it belongs to `o`, and
+/// the column `rc` (a computed column), if any: `check CK_x`, `default DF_x`, `column total`,
+/// or NULL when it is the object's own code.
+fn via(r: &str, o: &str, rc: &str) -> String {
+    format!(
+        "CASE WHEN {r}.object_id <> {o}.object_id \
+         THEN CASE {r}.type WHEN 'C' THEN N'check ' ELSE N'default ' END + {r_name} \
+         WHEN {rc}.column_id IS NOT NULL THEN N'column ' + {rc_name} END",
+        r_name = shown(&format!("{r}.name")),
+        rc_name = shown(&format!("{rc}.name")),
+    )
+}
+
+/// What a synonym's base object name is, part by part (`p.server` ... `p.entity`), and the
+/// object it is in this database (`OBJECT_ID` reads it; another database's or server's is
+/// never taken for one here, whatever id it has there).
+fn synonym_target(sn: &str) -> String {
+    format!(
+        "CROSS APPLY (SELECT PARSENAME({sn}.base_object_name, 4) AS server, \
+         PARSENAME({sn}.base_object_name, 3) AS db, PARSENAME({sn}.base_object_name, 2) AS sch, \
+         PARSENAME({sn}.base_object_name, 1) AS entity) AS p \
+         CROSS APPLY (SELECT CASE WHEN p.server IS NULL \
+         AND (p.db IS NULL OR DB_ID(p.db) = DB_ID()) \
+         THEN OBJECT_ID({sn}.base_object_name) END AS id) AS t"
+    )
+}
+
+/// The `uses` section: what the object refers to (schema-commands.md §6.7). Its own code's
+/// references, and those of its computed columns and its check and default constraints, from
+/// `sys.sql_expression_dependencies`; the tables its foreign keys point at; a synonym's
+/// target. A reference to itself (a computed column naming its table) is left out.
+fn uses_sql() -> String {
+    let note = "STUFF(NULLIF(CONCAT(\
+         CASE WHEN d.referenced_server_name IS NOT NULL THEN N', other server' \
+         WHEN d.referenced_database_name IS NOT NULL \
+         AND ISNULL(DB_ID(d.referenced_database_name), 0) <> DB_ID() THEN N', other database' \
+         WHEN d.is_caller_dependent = 1 THEN N', caller-dependent' \
+         WHEN d.is_ambiguous = 1 THEN N', ambiguous' \
+         WHEN d.referenced_id IS NULL THEN N', not found' END, \
+         CASE WHEN d.is_schema_bound_reference = 1 THEN N', schema-bound' END), N''), 1, 2, N'')";
+    format!(
+        "SELECT name, type, via, note FROM (\
+         SELECT CASE WHEN ro.object_id IS NOT NULL THEN {resolved} ELSE {as_written} END AS name, \
+         CASE WHEN ro.object_id IS NOT NULL THEN ro.type_desc \
+         WHEN d.referenced_class <> 1 THEN d.referenced_class_desc END AS type, \
+         {via} AS via, {note} AS note \
+         FROM sys.sql_expression_dependencies AS d \
+         JOIN sys.all_objects AS r ON r.object_id = d.referencing_id \
+         JOIN sys.all_objects AS o ON o.object_id = @id \
+         LEFT JOIN sys.all_objects AS ro ON d.referenced_class = 1 AND ro.object_id = d.referenced_id \
+         LEFT JOIN sys.schemas AS rs ON rs.schema_id = ro.schema_id \
+         LEFT JOIN sys.all_columns AS rc ON d.referencing_minor_id > 0 \
+         AND rc.object_id = d.referencing_id AND rc.column_id = d.referencing_minor_id \
+         WHERE d.referencing_class = 1 \
+         AND (r.object_id = @id OR (r.parent_object_id = @id AND r.type IN ('C', 'D'))) \
+         AND NOT (d.referenced_class = 1 AND ISNULL(d.referenced_id, 0) = @id) \
+         UNION \
+         SELECT {resolved}, ro.type_desc, N'foreign key ' + {fk_name}, NULL \
+         FROM sys.foreign_keys AS fk JOIN sys.all_objects AS ro ON ro.object_id = fk.referenced_object_id \
+         JOIN sys.schemas AS rs ON rs.schema_id = ro.schema_id \
+         WHERE fk.parent_object_id = @id AND fk.referenced_object_id <> @id \
+         UNION \
+         SELECT CASE WHEN ro.object_id IS NOT NULL THEN {resolved} ELSE {target_written} END, \
+         ro.type_desc, NULL, \
+         CASE WHEN p.server IS NOT NULL THEN N'other server' \
+         WHEN p.db IS NOT NULL AND ISNULL(DB_ID(p.db), 0) <> DB_ID() THEN N'other database' \
+         WHEN ro.object_id IS NULL THEN N'not found' END \
+         FROM sys.synonyms AS sn {target} \
+         LEFT JOIN sys.all_objects AS ro ON ro.object_id = t.id \
+         LEFT JOIN sys.schemas AS rs ON rs.schema_id = ro.schema_id \
+         WHERE sn.object_id = @id\
+         ) AS u ORDER BY name;",
+        resolved = qualified("rs.name", "ro.name"),
+        as_written = written(
+            "d.referenced_server_name",
+            "d.referenced_database_name",
+            "d.referenced_schema_name",
+            "d.referenced_entity_name"
+        ),
+        via = via("r", "o", "rc"),
+        fk_name = shown("fk.name"),
+        target_written = written("p.server", "p.db", "p.sch", "p.entity"),
+        target = synonym_target("sn"),
+    )
+}
+
+/// The `used_by` section: what refers to the object (schema-commands.md §6.7). Code that
+/// refers to it by id (a module, or a table's computed column, check or default constraint,
+/// shown as the table with `via`); code whose reference SQL Server resolves at run time by
+/// the caller's schema (`EXEC usp_x`, `caller-dependent`), matched by name; the tables whose
+/// foreign keys point at it; the synonyms for it.
+fn used_by_sql() -> String {
+    format!(
+        "SELECT name, type, via, note FROM (\
+         SELECT {name} AS name, o.type_desc AS type, {via} AS via, \
+         STUFF(NULLIF(CONCAT(CASE WHEN d.referenced_id IS NULL THEN N', caller-dependent' END, \
+         CASE WHEN d.is_schema_bound_reference = 1 THEN N', schema-bound' END), N''), 1, 2, N'') \
+         AS note \
+         FROM sys.sql_expression_dependencies AS d \
+         JOIN sys.all_objects AS r ON r.object_id = d.referencing_id \
+         JOIN sys.all_objects AS o ON o.object_id = CASE WHEN r.type IN ('C', 'D') \
+         THEN r.parent_object_id ELSE r.object_id END \
+         JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
+         LEFT JOIN sys.all_columns AS rc ON d.referencing_minor_id > 0 \
+         AND rc.object_id = d.referencing_id AND rc.column_id = d.referencing_minor_id \
+         WHERE d.referencing_class = 1 AND d.referenced_class = 1 AND o.object_id <> @id \
+         AND (d.referenced_id = @id \
+         OR (d.referenced_id IS NULL AND d.is_caller_dependent = 1 \
+         AND d.referenced_server_name IS NULL \
+         AND (d.referenced_database_name IS NULL OR DB_ID(d.referenced_database_name) = DB_ID()) \
+         AND d.referenced_entity_name = @name \
+         AND (d.referenced_schema_name IS NULL OR d.referenced_schema_name = @schema))) \
+         UNION \
+         SELECT {name}, o.type_desc, N'foreign key ' + {fk_name}, NULL \
+         FROM sys.foreign_keys AS fk JOIN sys.all_objects AS o ON o.object_id = fk.parent_object_id \
+         JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
+         WHERE fk.referenced_object_id = @id AND fk.parent_object_id <> @id \
+         UNION \
+         SELECT {synonym}, sn.type_desc, NULL, NULL \
+         FROM sys.synonyms AS sn JOIN sys.schemas AS s ON s.schema_id = sn.schema_id {target} \
+         WHERE t.id = @id\
+         ) AS u ORDER BY name;",
+        name = qualified("s.name", "o.name"),
+        via = via("r", "o", "rc"),
+        fk_name = shown("fk.name"),
+        synonym = qualified("s.name", "sn.name"),
+        target = synonym_target("sn"),
+    )
+}
+
+/// `deps`: what the object uses and what uses it, or why that can't be shown.
+fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failure> {
+    if !view_definition {
+        return Err(name_error(
+            "deps needs VIEW DEFINITION on the database, which the login lacks: without it SQL \
+             Server shows no dependencies at all. describe shows foreign keys, and def an \
+             object's source"
+                .to_owned(),
+        ));
+    }
+    Ok(vec![Step {
+        sql: format!(
+            "DECLARE @id int = {id}, @schema sysname = {schema}, @name sysname = {name};\n{uses}\n{used_by}\n",
+            id = object.id,
+            schema = literal(&object.schema),
+            name = literal(&object.name),
+            uses = uses_sql(),
+            used_by = used_by_sql(),
+        ),
+        sections: vec![Section::rows("uses"), Section::rows("used_by")],
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1145,8 @@ mod tests {
             (&["def", ""][..], false, "def needs NAME"),
             (&["dbs", "x"][..], false, "dbs takes no arguments"),
             (&["tables", "a", "b"][..], false, "tables takes one pattern"),
+            (&["deps"][..], false, "deps needs NAME: sqlh deps NAME"),
+            (&["deps", "a", "b"][..], false, "deps takes one NAME"),
             (
                 &["describe", "x"][..],
                 true,
@@ -977,7 +1169,7 @@ mod tests {
         assert_eq!(literal("[a]]b]"), "N'[a]]b]'");
         let sql = tables_sql(Some("x'; SELECT 1 --"));
         assert!(sql.contains("LIKE N'%x''; SELECT 1 --%'"), "{sql}");
-        let Plan::Lookup { sql, .. } = lookup("it's", false).unwrap() else {
+        let Plan::Lookup { sql, .. } = lookup("it's", Shows::Describe).unwrap() else {
             panic!("a lookup");
         };
         assert!(
@@ -986,7 +1178,7 @@ mod tests {
             ),
             "{sql}"
         );
-        let Plan::Lookup { sql, .. } = lookup("[a'b].\"c.d\"", false).unwrap() else {
+        let Plan::Lookup { sql, .. } = lookup("[a'b].\"c.d\"", Shows::Describe).unwrap() else {
             panic!("a lookup");
         };
         assert!(
@@ -1058,7 +1250,7 @@ mod tests {
         }
         // Refused before connecting, with exit 3, through the command too.
         for input in [format!("[{long}].p"), "srv.db.dbo.p".into()] {
-            let Err(failure) = lookup(&input, true) else {
+            let Err(failure) = lookup(&input, Shows::Def) else {
                 panic!("{input} refused");
             };
             assert_eq!(failure.exit, Exit::Usage, "{input}");
@@ -1249,7 +1441,7 @@ mod tests {
 
     #[test]
     fn a_temporary_table_is_refused_before_anything_runs() {
-        let Err(failure) = lookup("#orders", false) else {
+        let Err(failure) = lookup("#orders", Shows::Describe) else {
             panic!("refused");
         };
         assert!(
@@ -1317,6 +1509,56 @@ mod tests {
         assert!(!object_sql("V").contains("AS rows"));
     }
 
+    // schema-commands.md §6.7: two sections, the object's names as literals, and a refusal
+    // where SQL Server would show no dependencies at all.
+    #[test]
+    fn deps_shows_both_directions_or_says_why_not() {
+        let steps = deps_steps(&object("P"), true).unwrap();
+        assert_eq!(labels(&steps), ["uses", "used_by"]);
+        let sql = &steps[0].sql;
+        assert!(
+            sql.starts_with(
+                "DECLARE @id int = -5, @schema sysname = N'dbo', @name sysname = N'X';\n\
+                 SELECT name, type, via, note FROM ("
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql.matches(") AS u ORDER BY name;\n").count(), 2, "{sql}");
+        // A caller-dependent reference is matched by name, never one that SQL Server failed
+        // to resolve for another reason.
+        assert!(
+            sql.contains("d.referenced_id IS NULL AND d.is_caller_dependent = 1"),
+            "{sql}"
+        );
+        let refused = deps_steps(&object("P"), false).unwrap_err();
+        assert_eq!(refused.exit, Exit::SqlError);
+        assert!(
+            refused
+                .message
+                .starts_with("deps needs VIEW DEFINITION on the database"),
+            "{}",
+            refused.message
+        );
+        let found = |flag| -> Found {
+            vec![vec![vec![
+                Value::Int(1),
+                Value::Text("AppDb".into()),
+                Value::Int(flag),
+            ]]]
+        };
+        assert!(view_definition(&found(1)));
+        assert!(!view_definition(&found(0)));
+        assert!(!view_definition(&Vec::new()));
+        // A name as written: leading parts left out, an empty inner one kept.
+        let sql = written("a", "b", "c", "d");
+        assert!(
+            sql.starts_with("CASE WHEN a IS NOT NULL THEN CONCAT(")
+                && sql.contains("WHEN b IS NOT NULL THEN CONCAT(")
+                && sql.ends_with("QUOTENAME(d) END END"),
+            "{sql}"
+        );
+    }
+
     #[test]
     fn def_refuses_what_has_no_definition_to_show() {
         let steps = def_steps(&object("P")).unwrap();
@@ -1367,6 +1609,9 @@ mod tests {
     fn describe_and_def_have_their_own_default_limits() {
         let mut limits = Limits::default();
         Command::Describe("x".into()).limits(&mut limits, false, false);
+        assert_eq!((limits.max_rows, limits.max_cell), (2000, 4000));
+        let mut limits = Limits::default();
+        Command::Deps("x".into()).limits(&mut limits, false, false);
         assert_eq!((limits.max_rows, limits.max_cell), (2000, 4000));
         let mut limits = Limits::default();
         Command::Def("x".into()).limits(&mut limits, true, false);

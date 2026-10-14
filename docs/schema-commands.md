@@ -1,6 +1,6 @@
 # Schema commands: design and plan
 
-Status: built 2026-10-13 (`src/schema.rs`; PLAN.md Phase 4), except `deps`, which stays phase 2. This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
+Status: built 2026-10-13 (`src/schema.rs`; PLAN.md Phase 4), and `deps` on 2026-10-14 (§6.7). This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
 
 **As built, where it differs from the proposal below** (the sections below are corrected too):
 - **The lookup is not a batch.** `describe` and `def` look the name up first on the run's own connection (`run::Plan::Lookup`), inside the read-only wrapper; the lookup shows nothing, and its rows decide the one batch that follows. So a `describe` is `ok: 1 batch`. An error in the lookup ends the run as a failure quoting the server's message.
@@ -36,7 +36,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 | `sqlh describe <object>` | Everything needed to query a table or view, or call a procedure or function. |
 | `sqlh find <pattern> [--text]` | Objects and columns whose names match. With `--text`, also procedure, view and function bodies that contain the pattern. |
 | `sqlh def <object>` | The source of a view, procedure, function or trigger. |
-| `sqlh deps <object>` (phase 2) | What the object references and what references it. |
+| `sqlh deps <object>` | What the object references and what references it. |
 
 **Invocation.**
 - The command is the first positional word after the connection options: `sqlh --profile test describe dbo.Users`.
@@ -209,12 +209,24 @@ SELECT N'dbo.usp_Get' AS name, N'SQL_STORED_PROCEDURE' AS type, @definition AS d
 - **Tables:** the run fails, `def shows views, procedures, functions and triggers; for a table use: sqlh describe dbo.Users`. Scripting `CREATE TABLE` is out of scope.
 - **Synonyms:** the run fails, `dbo.s is a synonym for [dbo].[t]; run: sqlh def [dbo].[t]`.
 
-### 6.7 `deps <object>` (phase 2)
+### 6.7 `deps <object>` (built 2026-10-14)
 
-- **uses:** from `sys.sql_expression_dependencies` where `referencing_id = @id`, with `entity, type, columns`, including cross-database references by name.
-- **used_by:** from `sys.dm_sql_referencing_entities`, via its documented error-tolerant use.
+What the object refers to and what refers to it, one level each way. The name is looked up as for `describe` (§5). Two sections, each `name, type, via, note`, ordered by name:
 
-This is phase 2 because the DMV has permission and ambiguity quirks worth testing against real schemas first.
+- **uses:** what the object's code refers to, from `sys.sql_expression_dependencies` (`referencing_id` = the object, or one of its check and default constraints), plus the tables its foreign keys point at and, for a synonym, its target. A table's code is its computed columns and constraints. A reference to the object itself (a computed column naming its own table) is left out.
+- **used_by:** what refers to the object: code that refers to it by id (`referenced_id`), code whose reference SQL Server resolves only at run time by the caller's default schema (`EXEC usp_x`, `is_caller_dependent`), matched by name and schema (when given), the tables whose foreign keys point at it, and the synonyms for it.
+
+The columns:
+- **name:** the object, shown as every name is (§5 "Names shown"). In `uses`, a reference that SQL Server resolved shows the object it resolved to (`dbo.Orders` for an unqualified `Orders`); one it didn't shows the name as written, each part shown the same way (`master.dbo.spt_values`, `usp_x`). In `used_by`, a reference held by a table's computed column or constraint shows the table.
+- **type:** `type_desc` of the object (`USER_TABLE`, `SQL_STORED_PROCEDURE`, ...); for a referenced type, XML schema collection or partition function, that class (`TYPE`, ...); NULL for an object SQL Server didn't resolve.
+- **via:** the part of the object that holds the reference, when it isn't the object's own code: `column total` (a computed column), `check CK_x`, `default DF_x`, `foreign key FK_x`. NULL for a module's code and a synonym.
+- **note:** what SQL Server says about the reference, NULL when there is nothing to say: `other server`, `other database` (not followed: catalog views are per database), `caller-dependent` (resolved at run time, by the caller's default schema: in `used_by`, a reference that may mean this object), `ambiguous`, `not found` (no such object in this database, or none the login can see; deferred name resolution allows it), and `schema-bound` (the referenced object can't be dropped or altered while this exists: schema-bound views and functions, and constraints and computed columns that call a function). At most one of the first five applies, and `schema-bound` follows it after `, ` when both do.
+
+Column-level detail (which columns a procedure reads) is left out: `sys.dm_sql_referenced_entities` gives it, but it re-binds the module and fails on one with a missing reference; `def` shows the source, and `find --text` finds a column's uses. Only one level is shown; run `deps` on what it lists to go further. Database and server DDL triggers aren't listed (`referencing_class` 1 only).
+
+**Permissions.** `sys.sql_expression_dependencies` returns no rows at all to a login without VIEW DEFINITION on the database, not even for the objects it can see (checked on SQL Server 2025 with a `db_datareader` user). So `deps` checks it (`HAS_PERMS_BY_NAME(NULL, 'DATABASE', 'VIEW DEFINITION')`, read by the lookup) and, without it, fails with exit 1: `deps needs VIEW DEFINITION on the database, which the login lacks: without it SQL Server shows no dependencies at all. describe shows foreign keys, and def an object's source`. It doesn't use `sys.dm_sql_referencing_entities`, which needs CONTROL on the object.
+
+**Limits:** as `describe`: 2,000 rows a section and 4,000 characters a value by default (§4).
 
 ## 7. Patterns (`tables`, `find`)
 
@@ -232,7 +244,7 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
 - **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed. No command needs `VIEW SERVER STATE`.
 - **Temp tables:** `describe #t` works only on the session that created the table. That means MCP sessions (`docs/mcp-mode.md`), not one-shot CLI calls, so the CLI refuses `#` names before connecting (exit 1, `#t is a temporary table, which only the session that made it can see; each sqlh run is a new session`).
 
-## 9. Implementation plan (done 2026-10-13, except `deps`; as built above)
+## 9. Implementation plan (done 2026-10-13, `deps` 2026-10-14; as built above)
 
 1. **Output sections** (`src/output/`)
    - `Section { label, names_only, collapse_empty, raw }` and `Output::set_sections`
