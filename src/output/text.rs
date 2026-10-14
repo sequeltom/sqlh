@@ -51,7 +51,12 @@ impl<W: Write> TextSink<W> {
     /// lines (schema-commands.md §4). Each line is escaped like a value, except that a tab
     /// stays a tab, so nothing in it can break a line; the count tells a reader where the
     /// block ends, so a line that starts with `--` (a T-SQL comment) can't pass for metadata.
-    /// Lines that don't fit the output budget are left out, and the header says so.
+    ///
+    /// When not all of it is shown, the header counts the lines that are, and says what wasn't
+    /// and why (DESIGN.md §5.1): whole lines the output budget had no room for (`--max-output`,
+    /// which then stops the body), and the part the read cut (`--max-cell N`, or the output
+    /// budget when there is no cell limit). A read cut leaves the number of lines after it
+    /// unknown, so that count is a lower bound, and a line it cut in two is marked.
     fn definition(&mut self, values: &[Value]) -> io::Result<()> {
         fn text(value: Option<&Value>) -> &str {
             match value {
@@ -60,10 +65,10 @@ impl<W: Write> TextSink<W> {
             }
         }
         let (name, kind) = (escaped(text(values.first())), escaped(text(values.get(1))));
-        let (body, cut) = match values.get(2) {
-            Some(Value::Text(s)) => (s.as_str(), false),
-            Some(Value::TextCut(s, _)) => (s.as_str(), true),
-            _ => ("", false),
+        let (body, more) = match values.get(2) {
+            Some(Value::Text(s)) => (s.as_str(), None),
+            Some(Value::TextCut(s, more)) => (s.as_str(), Some(*more)),
+            _ => ("", None),
         };
         let mut lines: Vec<String> = body
             .split('\n')
@@ -83,28 +88,57 @@ impl<W: Write> TextSink<W> {
         if body.ends_with('\n') {
             lines.pop();
         }
-        let total = lines.len();
+        let read = lines.len();
+        // The read stopped inside a line: the last line read is only its start.
+        let partial = more.is_some() && !body.is_empty() && !body.ends_with('\n');
+        let read_cut = more.map(|_| match self.tally.limits().max_cell {
+            0 => "--max-output".to_owned(),
+            cell => format!("--max-cell {cell}"),
+        });
         let header = |shown: usize| {
-            let s = if total == 1 { "" } else { "s" };
-            if shown == total && !cut {
-                format!("-- definition: {name} ({kind}), {total} line{s}")
-            } else {
-                let at_least = if cut { "≥" } else { "" };
-                format!(
-                    "-- definition: {name} ({kind}), first {shown} of {at_least}{total} line{s} \
-                     shown (--max-output)"
-                )
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            if shown == read && more.is_none() {
+                return format!(
+                    "-- definition: {name} ({kind}), {read} line{}",
+                    plural(read)
+                );
             }
+            let mut header = format!(
+                "-- definition: {name} ({kind}), first {shown} line{} shown",
+                plural(shown)
+            );
+            if partial && shown == read {
+                header.push_str(", the last one cut short");
+            }
+            let mut why = Vec::new();
+            let rest = if shown < read {
+                why.push("--max-output");
+                let left = read - shown;
+                let at_least = if more.is_some() { "≥" } else { "" };
+                format!("{at_least}{left} more line{}", plural(left))
+            } else {
+                let more = more.unwrap_or(0);
+                format!("{more} more character{}", plural(more))
+            };
+            if let Some(cut) = &read_cut
+                && !why.contains(&cut.as_str())
+            {
+                why.push(cut);
+            }
+            let _ = write!(header, "; {rest} not shown ({})", why.join(", "));
+            header
         };
-        // The longest the header can be, so the lines counted in it are sure to fit after it.
+        // The longest the header can be, so the lines counted in it are sure to fit after it:
+        // its counts take at most as many digits as `read`, twice.
+        let longest = header(0).len().max(header(read).len()) + read.to_string().len() + 1;
         let room = self.tally.body_room(self.written);
-        let mut used = header(0).len() + 1;
-        let mut shown = 0;
-        if used > room {
+        if longest > room {
             self.tally.withhold_result();
             self.tally.row_withheld();
             return Ok(());
         }
+        let mut used = longest;
+        let mut shown = 0;
         for line in &lines {
             used += line.len() + 1;
             if used > room {
@@ -117,9 +151,9 @@ impl<W: Write> TextSink<W> {
             self.write_line(line)?;
         }
         self.tally.row_shown();
-        if shown < total || cut {
+        if shown < read {
             self.tally
-                .withhold_definition_lines((total - shown) as u64 + u64::from(cut));
+                .withhold_definition_lines((read - shown) as u64, more.is_some());
         }
         Ok(())
     }
@@ -782,28 +816,32 @@ pub(super) mod tests {
         );
     }
 
+    fn definition_out(limits: Limits, value: Value) -> String {
+        let mut s = TextSink::new(Vec::new(), limits);
+        s.set_sections(&[Section::definition("definition")]);
+        s.columns(&[col("name", "nvarchar(257)")]).unwrap();
+        let mut row = definition_row("");
+        row[2] = value;
+        s.row(&row).unwrap();
+        s.end_rows().unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        text(s)
+    }
+
     // A definition longer than the output budget shows the lines that fit, and its header and
     // the closing note say how many there were.
     #[test]
     fn a_definition_is_cut_at_whole_lines_and_says_so() {
-        let mut s = TextSink::new(
-            Vec::new(),
-            Limits {
-                max_output: crate::output::OUTPUT_RESERVE + 120,
-                ..Limits::default()
-            },
-        );
-        s.set_sections(&[Section::definition("definition")]);
-        s.columns(&[col("name", "nvarchar(257)")]).unwrap();
+        let limits = Limits {
+            max_output: crate::output::OUTPUT_RESERVE + 140,
+            ..Limits::default()
+        };
         let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
-        s.row(&definition_row(&body)).unwrap();
-        s.end_rows().unwrap();
-        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
-        let out = text(s);
+        let out = definition_out(limits, Value::Text(body));
         assert!(
             out.starts_with(
-                "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 4 of 20 lines shown \
-                 (--max-output)\nline 1\nline 2\nline 3\nline 4\n\
+                "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 4 lines shown; 16 more \
+                 lines not shown (--max-output)\nline 1\nline 2\nline 3\nline 4\n\
                  -- note: output stopped at the --max-output"
             ),
             "{out}"
@@ -812,6 +850,57 @@ pub(super) mod tests {
             out.contains("these weren't shown: 16 definition lines"),
             "{out}"
         );
+    }
+
+    // R29: a definition the read cut says which limit cut it and what is left, marks a line
+    // it cut in two, and doesn't claim an output limit that isn't there.
+    #[test]
+    fn a_definition_cut_while_read_says_by_what() {
+        let cell = |max_cell, max_output| Limits {
+            max_cell,
+            max_output,
+            ..Limits::default()
+        };
+        // Cut inside the first line, with no output limit: no --max-output anywhere.
+        let out = definition_out(cell(10, 0), Value::TextCut("CREATE PRO".into(), 52));
+        assert_eq!(
+            out,
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 1 line shown, the last one cut \
+             short; 52 more characters not shown (--max-cell 10)\n\
+             CREATE PRO\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+        // Cut just after a line break: every line read is whole.
+        let out = definition_out(cell(5, 0), Value::TextCut("a\nbc\n".into(), 1));
+        assert_eq!(
+            out,
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 2 lines shown; 1 more \
+             character not shown (--max-cell 5)\na\nbc\n-- ok: 1 batch, 3 ms\n"
+        );
+        // Both: the read was cut and the budget had no room for all of what was read, so the
+        // lines left are a lower bound, here and in the note.
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let out = definition_out(
+            cell(150, crate::output::OUTPUT_RESERVE + 160),
+            Value::TextCut(body[..150].into(), 1000),
+        );
+        assert!(
+            out.starts_with(
+                "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 2 lines shown; ≥18 more \
+                 lines not shown (--max-output, --max-cell 150)\nline 1\nline 2\n-- note"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("these weren't shown: ≥18 definition lines"),
+            "{out}"
+        );
+        // No cell limit: the read was cut at the output budget.
+        let out = definition_out(
+            cell(0, crate::output::OUTPUT_RESERVE + 160),
+            Value::TextCut(body[..150].into(), 1000),
+        );
+        assert!(out.contains("lines not shown (--max-output)\n"), "{out}");
     }
 
     // Helpers for the tests of the whole-response budget, shared by all three formats.

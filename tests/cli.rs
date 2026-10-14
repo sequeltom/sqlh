@@ -2205,6 +2205,18 @@ fn schema_commands_refuse_what_they_cannot_answer_before_connecting() {
         "{}",
         r.stdout
     );
+    // R27: a name is parsed before connecting; an invalid part, or a server, is refused.
+    let long = format!("[{}].p", "s".repeat(129));
+    for (name, why) in [
+        (long.as_str(), "a part is longer than 128 characters"),
+        ("a.b.c.d.e", "it has more than four parts"),
+        ("[dbo.p", "a delimited part isn't closed"),
+        ("srv.db.dbo.p", "names a server (srv)"),
+    ] {
+        let r = run(&["def", name]);
+        assert_eq!(r.code, 3, "{name}: {}", r.stdout);
+        assert!(r.stdout.contains(why), "{name}: {}", r.stdout);
+    }
 }
 
 // AGENTS.md: models read --help, so it stays short. PLAN.md 2.13 holds it at 62 lines.
@@ -5716,7 +5728,9 @@ mod live {
     /// index with a descending key and an include, a foreign key, a trigger, descriptions), the
     /// table it references, a view, a procedure with an output parameter and a comment line, a
     /// scalar and a table-valued function, a synonym, and two tables with one name in two
-    /// schemas. Every name starts with the probe's, so the test's own objects are easy to find.
+    /// schemas; an XML and a columnstore index; a table, columns, an index and a view whose
+    /// names need brackets; and an encrypted procedure. Every name starts with the probe's, so
+    /// the test's own objects are easy to find.
     struct Schema {
         objects: Objects,
     }
@@ -5760,7 +5774,8 @@ mod live {
                          total AS (amount * 2) PERSISTED, \
                          phone {phone}, \
                          created datetime2(3) NOT NULL, \
-                         note nvarchar(max) NULL);\n\
+                         note nvarchar(max) NULL, \
+                         doc xml NULL);\n\
                          EXEC sys.sp_addextendedproperty N'MS_Description', N'Orders, one row \
                          each', N'SCHEMA', N'dbo', N'TABLE', N'{t}';\n\
                          EXEC sys.sp_addextendedproperty N'MS_Description', N'Open, paid or \
@@ -5836,6 +5851,41 @@ mod live {
                 (
                     format!("CREATE TABLE {s2}.twin (id int NOT NULL)"),
                     format!("DROP TABLE IF EXISTS {s2}.twin"),
+                ),
+                // Index types whose columns have no key order (R29's catalog follow-up).
+                (
+                    format!(
+                        "CREATE PRIMARY XML INDEX {px} ON {orders} (doc)",
+                        px = bare(&n("px"))
+                    ),
+                    format!("DROP INDEX IF EXISTS {} ON {orders}", bare(&n("px"))),
+                ),
+                (
+                    format!(
+                        "CREATE NONCLUSTERED COLUMNSTORE INDEX {cs} ON {parent} (id, code)",
+                        cs = bare(&n("cs"))
+                    ),
+                    format!("DROP INDEX IF EXISTS {} ON {parent}", bare(&n("cs"))),
+                ),
+                // Names that only brackets keep apart (R32).
+                (
+                    format!(
+                        "CREATE TABLE {s1}.[x.y] ([a, b] int NOT NULL, [c DESC] int NOT NULL);\n\
+                         CREATE INDEX [ix odd] ON {s1}.[x.y] ([a, b], [c DESC] DESC);"
+                    ),
+                    format!("DROP TABLE IF EXISTS {s1}.[x.y]"),
+                ),
+                (
+                    format!("CREATE VIEW {s1}.[v.w] AS SELECT 1 AS one"),
+                    format!("DROP VIEW IF EXISTS {s1}.[v.w]"),
+                ),
+                // A body nobody can see (R33).
+                (
+                    format!(
+                        "CREATE PROCEDURE {secret} WITH ENCRYPTION AS SELECT COUNT(*) FROM {orders}",
+                        secret = n("secret")
+                    ),
+                    format!("DROP PROCEDURE IF EXISTS {}", n("secret")),
                 ),
             ];
             for (create, drop) in steps {
@@ -6000,6 +6050,25 @@ mod live {
             "{out}"
         );
         has(&out, "-- ok: a comment line that reads like a status line");
+        // R29: cut while read, with no output limit: the cell limit is named, and the line it
+        // cut in two is marked; nothing claims --max-output.
+        let out = ok(&[
+            "def",
+            &schema.name("get"),
+            "--max-cell",
+            "10",
+            "--max-output",
+            "0",
+        ]);
+        assert!(
+            out.starts_with(&format!(
+                "-- definition: {} (SQL_STORED_PROCEDURE), first 1 line shown, the last one cut \
+                 short; ",
+                schema.name("get")
+            )) && out.contains(" more characters not shown (--max-cell 10)\nCREATE PRO\n-- ok:"),
+            "{out}"
+        );
+        assert!(!out.contains("--max-output"), "{out}");
         let r = run(&["def", &orders]);
         assert_eq!(r.code, 1, "{}", r.stdout);
         assert!(
@@ -6069,6 +6138,110 @@ mod live {
         assert!(
             out.contains(&format!("\n{}\tview\tNULL\t", schema.name("v"))),
             "{out}"
+        );
+
+        // Index types with no key order list the columns they cover as their keys.
+        let out = ok(&["describe", &orders]);
+        has(
+            &out,
+            &format!("{}\tXML\t0\t0\tdoc\tNULL\tNULL\t0", schema.bare("px")),
+        );
+        let out = ok(&["describe", &parent]);
+        has(
+            &out,
+            &format!(
+                "{}\tNONCLUSTERED COLUMNSTORE\t0\t0\tid, code\tNULL\tNULL\t0",
+                schema.bare("cs")
+            ),
+        );
+
+        // R32: a name that needs brackets is shown in them, in names and in lists, and given
+        // back it reaches the same object.
+        let s1 = schema.bare("s1");
+        let odd = format!("{s1}.[x.y]");
+        let out = ok(&["describe", &odd]);
+        assert!(out.contains(&format!("\n{odd}\tUSER_TABLE\t0\t")), "{out}");
+        has(&out, "a, b\tint\t0\t0\tNULL\tNULL\tNULL");
+        has(
+            &out,
+            "ix odd\tNONCLUSTERED\t0\t0\t[a, b], [c DESC] DESC\tNULL\tNULL\t0",
+        );
+        let out = ok(&["tables", &format!("{s1}.*")]);
+        assert!(out.contains(&format!("\n{odd}\ttable\t0\t")), "{out}");
+        let out = ok(&["def", &format!("{s1}.[v.w]")]);
+        assert!(
+            out.starts_with(&format!("-- definition: {s1}.[v.w] (VIEW), 1 line\n")),
+            "{out}"
+        );
+
+        // R27: an invalid qualifier is refused (exit 3), never set aside for the object's name.
+        let long = "s".repeat(129);
+        let get = schema.bare("get");
+        for name in [
+            format!("[{long}].{get}"),
+            format!("[{long}].dbo.{get}"),
+            format!("[{long}].{db}.dbo.{get}"),
+        ] {
+            let r = run(&["def", &name]);
+            assert_eq!(r.code, 3, "{name}: {}", r.stdout);
+            assert!(!r.stdout.contains("-- definition"), "{}", r.stdout);
+        }
+        // R28: SQL Server decides whether a database part is the current database: in another
+        // case it is (the server's collation is case-insensitive); one that doesn't exist is
+        // refused.
+        let out = ok(&[
+            "describe",
+            &format!("{}..{}", db.to_uppercase(), schema.bare("parent")),
+        ]);
+        assert!(out.contains(&format!("\n{parent}\tUSER_TABLE\t")), "{out}");
+        let r = run(&["describe", "sqlh_no_such_db.dbo.x"]);
+        assert_eq!(r.code, 3, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("there is no database sqlh_no_such_db"),
+            "{}",
+            r.stdout
+        );
+
+        // R33: a body nobody can see (an encrypted procedure) isn't searched, and doesn't fail
+        // the search; its name is still found.
+        let secret = schema.name("secret");
+        let out = ok(&["find", &probe, "--text"]);
+        has(&out, &format!("{secret}\tSQL_STORED_PROCEDURE"));
+        assert!(
+            !out.contains(&format!("\n{secret}\tSQL_STORED_PROCEDURE\t")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n{}\tSQL_STORED_PROCEDURE\t1\t",
+                schema.name("get")
+            )),
+            "{out}"
+        );
+        // A login that sees a view (it may read it) but not its body: the same. It may see one
+        // function's body, which is searched.
+        let reader = Reader::create(&p, &db);
+        let (view, by_status) = (schema.name("v"), schema.name("by_status"));
+        let r = reader.probe.server.write(&format!(
+            "REVOKE VIEW DEFINITION FROM [{login}];\n\
+             GRANT VIEW DEFINITION ON {by_status} TO [{login}];",
+            login = reader.login
+        ));
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let r = reader.run(&["find", &probe, "--text"]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        has(&r.stdout, &format!("{view}\tVIEW"));
+        assert!(
+            !r.stdout.contains(&format!("\n{view}\tVIEW\t")),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains(&format!(
+                "\n{by_status}\tSQL_INLINE_TABLE_VALUED_FUNCTION\t1\tCREATE FUNCTION"
+            )),
+            "{}",
+            r.stdout
         );
 
         // JSON: each section's result is labeled; an empty one is kept.

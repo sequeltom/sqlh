@@ -803,7 +803,8 @@ async fn look_up(
         .run(
             sql.to_owned(),
             timeout,
-            Counting::EXACT,
+            // Rows past the bounds already fail the lookup; counting them stops early.
+            Counting::BOUNDED,
             cancel,
             &mut capture,
             gate,
@@ -816,41 +817,83 @@ async fn look_up(
             ),
             e => db_failure(e),
         })?;
-    match capture.error {
-        Some((number, text)) => Err(Failure::new(
-            Exit::SqlError,
-            format!("looking the name up failed: error {number}: {text}"),
-        )),
-        None => Ok(capture.found),
-    }
+    capture.finish()
 }
 
-/// The sink of a lookup: keeps every row of every result set, and its first error.
+/// The most a lookup keeps (R31): result sets, rows in each, and characters of a value. The
+/// lookup's own SQL returns a few short rows (the candidates query has `TOP`, and a total for
+/// the rest), so anything past these is a reply sqlh didn't ask for: it fails the run rather
+/// than grow, and is never taken for a whole answer.
+const CAPTURE_RESULTS: usize = 4;
+const CAPTURE_ROWS: usize = 16;
+const CAPTURE_CHARS: usize = 4096;
+
+/// The sink of a lookup: keeps the rows of its result sets, within the `CAPTURE_` bounds, and
+/// its first error.
 #[derive(Default)]
 struct Capture {
     found: Found,
     error: Option<(u32, String)>,
+    /// The reply went past a bound: what was kept isn't all of it.
+    overflow: bool,
+}
+
+impl Capture {
+    /// What the lookup returned, or why it can't be used.
+    fn finish(self) -> Result<Found, Failure> {
+        if let Some((number, text)) = self.error {
+            return Err(Failure::new(
+                Exit::SqlError,
+                format!("looking the name up failed: error {number}: {text}"),
+            ));
+        }
+        if self.overflow {
+            return Err(Failure::new(
+                Exit::Internal,
+                "the name lookup returned more than it should; nothing was shown",
+            ));
+        }
+        Ok(self.found)
+    }
 }
 
 impl BatchSink for Capture {
     fn columns(&mut self, _columns: &[Column]) -> io::Result<()> {
-        self.found.push(Vec::new());
-        Ok(())
-    }
-    fn wants_values(&self) -> bool {
-        true
-    }
-    fn cell_limit(&self) -> usize {
-        0
-    }
-    fn row(&mut self, values: &[Value]) -> io::Result<()> {
-        if let Some(rows) = self.found.last_mut() {
-            rows.push(values.to_vec());
+        if self.found.len() < CAPTURE_RESULTS {
+            self.found.push(Vec::new());
+        } else {
+            self.overflow = true;
         }
         Ok(())
     }
-    fn skipped_row(&mut self) {}
-    fn counting_stopped(&mut self, _by: Stop) {}
+    fn wants_values(&self) -> bool {
+        !self.overflow
+            && self
+                .found
+                .last()
+                .is_some_and(|rows| rows.len() < CAPTURE_ROWS)
+    }
+    fn cell_limit(&self) -> usize {
+        CAPTURE_CHARS
+    }
+    fn row(&mut self, values: &[Value]) -> io::Result<()> {
+        let cut = values
+            .iter()
+            .any(|v| matches!(v, Value::TextCut(..) | Value::BinCut(..)));
+        match self.found.last_mut() {
+            Some(rows) if !cut && !self.overflow && rows.len() < CAPTURE_ROWS => {
+                rows.push(values.to_vec());
+            }
+            _ => self.overflow = true,
+        }
+        Ok(())
+    }
+    fn skipped_row(&mut self) {
+        self.overflow = true;
+    }
+    fn counting_stopped(&mut self, _by: Stop) {
+        self.overflow = true;
+    }
     fn end_rows(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -898,6 +941,72 @@ pub(crate) fn output_failure(error: io::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R31: a lookup keeps a bounded reply and fails on more, never taking what it kept for all
+    // of it.
+    #[test]
+    fn a_lookup_keeps_a_bounded_reply() {
+        let row = || vec![Value::Int(1), Value::Text("dbo".into())];
+        let mut capture = Capture::default();
+        capture.columns(&[]).unwrap();
+        for _ in 0..CAPTURE_ROWS {
+            assert!(capture.wants_values());
+            capture.row(&row()).unwrap();
+        }
+        assert!(!capture.wants_values());
+        assert_eq!(capture.cell_limit(), CAPTURE_CHARS);
+        let found = capture.finish().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].len(), CAPTURE_ROWS);
+
+        let overflowed = |feed: &dyn Fn(&mut Capture)| {
+            let mut capture = Capture::default();
+            feed(&mut capture);
+            let failure = capture.finish().unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal);
+            assert!(failure.message.contains("returned more than it should"));
+        };
+        overflowed(&|c| {
+            c.columns(&[]).unwrap();
+            for _ in 0..CAPTURE_ROWS {
+                c.row(&row()).unwrap();
+            }
+            c.skipped_row();
+        });
+        overflowed(&|c| {
+            c.columns(&[]).unwrap();
+            c.row(&[Value::TextCut("x".repeat(CAPTURE_CHARS), 1)])
+                .unwrap();
+        });
+        overflowed(&|c| {
+            for _ in 0..=CAPTURE_RESULTS {
+                c.columns(&[]).unwrap();
+            }
+        });
+        overflowed(&|c| {
+            c.columns(&[]).unwrap();
+            c.counting_stopped(Stop::Budget);
+        });
+
+        // The server's error comes first.
+        let mut capture = Capture::default();
+        capture.skipped_row();
+        let error = ServerMessage {
+            number: 208,
+            severity: 16,
+            state: 1,
+            line: Some(1),
+            procedure: None,
+            text: "Invalid object name".into(),
+        };
+        capture.error(&error).unwrap();
+        let failure = capture.finish().unwrap_err();
+        assert_eq!(failure.exit, Exit::SqlError);
+        assert_eq!(
+            failure.message,
+            "looking the name up failed: error 208: Invalid object name"
+        );
+    }
 
     // R14: a read-only run whose wrapper is gone after the last batch, with no batch having
     // failed, is a failure (exit 1); every other combination is left alone.

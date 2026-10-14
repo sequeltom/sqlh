@@ -23,9 +23,9 @@ pub const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
     CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
     SYSDATETIMEOFFSET() AS server_time;";
 
-/// The longest name `describe` and `def` take: `nvarchar(776)` holds four bracketed parts of
-/// 128 characters, `PARSENAME`'s input.
-const MAX_NAME_CHARS: usize = 776;
+/// The longest name `describe` and `def` take: four delimited parts of 128 characters, each
+/// with every character a doubled `]`, and three dots (`parse_name` checks each part).
+const MAX_NAME_CHARS: usize = 4 * 258 + 3;
 
 /// The longest pattern `tables` and `find` take.
 const MAX_PATTERN_CHARS: usize = 500;
@@ -211,6 +211,48 @@ pub fn like_pattern(pattern: &str) -> String {
 /// Matching that a case-sensitive database's collation doesn't change (schema-commands.md §7).
 const CI: &str = "COLLATE Latin1_General_100_CI_AI";
 
+/// Whether `name` can be shown as it is, by the rule `shown` applies in SQL: ASCII letters,
+/// digits and `_ @ # $`, starting with a letter or `_`. Anything else is shown in brackets.
+/// Reserved words aren't bracketed: sqlh's own name parser takes them as they are.
+fn plain(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'))
+}
+
+/// One part of a name as sqlh shows it (R32): as it is when that is unambiguous (`plain`),
+/// else in brackets with `]` doubled, as `QUOTENAME` does, so a shown name can be given back
+/// to `describe` or `def`, and a dot or comma in it isn't taken for a separator.
+fn quoted(name: &str) -> String {
+    if plain(name) {
+        name.to_owned()
+    } else {
+        format!("[{}]", name.replace(']', "]]"))
+    }
+}
+
+/// `schema.name`, each part `quoted`.
+fn qualified_name(schema: &str, name: &str) -> String {
+    format!("{}.{}", quoted(schema), quoted(name))
+}
+
+/// `quoted` in T-SQL, for a name expression `n`.
+fn shown(n: &str) -> String {
+    format!(
+        "CASE WHEN {n} COLLATE Latin1_General_100_BIN2 LIKE N'[A-Za-z_]%' \
+         AND {n} COLLATE Latin1_General_100_BIN2 NOT LIKE N'%[^A-Za-z0-9_@#$]%' \
+         THEN {n} ELSE QUOTENAME({n}) END"
+    )
+}
+
+/// `qualified_name` in T-SQL.
+fn qualified(schema: &str, name: &str) -> String {
+    format!("{} + N'.' + {}", shown(schema), shown(name))
+}
+
 /// A type's name with its size, precision or scale, for a type name expression `n` and the
 /// column's (or parameter's) `max_length`, `precision` and `scale`. `nvarchar` and `nchar`
 /// lengths are in bytes in the catalog, so they are halved.
@@ -243,10 +285,15 @@ fn type_sql(owner: &str) -> String {
     )
 }
 
-/// A list aggregated server-side (schema-commands.md §3): `items` is a `SELECT N', ' + ...`
-/// query; the result has no leading separator, and XML's entities aren't left in it.
-fn joined(items: &str) -> String {
-    format!("STUFF(({items} FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')")
+/// A list aggregated server-side (schema-commands.md §3): `item` for each row of `from`
+/// (`FROM ... WHERE ...`), in `order`, joined with `, `; NULL when there are none.
+/// `STRING_AGG` (SQL Server 2017+) takes any character, where `FOR XML PATH` fails on a
+/// control character in a name.
+fn joined(item: &str, from: &str, order: &str) -> String {
+    format!(
+        "(SELECT STRING_AGG(CAST({item} AS nvarchar(max)), N', ') \
+         WITHIN GROUP (ORDER BY {order}) {from})"
+    )
 }
 
 const DBS_SQL: &str = "SELECT name, state_desc AS state, HAS_DBACCESS(name) AS accessible, \
@@ -264,105 +311,231 @@ fn tables_sql(pattern: Option<&str>) -> String {
         None => String::new(),
     };
     format!(
-        "SELECT s.name + N'.' + o.name AS name, \
+        "SELECT {name} AS name, \
          CASE o.type WHEN 'U' THEN N'table' ELSE N'view' END AS type, \
          CASE WHEN o.type = 'U' THEN (SELECT SUM(p.rows) FROM sys.partitions AS p \
          WHERE p.object_id = o.object_id AND p.index_id IN (0, 1)) END AS rows, \
          o.modify_date AS modified \
          FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
          WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 {filter} \
-         ORDER BY s.name, o.name;"
+         ORDER BY s.name, o.name;",
+        name = qualified("s.name", "o.name")
     )
 }
 
 fn find_sql(pattern: &str, text: bool) -> String {
     let like = literal(&like_pattern(pattern));
     let mut sql = format!(
-        "SELECT s.name + N'.' + o.name AS name, o.type_desc AS type \
+        "SELECT {object} AS name, o.type_desc AS type \
          FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
          WHERE o.is_ms_shipped = 0 \
          AND o.type IN ('U', 'V', 'P', 'PC', 'X', 'FN', 'FS', 'IF', 'TF', 'FT', 'AF', 'SN', 'TR', 'SO') \
          AND o.name {CI} LIKE {like} \
          UNION ALL \
-         SELECT s.name + N'.' + ty.name, N'TYPE' \
+         SELECT {ty_name}, N'TYPE' \
          FROM sys.types AS ty JOIN sys.schemas AS s ON s.schema_id = ty.schema_id \
          WHERE ty.is_user_defined = 1 AND ty.name {CI} LIKE {like} \
          ORDER BY name;\n\
-         SELECT s.name + N'.' + o.name AS [table], c.name AS [column], {ty} AS type \
+         SELECT {object} AS [table], c.name AS [column], {ty} AS type \
          FROM sys.columns AS c JOIN sys.objects AS o ON o.object_id = c.object_id \
          JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
          JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
          WHERE o.is_ms_shipped = 0 AND o.type IN ('U', 'V', 'IF', 'TF', 'FT') \
          AND c.name {CI} LIKE {like} \
-         ORDER BY [table], c.column_id;",
+         ORDER BY s.name, o.name, c.column_id;",
+        object = qualified("s.name", "o.name"),
+        ty_name = qualified("s.name", "ty.name"),
         ty = type_sql("c")
     );
     if text {
         // The line of the first match: its number (line breaks before it, plus one) and its
-        // text, cut to 200 characters.
+        // text, cut to 200 characters. Every position is taken in one collation, so they all
+        // count the same units. A body the login can't see is NULL: it isn't searched, and
+        // ISNULL keeps PATINDEX from getting a NULL whatever order the server evaluates the
+        // predicates in (R33).
         let anywhere = literal(&format!("%{}%", like_pattern(pattern).trim_matches('%')));
         sql.push_str(&format!(
-            "\nSELECT s.name + N'.' + o.name AS name, o.type_desc AS type, \
+            "\nSELECT {object} AS name, o.type_desc AS type, \
              (DATALENGTH(h.head) - DATALENGTH(REPLACE(h.head, NCHAR(10), N''))) / 2 + 1 AS line, \
-             LEFT(REPLACE(SUBSTRING(m.definition, l.first, l.past - l.first), NCHAR(13), N''), 200) \
+             LEFT(REPLACE(SUBSTRING(md.d, l.first, l.past - l.first), NCHAR(13), N''), 200) \
              AS text \
              FROM sys.sql_modules AS m JOIN sys.objects AS o ON o.object_id = m.object_id \
              JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-             CROSS APPLY (SELECT PATINDEX({anywhere}, m.definition {CI}) AS at) AS f \
-             CROSS APPLY (SELECT LEFT(m.definition, f.at) AS head) AS h \
+             CROSS APPLY (SELECT ISNULL(m.definition, N'') {CI} AS d) AS md \
+             CROSS APPLY (SELECT PATINDEX({anywhere}, md.d) AS at) AS f \
+             CROSS APPLY (SELECT LEFT(md.d, f.at) AS head) AS h \
              CROSS APPLY (SELECT CHARINDEX(NCHAR(10), REVERSE(h.head)) AS back, \
-             CHARINDEX(NCHAR(10), m.definition, f.at) AS next) AS b \
+             CHARINDEX(NCHAR(10), md.d, f.at) AS next) AS b \
              CROSS APPLY (SELECT CASE WHEN b.back = 0 THEN 1 ELSE f.at - b.back + 2 END AS first, \
-             CASE WHEN b.next = 0 THEN LEN(m.definition) + 1 ELSE b.next END AS past) AS l \
-             WHERE o.is_ms_shipped = 0 AND f.at > 0 \
-             ORDER BY name;"
+             CASE WHEN b.next = 0 THEN DATALENGTH(md.d) / 2 + 1 ELSE b.next END AS past) AS l \
+             WHERE o.is_ms_shipped = 0 AND m.definition IS NOT NULL AND f.at > 0 \
+             ORDER BY s.name, o.name;",
+            object = qualified("s.name", "o.name")
         ));
     }
     sql
 }
 
-/// Looks `name` up for `describe` (or `def`, with `definition`): the name's parts, and the
-/// objects it can mean (schema-commands.md §5, with the review's corrections):
-/// 1. `OBJECT_ID`, which reads 1- and 2-part names, brackets and quotes, and an unqualified
-///    name in the user's default schema, in the database's own collation.
-/// 2. Failing that, the objects with that name in any schema, or in the schema given (an
+/// A name as `describe` and `def` take it: up to four dot-separated parts (R27), each plain
+/// or delimited, `[...]` with `]]` for a `]` and `"..."` with `""` for a `"`, so a delimited
+/// part can hold dots. A part left empty (`db..name`) is omitted; the object's part can't be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Name {
+    server: Option<String>,
+    db: Option<String>,
+    schema: Option<String>,
+    object: String,
+}
+
+/// The most UTF-16 units in a part: SQL Server's limit for an identifier (`sysname`).
+const MAX_PART_UNITS: usize = 128;
+
+/// Parses a name for `describe` and `def`, before anything connects: a part that isn't a
+/// valid identifier is refused (exit 3), never taken as omitted (R27).
+fn parse_name(name: &str) -> Result<Name, Failure> {
+    let bad = |why: &str| {
+        Failure::usage(format!(
+            "{name:?} is not an object name: {why}; a name has at most four dot-separated \
+             parts, each plain or in [brackets] or \"quotes\", of at most 128 characters"
+        ))
+    };
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(bad("it is too long"));
+    }
+    let mut parts: Vec<Option<String>> = Vec::new();
+    let mut chars = name.chars().peekable();
+    loop {
+        let part = match chars.peek().copied() {
+            Some(open @ ('[' | '"')) => {
+                chars.next();
+                let close = if open == '[' { ']' } else { '"' };
+                let mut part = String::new();
+                loop {
+                    match chars.next() {
+                        None => return Err(bad("a delimited part isn't closed")),
+                        Some(c) if c == close => {
+                            if chars.peek() == Some(&close) {
+                                chars.next();
+                                part.push(close);
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(c) => part.push(c),
+                    }
+                }
+                if part.is_empty() {
+                    return Err(bad("a delimited part is empty"));
+                }
+                Some(part)
+            }
+            _ => {
+                let mut part = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == '.' {
+                        break;
+                    }
+                    if matches!(c, '[' | ']' | '"') {
+                        return Err(bad("a part with [, ] or \" in it goes in brackets"));
+                    }
+                    part.push(c);
+                    chars.next();
+                }
+                (!part.is_empty()).then_some(part)
+            }
+        };
+        if part
+            .as_ref()
+            .is_some_and(|p| p.encode_utf16().count() > MAX_PART_UNITS)
+        {
+            return Err(bad("a part is longer than 128 characters"));
+        }
+        parts.push(part);
+        match chars.next() {
+            None => break,
+            Some('.') => {}
+            Some(_) => return Err(bad("a delimited part ends at a dot or the end")),
+        }
+    }
+    if parts.len() > 4 {
+        return Err(bad("it has more than four parts"));
+    }
+    let object = parts
+        .pop()
+        .flatten()
+        .ok_or_else(|| bad("the object's part is empty"))?;
+    let schema = parts.pop().flatten();
+    let db = parts.pop().flatten();
+    let server = parts.pop().flatten();
+    Ok(Name {
+        server,
+        db,
+        schema,
+        object,
+    })
+}
+
+/// `s` as a T-SQL literal, or `NULL`.
+fn literal_or_null(s: Option<&str>) -> String {
+    s.map_or_else(|| "NULL".to_owned(), literal)
+}
+
+/// How many candidates the lookup returns (`TOP`): enough to list `AMBIGUOUS_SHOWN` of them and
+/// know there are more; the total comes with them (R31).
+const CANDIDATES: usize = AMBIGUOUS_SHOWN + 1;
+
+/// Looks `asked` up for `describe` (or `def`, with `definition`): the objects it can mean
+/// (schema-commands.md §5, with the reviews' corrections):
+/// 0. The name is parsed here (`parse_name`); a server part is refused.
+/// 1. Whether its database part is the current database is SQL Server's decision, made once
+///    (`DB_ID`, which compares database names as the server does), and both the candidates
+///    and the refusal of another database follow from it (R28).
+/// 2. `OBJECT_ID` of the parts, each `QUOTENAME`d: an unqualified name in the user's default
+///    schema, in the database's own collation.
+/// 3. Failing that, the objects with that name in any schema, or in the schema given (an
 ///    explicit schema is never set aside), compared case-insensitively, so a case-sensitive
 ///    database still finds `Users` for `users`, and two that differ only in case are
 ///    ambiguous.
-fn lookup(name: &str, definition: bool) -> Result<Plan, Failure> {
-    if name.starts_with('#') {
+fn lookup(asked: &str, definition: bool) -> Result<Plan, Failure> {
+    let name = parse_name(asked)?;
+    if name.object.starts_with('#') {
         return Err(name_error(format!(
-            "{name} is a temporary table, which only the session that made it can see; each \
+            "{asked} is a temporary table, which only the session that made it can see; each \
              sqlh run is a new session"
         )));
     }
-    if name.chars().count() > MAX_NAME_CHARS {
+    if let Some(server) = &name.server {
         return Err(Failure::usage(format!(
-            "the name is longer than {MAX_NAME_CHARS} characters"
+            "{asked} names a server ({server}); schema commands look at the current database \
+             on the server sqlh connects to (-S)"
         )));
     }
     let sql = format!(
-        "DECLARE @name nvarchar(776) = {name};\n\
-         SELECT PARSENAME(@name, 4) AS server_part, PARSENAME(@name, 3) AS db_part, \
-         DB_NAME() AS db, PARSENAME(@name, 1) AS object_part;\n\
-         SELECT o.object_id, s.name AS [schema], o.name, RTRIM(o.type) AS type, o.type_desc, \
+        "DECLARE @db sysname = {db}, @schema sysname = {schema}, @object sysname = {object};\n\
+         DECLARE @scope int = CASE WHEN @db IS NULL OR DB_ID(@db) = DB_ID() THEN 1 \
+         WHEN DB_ID(@db) IS NULL THEN 2 ELSE 0 END;\n\
+         DECLARE @id int = CASE WHEN @scope = 1 \
+         THEN OBJECT_ID(ISNULL(QUOTENAME(@schema) + N'.', N'') + QUOTENAME(@object)) END;\n\
+         SELECT @scope AS scope, DB_NAME() AS db;\n\
+         SELECT TOP ({CANDIDATES}) o.object_id, s.name AS [schema], o.name, \
+         RTRIM(o.type) AS type, o.type_desc, \
          CASE WHEN OBJECT_DEFINITION(o.object_id) IS NULL THEN 0 ELSE 1 END AS visible, \
-         sn.base_object_name AS base \
+         sn.base_object_name AS base, COUNT(*) OVER () AS total \
          FROM sys.all_objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
          LEFT JOIN sys.synonyms AS sn ON sn.object_id = o.object_id \
-         WHERE PARSENAME(@name, 4) IS NULL \
-         AND (PARSENAME(@name, 3) IS NULL OR PARSENAME(@name, 3) = DB_NAME()) \
-         AND (o.object_id = OBJECT_ID(@name) \
-         OR (OBJECT_ID(@name) IS NULL AND o.parent_object_id = 0 \
-         AND o.name {CI} = PARSENAME(@name, 1) {CI} \
-         AND (PARSENAME(@name, 2) IS NULL OR s.name {CI} = PARSENAME(@name, 2) {CI}))) \
+         WHERE @scope = 1 AND (o.object_id = @id \
+         OR (@id IS NULL AND o.parent_object_id = 0 \
+         AND o.name {CI} = @object {CI} \
+         AND (@schema IS NULL OR s.name {CI} = @schema {CI}))) \
          ORDER BY s.name, o.name;",
-        name = literal(name),
+        db = literal_or_null(name.db.as_deref()),
+        schema = literal_or_null(name.schema.as_deref()),
+        object = literal(&name.object),
         CI = "COLLATE Latin1_General_100_CI_AS"
     );
-    let asked = name.to_owned();
+    let asked = asked.to_owned();
     let then = move |found: &Found| -> Result<Vec<Step>, Failure> {
-        let object = resolve(&asked, found)?;
+        let object = resolve(&asked, &name, found)?;
         if definition {
             def_steps(&object)
         } else {
@@ -379,7 +552,10 @@ fn lookup(name: &str, definition: bool) -> Result<Plan, Failure> {
 #[derive(Debug, PartialEq, Eq)]
 struct Object {
     id: i64,
-    /// `schema.name`, as the catalog has it.
+    /// Its schema and name, as the catalog has them.
+    schema: String,
+    name: String,
+    /// `schema.name`, as sqlh shows it (`qualified_name`).
     qualified: String,
     /// `sys.objects.type`: `U`, `V`, `P`, `FN`, ...
     kind: String,
@@ -406,40 +582,42 @@ fn int(value: Option<&Value>) -> Option<i64> {
 
 /// The lookup's rows (`lookup`) as one object, or the error for a name that names none, more
 /// than one, or one outside the current database.
-fn resolve(asked: &str, found: &Found) -> Result<Object, Failure> {
+fn resolve(asked: &str, name: &Name, found: &Found) -> Result<Object, Failure> {
     let unexpected = || Failure::new(Exit::Internal, "the name lookup returned unexpected rows");
-    let parts = found
+    let scope_row = found
         .first()
         .and_then(|rows| rows.first())
         .ok_or_else(unexpected)?;
-    let db = text(parts.get(2)).unwrap_or("?");
-    let Some(object_part) = text(parts.get(3)) else {
-        return Err(Failure::usage(format!(
-            "{asked:?} is not an object name: at most four dot-separated parts, each plain or \
-             in [brackets] or \"quotes\""
-        )));
-    };
-    if text(parts.first()).is_some() {
-        return Err(Failure::usage(format!(
-            "{asked} names a linked server; schema commands look at the current database ({db})"
-        )));
+    let scope = int(scope_row.first()).ok_or_else(unexpected)?;
+    let current = text(scope_row.get(1)).unwrap_or("?");
+    match (scope, name.db.as_deref()) {
+        (1, _) => {}
+        (2, Some(db)) => {
+            return Err(Failure::usage(format!(
+                "{asked}: there is no database {db} on this server; schema commands look at \
+                 the current database ({current})"
+            )));
+        }
+        (0, Some(db)) => {
+            return Err(Failure::usage(format!(
+                "{asked} is in database {db}; schema commands look at the current database \
+                 ({current}): run with -d {db}"
+            )));
+        }
+        _ => return Err(unexpected()),
     }
-    if let Some(other) = text(parts.get(1))
-        && !other.eq_ignore_ascii_case(db)
-    {
-        return Err(Failure::usage(format!(
-            "{asked} is in database {other}; schema commands look at the current database \
-             ({db}): run with -d {other}"
-        )));
-    }
-    let candidates: Vec<Object> = found
-        .get(1)
-        .ok_or_else(unexpected)?
+    let rows = found.get(1).ok_or_else(unexpected)?;
+    let mut total = 0;
+    let candidates: Vec<Object> = rows
         .iter()
         .map(|row| {
+            let (schema, object) = (text(row.get(1))?, text(row.get(2))?);
+            total = int(row.get(7))?;
             Some(Object {
                 id: int(row.first())?,
-                qualified: format!("{}.{}", text(row.get(1))?, text(row.get(2))?),
+                schema: schema.to_owned(),
+                name: object.to_owned(),
+                qualified: qualified_name(schema, object),
                 kind: text(row.get(3))?.to_owned(),
                 type_desc: text(row.get(4))?.to_owned(),
                 visible: int(row.get(5))? == 1,
@@ -448,24 +626,33 @@ fn resolve(asked: &str, found: &Found) -> Result<Object, Failure> {
         })
         .collect::<Option<_>>()
         .ok_or_else(unexpected)?;
+    let total = usize::try_from(total).map_err(|_| unexpected())?;
+    // The total is the server's count of all of them: never fewer than the rows, and the rows
+    // are fewer only because of the TOP.
+    if candidates.len() > CANDIDATES
+        || total < candidates.len()
+        || (total > candidates.len() && candidates.len() < CANDIDATES)
+    {
+        return Err(unexpected());
+    }
     match candidates.len() {
         0 => Err(name_error(format!(
-            "no object named {asked} in database {db}; try: sqlh find {object_part}"
+            "no object named {asked} in database {current}; try: sqlh find {}",
+            name.object
         ))),
         1 => Ok(candidates.into_iter().next().ok_or_else(unexpected)?),
-        n => {
-            let mut names: Vec<&str> = candidates
+        _ => {
+            let names: Vec<&str> = candidates
                 .iter()
                 .take(AMBIGUOUS_SHOWN)
                 .map(|o| o.qualified.as_str())
                 .collect();
-            let more = n.saturating_sub(AMBIGUOUS_SHOWN);
+            let more = total - names.len();
             let more = if more > 0 {
                 format!(" and {more} more")
             } else {
                 String::new()
             };
-            names.sort_unstable();
             Err(name_error(format!(
                 "ambiguous name {asked}: {}{more}; qualify it with the schema",
                 names.join(", ")
@@ -532,14 +719,15 @@ fn object_sql(kind: &str) -> String {
         _ => ("", ""),
     };
     format!(
-        "SELECT s.name + N'.' + o.name AS name, o.type_desc AS type, {extra}\
+        "SELECT {name} AS name, o.type_desc AS type, {extra}\
          o.create_date AS created, o.modify_date AS modified, \
          CAST(ep.value AS nvarchar(4000)) AS description \
          FROM sys.all_objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
          {join}\
          LEFT JOIN sys.extended_properties AS ep ON ep.class = 1 AND ep.major_id = o.object_id \
          AND ep.minor_id = 0 AND ep.name = N'MS_Description' \
-         WHERE o.object_id = @id;"
+         WHERE o.object_id = @id;",
+        name = qualified("s.name", "o.name")
     )
 }
 
@@ -565,21 +753,26 @@ fn columns_sql() -> String {
     )
 }
 
+/// Indexes, with their columns `quoted` (R32). A B-tree index (clustered, nonclustered, hash)
+/// has key columns, in key order, and included ones; every other type (columnstore, XML,
+/// spatial, JSON) lists the columns it covers as its keys, since the catalog gives them no
+/// key order (`key_ordinal` 0).
 fn indexes_sql() -> String {
+    let from = "FROM sys.index_columns AS ic JOIN sys.all_columns AS c \
+         ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id";
     let keys = joined(
-        "SELECT N', ' + c.name + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N'' END \
-         FROM sys.index_columns AS ic JOIN sys.all_columns AS c ON c.object_id = ic.object_id \
-         AND c.column_id = ic.column_id \
-         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id \
-         AND (ic.key_ordinal > 0 OR (i.type IN (5, 6) AND ic.is_included_column = 0)) \
-         ORDER BY ic.key_ordinal, ic.index_column_id",
+        &format!(
+            "{} + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N'' END",
+            shown("c.name")
+        ),
+        &format!("{from} AND (ic.key_ordinal > 0 OR i.type NOT IN (1, 2, 7))"),
+        "ic.key_ordinal, ic.index_column_id",
     );
     let includes = joined(
-        "SELECT N', ' + c.name \
-         FROM sys.index_columns AS ic JOIN sys.all_columns AS c ON c.object_id = ic.object_id \
-         AND c.column_id = ic.column_id \
-         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id \
-         AND ic.is_included_column = 1 ORDER BY ic.index_column_id",
+        &shown("c.name"),
+        &format!("{from} AND ic.is_included_column = 1 AND i.type IN (1, 2, 7)"),
+        "ic.index_column_id",
     );
     format!(
         "SELECT i.name, i.type_desc AS type, i.is_unique AS [unique], i.is_primary_key AS pk, \
@@ -589,36 +782,45 @@ fn indexes_sql() -> String {
     )
 }
 
-/// The table's foreign keys, or (`referenced_by`) the ones that point at it.
+/// The table's foreign keys, or (`referenced_by`) the ones that point at it; names `quoted`.
 fn foreign_keys_sql(referenced_by: bool) -> String {
     let columns = |table: &str, column: &str| {
-        joined(&format!(
-            "SELECT N', ' + c.name FROM sys.foreign_key_columns AS k \
-             JOIN sys.all_columns AS c ON c.object_id = k.{table} AND c.column_id = k.{column} \
-             WHERE k.constraint_object_id = fk.object_id ORDER BY k.constraint_column_id"
-        ))
+        joined(
+            &shown("c.name"),
+            &format!(
+                "FROM sys.foreign_key_columns AS k JOIN sys.all_columns AS c \
+                 ON c.object_id = k.{table} AND c.column_id = k.{column} \
+                 WHERE k.constraint_object_id = fk.object_id"
+            ),
+            "k.constraint_column_id",
+        )
     };
     let own = columns("parent_object_id", "parent_column_id");
     let theirs = columns("referenced_object_id", "referenced_column_id");
     let common = "fk.delete_referential_action_desc AS on_delete, \
          fk.update_referential_action_desc AS on_update, \
          CASE WHEN fk.is_not_trusted = 0 AND fk.is_disabled = 0 THEN 1 ELSE 0 END AS trusted";
-    if referenced_by {
-        format!(
-            "SELECT fk.name, OBJECT_SCHEMA_NAME(fk.parent_object_id) + N'.' \
-             + OBJECT_NAME(fk.parent_object_id) AS [table], {own} AS columns, \
-             {theirs} AS ref_columns, {common} \
-             FROM sys.foreign_keys AS fk WHERE fk.referenced_object_id = @id \
-             ORDER BY [table], fk.name;"
-        )
+    let other = qualified("s.name", "o.name");
+    let (column, joins_on, mine) = if referenced_by {
+        ("[table]", "fk.parent_object_id", "fk.referenced_object_id")
     } else {
-        format!(
-            "SELECT fk.name, {own} AS columns, OBJECT_SCHEMA_NAME(fk.referenced_object_id) \
-             + N'.' + OBJECT_NAME(fk.referenced_object_id) AS [references], \
-             {theirs} AS ref_columns, {common} \
-             FROM sys.foreign_keys AS fk WHERE fk.parent_object_id = @id ORDER BY fk.name;"
+        (
+            "[references]",
+            "fk.referenced_object_id",
+            "fk.parent_object_id",
         )
-    }
+    };
+    let select = if referenced_by {
+        format!("{other} AS [table], {own} AS columns")
+    } else {
+        format!("{own} AS columns, {other} AS [references]")
+    };
+    format!(
+        "SELECT fk.name, {select}, {theirs} AS ref_columns, {common} \
+         FROM sys.foreign_keys AS fk JOIN sys.all_objects AS o ON o.object_id = {joins_on} \
+         JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
+         WHERE {mine} = @id ORDER BY {column}, fk.name;"
+    )
 }
 
 const CHECKS_SQL: &str = "SELECT name, ISNULL(definition, N'(hidden)') AS definition, \
@@ -627,8 +829,9 @@ const CHECKS_SQL: &str = "SELECT name, ISNULL(definition, N'(hidden)') AS defini
 
 fn triggers_sql() -> String {
     let events = joined(
-        "SELECT N', ' + te.type_desc FROM sys.trigger_events AS te \
-         WHERE te.object_id = tr.object_id ORDER BY te.type",
+        "te.type_desc",
+        "FROM sys.trigger_events AS te WHERE te.object_id = tr.object_id",
+        "te.type",
     );
     format!(
         "SELECT tr.name, {events} AS events, tr.is_instead_of_trigger AS instead_of, \
@@ -651,6 +854,11 @@ fn parameters_sql() -> String {
 }
 
 /// `def`: the object's source as one definition section, or why there is none to show.
+///
+/// The lookup found the definition visible, but the catalog can change before the definition
+/// is read (R30). So the read keeps the definition in a variable, checks that it isn't NULL and
+/// that the object still has the name it was looked up by, and fails (exit 1, as an error in
+/// every format) when not; the row shown carries that same variable.
 fn def_steps(object: &Object) -> Result<Vec<Step>, Failure> {
     let name = &object.qualified;
     if matches!(object.kind.as_str(), "U" | "S" | "IT") {
@@ -671,13 +879,26 @@ fn def_steps(object: &Object) -> Result<Vec<Step>, Failure> {
             object.type_desc
         )));
     }
+    let gone = literal(&format!(
+        "the definition of {name} can't be shown: since it was looked up, the object was \
+         dropped or renamed, or its definition was encrypted or hidden from the login; run the \
+         command again"
+    ));
     Ok(vec![Step {
         sql: format!(
-            "SELECT s.name + N'.' + o.name AS name, o.type_desc AS type, \
-             OBJECT_DEFINITION(o.object_id) AS definition \
-             FROM sys.all_objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-             WHERE o.object_id = {};",
-            object.id
+            "DECLARE @id int = {id};\n\
+             DECLARE @definition nvarchar(max) = OBJECT_DEFINITION(@id);\n\
+             IF @definition IS NULL OR NOT EXISTS (SELECT 1 FROM sys.all_objects AS o \
+             JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
+             WHERE o.object_id = @id AND s.name = {schema} {BIN} AND o.name = {object} {BIN}) \
+             THROW 50000, {gone}, 1;\n\
+             SELECT {shown} AS name, {kind} AS type, @definition AS definition;",
+            id = object.id,
+            schema = literal(&object.schema),
+            object = literal(&object.name),
+            shown = literal(name),
+            kind = literal(&object.type_desc),
+            BIN = "COLLATE Latin1_General_100_BIN2",
         ),
         sections: vec![Section::definition("definition")],
     }])
@@ -753,7 +974,118 @@ mod tests {
             panic!("a lookup");
         };
         assert!(
-            sql.starts_with("DECLARE @name nvarchar(776) = N'it''s';\n"),
+            sql.starts_with(
+                "DECLARE @db sysname = NULL, @schema sysname = NULL, @object sysname = N'it''s';\n"
+            ),
+            "{sql}"
+        );
+        let Plan::Lookup { sql, .. } = lookup("[a'b].\"c.d\"", false).unwrap() else {
+            panic!("a lookup");
+        };
+        assert!(
+            sql.starts_with(
+                "DECLARE @db sysname = NULL, @schema sysname = N'a''b', @object sysname = N'c.d';\n"
+            ),
+            "{sql}"
+        );
+    }
+
+    fn name(server: Option<&str>, db: Option<&str>, schema: Option<&str>, object: &str) -> Name {
+        Name {
+            server: server.map(Into::into),
+            db: db.map(Into::into),
+            schema: schema.map(Into::into),
+            object: object.into(),
+        }
+    }
+
+    // R27: a name's parts are parsed before anything connects. Delimited parts keep their dots
+    // and doubled delimiters; an empty part is omitted, except the object's; anything invalid is
+    // refused with exit 3, never taken for an omitted part.
+    #[test]
+    fn names_are_parsed_part_by_part() {
+        for (input, wanted) in [
+            ("Users", name(None, None, None, "Users")),
+            ("dbo.Users", name(None, None, Some("dbo"), "Users")),
+            ("My Table", name(None, None, None, "My Table")),
+            ("[s.a].[b]", name(None, None, Some("s.a"), "b")),
+            ("[s].[a.b]", name(None, None, Some("s"), "a.b")),
+            ("[a]]b]", name(None, None, None, "a]b")),
+            ("\"a\"\"b\".c", name(None, None, Some("a\"b"), "c")),
+            ("db..t", name(None, Some("db"), None, "t")),
+            ("App.dbo.t", name(None, Some("App"), Some("dbo"), "t")),
+            (
+                "srv.db.dbo.t",
+                name(Some("srv"), Some("db"), Some("dbo"), "t"),
+            ),
+            (".t", name(None, None, None, "t")),
+            ("[c DESC]", name(None, None, None, "c DESC")),
+        ] {
+            assert_eq!(parse_name(input).unwrap(), wanted, "{input}");
+        }
+        let long = "s".repeat(129);
+        // 128 UTF-16 units is the limit: an astral character is two.
+        let astral = "\u{1F600}".repeat(64);
+        assert!(parse_name(&format!("[{astral}]")).is_ok());
+        for (input, why) in [
+            (format!("[{long}].p"), "longer than 128"),
+            (format!("[{long}].dbo.p"), "longer than 128"),
+            (format!("[{long}].db.dbo.p"), "longer than 128"),
+            (format!("{long}.p"), "longer than 128"),
+            (format!("[{astral}x].p"), "longer than 128"),
+            ("a.b.c.d.e".into(), "more than four parts"),
+            ("dbo.".into(), "the object's part is empty"),
+            ("[dbo].[]".into(), "a delimited part is empty"),
+            ("[dbo.p".into(), "isn't closed"),
+            ("[dbo]x.p".into(), "ends at a dot"),
+            ("a]b".into(), "goes in brackets"),
+            ("x".repeat(MAX_NAME_CHARS + 1), "too long"),
+        ] {
+            let failure = parse_name(&input).unwrap_err();
+            assert_eq!(failure.exit, Exit::Usage, "{input}");
+            assert!(
+                failure.message.contains(why),
+                "{input}: {}",
+                failure.message
+            );
+        }
+        // Refused before connecting, with exit 3, through the command too.
+        for input in [format!("[{long}].p"), "srv.db.dbo.p".into()] {
+            let Err(failure) = lookup(&input, true) else {
+                panic!("{input} refused");
+            };
+            assert_eq!(failure.exit, Exit::Usage, "{input}");
+        }
+    }
+
+    // R32: a name is shown as it is when that is unambiguous, else bracketed, the same way in
+    // Rust and in the SQL.
+    #[test]
+    fn names_are_shown_so_they_can_be_given_back() {
+        for (input, shown_as) in [
+            ("Users", "Users"),
+            ("_x1@#$", "_x1@#$"),
+            ("select", "select"),
+            ("My Table", "[My Table]"),
+            ("s.a", "[s.a]"),
+            ("a, b", "[a, b]"),
+            ("c DESC", "[c DESC]"),
+            ("a]b", "[a]]b]"),
+            ("1st", "[1st]"),
+            ("Größe", "[Größe]"),
+            ("a\"b", "[a\"b]"),
+        ] {
+            assert_eq!(quoted(input), shown_as, "{input}");
+            // Given back, the shown name is the same name.
+            assert_eq!(parse_name(shown_as).unwrap().object, input, "{input}");
+        }
+        assert_eq!(qualified_name("s.a", "b"), "[s.a].b");
+        assert_eq!(qualified_name("s", "a.b"), "s.[a.b]");
+        let sql = shown("c.name");
+        assert!(
+            sql.contains("LIKE N'[A-Za-z_]%'")
+                && sql.contains("NOT LIKE N'%[^A-Za-z0-9_@#$]%'")
+                && sql.ends_with("ELSE QUOTENAME(c.name) END"),
             "{sql}"
         );
     }
@@ -776,10 +1108,24 @@ mod tests {
         }
     }
 
-    fn found(parts: [Option<&str>; 4], objects: &[(i64, &str, &str, &str, i64)]) -> Found {
-        let text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Text(s.into()));
+    // R33: the text search never hands PATINDEX a NULL, and doesn't search hidden bodies.
+    #[test]
+    fn the_text_search_skips_hidden_bodies() {
+        let sql = find_sql("x", true);
+        assert!(
+            sql.contains("ISNULL(m.definition, N'') COLLATE Latin1_General_100_CI_AI AS d")
+                && sql.contains("PATINDEX(N'%x%', md.d)")
+                && sql.contains("m.definition IS NOT NULL AND f.at > 0"),
+            "{sql}"
+        );
+        assert!(!find_sql("x", false).contains("sql_modules"));
+    }
+
+    /// A lookup's reply: the scope row, then the candidates (id, schema, name, type,
+    /// visible), with `total` as the server's count of all of them.
+    fn found(scope: i64, objects: &[(i64, &str, &str, &str, i64)], total: i64) -> Found {
         vec![
-            vec![parts.iter().map(|p| text(*p)).collect()],
+            vec![vec![Value::Int(scope), Value::Text("AppDb".into())]],
             objects
                 .iter()
                 .map(|(id, schema, name, kind, visible)| {
@@ -791,41 +1137,50 @@ mod tests {
                         Value::Text("USER_TABLE".into()),
                         Value::Int(*visible),
                         Value::Null,
+                        Value::Int(total),
                     ]
                 })
                 .collect(),
         ]
     }
 
-    // schema-commands.md §5 with the review's corrections: one candidate is the object; none
-    // and several are errors that say what to do; other databases and servers are refused.
+    fn resolved(asked: &str, found: &Found) -> Result<Object, Failure> {
+        resolve(asked, &parse_name(asked).unwrap(), found)
+    }
+
+    // schema-commands.md §5 with the reviews' corrections: one candidate is the object; none
+    // and several are errors that say what to do; other databases are refused, by the scope
+    // SQL Server decided (R28).
     #[test]
     fn a_name_resolves_to_one_object_or_says_why_not() {
-        let here = [None, None, Some("AppDb"), Some("Users")];
-        let object = resolve("Users", &found(here, &[(5, "sales", "Users", "U", 0)])).unwrap();
+        let object = resolved("Users", &found(1, &[(5, "sales", "Users", "U", 0)], 1)).unwrap();
         assert_eq!(object.id, 5);
         assert_eq!(object.qualified, "sales.Users");
+        assert_eq!(
+            (object.schema.as_str(), object.name.as_str()),
+            ("sales", "Users")
+        );
         assert_eq!(object.kind, "U");
 
-        let none = resolve(
-            "Usrs",
-            &found([None, None, Some("AppDb"), Some("Usrs")], &[]),
-        )
-        .unwrap_err();
+        let odd = resolved("[s.a].b", &found(1, &[(7, "s.a", "b", "U", 0)], 1)).unwrap();
+        assert_eq!(odd.qualified, "[s.a].b");
+
+        let none = resolved("Usrs", &found(1, &[], 0)).unwrap_err();
         assert_eq!(
             none.message,
             "no object named Usrs in database AppDb; try: sqlh find Usrs"
         );
         assert_eq!(none.exit, Exit::SqlError);
 
-        let two = resolve(
+        let two = resolved(
             "users",
             &found(
-                here,
+                1,
                 &[
-                    (5, "sales", "Users", "U", 0),
                     (6, "archive", "users", "U", 0),
+                    (5, "sales", "Users", "U", 0),
                 ],
+                2,
             ),
         )
         .unwrap_err();
@@ -834,41 +1189,44 @@ mod tests {
             "ambiguous name users: archive.users, sales.Users; qualify it with the schema"
         );
 
-        let other = resolve(
-            "Other.dbo.T",
-            &found([None, Some("Other"), Some("AppDb"), Some("T")], &[]),
-        )
-        .unwrap_err();
+        // R31: the lookup returns eleven at most, and the total says how many more there are.
+        let eleven: Vec<(i64, String)> = (0..11).map(|n| (n, format!("s{n:02}"))).collect();
+        let rows: Vec<(i64, &str, &str, &str, i64)> = eleven
+            .iter()
+            .map(|(n, s)| (*n, s.as_str(), "t", "U", 0))
+            .collect();
+        let many = resolved("t", &found(1, &rows, 5000)).unwrap_err();
+        assert!(
+            many.message.starts_with("ambiguous name t: s00.t, s01.t,")
+                && many.message.contains("s09.t and 4990 more; qualify"),
+            "{}",
+            many.message
+        );
+        // A total that doesn't fit the rows is not an answer to trust.
+        for (rows, total) in [(&rows[..1], 2), (&rows[..2], 1), (&rows[..], 3)] {
+            let failure = resolved("t", &found(1, rows, total)).unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal, "{} rows, {total}", rows.len());
+        }
+
+        let other = resolved("Other.dbo.T", &found(0, &[], 0)).unwrap_err();
         assert_eq!(
             other.message,
             "Other.dbo.T is in database Other; schema commands look at the current database \
              (AppDb): run with -d Other"
         );
         assert_eq!(other.exit, Exit::Usage);
-        let linked = resolve(
-            "srv.db.dbo.T",
-            &found([Some("srv"), Some("db"), Some("AppDb"), Some("T")], &[]),
-        )
-        .unwrap_err();
+        let missing = resolved("Nope.dbo.T", &found(2, &[], 0)).unwrap_err();
+        assert_eq!(missing.exit, Exit::Usage);
         assert!(
-            linked.message.contains("names a linked server"),
+            missing.message.contains("there is no database Nope"),
             "{}",
-            linked.message
+            missing.message
         );
-        let bad = resolve("a.b.c.d.e", &found([None, None, Some("AppDb"), None], &[])).unwrap_err();
+        // The current database named in any spelling the server accepts is fine.
         assert!(
-            bad.message.contains("is not an object name"),
-            "{}",
-            bad.message
-        );
-        // The current database named explicitly is fine.
-        assert!(
-            resolve(
-                "AppDb.sales.Users",
-                &found(
-                    [None, Some("AppDb"), Some("AppDb"), Some("Users")],
-                    &[(5, "sales", "Users", "U", 0)]
-                )
+            resolved(
+                "APPDB.sales.Users",
+                &found(1, &[(5, "sales", "Users", "U", 0)], 1)
             )
             .is_ok()
         );
@@ -889,6 +1247,8 @@ mod tests {
     fn object(kind: &str) -> Object {
         Object {
             id: -5,
+            schema: "dbo".into(),
+            name: "X".into(),
             qualified: "dbo.X".into(),
             kind: kind.into(),
             type_desc: "X".into(),
@@ -944,7 +1304,19 @@ mod tests {
 
     #[test]
     fn def_refuses_what_has_no_definition_to_show() {
-        assert_eq!(labels(&def_steps(&object("P")).unwrap()), ["definition"]);
+        let steps = def_steps(&object("P")).unwrap();
+        assert_eq!(labels(&steps), ["definition"]);
+        // R30: the definition shown is the one checked.
+        let sql = &steps[0].sql;
+        assert!(
+            sql.contains("DECLARE @definition nvarchar(max) = OBJECT_DEFINITION(@id);")
+                && sql.contains("IF @definition IS NULL OR NOT EXISTS")
+                && sql.contains("s.name = N'dbo' COLLATE Latin1_General_100_BIN2")
+                && sql.contains("THROW 50000, N'the definition of dbo.X can''t be shown")
+                && sql
+                    .ends_with("SELECT N'dbo.X' AS name, N'X' AS type, @definition AS definition;"),
+            "{sql}"
+        );
         let table = def_steps(&object("U")).unwrap_err();
         assert!(
             table

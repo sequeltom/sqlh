@@ -504,6 +504,9 @@ struct Withheld {
     connection: u64,
     /// Lines of a definition block (`def`) that didn't fit.
     definition_lines: u64,
+    /// The read of a definition was cut too, so more lines than `definition_lines` weren't
+    /// shown: the count is a lower bound.
+    definition_lines_more: bool,
 }
 
 /// Limits and counts shared by all formats.
@@ -611,10 +614,12 @@ impl Tally {
         std::mem::take(&mut self.empty_sections)
     }
 
-    /// `lines` lines of a definition block didn't fit the budget, which is then used up.
-    pub fn withhold_definition_lines(&mut self, lines: u64) {
+    /// `lines` lines of a definition block didn't fit the budget, which is then used up;
+    /// `more`: the read was cut, so more followed them, how many unknown.
+    pub fn withhold_definition_lines(&mut self, lines: u64, more: bool) {
         self.exhausted = true;
         self.withheld.definition_lines += lines;
+        self.withheld.definition_lines_more |= more;
     }
 
     /// Whether `bytes` more of the body fit in the output budget, given the `used` bytes
@@ -1032,11 +1037,19 @@ impl Tally {
                     "connection description",
                     "connection descriptions",
                 ),
-                (w.definition_lines, "definition line", "definition lines"),
             ]
             .iter()
             .filter(|(n, _, _)| *n > 0)
             .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .chain((w.definition_lines > 0).then(|| {
+                let at_least = if w.definition_lines_more { "≥" } else { "" };
+                let s = if w.definition_lines == 1 && !w.definition_lines_more {
+                    ""
+                } else {
+                    "s"
+                };
+                format!("{at_least}{} definition line{s}", w.definition_lines)
+            }))
             .collect();
             let mut note = format!(
                 "output stopped at the --max-output limit of {} bytes; the run continued",
