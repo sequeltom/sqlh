@@ -5723,6 +5723,23 @@ mod live {
         }
     }
 
+    /// `CREATE PROCEDURE name AS SELECT N'xx…x😀' AS a`, padded so the emoji's first UTF-16 unit
+    /// is the line's 200th.
+    fn astral_line(name: &str) -> String {
+        format!(
+            "{}{}' AS a",
+            astral_preview(name),
+            char::from_u32(0x1F600).unwrap()
+        )
+    }
+
+    /// What `find --text` shows of `astral_line`: the 199 units before the emoji.
+    fn astral_preview(name: &str) -> String {
+        let head = format!("CREATE PROCEDURE {name} AS SELECT N'");
+        let pad = "x".repeat(199 - head.encode_utf16().count());
+        format!("{head}{pad}")
+    }
+
     /// The schema commands' fixture: a table with every feature `describe` reports (an
     /// identity, a default, a check, a persisted computed column, an alias type, a filtered
     /// index with a descending key and an include, a foreign key, a trigger, descriptions), the
@@ -5886,6 +5903,12 @@ mod live {
                         secret = n("secret")
                     ),
                     format!("DROP PROCEDURE IF EXISTS {}", n("secret")),
+                ),
+                // A line whose 200th UTF-16 unit is the first half of a surrogate pair, where
+                // `find --text` cuts its preview.
+                (
+                    astral_line(&n("astral")),
+                    format!("DROP PROCEDURE IF EXISTS {}", n("astral")),
                 ),
             ];
             for (create, drop) in steps {
@@ -6217,6 +6240,15 @@ mod live {
                 schema.name("get")
             )),
             "{out}"
+        );
+        // The preview stops before a character it would cut in half.
+        let astral = schema.name("astral");
+        has(
+            &out,
+            &format!(
+                "{astral}\tSQL_STORED_PROCEDURE\t1\t{}",
+                astral_preview(&astral)
+            ),
         );
         // A login that sees a view (it may read it) but not its body: the same. It may see one
         // function's body, which is searched.

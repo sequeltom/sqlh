@@ -30,6 +30,9 @@ const MAX_NAME_CHARS: usize = 4 * 258 + 3;
 /// The longest pattern `tables` and `find` take.
 const MAX_PATTERN_CHARS: usize = 500;
 
+/// The longest line `find --text` shows of a match, in UTF-16 units.
+const PREVIEW_UNITS: usize = 200;
+
 /// How many names an ambiguity error lists.
 const AMBIGUOUS_SHOWN: usize = 10;
 
@@ -349,16 +352,18 @@ fn find_sql(pattern: &str, text: bool) -> String {
     );
     if text {
         // The line of the first match: its number (line breaks before it, plus one) and its
-        // text, cut to 200 characters. Every position is taken in one collation, so they all
-        // count the same units. A body the login can't see is NULL: it isn't searched, and
+        // text, cut to `PREVIEW_UNITS` UTF-16 units, or one fewer where the cut would split a
+        // surrogate pair (a character outside the BMP), so the preview never ends in half a
+        // character. Every position is taken in one non-supplementary collation, so they all
+        // count UTF-16 units. A body the login can't see is NULL: it isn't searched, and
         // ISNULL keeps PATINDEX from getting a NULL whatever order the server evaluates the
         // predicates in (R33).
         let anywhere = literal(&format!("%{}%", like_pattern(pattern).trim_matches('%')));
         sql.push_str(&format!(
             "\nSELECT {object} AS name, o.type_desc AS type, \
              (DATALENGTH(h.head) - DATALENGTH(REPLACE(h.head, NCHAR(10), N''))) / 2 + 1 AS line, \
-             LEFT(REPLACE(SUBSTRING(md.d, l.first, l.past - l.first), NCHAR(13), N''), 200) \
-             AS text \
+             LEFT(t.whole, CASE WHEN UNICODE(SUBSTRING(t.whole, {PREVIEW_UNITS}, 1)) \
+             BETWEEN 55296 AND 56319 THEN {PREVIEW_UNITS} - 1 ELSE {PREVIEW_UNITS} END) AS text \
              FROM sys.sql_modules AS m JOIN sys.objects AS o ON o.object_id = m.object_id \
              JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
              CROSS APPLY (SELECT ISNULL(m.definition, N'') {CI} AS d) AS md \
@@ -368,6 +373,8 @@ fn find_sql(pattern: &str, text: bool) -> String {
              CHARINDEX(NCHAR(10), md.d, f.at) AS next) AS b \
              CROSS APPLY (SELECT CASE WHEN b.back = 0 THEN 1 ELSE f.at - b.back + 2 END AS first, \
              CASE WHEN b.next = 0 THEN DATALENGTH(md.d) / 2 + 1 ELSE b.next END AS past) AS l \
+             CROSS APPLY (SELECT REPLACE(SUBSTRING(md.d, l.first, l.past - l.first), NCHAR(13), \
+             N'') AS whole) AS t \
              WHERE o.is_ms_shipped = 0 AND m.definition IS NOT NULL AND f.at > 0 \
              ORDER BY s.name, o.name;",
             object = qualified("s.name", "o.name")
@@ -1116,6 +1123,14 @@ mod tests {
             sql.contains("ISNULL(m.definition, N'') COLLATE Latin1_General_100_CI_AI AS d")
                 && sql.contains("PATINDEX(N'%x%', md.d)")
                 && sql.contains("m.definition IS NOT NULL AND f.at > 0"),
+            "{sql}"
+        );
+        // The preview never ends in half a surrogate pair.
+        assert!(
+            sql.contains(
+                "LEFT(t.whole, CASE WHEN UNICODE(SUBSTRING(t.whole, 200, 1)) \
+                 BETWEEN 55296 AND 56319 THEN 200 - 1 ELSE 200 END) AS text"
+            ),
             "{sql}"
         );
         assert!(!find_sql("x", false).contains("sql_modules"));

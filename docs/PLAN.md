@@ -379,6 +379,8 @@ Catalog follow-ups: ordered STRING_AGG casts to nvarchar(max), removes XML seria
 
 Independent `pwsh -NoProfile -File scripts/check.ps1` passed in about 36 seconds: locked metadata, fmt, Clippy default/timing with warnings denied, 318 unit tests (four ignored), 62 debug process tests (49 ignored), 59 release process tests (43 ignored), a 2,478,592-byte exe and the expected ten in-box DLLs. All nineteen additional release-exe probes passed, plus the definition-framing and cross-format loss-count checks. Loopback TDS supplied reply tokens and inspected outgoing SQL; it did not execute catalog SQL. **Live and Credential Manager tests were not independently run, as instructed; developer reports 49 debug and 43 release live passes at 75e4d88.** The owner's profile/database was not used. Production source and Cargo.lock were not edited; no remote, hosted workflow or signing action was taken.
 
+**Follow-up, the preview cut (2026-10-14):** `find --text` cuts its preview at 200 UTF-16 units, or 199 when the 200th is a high surrogate (`UNICODE(SUBSTRING(t.whole, 200, 1)) BETWEEN 55296 AND 56319`, in the same non-SC collation as every other position), so the preview never ends in half a character and the driver has nothing to replace. Unit: `the_text_search_skips_hidden_bodies` asserts the cut. Live: a procedure whose line has the first unit of U+1F600 at unit 200 previews as the 199 units before it; with the fix disabled, the same test fails. schema-commands.md §6.5 says so.
+
 ### Phase 5: connection reuse (VISION priority 3b)
 
 Decide the mechanism using the 2.1 results:
