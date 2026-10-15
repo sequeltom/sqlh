@@ -81,7 +81,7 @@ archive/         git-ignored, never pushed: archive/reviews/ holds the external 
                  (findings F.., R01–R19; PLAN.md records each one and its fix)
 ```
 
-Planned, not built: an md format in `src/output/`. The workflows are written but have never run: there is no remote yet (PLAN.md 3.5, 3.6).
+Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (PLAN.md 3.5, 3.6).
 
 The exe's version is `SQLH_VERSION` at build time if set (the release workflow sets it), else `Cargo.toml`'s. A release tag must match `Cargo.toml`, so bump the version there before tagging.
 
@@ -116,7 +116,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
 - Commit source, tests and synthetic fixtures, Cargo.lock, build configuration, shared agent instructions, and useful design, plan and review documents. Early-development notes are worth keeping when they record decisions or findings.
 - Put disposable experiments in `scratch/` and local query results, logs and copied executables in `artifacts/`. Both root directories are ignored. Promote useful work into source, tests or docs before relying on it.
 - Code reviews are kept in the git-ignored `archive/reviews/` and never committed. A reviewer's new round goes there; PLAN.md records each finding (R-number), its fix and its verification, so the plan never depends on the review files.
-- Never push to the remote, or create the GitHub repository, until the owner says the project is ready (owner, 2026-10-12). The history was rewritten on 2026-10-12 to drop the review files (PLAN.md §6.8), so never commit one again. Commit ids from before the rewrite (in the local reviews, or in old copies of the docs) map to the new ones in `artifacts/history-rewrite-commit-map.txt`, which stays local.
+- The remote is `tkwj/sqlh` on GitHub, private (created by the owner and first pushed 2026-10-15). Push only when the owner asks, and push `main` only: other local refs (`drain-prototype`, tool checkpoints) stay local. Before a push, check what it would publish (the history audit of 2026-10-15 found nothing to rewrite). Making the repository public is the owner's decision. The history was rewritten on 2026-10-12 to drop the review files (PLAN.md §6.8), so never commit one again. Commit ids from before the rewrite (in the local reviews, or in old copies of the docs) map to the new ones in `artifacts/history-rewrite-commit-map.txt`, which stays local.
 - Keep real server data, connection profiles, credentials and personal agent state out of commits. Do not blanket-ignore SQL, JSON or CSV: those formats can also hold legitimate fixtures and examples.
 - Keep `target/` as a local build cache during active development. Run `cargo clean` when reclaiming disk space or troubleshooting build artifacts; the next build must recreate them. Do not routinely clean between agent turns.
 - Before committing, inspect `git status --short`, `git diff --cached --stat`, and `git diff --cached`. Use `git ls-files --cached --ignored --exclude-standard` to catch previously tracked files that ignore rules do not remove. Review new files as well as edits.
