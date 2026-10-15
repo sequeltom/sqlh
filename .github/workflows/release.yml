@@ -104,7 +104,8 @@ jobs:
     needs: build
     if: github.repository_owner == 'tkwj' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
     runs-on: windows-latest
-    # The Azure federated credential's subject is repo:tkwj/sqlh:environment:release, the same
+    # The Azure federated credential's subject is GitHub's immutable form,
+    # repo:tkwj@6507651/sqlh@1420069809:environment:release (owner and repository ids), the same
     # for tag and dispatch runs. The environment allows only main and v* tags.
     environment: release
     permissions:
