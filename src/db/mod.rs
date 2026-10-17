@@ -2013,7 +2013,9 @@ mod tests {
 /// `Session::run` against a fake server on a loopback socket: a TDS 7.4 endpoint that answers
 /// the prelogin (no encryption) and the login, then plays a script, so the real execution path
 /// (driver included) meets a deadline at exactly the points a live server can't be made to
-/// hit on demand (R15 follow-ups A and B). Adapted from the reviewer's probe.
+/// hit on demand (R15 follow-ups A and B). Adapted from the reviewer's probe. `serve` plays one
+/// connection and one batch; `serve_pool` plays a pooled session, connection after connection
+/// and request after request, for the engine's tests (`engine::tests`).
 #[cfg(test)]
 pub(crate) mod fake_server {
     use super::{
@@ -2022,23 +2024,93 @@ pub(crate) mod fake_server {
     };
     use std::future::Future;
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// The type of the next whole message from the client, after reading all its packets
-    /// (`None` once the client is gone). 0x12 prelogin, 0x10 login, 1 SQL batch, 6 attention.
-    fn receive(s: &mut TcpStream) -> Option<u8> {
+    /// The status byte of a packet's header (MS-TDS 2.2.3.1.2): the message's last packet, and
+    /// the reset a client asks for before the server processes the message, which only the
+    /// first packet of a SQL batch (or an RPC) carries.
+    const EOM: u8 = 0x01;
+    const RESET: u8 = 0x08;
+    const RESET_SKIP_TRAN: u8 = 0x10;
+
+    /// The most of a message's payload `Message` keeps: more than any SQL a test reads back, and
+    /// not all 8 MB of `long_sql`.
+    const KEEP: usize = 64 << 10;
+
+    /// One whole message from the client.
+    struct Message {
+        /// 0x12 prelogin, 0x10 login, 1 SQL batch, 6 attention.
+        kind: u8,
+        /// The first packet's status byte.
+        status: u8,
+        /// The payload of all its packets, up to `KEEP` bytes.
+        payload: Vec<u8>,
+    }
+
+    impl Message {
+        /// Whether the client asked for the session to be reset first, its transaction rolled
+        /// back (the RESETCONNECTION bit, which `Session::reset_before_next` sets).
+        fn reset(&self) -> bool {
+            self.status & RESET != 0
+        }
+
+        /// Whether the client asked for a reset that keeps the transaction
+        /// (RESETCONNECTIONSKIPTRAN), which sqlh never does.
+        fn reset_keeping_transaction(&self) -> bool {
+            self.status & RESET_SKIP_TRAN != 0
+        }
+
+        /// A SQL batch's text. Its payload is ALL_HEADERS, a u32 LE total length (which counts
+        /// itself) and the headers (the driver sends one, the transaction descriptor: `u32 18 |
+        /// u16 2 | u64 descriptor | u32 1`), then the SQL as UTF-16LE.
+        fn sql(&self) -> String {
+            let headers = match self.payload.get(..4) {
+                Some(&[a, b, c, d]) => u32::from_le_bytes([a, b, c, d]) as usize,
+                _ => 0,
+            };
+            let units: Vec<u16> = self
+                .payload
+                .get(headers..)
+                .unwrap_or_default()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+    }
+
+    /// The next whole message from the client, read packet by packet to the one marked EOM
+    /// (`None` once the client is gone). A packet's header is `type | status | length u16 BE,
+    /// the header's 8 bytes included | spid u16 | packet id | window`.
+    fn receive_message(s: &mut TcpStream) -> Option<Message> {
+        let mut message: Option<Message> = None;
         loop {
             let mut header = [0u8; 8];
             s.read_exact(&mut header).ok()?;
             let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-            let mut payload = vec![0; length.checked_sub(8)?];
-            s.read_exact(&mut payload).ok()?;
-            if header[1] & 1 != 0 {
-                return Some(header[0]);
+            let mut part = vec![0; length.checked_sub(8)?];
+            s.read_exact(&mut part).ok()?;
+            let whole = message.get_or_insert_with(|| Message {
+                kind: header[0],
+                status: header[1],
+                payload: Vec::new(),
+            });
+            let room = KEEP.saturating_sub(whole.payload.len());
+            whole.payload.extend(part.iter().take(room));
+            if header[1] & EOM != 0 {
+                return message;
             }
         }
+    }
+
+    /// The type of the next whole message from the client (see `receive_message`).
+    fn receive(s: &mut TcpStream) -> Option<u8> {
+        receive_message(s).map(|message| message.kind)
     }
 
     fn send(s: &mut TcpStream, payload: &[u8]) {
@@ -2047,26 +2119,83 @@ pub(crate) mod fake_server {
 
     /// One packet of a server message; `last` marks the end of the message (EOM).
     fn send_packet(s: &mut TcpStream, payload: &[u8], last: bool) {
-        let length = u16::try_from(payload.len() + 8).unwrap();
-        let [high, low] = length.to_be_bytes();
-        s.write_all(&[4, u8::from(last), high, low, 0, 0, 1, 0])
-            .unwrap();
-        s.write_all(payload).unwrap();
+        write_packet(s, payload, last).unwrap();
     }
 
-    /// DONE, final, with a row count.
-    fn done(rows: u64) -> Vec<u8> {
-        let mut token = vec![0xfd, 0x10, 0, 0xc1, 0];
+    /// `send_packet`, failing when the client has gone (the pooled fake's connections outlive
+    /// the calls that use them). The header is type 4 (a reply), the status (EOM or not), the
+    /// length, spid 0, packet id 1, window 0.
+    fn write_packet(s: &mut TcpStream, payload: &[u8], last: bool) -> io::Result<()> {
+        let length = u16::try_from(payload.len() + 8).map_err(io::Error::other)?;
+        let [high, low] = length.to_be_bytes();
+        s.write_all(&[4, u8::from(last), high, low, 0, 0, 1, 0])?;
+        s.write_all(payload)
+    }
+
+    /// DONE: `FD | status u16 LE | curcmd u16 LE | row count u64 LE`. Status bits: 0x01 MORE,
+    /// 0x02 ERROR, 0x04 INXACT, 0x10 COUNT (the row count is valid), 0x20 ATTN.
+    fn done_token(status: u16, curcmd: u16, rows: u64) -> Vec<u8> {
+        let mut token = vec![0xfd];
+        token.extend(status.to_le_bytes());
+        token.extend(curcmd.to_le_bytes());
         token.extend(rows.to_le_bytes());
         token
     }
 
-    /// One `int` column named x, `rows` rows of it, and the final DONE.
-    pub(crate) fn int_rows(rows: u64) -> Vec<u8> {
+    /// DONE, final, with a row count, after a SELECT (curcmd 0xC1).
+    fn done(rows: u64) -> Vec<u8> {
+        done_token(0x10, 0xc1, rows)
+    }
+
+    /// DONE, final, with no row count: what a `SET`, `USE` or `BEGIN TRANSACTION` ends with.
+    fn done_empty() -> Vec<u8> {
+        done_token(0, 0, 0)
+    }
+
+    /// DONE with ATTN and MORE clear: the server's acknowledgement of an attention, the only
+    /// form the driver takes as one.
+    fn done_attn() -> Vec<u8> {
+        done_token(0x20, 0, 0)
+    }
+
+    /// ENVCHANGE ResetConnection (subtype 18), the acknowledgement of a reset: `E3 | length
+    /// u16 LE, 3 | 18 | new value, an empty B_VARBYTE (0) | old value, empty (0)`.
+    fn env_reset() -> Vec<u8> {
+        vec![0xe3, 3, 0, 18, 0, 0]
+    }
+
+    /// ENVCHANGE BeginTransaction (subtype 8): `E3 | 11 0 | 8 | new value, 8 bytes: the
+    /// descriptor u64 LE | old value, empty (0)`. The driver keeps the descriptor, which is
+    /// what `Session::in_transaction` reads.
+    fn env_begin(descriptor: u64) -> Vec<u8> {
+        let mut token = vec![0xe3, 11, 0, 8, 8];
+        token.extend(descriptor.to_le_bytes());
+        token.push(0);
+        token
+    }
+
+    /// ENVCHANGE RollbackTransaction (subtype 10): `E3 | 11 0 | 10 | new value, empty (0) |
+    /// old value, 8 bytes: the descriptor u64 LE`. The driver clears its descriptor.
+    fn env_rollback(descriptor: u64) -> Vec<u8> {
+        let mut token = vec![0xe3, 11, 0, 10, 0, 8];
+        token.extend(descriptor.to_le_bytes());
+        token
+    }
+
+    /// COLMETADATA for one `int` column named x (`81 | column count u16 LE | user type u32 |
+    /// flags u16 | type 0x38, INT4 | name B_VARCHAR, UTF-16`), then `rows` ROWs (`D1 | the int
+    /// 1, LE`), and no DONE: a result still being produced.
+    fn int_rows_open(rows: u64) -> Vec<u8> {
         let mut reply = vec![0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, b'x', 0];
         for _ in 0..rows {
             reply.extend([0xd1, 1, 0, 0, 0]);
         }
+        reply
+    }
+
+    /// One `int` column named x, `rows` rows of it, and the final DONE.
+    pub(crate) fn int_rows(rows: u64) -> Vec<u8> {
+        let mut reply = int_rows_open(rows);
         reply.extend(done(rows));
         reply
     }
@@ -2108,6 +2237,20 @@ pub(crate) mod fake_server {
         StopReading { bytes: usize },
     }
 
+    /// The prelogin's answer: the VERSION option (offset 11, 6 bytes) and ENCRYPTION (offset
+    /// 17, 1 byte), the terminator, then the version 17.0.0.0 and ENCRYPT_NOT_SUP (2), so that
+    /// with `Encrypt::Optional` the connection has no TLS.
+    const PRELOGIN_REPLY: [u8; 18] = [0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff, 17, 0, 0, 0, 0, 0, 2];
+
+    /// Answers the prelogin and the login; false when the client went away or sent something
+    /// else first.
+    fn handshake(s: &mut TcpStream) -> bool {
+        receive(s) == Some(0x12)
+            && write_packet(s, &PRELOGIN_REPLY, true).is_ok()
+            && receive(s) == Some(0x10)
+            && write_packet(s, &login_reply(), true).is_ok()
+    }
+
     /// Starts the fake server; returns its address for `-S`.
     pub(crate) fn serve(script: Script) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2116,17 +2259,9 @@ pub(crate) mod fake_server {
             let Ok((mut s, _)) = listener.accept() else {
                 return;
             };
-            if receive(&mut s) != Some(0x12) {
+            if !handshake(&mut s) {
                 return;
             }
-            send(
-                &mut s,
-                &[0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff, 17, 0, 0, 0, 0, 0, 2],
-            );
-            if receive(&mut s) != Some(0x10) {
-                return;
-            }
-            send(&mut s, &login_reply());
             match script {
                 Script::Reply(tokens) => {
                     if receive(&mut s) == Some(1) {
@@ -2137,10 +2272,7 @@ pub(crate) mod fake_server {
                 Script::Silent => while receive(&mut s).is_some() {},
                 Script::RowsThenSilent { rows } => {
                     if receive(&mut s) == Some(1) {
-                        let mut reply = vec![0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, b'x', 0];
-                        for _ in 0..rows {
-                            reply.extend([0xd1, 1, 0, 0, 0]);
-                        }
+                        let reply = int_rows_open(rows);
                         // In packets of at most 4,096 bytes, as negotiated, none of them the
                         // message's last: the result is still being produced.
                         for chunk in reply.chunks(4088) {
@@ -2158,6 +2290,331 @@ pub(crate) mod fake_server {
             }
         });
         format!("127.0.0.1,{port}")
+    }
+
+    // A pooled session (PLAN.md 5.2, the engine's tests): `serve_pool` accepts any number of
+    // connections and answers request after request on each, the way SQL Server answers the
+    // batches sqlh sends (`answer`), with the reset, the wrapper transaction and attentions
+    // handled, and with the faults a pool has to survive played where a test asks (`Conn`).
+
+    /// What one connection does with one of its SQL batches.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Turn {
+        /// Answer it as the server would (`answer`).
+        Answer,
+        /// Answer it after this long: a slow query, which holds its connection meanwhile.
+        Delay(Duration),
+        /// Send a result's first rows and no end, as a query that is still running does, then
+        /// wait for the attention: acknowledge it with DONE ATTN (`ack`), which settles the
+        /// cancel and keeps the connection in step, or never answer anything again (the driver
+        /// waits 5 s for the acknowledgement, then marks the connection dead).
+        Hang { ack: bool },
+        /// Never answer it, nor anything after it, the attention included: a server that has
+        /// stopped responding.
+        Silent,
+        /// Send a result's first rows, then close the connection: a server lost mid-reply.
+        Drop,
+    }
+
+    /// The script of one connection of `serve_pool`: `Turn::Answer` for every SQL batch but
+    /// the ones it names, every reset acknowledged, and open until the client closes it.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Conn {
+        turns: Vec<(usize, Turn)>,
+        close_after: Option<usize>,
+        no_reset_ack: bool,
+    }
+
+    impl Conn {
+        pub(crate) fn new() -> Conn {
+            Conn::default()
+        }
+
+        /// Plays `turn` for the connection's `request`th SQL batch, counted from 1. A call on a
+        /// new connection sends three: the session setup, its SQL, the wrapper's rollback; a
+        /// call on a reused one the same, the setup carrying the reset.
+        pub(crate) fn at(mut self, request: usize, turn: Turn) -> Conn {
+            self.turns.push((request, turn));
+            self
+        }
+
+        /// Closes the connection once `requests` SQL batches are answered, without reading
+        /// another: a connection dropped while it sat idle (the network, a DBA's `KILL`), which
+        /// the client only finds at its next request.
+        pub(crate) fn close_after(mut self, requests: usize) -> Conn {
+            self.close_after = Some(requests);
+            self
+        }
+
+        /// Answers a request that asks for a reset without acknowledging it (no ENVCHANGE 18),
+        /// as a server that didn't reset the session would.
+        pub(crate) fn without_reset_ack(mut self) -> Conn {
+            self.no_reset_ack = true;
+            self
+        }
+
+        fn turn(&self, request: usize) -> Turn {
+            self.turns
+                .iter()
+                .find(|(number, _)| *number == request)
+                .map_or(Turn::Answer, |&(_, turn)| turn)
+        }
+    }
+
+    /// A SQL batch the pooled fake received.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Seen {
+        /// The connection, numbered from 0 in the order they were accepted.
+        pub(crate) conn: usize,
+        /// Whether its first packet carried the RESETCONNECTION bit (0x08).
+        pub(crate) reset: bool,
+        pub(crate) sql: String,
+    }
+
+    /// How a connection of the pooled fake ended.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum End {
+        /// The client closed it (or went away mid-message).
+        Client,
+        /// The script closed it (`Conn::close_after`, `Turn::Drop`).
+        Server,
+    }
+
+    /// What the pooled fake has seen, shared by its threads and the test.
+    #[derive(Default)]
+    struct Log {
+        accepted: usize,
+        requests: Vec<Seen>,
+        /// For each connection, the descriptor of its open transaction; 0 when none is.
+        transactions: Vec<u64>,
+        ended: Vec<(usize, End)>,
+    }
+
+    /// The pooled fake: its address, and what it has seen so far.
+    pub(crate) struct Fake {
+        /// The address for `-S` (`ConnectOptions::server`).
+        pub(crate) server: String,
+        log: Arc<Mutex<Log>>,
+    }
+
+    impl Fake {
+        fn log(&self) -> std::sync::MutexGuard<'_, Log> {
+            self.log.lock().unwrap()
+        }
+
+        /// How many connections the server accepted.
+        pub(crate) fn accepted(&self) -> usize {
+            self.log().accepted
+        }
+
+        /// The SQL batches connection `conn` received, in order.
+        pub(crate) fn requests(&self, conn: usize) -> Vec<Seen> {
+            let log = self.log();
+            log.requests
+                .iter()
+                .filter(|seen| seen.conn == conn)
+                .cloned()
+                .collect()
+        }
+
+        /// Which of connection `conn`'s SQL batches carried the reset bit, in order.
+        pub(crate) fn resets(&self, conn: usize) -> Vec<bool> {
+            self.requests(conn).iter().map(|seen| seen.reset).collect()
+        }
+
+        /// Connection `conn`'s SQL batches, in order.
+        pub(crate) fn sql(&self, conn: usize) -> Vec<String> {
+            self.requests(conn)
+                .into_iter()
+                .map(|seen| seen.sql)
+                .collect()
+        }
+
+        /// Whether connection `conn` has a transaction open, as the server sees it.
+        pub(crate) fn in_transaction(&self, conn: usize) -> bool {
+            self.log().transactions.get(conn).is_some_and(|&d| d != 0)
+        }
+
+        /// How connection `conn` ended, if it has.
+        pub(crate) fn ended(&self, conn: usize) -> Option<End> {
+            let log = self.log();
+            log.ended
+                .iter()
+                .find(|(number, _)| *number == conn)
+                .map(|&(_, end)| end)
+        }
+
+        /// Waits until `ready` holds of the fake, at most `within`; whether it came to hold.
+        /// The fake's threads run on their own, so a test that needs one of them to have got
+        /// somewhere (a connection closed) waits for it here, on the runtime's clock.
+        pub(crate) async fn wait_for(
+            &self,
+            within: Duration,
+            ready: impl Fn(&Fake) -> bool,
+        ) -> bool {
+            let until = Instant::now() + within;
+            while !ready(self) {
+                if Instant::now() >= until {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            true
+        }
+    }
+
+    /// Starts a fake server that accepts any number of connections, each on its own thread, and
+    /// plays `conns[n]` on the `n`th (from 0), `Conn::new()` past the end of the list. The
+    /// listener's thread waits in `accept` for as long as the test process lives.
+    pub(crate) fn serve_pool(conns: Vec<Conn>) -> Fake {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Log::default()));
+        let shared = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let conn = {
+                    let mut log = shared.lock().unwrap();
+                    log.accepted += 1;
+                    log.transactions.push(0);
+                    log.accepted - 1
+                };
+                let script = conns.get(conn).cloned().unwrap_or_default();
+                let log = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let end = play(stream, conn, &script, &log);
+                    log.lock().unwrap().ended.push((conn, end));
+                });
+            }
+        });
+        Fake {
+            server: format!("127.0.0.1,{port}"),
+            log,
+        }
+    }
+
+    /// One connection of `serve_pool`, from the handshake to its end.
+    fn play(mut s: TcpStream, conn: usize, script: &Conn, log: &Mutex<Log>) -> End {
+        if !handshake(&mut s) {
+            return End::Client;
+        }
+        let mut answered = 0;
+        loop {
+            if script.close_after == Some(answered) {
+                let _ = s.shutdown(Shutdown::Both);
+                return End::Server;
+            }
+            let Some(message) = receive_message(&mut s) else {
+                return End::Client;
+            };
+            match message.kind {
+                1 => {}
+                // An attention that found no reply in progress (it came after the final DONE):
+                // the server acknowledges it all the same.
+                6 => {
+                    if write_packet(&mut s, &done_attn(), true).is_err() {
+                        return End::Client;
+                    }
+                    continue;
+                }
+                _ => continue,
+            }
+            answered += 1;
+            let sql = message.sql();
+            log.lock().unwrap().requests.push(Seen {
+                conn,
+                reset: message.reset(),
+                sql: sql.clone(),
+            });
+            // The server resets the session before it runs the request, so the acknowledgement
+            // leads the reply; the reset rolls back an open transaction, which needs no token.
+            let mut reply = Vec::new();
+            if message.reset() || message.reset_keeping_transaction() {
+                if message.reset() {
+                    log.lock().unwrap().transactions[conn] = 0;
+                }
+                if !script.no_reset_ack {
+                    reply.extend(env_reset());
+                }
+            }
+            let sent = match script.turn(answered) {
+                Turn::Answer => {
+                    reply.extend(answer(&sql, conn, log));
+                    write_packet(&mut s, &reply, true)
+                }
+                Turn::Delay(delay) => {
+                    std::thread::sleep(delay);
+                    reply.extend(answer(&sql, conn, log));
+                    write_packet(&mut s, &reply, true)
+                }
+                Turn::Hang { ack } => {
+                    reply.extend(int_rows_open(3));
+                    if write_packet(&mut s, &reply, false).is_err() {
+                        return End::Client;
+                    }
+                    loop {
+                        match receive_message(&mut s) {
+                            None => return End::Client,
+                            Some(next) if next.kind == 6 => break,
+                            Some(_) => {}
+                        }
+                    }
+                    if !ack {
+                        while receive(&mut s).is_some() {}
+                        return End::Client;
+                    }
+                    write_packet(&mut s, &done_attn(), true)
+                }
+                Turn::Silent => {
+                    while receive(&mut s).is_some() {}
+                    return End::Client;
+                }
+                Turn::Drop => {
+                    reply.extend(int_rows_open(3));
+                    let _ = write_packet(&mut s, &reply, false);
+                    let _ = s.shutdown(Shutdown::Both);
+                    return End::Server;
+                }
+            };
+            if sent.is_err() {
+                return End::Client;
+            }
+        }
+    }
+
+    /// The reply to one of the batches sqlh sends, as SQL Server gives it: the session setup
+    /// ends in the wrapper's `BEGIN TRANSACTION`, which opens a transaction (ENVCHANGE 8, then
+    /// DONE); the rollback ends the open one (ENVCHANGE 10, then DONE); a `SELECT` returns one
+    /// row (`int_rows`); anything else (a `SET`, a `USE`) only a DONE. Connection `conn`'s
+    /// transaction is tracked in the log, where the test can see it.
+    fn answer(sql: &str, conn: usize, log: &Mutex<Log>) -> Vec<u8> {
+        let mut log = log.lock().unwrap();
+        let open = log.transactions[conn];
+        let mut reply = Vec::new();
+        if sql.contains("BEGIN TRANSACTION") {
+            // A nested BEGIN only counts up @@TRANCOUNT, which the client isn't told.
+            if open == 0 {
+                // Unique to the connection, and never 0.
+                let descriptor = ((conn as u64 + 1) << 32) | (log.requests.len() as u64 + 1);
+                log.transactions[conn] = descriptor;
+                reply.extend(env_begin(descriptor));
+            }
+            reply.extend(done_empty());
+        } else if sql.contains("ROLLBACK TRANSACTION") {
+            if open != 0 {
+                log.transactions[conn] = 0;
+                reply.extend(env_rollback(open));
+            }
+            reply.extend(done_empty());
+        } else if sql.trim_start().starts_with("SELECT") {
+            reply.extend(int_rows(1));
+        } else {
+            reply.extend(done_empty());
+        }
+        reply
     }
 
     /// Shows rows (up to `quota`, like `--max-rows`), or hides them all, and spends `work`
@@ -2263,6 +2720,24 @@ pub(crate) mod fake_server {
         after: Option<Result<(), DbError>>,
     }
 
+    /// How to connect to a fake server at `server`: SQL authentication with synthetic strings,
+    /// unrelated to any real account, no TLS (see `PRELOGIN_REPLY`), a 5 s login timeout.
+    pub(crate) fn options(server: String) -> ConnectOptions {
+        ConnectOptions {
+            server,
+            database: None,
+            auth: Auth::Sql {
+                user: "fake".into(),
+                password: crate::secret::Secret::new("fake".into()),
+            },
+            encrypt: Encrypt::Optional,
+            trust_server_certificate: false,
+            login_timeout: 5,
+            read_only_intent: false,
+            multi_subnet_failover: false,
+        }
+    }
+
     /// Connects to `server`, runs `sql` with `-t 1`, and reports.
     pub(crate) fn run_once<S: BatchSink>(
         server: String,
@@ -2287,20 +2762,7 @@ pub(crate) mod fake_server {
             .unwrap();
         runtime.block_on(async {
             let cancel = Cancel::new();
-            let options = ConnectOptions {
-                server,
-                database: None,
-                // Synthetic strings for the fake server, unrelated to any real account.
-                auth: Auth::Sql {
-                    user: "fake".into(),
-                    password: crate::secret::Secret::new("fake".into()),
-                },
-                encrypt: Encrypt::Optional,
-                trust_server_certificate: false,
-                login_timeout: 5,
-                read_only_intent: false,
-                multi_subnet_failover: false,
-            };
+            let options = options(server);
             let mut session = Session::connect(&options, &cancel)
                 .await
                 .expect("connected to the fake server");
