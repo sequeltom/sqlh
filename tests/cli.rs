@@ -3447,8 +3447,10 @@ mod mcp {
     }
 
     /// docs/mcp-mode.md §2: `subscriptions/listen` is acknowledged with none of what it asks
-    /// for (the tool list never changes), holds its id while open, ends without a word when the
-    /// client cancels it, and is answered when the server ends (Graceful Closure).
+    /// for (the tool list never changes), holds its id while open (a request reusing it gets
+    /// that refusal and nothing else, whatever its arguments), ends without a word when the
+    /// client cancels it, and is answered and then torn down with `notifications/cancelled`
+    /// when the server ends. At most 8 are open at once.
     #[test]
     fn a_subscription_is_acknowledged_and_answered_at_the_end() {
         let config = profiles("mcp_listen");
@@ -3470,19 +3472,26 @@ mod mcp {
                     r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{{META},"name":"databases","arguments":{{}}}}}}"#
                 ),
                 format!(
+                    r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":""}}}}}}"#
+                ),
+                format!(
                     r#"{{"jsonrpc":"2.0","id":22,"method":"subscriptions/listen","params":{{{META},"notifications":[]}}}}"#
                 ),
                 r#"{"jsonrpc":"2.0","id":23,"method":"subscriptions/listen","params":{"protocolVersion":"x"}}"#
                     .into(),
-            ],
+            ]
+            .into_iter()
+            // 20 is open; seven more make 8, and the ninth is refused.
+            .chain((30..38).map(listen))
+            .collect::<Vec<_>>(),
         );
         assert_eq!(r.code, 0, "{}", r.stderr);
         let acks: Vec<_> = messages
             .iter()
             .filter(|m| m["method"] == "notifications/subscriptions/acknowledged")
             .collect();
-        assert_eq!(acks.len(), 2, "{messages:?}");
-        for (ack, id) in acks.iter().zip([20, 21]) {
+        assert_eq!(acks.len(), 9, "{messages:?}");
+        for (ack, id) in acks.iter().zip([20, 21].into_iter().chain(30..37)) {
             assert_eq!(
                 ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
                 id
@@ -3495,7 +3504,7 @@ mod mcp {
             .iter()
             .filter(|m| m["id"] == 20 && m.get("error").is_some())
             .collect();
-        assert_eq!(taken.len(), 2, "{messages:?}");
+        assert_eq!(taken.len(), 3, "{messages:?}");
         for error in taken {
             assert_eq!(error["error"]["code"], -32600);
             assert_eq!(
@@ -3504,20 +3513,34 @@ mod mcp {
             );
         }
         assert_eq!(by_id(&messages, 22)["error"]["code"], -32602);
+        assert_eq!(
+            by_id(&messages, 37)["error"]["message"],
+            "Invalid request: at most 8 subscriptions may be open; cancel one first"
+        );
         // No _meta and no initialize: refused before anything else is looked at.
         assert_eq!(by_id(&messages, 23)["error"]["code"], -32602);
-        // At the end, 20 is answered; 21, cancelled, never is.
-        let end = messages
-            .iter()
-            .find(|m| m["id"] == 20 && m.get("result").is_some())
-            .unwrap_or_else(|| panic!("20 not answered: {messages:?}"));
-        assert_eq!(end["result"]["resultType"], "complete");
-        assert_eq!(
-            end["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-            20
+        // At the end, each open one is answered and then torn down; 21, cancelled, never is.
+        for id in [20].into_iter().chain(30..37) {
+            let at = messages
+                .iter()
+                .position(|m| m["id"] == id && m.get("result").is_some())
+                .unwrap_or_else(|| panic!("{id} not answered: {messages:?}"));
+            let end = &messages[at]["result"];
+            assert_eq!(end["resultType"], "complete");
+            assert_eq!(end["_meta"]["io.modelcontextprotocol/subscriptionId"], id);
+            let teardown = &messages[at + 1];
+            assert_eq!(teardown["method"], "notifications/cancelled", "{teardown}");
+            assert_eq!(teardown["params"]["requestId"], id);
+            assert_eq!(teardown["params"]["reason"], "the server is ending");
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m["id"] == 21 || m["params"]["requestId"] == 21),
+            "{messages:?}"
         );
-        assert!(!messages.iter().any(|m| m["id"] == 21), "{messages:?}");
-        assert_eq!(messages.len(), 7, "{messages:?}");
+        // 9 acks, 3 refusals of 20, 22, 23, the ninth refused, and 8 answers and teardowns.
+        assert_eq!(messages.len(), 9 + 3 + 2 + 1 + 16, "{messages:?}");
     }
 
     /// docs/mcp-mode.md §2: a client that goes away (its end of stdout closed) ends the server,
@@ -3579,26 +3602,46 @@ mod mcp {
             ),
         )
         .unwrap();
-        let lines: Vec<String> = (1..=65)
+        let mut lines: Vec<String> = (1..=65)
             .map(|id| {
                 format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1"}}}}}}"#
                 )
             })
             .collect();
+        lines.push(format!(
+            r#"{{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1","format":"json"}}}}}}"#
+        ));
         let (r, messages) = session(&config, &["--profile", "slow"], &lines);
         drop(silent);
         assert_eq!(r.code, 0, "{}", r.stderr);
-        assert_eq!(messages.len(), 65, "{messages:?}");
+        assert_eq!(messages.len(), 66, "{messages:?}");
         let refused = &by_id(&messages, 65)["result"];
         assert_eq!(refused["isError"], true);
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "-- error: 64 calls are already running; wait for one to finish\n\
+                 -- failed (exit 3): usage error, "
+            ),
+            "{text}"
+        );
+        // In the format the call asked for.
+        let json: serde_json::Value = serde_json::from_str(
+            by_id(&messages, 66)["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .trim_end(),
+        )
+        .unwrap();
+        assert_eq!(json["exit_code"], 3, "{json}");
         assert_eq!(
-            refused["content"][0]["text"],
-            "-- error: 64 calls are already running; wait for one to finish\n\
-             -- failed (exit 3): too many calls\n"
+            json["error"],
+            "64 calls are already running; wait for one to finish"
         );
         // Answered first, while the others still wait on the silent server.
         assert_eq!(messages[0]["id"], 65, "{:?}", messages[0]);
+        assert_eq!(messages[1]["id"], 66, "{:?}", messages[1]);
         for id in 1..=64 {
             let result = &by_id(&messages, id)["result"];
             assert_eq!(result["isError"], true, "{result}");

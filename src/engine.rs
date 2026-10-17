@@ -377,19 +377,26 @@ async fn wait_for_connection<'p>(
                 "query timeout after {timeout} s waiting for a free connection (all {} of the \
                  profile's connections were busy); {}",
                 pool.max,
-                more_connections(&pool.settings)
+                more_connections(&pool.settings, timeout)
             ),
         )),
     }
 }
 
-/// The advice when every connection was busy: more time, or more connections. In `sqlh mcp`
-/// the pool's size is the server's launch flag, which the client can't pass.
-fn more_connections(settings: &Settings) -> String {
-    let raise = run::raise_timeout(settings);
-    match settings.limits.advice {
-        Advice::Cli => format!("{raise}, or --pool for more connections"),
-        Advice::Mcp => format!("{raise}, or start sqlh mcp with a larger --pool"),
+/// The advice when every connection was busy for the call's `timeout`: more time, or more
+/// connections. In `sqlh mcp` the pool's size is the server's launch flag, which the client
+/// can't pass, and so is the timeout once the call has the server's limit.
+fn more_connections(settings: &Settings, timeout: u32) -> String {
+    match (
+        settings.limits.advice,
+        run::raise_timeout(settings, timeout),
+    ) {
+        (Advice::Cli, raise) => format!(
+            "{}, or --pool for more connections",
+            raise.unwrap_or_else(|| "raise -t".into())
+        ),
+        (Advice::Mcp, Some(raise)) => format!("{raise}, or start sqlh mcp with a larger --pool"),
+        (Advice::Mcp, None) => "start sqlh mcp with a larger --pool or -t".into(),
     }
 }
 
@@ -579,17 +586,22 @@ mod tests {
         let fake = serve_pool(Vec::new());
         let mut settings = settings(&fake);
         assert_eq!(
-            more_connections(&settings),
+            more_connections(&settings, 30),
             "raise -t, or --pool for more connections"
         );
         settings.limits.advice = Advice::Mcp;
         assert_eq!(
-            more_connections(&settings),
+            more_connections(&settings, 10),
             "raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger --pool"
+        );
+        // At the server's limit there is no larger timeout to ask for.
+        assert_eq!(
+            more_connections(&settings, 30),
+            "start sqlh mcp with a larger --pool or -t"
         );
         settings.query_timeout = 0;
         assert_eq!(
-            more_connections(&settings),
+            more_connections(&settings, 10),
             "raise timeout, or start sqlh mcp with a larger --pool"
         );
     }

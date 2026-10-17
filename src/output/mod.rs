@@ -60,6 +60,9 @@ pub struct Limits {
     pub stall_secs: u32,
     /// Whose flags the output's advice names.
     pub advice: Advice,
+    /// In `sqlh mcp`: the call's timeout is the server's limit, so the advice offers no
+    /// larger one.
+    pub timeout_at_limit: bool,
 }
 
 /// Whose flags a run's advice names: the command line's (`--exact-count`, `-t`), or, in
@@ -116,6 +119,7 @@ impl Default for Limits {
             max_output: 1_000_000,
             stall_secs: 60,
             advice: Advice::Cli,
+            timeout_at_limit: false,
         }
     }
 }
@@ -1119,6 +1123,7 @@ impl Tally {
                 self.stopped_by_budget,
                 self.stopped_by_timeout,
                 self.limits.advice,
+                self.limits.timeout_at_limit,
             ));
         }
         if self.exhausted {
@@ -1154,8 +1159,11 @@ impl Tally {
             }))
             .collect();
             let mut note = format!(
-                "output stopped at the {} limit of {} bytes; the run continued",
-                self.limits.advice.max_output(),
+                "output stopped at {} limit of {} bytes; the run continued",
+                match self.limits.advice {
+                    Advice::Cli => "the --max-output",
+                    Advice::Mcp => "the server's --max-output",
+                },
                 self.limits.max_output
             );
             if !counts.is_empty() {
@@ -1185,7 +1193,13 @@ const NOTE_BATCHES: usize = 5;
 /// later statements didn't run. The advice follows what stopped the counts: the budget, which
 /// `--exact-count` lifts (a run that has it can't be stopped by the budget, so it is never
 /// advised to it again), or `-t`, which only raising it lifts. A run with both kinds gets both.
-fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool, advice: Advice) -> String {
+fn stopped_note(
+    batches: &[usize],
+    by_budget: bool,
+    by_timeout: bool,
+    advice: Advice,
+    timeout_at_limit: bool,
+) -> String {
     let shown: Vec<String> = batches
         .iter()
         .take(NOTE_BATCHES)
@@ -1217,6 +1231,8 @@ fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool, advice: Ad
             "a larger timeout counts longer",
         ),
     };
+    // A call already at the server's limit has no larger timeout to ask for.
+    let by_timeout = by_timeout && !(advice == Advice::Mcp && timeout_at_limit);
     for advice in [(by_budget, exact), (by_timeout, longer)]
         .iter()
         .filter(|(applies, _)| *applies)
@@ -1490,7 +1506,7 @@ mod tests {
 
     #[test]
     fn the_note_names_the_batches_where_counting_stopped() {
-        let note = |batches: &[usize]| stopped_note(batches, true, false, Advice::Cli);
+        let note = |batches: &[usize]| stopped_note(batches, true, false, Advice::Cli, false);
         let tail = "; --exact-count counts every row";
         assert_eq!(
             note(&[4]),
@@ -1524,25 +1540,31 @@ mod tests {
         let first = "counting stopped in batch 2: the rest of that batch was cancelled, so its \
                      later statements did not run";
         assert_eq!(
-            stopped_note(&[2], true, false, Advice::Cli),
+            stopped_note(&[2], true, false, Advice::Cli, false),
             format!("{first}; --exact-count counts every row")
         );
         assert_eq!(
-            stopped_note(&[2], false, true, Advice::Cli),
+            stopped_note(&[2], false, true, Advice::Cli, false),
             format!("{first}; raise -t to count longer")
         );
         assert_eq!(
-            stopped_note(&[2], true, true, Advice::Cli),
+            stopped_note(&[2], true, true, Advice::Cli, false),
             format!("{first}; --exact-count counts every row; raise -t to count longer")
         );
         // sqlh mcp names what its reader can change: the profile, and the call's timeout.
         assert_eq!(
-            stopped_note(&[2], true, true, Advice::Mcp),
+            stopped_note(&[2], true, true, Advice::Mcp, false),
             format!(
                 "{first}; the profile's exact_count = true counts every row; a larger timeout \
                  counts longer"
             )
         );
+        // A call already at the server's limit is offered no larger timeout.
+        assert_eq!(
+            stopped_note(&[2], true, true, Advice::Mcp, true),
+            format!("{first}; the profile's exact_count = true counts every row")
+        );
+        assert_eq!(stopped_note(&[2], false, true, Advice::Mcp, true), first);
         // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
         let batch = |number| BatchInfo {
             number,
@@ -1597,6 +1619,17 @@ mod tests {
         assert_eq!(
             tally.limit_notes(),
             ["output stopped at the --max-output limit of 1124 bytes; the run continued"]
+        );
+        // In sqlh mcp it is the server's launch flag (docs/mcp-mode.md §4).
+        let mut mcp = Tally::new(Limits {
+            max_output: OUTPUT_RESERVE + 100,
+            advice: Advice::Mcp,
+            ..Limits::default()
+        });
+        assert!(!mcp.admit(101, 1));
+        assert_eq!(
+            mcp.limit_notes(),
+            ["output stopped at the server's --max-output limit of 1124 bytes; the run continued"]
         );
         let mut unlimited = Tally::new(Limits {
             max_output: 0,

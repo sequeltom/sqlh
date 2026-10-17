@@ -628,6 +628,7 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
             max_output: opts.max_output.unwrap_or(defaults.max_output),
             stall_secs: query_timeout,
             advice: defaults.advice,
+            timeout_at_limit: false,
         },
         query_timeout,
         allow_write,

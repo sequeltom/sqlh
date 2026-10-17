@@ -752,15 +752,17 @@ fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> C
     }
 }
 
-/// The advice for a timeout: `raise -t` on the command line; in `sqlh mcp`, the call's
-/// `timeout`, which can go up to the server's own (`output::Advice`).
-pub(crate) fn raise_timeout(settings: &Settings) -> String {
+/// The advice for a run's `timeout` that expired: `raise -t` on the command line; in
+/// `sqlh mcp`, the call's `timeout`, which can go up to the server's own (`output::Advice`).
+/// `None` when the call already had the server's limit, so there is no larger one to offer.
+pub(crate) fn raise_timeout(settings: &Settings, timeout: u32) -> Option<String> {
     match (settings.limits.advice, settings.query_timeout) {
-        (output::Advice::Cli, _) => "raise -t".into(),
-        (output::Advice::Mcp, 0) => "raise timeout".into(),
-        (output::Advice::Mcp, limit) => {
-            format!("raise timeout (the server allows up to {limit} s)")
+        (output::Advice::Cli, _) => Some("raise -t".into()),
+        (output::Advice::Mcp, 0) => Some("raise timeout".into()),
+        (output::Advice::Mcp, limit) if timeout < limit => {
+            Some(format!("raise timeout (the server allows up to {limit} s)"))
         }
+        (output::Advice::Mcp, _) => None,
     }
 }
 
@@ -967,14 +969,26 @@ pub(crate) async fn run_opened(
                 counts: &mut *counts,
             };
             session
-                .run(batch.sql.clone(), timeout, counting, cancel, &mut sink, gate)
+                .run(
+                    batch.sql.clone(),
+                    timeout,
+                    counting,
+                    cancel,
+                    &mut sink,
+                    gate,
+                )
                 .await
                 .map_err(|e| match e {
                     DbError::Timeout(_) => Failure::new(
                         Exit::Timeout,
                         format!(
-                            "query timeout after {timeout} s in batch {number}; {} or narrow the query",
-                            raise_timeout(settings)
+                            "query timeout after {timeout} s in batch {number}; {}",
+                            match raise_timeout(settings, timeout) {
+                                Some(raise) => format!("{raise} or narrow the query"),
+                                None => {
+                                    format!("narrow the query ({timeout} s is the server's limit)")
+                                }
+                            }
                         ),
                     ),
                     e => db_failure(e, settings.limits.advice),
@@ -1053,7 +1067,8 @@ async fn look_up(
                 Exit::Timeout,
                 format!(
                     "query timeout after {timeout} s while looking the name up; {}",
-                    raise_timeout(settings)
+                    raise_timeout(settings, timeout)
+                        .unwrap_or_else(|| format!("{timeout} s is the server's limit"))
                 ),
             ),
             e => db_failure(e, settings.limits.advice),
@@ -1279,6 +1294,26 @@ mod tests {
         assert!(wrapper_lost_unreported(true, false, true).is_none());
         assert!(wrapper_lost_unreported(false, false, false).is_none());
         assert!(wrapper_lost_unreported(false, true, false).is_none());
+    }
+
+    // A timeout's advice names what its reader can change: -t on the command line; in sqlh mcp
+    // a larger `timeout`, up to the server's limit, and nothing once the call has that limit.
+    #[test]
+    fn the_timeout_advice_offers_only_what_can_be_raised() {
+        let mut settings = settings(false);
+        settings.query_timeout = 30;
+        assert_eq!(raise_timeout(&settings, 30).as_deref(), Some("raise -t"));
+        settings.limits.advice = output::Advice::Mcp;
+        assert_eq!(
+            raise_timeout(&settings, 10).as_deref(),
+            Some("raise timeout (the server allows up to 30 s)")
+        );
+        assert_eq!(raise_timeout(&settings, 30), None);
+        settings.query_timeout = 0;
+        assert_eq!(
+            raise_timeout(&settings, 10).as_deref(),
+            Some("raise timeout")
+        );
     }
 
     // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,

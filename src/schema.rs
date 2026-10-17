@@ -591,7 +591,7 @@ fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
         let object = resolve(&asked, &name, found, advice)?;
         match shows {
             Shows::Describe => Ok(describe_steps(&object, Aggregate::for_level(compat(found)))),
-            Shows::Def => def_steps(&object),
+            Shows::Def => def_steps(&object, advice),
             Shows::Deps => deps_steps(&object, view_definition(found)),
         }
     };
@@ -930,18 +930,27 @@ fn parameters_sql() -> String {
 /// is read (R30). So the read keeps the definition in a variable, checks that it isn't NULL and
 /// that the object still has the name it was looked up by, and fails (exit 1, as an error in
 /// every format) when not; the row shown carries that same variable.
-fn def_steps(object: &Object) -> Result<Vec<Step>, Failure> {
+fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
     let name = &object.qualified;
     if matches!(object.kind.as_str(), "U" | "S" | "IT") {
-        return Err(name_error(format!(
-            "def shows views, procedures, functions and triggers; for a table use: sqlh \
-             describe {name}"
-        )));
+        return Err(name_error(match advice {
+            Advice::Cli => format!(
+                "def shows views, procedures, functions and triggers; for a table use: sqlh \
+                 describe {name}"
+            ),
+            Advice::Mcp => format!(
+                "definition shows views, procedures, functions and triggers; for a table use: \
+                 describe with object {name}"
+            ),
+        }));
     }
     if let Some(base) = &object.base {
-        return Err(name_error(format!(
-            "{name} is a synonym for {base}; run: sqlh def {base}"
-        )));
+        return Err(name_error(match advice {
+            Advice::Cli => format!("{name} is a synonym for {base}; run: sqlh def {base}"),
+            Advice::Mcp => {
+                format!("{name} is a synonym for {base}; call definition with object {base}")
+            }
+        }));
     }
     if !object.visible {
         return Err(name_error(format!(
@@ -1681,7 +1690,7 @@ mod tests {
 
     #[test]
     fn def_refuses_what_has_no_definition_to_show() {
-        let steps = def_steps(&object("P")).unwrap();
+        let steps = def_steps(&object("P"), Advice::Cli).unwrap();
         assert_eq!(labels(&steps), ["definition"]);
         // R30: the definition shown is the one checked.
         let sql = &steps[0].sql;
@@ -1694,7 +1703,7 @@ mod tests {
                     .ends_with("SELECT N'dbo.X' AS name, N'X' AS type, @definition AS definition;"),
             "{sql}"
         );
-        let table = def_steps(&object("U")).unwrap_err();
+        let table = def_steps(&object("U"), Advice::Cli).unwrap_err();
         assert!(
             table
                 .message
@@ -1702,26 +1711,41 @@ mod tests {
             "{}",
             table.message
         );
-        let hidden = def_steps(&Object {
-            visible: false,
-            ..object("P")
-        })
+        let hidden = def_steps(
+            &Object {
+                visible: false,
+                ..object("P")
+            },
+            Advice::Cli,
+        )
         .unwrap_err();
         assert!(
             hidden.message.contains("is not visible"),
             "{}",
             hidden.message
         );
-        let synonym = def_steps(&Object {
+        let synonym = Object {
             base: Some("[dbo].[Y]".into()),
             visible: false,
             ..object("SN")
-        })
-        .unwrap_err();
+        };
+        let refused = def_steps(&synonym, Advice::Cli).unwrap_err();
         assert!(
-            synonym.message.contains("is a synonym for [dbo].[Y]"),
+            refused
+                .message
+                .contains("is a synonym for [dbo].[Y]; run: sqlh def [dbo].[Y]"),
             "{}",
-            synonym.message
+            refused.message
+        );
+        // In sqlh mcp the refusals name the tools and their arguments.
+        assert_eq!(
+            def_steps(&object("U"), Advice::Mcp).unwrap_err().message,
+            "definition shows views, procedures, functions and triggers; for a table use: \
+             describe with object dbo.X"
+        );
+        assert_eq!(
+            def_steps(&synonym, Advice::Mcp).unwrap_err().message,
+            "dbo.X is a synonym for [dbo].[Y]; call definition with object [dbo].[Y]"
         );
     }
 

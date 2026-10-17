@@ -267,7 +267,7 @@ pub(crate) struct Planned {
     max_rows: Option<u64>,
     max_cell: Option<usize>,
     timeout: Option<u32>,
-    format: Format,
+    pub(crate) format: Format,
 }
 
 /// Why a `tools/call` was refused before it ran (docs/mcp-mode.md §4, Errors). A request that
@@ -280,6 +280,16 @@ pub(crate) struct Planned {
 pub(crate) enum Refused {
     Protocol(ProtocolError),
     Arguments { message: String, format: Format },
+}
+
+/// What a refusal shows of a name the client sent (a tool, an argument, a profile): enough to
+/// recognize it, so a huge one can't make the answer huge.
+fn echo(name: &str) -> String {
+    const SHOWN: usize = 100;
+    match name.char_indices().nth(SHOWN) {
+        Some((at, _)) => format!("{}…", &name[..at]),
+        None => name.to_owned(),
+    }
 }
 
 /// The arguments every tool takes, after its own.
@@ -298,7 +308,8 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
     };
     let Some(tool) = TOOLS.iter().find(|t| t.name == name) else {
         return Err(Refused::Protocol(ProtocolError::invalid_params(format!(
-            "Unknown tool: {name}"
+            "Unknown tool: {}",
+            echo(name)
         ))));
     };
     let empty = Map::new();
@@ -342,7 +353,8 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
                 .chain(COMMON_ARGS)
                 .collect();
             return Err(invalid(&format!(
-                "unknown argument {key} ({} takes {})",
+                "unknown argument {} ({} takes {})",
+                echo(key),
                 tool.name,
                 takes.join(", ")
             )));
@@ -387,7 +399,11 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
             .position(|p| p.name == name)
             .ok_or_else(|| {
                 let names: Vec<&str> = launch.profiles.iter().map(|p| p.name.as_str()).collect();
-                invalid(&format!("profile {name} isn't one of {}", names.join(", ")))
+                invalid(&format!(
+                    "profile {} isn't one of {}",
+                    echo(&name),
+                    names.join(", ")
+                ))
             })?,
         None if launch.profiles.len() == 1 => 0,
         None => {
@@ -451,12 +467,13 @@ fn arg_name(arg: Arg) -> &'static str {
     }
 }
 
-/// The result of a call whose arguments were refused (`Refused::Arguments`): a usage error,
-/// exit 3, as the run's own output would give it, so its text is escaped like any other.
-pub(crate) fn refusal(message: String, format: Format) -> String {
+/// The result of a call refused before it ran (`Refused::Arguments`, or one call too many): a
+/// usage error, exit 3, as the run's own output would give it, so its text is escaped like any
+/// other and held to the server's `--max-output` (`limits`, the launch's).
+pub(crate) fn refusal(message: String, format: Format, limits: Limits) -> String {
     let limits = Limits {
         advice: Advice::Mcp,
-        ..Limits::default()
+        ..limits
     };
     let mut out = Collected::new(format, limits);
     let outcome = RunOutcome::new(Err(Failure::usage(message)));
@@ -490,6 +507,7 @@ pub(crate) async fn execute(
         (Some(asked), limit) => asked.min(limit),
         (None, limit) => limit,
     };
+    limits.timeout_at_limit = settings.query_timeout > 0 && timeout >= settings.query_timeout;
     let mut out = Collected::new(planned.format, limits);
     let outcome = match prepare(&planned, settings) {
         Ok(prepared) => {
@@ -767,7 +785,8 @@ mod tests {
             panic!("refused");
         };
         assert_eq!(format, Format::Json);
-        let json: Value = serde_json::from_str(refusal(message, format).trim_end()).unwrap();
+        let json: Value =
+            serde_json::from_str(refusal(message, format, Limits::default()).trim_end()).unwrap();
         assert_eq!(json["exit_code"], 3, "{json}");
         assert_eq!(json["error"], "invalid arguments for query: sql is empty");
         // A client's text in the refusal is escaped like any other: one line stays one line.
@@ -778,12 +797,41 @@ mod tests {
             panic!("refused");
         };
         assert_eq!(format, Format::Text);
-        let text = refusal(message, format);
+        let text = refusal(message, format, Limits::default());
         assert!(
             text.starts_with("-- error: invalid arguments for query: unknown argument r")
                 && text.contains("-- failed (exit 3): usage error, "),
             "{text}"
         );
         assert_eq!(text.lines().count(), 2, "{text}");
+        // A name the client sent is shown cut short, and the answer is held to the server's
+        // --max-output.
+        let Err(Refused::Arguments { message, .. }) = plan(
+            &call(json!({"name": "query", "arguments": {"sql": "x", "k".repeat(5000): 1}})),
+            &one,
+        ) else {
+            panic!("refused");
+        };
+        assert!(
+            message.contains(&format!(
+                "unknown argument {}… (query takes",
+                "k".repeat(100)
+            )),
+            "{message}"
+        );
+        let small = Limits {
+            max_output: 4096,
+            ..Limits::default()
+        };
+        let long = format!("invalid arguments for query: {}", "x".repeat(10_000));
+        let text = refusal(long, Format::Text, small);
+        assert!(text.len() <= 4096, "{}", text.len());
+        assert!(
+            text.starts_with("-- error: invalid arguments for query: xxx")
+                && text.contains("-- failed (exit 3): usage error, "),
+            "{text}"
+        );
+        assert_eq!(echo("short"), "short");
+        assert_eq!(echo(&"é".repeat(150)), format!("{}…", "é".repeat(100)));
     }
 }

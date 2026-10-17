@@ -49,6 +49,10 @@ const MAX_MESSAGE: usize = 4 << 20;
 /// How many responses may wait for stdout before the server stops reading stdin.
 const MAX_UNWRITTEN: usize = 64;
 
+/// How many `subscriptions/listen` streams may be open at once. sqlh honors none of their
+/// notifications, so a few are plenty; each holds its id until it ends.
+const MAX_SUBSCRIPTIONS: usize = 8;
+
 /// How many calls may run at once; one more is answered at once with a tool error, so stdin
 /// keeps being read (and cancels keep arriving) whatever a client sends.
 const MAX_IN_FLIGHT: usize = 64;
@@ -190,6 +194,12 @@ impl Server {
         }
     }
 
+    /// The launch's limits, for an answer given before a call has a profile (the
+    /// `--max-output` is the launch's whatever the profile).
+    fn limits(&self) -> crate::output::Limits {
+        self.engine.settings(0).limits
+    }
+
     fn log(&self, line: String) {
         if let Some(log) = &self.log {
             // Dropped when stderr is behind: logging must never hold the server up.
@@ -296,13 +306,12 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     wait_for_calls(&running, END_GRACE).await;
     // An open subscription ends gracefully: its request is answered (the subscriptions page's
     // Graceful Closure), so the client can tell this end from a dropped transport.
-    for id in server.subscriptions.borrow_mut().drain(..) {
-        let meta = json!({"_meta": {protocol::META_SUBSCRIPTION: id}});
-        server.send(protocol::result_line(
-            &id,
-            Era::Modern,
-            protocol::object(meta),
-        ));
+    // The stream is then torn down with `notifications/cancelled`, which the cancellation page
+    // requires of a server ending a subscription (and allows for nothing else); the answer
+    // comes first, as the subscriptions page has it sent before the stream closes.
+    let open: Vec<Value> = server.subscriptions.borrow_mut().drain(..).collect();
+    for id in open {
+        end_subscription(&server, &id, "the server is ending");
     }
     server.engine.close_all().await;
     // The writer ends once every sender is gone and the last lines are out. It gets as long
@@ -491,12 +500,41 @@ fn listen(server: &Server, id: Value, params: &Map<String, Value>) {
         server.send(protocol::error_line(Some(&id), &error));
         return;
     }
+    if server.subscriptions.borrow().len() >= MAX_SUBSCRIPTIONS {
+        server.send(protocol::error_line(
+            Some(&id),
+            &ProtocolError::new(
+                protocol::INVALID_REQUEST,
+                format!(
+                    "Invalid request: at most {MAX_SUBSCRIPTIONS} subscriptions may be open; \
+                     cancel one first"
+                ),
+            ),
+        ));
+        return;
+    }
     let ack = json!({"_meta": {protocol::META_SUBSCRIPTION: id}, "notifications": {}});
     server.send(protocol::notification_line(
         "notifications/subscriptions/acknowledged",
         protocol::object(ack),
     ));
     server.subscriptions.borrow_mut().push(id);
+}
+
+/// Ends an open subscription from the server's side: its answer, then the cancel that tears
+/// the stream down.
+fn end_subscription(server: &Server, id: &Value, reason: &str) {
+    let meta = json!({"_meta": {protocol::META_SUBSCRIPTION: id}});
+    server.send(protocol::result_line(
+        id,
+        Era::Modern,
+        protocol::object(meta),
+    ));
+    let cancelled = json!({"requestId": id, "reason": reason});
+    server.send(protocol::notification_line(
+        "notifications/cancelled",
+        protocol::object(cancelled),
+    ));
 }
 
 /// Starts a tool call on the runtime; its response goes out when it ends, unless it was
@@ -508,6 +546,12 @@ fn call(
     era: Era,
     params: &Map<String, Value>,
 ) {
+    // The id first: a request reusing one still open gets only that refusal, never a second
+    // answer under the same id.
+    if let Some(error) = in_use(server, &id) {
+        server.send(protocol::error_line(Some(&id), &error));
+        return;
+    }
     let planned = match tools::plan(params, &server.launch) {
         Ok(planned) => planned,
         Err(tools::Refused::Protocol(error)) => {
@@ -516,7 +560,7 @@ fn call(
         }
         Err(tools::Refused::Arguments { message, format }) => {
             let result = protocol::object(json!({
-                "content": [{"type": "text", "text": tools::refusal(message, format)}],
+                "content": [{"type": "text", "text": tools::refusal(message, format, server.limits())}],
                 "isError": true,
             }));
             server.send(protocol::result_line(&id, era, result));
@@ -524,9 +568,10 @@ fn call(
         }
     };
     if running.get() >= MAX_IN_FLIGHT {
-        let text = format!(
-            "-- error: {MAX_IN_FLIGHT} calls are already running; wait for one to finish\n\
-             -- failed (exit 3): too many calls\n"
+        let text = tools::refusal(
+            format!("{MAX_IN_FLIGHT} calls are already running; wait for one to finish"),
+            planned.format,
+            server.limits(),
         );
         let result = protocol::object(json!({
             "content": [{"type": "text", "text": text}],
@@ -536,10 +581,6 @@ fn call(
         return;
     }
     let key = id.to_string();
-    if let Some(error) = in_use(server, &id) {
-        server.send(protocol::error_line(Some(&id), &error));
-        return;
-    }
     let root = Cancel::new();
     let cancel = root.child();
     server.calls.borrow_mut().insert(key.clone(), Some(root));
