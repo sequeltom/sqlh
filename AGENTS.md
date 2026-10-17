@@ -39,7 +39,15 @@ src/run.rs       the execution core, free of the CLI and of delivery: Request (w
                  app from the flags), RunPolicy (guard, wrapper, --check), QueryOrigin (user SQL or
                  sqlh's own, which is always read-only), prepare (sources → batches → guard), the
                  session and batch loop into any Output, cancellation, Accounting (the run's own
-                 count of errors and stopped counts) and RunOutcome (exit code and counts)
+                 count of errors and stopped counts) and RunOutcome (exit code and counts); the run
+                 is split so a lent session can run it: preflight, open (the setup: a reused
+                 connection's reset rides on it), run_opened; Closing and close() end any output
+src/engine.rs    the connection-reuse engine (PLAN.md 5.2, decisions 14-19): a pool per profile,
+                 the reset on reuse, one silent retry on a connection dead before the call ran,
+                 the cancel rule (17, amended), idle close; no MCP in it
+src/mcp/         sqlh mcp (PLAN.md 5.3, docs/mcp-mode.md): protocol.rs (JSON-RPC, the two eras),
+                 tools.rs (the read-only tools, their schemas, a call into the engine), mod.rs
+                 (the stdin, stdout and stderr threads, dispatch, cancellation, shutdown)
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
 src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW); each password is bound
@@ -77,7 +85,7 @@ docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
 docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, harness kill, drain
                  experiment, memory, Windows shells, agent trials, the MCP reuse spike;
                  upstream-issues.md, the driver problems for the owner to raise upstream))
-docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   MCP's spec (decided, not built)
+docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   sqlh mcp's spec (built 2026-10-17)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
                  (findings F.., R01–R19; PLAN.md records each one and its fix)
 ```

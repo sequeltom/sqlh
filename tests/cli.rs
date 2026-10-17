@@ -3340,6 +3340,7 @@ mod mcp {
             &config,
             &["--profile", "win"],
             &[
+                r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#.into(),
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#.into(),
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.into(),
                 r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.into(),
@@ -3352,6 +3353,8 @@ mod mcp {
         assert_eq!(init["protocolVersion"], "2025-06-18");
         assert_eq!(init["capabilities"], serde_json::json!({"tools": {}}));
         assert_eq!(init["serverInfo"]["name"], "sqlh");
+        // A ping before initialize is answered too.
+        assert_eq!(by_id(&messages, 0)["result"], serde_json::json!({}));
         assert_eq!(by_id(&messages, 2)["result"], serde_json::json!({}));
         let list = &by_id(&messages, 3)["result"];
         assert_eq!(list["tools"].as_array().unwrap().len(), 9);
@@ -3360,7 +3363,7 @@ mod mcp {
         let call = &by_id(&messages, 4)["result"];
         assert_eq!(call["isError"], true);
         assert!(call.get("resultType").is_none());
-        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert_eq!(messages.len(), 5, "{messages:?}");
     }
 }
 

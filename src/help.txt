@@ -17,10 +17,9 @@ CONNECTION
   --profile NAME  saved connection (env SQLH_PROFILE). Without -S, the default profile is used
   -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
   -d database     (env SQLCMDDBNAME); default: the profile's, else the login's (often master)
-  -E              Windows integrated auth (the default when there is no -U)
+  -E              Windows auth (default without -U)  -Ns|-Nm|-No encrypt strict|mandatory (default)|optional
   -C              trust the server certificate (self-signed servers); profile add NAME -C saves it
   -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
-  -Ns | -Nm | -No encryption strict | mandatory (default) | optional
   -l seconds      login timeout (default 15; 0 = none), one attempt   -K ReadOnly   -M multi-subnet failover
 
 EXECUTION
@@ -50,6 +49,7 @@ SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs 
 PROFILES  (passwords live in Windows Credential Manager, never in files or arguments)
   sqlh profile add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
   sqlh profile list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks)
+  sqlh mcp --profile NAME [--profile NAME ...]   MCP server on stdio for harnesses: read-only tools
 
 FORMAT
   "-- " lines are metadata: "-- result N", a header of name:type columns, tab-separated rows,

@@ -20,6 +20,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +41,9 @@ use crate::{app, config, console};
 
 /// The longest message sqlh reads: 4 MB. A longer line is answered with an error and skipped.
 const MAX_MESSAGE: usize = 4 << 20;
+
+/// How many responses may wait for stdout before the server stops reading stdin.
+const MAX_UNWRITTEN: usize = 64;
 
 /// How often idle connections are checked against `--idle`.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
@@ -145,6 +150,9 @@ struct Server {
     tools: Value,
     instructions: String,
     out: std_mpsc::Sender<String>,
+    /// Lines handed to the stdout thread and not yet written: past `MAX_UNWRITTEN`, stdin
+    /// waits, so a client that stops reading can't make the server's memory grow.
+    unwritten: Arc<AtomicUsize>,
     log: Option<std_mpsc::SyncSender<String>>,
     /// The calls in flight, by request id (as JSON text), with the cancel that ends each.
     calls: RefCell<HashMap<String, Cancel>>,
@@ -156,7 +164,10 @@ impl Server {
     fn send(&self, line: String) {
         // A closed channel means the stdout thread ended: the client is gone, and the
         // server is ending already.
-        let _ = self.out.send(line);
+        self.unwritten.fetch_add(1, Ordering::Relaxed);
+        if self.out.send(line).is_err() {
+            self.unwritten.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn log(&self, line: String) {
@@ -179,9 +190,11 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         return Exit::Internal;
     }
     let (out, out_rx) = std_mpsc::channel::<String>();
+    let unwritten = Arc::new(AtomicUsize::new(0));
+    let written = Arc::clone(&unwritten);
     let writer = match thread::Builder::new()
         .name("sqlh-mcp-stdout".into())
-        .spawn(move || write_stdout(&out_rx, &lines_tx))
+        .spawn(move || write_stdout(&out_rx, &lines_tx, &written))
     {
         Ok(writer) => writer,
         Err(_) => {
@@ -196,6 +209,7 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         engine,
         launch,
         out,
+        unwritten,
         log,
         calls: RefCell::new(HashMap::new()),
         agreed: RefCell::new(None),
@@ -206,8 +220,9 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     let running = Rc::new(std::cell::Cell::new(0usize));
     let ended_by = loop {
+        let behind = server.unwritten.load(Ordering::Relaxed) >= MAX_UNWRITTEN;
         tokio::select! {
-            line = lines.recv() => match line {
+            line = lines.recv(), if !behind => match line {
                 Some(Line::Text(bytes)) => dispatch(&server, &running, &bytes),
                 Some(Line::TooLong) => server.send(protocol::error_line(
                     None,
@@ -219,6 +234,8 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
                 Some(Line::End) | None => break "stdin closed",
                 Some(Line::StdoutBroken) => break "stdout closed",
             },
+            // While stdout is behind, look again soon; stdin waits meanwhile.
+            () = tokio::time::sleep(Duration::from_millis(10)), if behind => {}
             _ = sweep.tick() => server.engine.sweep(),
             signal = async {
                 match signals.as_mut() {
@@ -318,6 +335,19 @@ fn request(
     let agreed = *server.agreed.borrow();
     let era = match protocol::era_of(params, agreed) {
         Ok(era) => era,
+        // A legacy client may ping before `initialize` (the only request it may send then).
+        Err(error)
+            if method == "ping"
+                && error.code == protocol::INVALID_PARAMS
+                && !params.contains_key("_meta") =>
+        {
+            server.send(protocol::result_line(
+                &id,
+                Era::Legacy(protocol::LEGACY[0]),
+                Map::new(),
+            ));
+            return;
+        }
         Err(error) => {
             server.send(protocol::error_line(Some(&id), &error));
             return;
@@ -475,7 +505,11 @@ fn read_line(reader: &mut impl BufRead, max: usize) -> io::Result<Option<Option<
 
 /// The stdout thread: each message on its own line. When stdout fails, the client is gone,
 /// and the server is told.
-fn write_stdout(lines: &std_mpsc::Receiver<String>, server: &mpsc::Sender<Line>) {
+fn write_stdout(
+    lines: &std_mpsc::Receiver<String>,
+    server: &mpsc::Sender<Line>,
+    unwritten: &AtomicUsize,
+) {
     let stdout = io::stdout();
     for line in lines {
         let mut out = stdout.lock();
@@ -483,6 +517,7 @@ fn write_stdout(lines: &std_mpsc::Receiver<String>, server: &mpsc::Sender<Line>)
             .write_all(line.as_bytes())
             .and_then(|()| out.write_all(b"\n"))
             .and_then(|()| out.flush());
+        unwritten.fetch_sub(1, Ordering::Relaxed);
         if written.is_err() {
             let _ = server.blocking_send(Line::StdoutBroken);
             return;

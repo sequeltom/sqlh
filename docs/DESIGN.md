@@ -62,12 +62,12 @@ Milestone 0 is a spike meant to find any deal-breakers early.
 sqlh [conn] [opts] -Q "<sql>"            run, print, exit
 sqlh [conn] [opts] -i a.sql [-i b.sql]   run files in order; "-i -" reads stdin
 <sql> | sqlh [conn] [opts]               piped stdin when there's no -Q or -i
-sqlh [conn] <subcommand> ...             tables, describe, find, def, dbs, info (M2)
+sqlh [conn] <command> ...                tables, describe, find, def, deps, dbs, info (§9)
 sqlh profile add|list|test|rm ...        human setup; the only command that may prompt
-sqlh mcp [conn]                          MCP stdio server (M3)
+sqlh mcp --profile A [--profile B ...]   MCP stdio server (§10)
 ```
 
-With no SQL source and stdin attached to a console, `sqlh` prints a short usage message and exits 3. It never waits.
+With no SQL source and stdin attached to a console, `sqlh` prints a short usage message and exits 3. It never waits. `profile` and `mcp` must be the first argument: `sqlh --profile x mcp` (or `... profile`) is a usage error, where it would have run the word as SQL. `sqlh mcp` with a console for stdin is refused too (exit 3); its usage errors go to stderr, since its stdout carries only protocol messages (§10).
 
 Multi-line SQL goes in a file or on stdin, not in `-Q`. `-i file.sql` works in every shell. Stdin takes a different form in each: a heredoc in bash and Git Bash, a here-string in PowerShell, and in cmd.exe only `type file.sql | sqlh` or `sqlh < file.sql`.
 
@@ -483,7 +483,7 @@ In read-only mode, three layers apply:
    - **DBCC** is allowed only for `SHOW_STATISTICS`, `INPUTBUFFER`, `OPENTRAN`, `USEROPTIONS` and `TRACESTATUS`.
    - **These words are blocked anywhere:** `MERGE`, `COMMIT`, `ROLLBACK`, `SAVE`, `GRANT`, `REVOKE`, `DENY`, `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `RECONFIGURE`, `CHECKPOINT`, `BULK`, `OPENQUERY`, `OPENROWSET`, `OPENDATASOURCE`, `WAITFOR`, `RECEIVE`, `SEND`, `CONVERSATION`, `ENABLE`, `DISABLE`, `UPDATETEXT`, `WRITETEXT`, `SETUSER`. If one of these is really an unbracketed column name, the message suggests writing it as `[Name]`.
 
-   When it blocks something, nothing runs. It reports `-- blocked: <where>: <reason>; nothing was run. <advice>` and exits 5, for example `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended`. The advice fits the refusal. `--allow-write` is suggested only where it helps, and a better spelling comes first where there is one: a `#temp` table instead of `##t`, `sys.sp_who` instead of `dbo.sp_who`, `sp_spaceused` without `@updateusage`, or fixing a typo. Under a profile whose `write_policy` is `deny`, `--allow-write` is a usage error, so no refusal offers it: the alternative stays, and the advice says the profile doesn't allow writes instead, `-- blocked: line 1: DELETE dbo.T would write; nothing was run. Profile test doesn't allow writes (write_policy = "deny")`, or `… Use a #temp table; profile test doesn't allow writes (write_policy = "deny")` (PLAN.md 2.16, from agent trial 2). A refusal `--allow-write` can't lift (`NOEXEC` under `--check`) keeps its own advice.
+   When it blocks something, nothing runs. It reports `-- blocked: <where>: <reason>; nothing was run. <advice>` and exits 5, for example `-- blocked: line 3: UPDATE dbo.Orders would write; nothing was run. Rerun with --allow-write if the write is intended`. The advice fits the refusal. `--allow-write` is suggested only where it helps, and a better spelling comes first where there is one: a `#temp` table instead of `##t`, `sys.sp_who` instead of `dbo.sp_who`, `sp_spaceused` without `@updateusage`, or fixing a typo. Under a profile whose `write_policy` is `deny`, `--allow-write` is a usage error, so no refusal offers it: the alternative stays, and the advice says the profile doesn't allow writes instead, `-- blocked: line 1: DELETE dbo.T would write; nothing was run. Profile test doesn't allow writes (write_policy = "deny")`, or `… Use a #temp table; profile test doesn't allow writes (write_policy = "deny")` (PLAN.md 2.16, from agent trial 2). `sqlh mcp` is read-only (owner decision 16), so its refusals don't offer `--allow-write` either: `... Use a #temp table; sqlh mcp is read-only`, or `sqlh mcp is read-only` alone (`guard::WritesOff`). A refusal `--allow-write` can't lift (`NOEXEC` under `--check`) keeps its own advice.
 
    **Under `--check`** one more rule applies, whether or not writes are allowed: input that mentions `NOEXEC` is refused, because `SET NOEXEC OFF` would run the SQL instead of compiling it. The rule is deliberately coarse. It refuses the word anywhere outside strings, comments and quoted names, so a bare column or alias named `NOEXEC` is refused too, while `[NOEXEC]` is fine. The advice says so, and that `--allow-write` doesn't lift this rule.
 
@@ -596,7 +596,7 @@ Catalog SQL must be validated on SQL Server 2025 Standard for the first release.
 
 The commands are canned SQL run through the normal pipeline, with lists aggregated server-side by `STRING_AGG` (SQL Server 2017+); schema-commands.md §3 explains why.
 
-## 10. MCP mode (Phase 5; decided 2026-10-15 to 2026-10-17, not built yet)
+## 10. MCP mode (built 2026-10-17, PLAN.md 5.2 and 5.3; decided 2026-10-15 to 2026-10-17)
 
 The detailed design and plan is [mcp-mode.md](mcp-mode.md); its shape is owner decisions 14–19 (PLAN.md §6). Summary:
 
@@ -606,7 +606,9 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md); its shape is owner d
   - **Fixed reach:** it serves only the profiles listed at launch, and each tool takes an optional `profile` among them (decision 18). Connection settings and credentials are fixed at launch, so no tool argument can choose a server or carry a secret.
 - **Tools, read-only** (decision 16): `query` (guarded, in the rolled-back wrapper), `check`, `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps`. No write tool: writes stay on the CLI, and an `execute` tool comes with Phase 6's command categorization.
 - **Connections:** every call is stateless (decision 15), on a pooled connection reset (TDS RESETCONNECTION) before the call, so it behaves exactly like one CLI run. Up to 2 connections per profile, closed after 15 idle minutes, and a dead reused connection reconnected and the call retried once (decision 19). After a cancel, timeout or count stop, a connection the driver kept is reused, and the next call's reset, whose acknowledgement the driver verifies, is the check that it is clean; one the driver marked dead is discarded (decision 17, amended).
-- **Results:** the text format as a single text content item (`format: "json"` for the JSON document). `isError` is set when the exit code isn't 0.
+- **Results:** the text format as a single text content item (`format: "json"` for the JSON document). `isError` is set when the exit code isn't 0. A reused connection's status line says `connect 0 ms`.
+- **Calls:** `$(var)` substitution is off (the environment is the server's); each tool takes `profile`, `database`, `max_rows`, `max_cell`, `timeout` and `format`. A call that doesn't fit its tool's schema is `-32602`; whatever the run finds is a tool error.
+- **Launch:** each listed profile is resolved at launch as a run's would be, nothing connects until a call needs it, and launch errors go to stderr (exit 3). `--max-output` can't be 0, since a result is held in memory.
 
 ## 11. Performance targets
 

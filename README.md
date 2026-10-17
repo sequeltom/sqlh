@@ -49,11 +49,19 @@ Orders	2026-09-30T14:02:11.483
 
 `--format json` and `--format csv` are also available. `sqlh --help` is the full reference; it's written to be read by models.
 
+To give Claude Code sqlh's commands as tools, with connections kept open between calls, add it as an MCP server (list each profile it may use):
+
+```powershell
+claude mcp add sqlh -- sqlh mcp --profile dev
+```
+
+The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mcp-mode.md) has the details.
+
 ## Built for agents
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 38 built, 3 planned.**
+**Tally: 39 built, 2 planned.**
 
 ### Built
 
@@ -97,6 +105,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **sqlcmd-compatible.** `-S -d -U -Q -i -v -t`, `GO`, `GO n` and `$(var)`; sqlcmd's formatting flags are accepted and ignored with one note, so a model's habits don't break. *(MVP)*
 - **`--help` written for models.** Example-first, about 60 lines, with the discovery tips agent trial 1 showed were missing (`describe` for a table's or view's columns). *(Phase 2.9; `describe` in Phase 4)*
 - **The schema in one call.** `describe dbo.Orders` gives a table's columns, keys, indexes, foreign keys both ways, checks and triggers (or a procedure's parameters, or a system view's columns); `def` prints a view's or procedure's source; `deps` lists what an object uses and what uses it, including foreign keys, synonyms and calls resolved only at run time; `tables`, `find` (names, or with `--text` module bodies), `dbs` and `info` answer the rest. Each is a few labeled sections with empty ones folded into one line, where hand-written catalog queries took agent trial 1 five calls and an invented view name. Any name it prints can be passed straight back (odd names come bracketed), and a cut definition says what was left out and which limit cut it. *(Phase 4)*
+- **Open connections, as native tools.** `sqlh mcp --profile NAME` is an MCP server: a harness such as Claude Code gets sqlh's commands as read-only tools, and an agent's repeated calls reuse an open connection instead of paying the 150–250 ms login each time (a quick query took 11 ms instead of 209 ms on the dev LAN). Every call starts clean, so nothing one call does leaks into the next. It is part of the same exe, and its code runs only when a harness starts it: using sqlh only as a command-line tool costs nothing for it at run time (no startup time, no memory, no open connections). *(Phase 5.3)*
 - **Multi-line SQL from any shell.** `-i file.sql` works everywhere, and stdin (`-i -`, heredocs) where the shell has it; UTF-8 and UTF-16 input are decoded. *(MVP)*
 - **Works the same in cmd.exe, PowerShell and Git Bash.** The `--help` examples run unchanged in each, and a test runs them. A Git Bash path (`/c/dir/f.sql`) that cmd.exe or PowerShell can't find is answered with the Windows spelling to use, and sqlh leaves the console's code page as it found it. A path from Explorer's "Copy as path" works as is after `-i` or `-o`. *(Phase 2.13)*
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. *(Phase 2.13)*
@@ -107,7 +116,6 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 ### Planned
 
-- **Connection reuse.** An MCP server, `sqlh mcp`, keeps connections open, so an agent's repeated calls skip the 150–250 ms login each time, and gets sqlh's commands as native, read-only tools. It is part of the same exe, and its code runs only when a harness starts it: using sqlh only as a command-line tool costs nothing for it at run time (no startup time, no memory, no open connections). *(Phase 5)*
 - **A wider read-only allowlist** for DBA workflows (`xp_readerrorlog`, `xp_instance_regread`, showplans) from a categorization of commands, not a longer blocklist. *(Phase 6)*
 - **A skill and a plugin** that teach agents the investigation workflow and install it in one step. *(Phase 8)*
 
