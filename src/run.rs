@@ -122,16 +122,26 @@ const AGENT_DEFAULTS: &str = "SET DEADLOCK_PRIORITY LOW;";
 const READ_UNCOMMITTED_NOTE: &str = "reads were uncommitted (--read-uncommitted): rows may include uncommitted, duplicated or missing data";
 
 /// The batch sent first on every connection: the SSMS options, the agent defaults, the lock
-/// timeout, READ UNCOMMITTED if this run reads that way, and last the wrapper transaction of
-/// a read-only run. The isolation level is set before the transaction begins, so it is the
-/// transaction's from its first statement.
-fn session_setup(lock_timeout: u32, read_uncommitted: bool, wrap: bool) -> String {
+/// timeout, the isolation level, and last the wrapper transaction of a read-only run. The
+/// isolation level is set before the transaction begins, so it is the transaction's from its
+/// first statement.
+///
+/// The level is set every time, not only for READ UNCOMMITTED: on SQL Server (all but Azure SQL
+/// Database) the connection reset a reused connection gets (`Session::reset_before_next`,
+/// `sp_reset_connection`) restores the login's options but not the isolation level, so a call
+/// that ran `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` (which the guard allows) would
+/// otherwise hand that level to the next call on its connection. READ COMMITTED is a fresh
+/// login's level, and still reads row versions where the database has READ_COMMITTED_SNAPSHOT
+/// on, so a run on a new connection reads as it did before.
+pub(crate) fn session_setup(lock_timeout: u32, read_uncommitted: bool, wrap: bool) -> String {
     let mut setup = format!(
         "{SESSION_SETUP} {AGENT_DEFAULTS} SET LOCK_TIMEOUT {};",
         config::lock_timeout_ms(lock_timeout)
     );
     if read_uncommitted {
         setup.push_str(" SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;");
+    } else {
+        setup.push_str(" SET TRANSACTION ISOLATION LEVEL READ COMMITTED;");
     }
     if wrap {
         setup.push_str(" BEGIN TRANSACTION;");
@@ -1216,11 +1226,12 @@ mod tests {
     }
 
     // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,
-    // writes allowed or not; READ UNCOMMITTED only when asked for, before the wrapper
-    // transaction begins.
+    // writes allowed or not; READ UNCOMMITTED only when asked for, and READ COMMITTED
+    // otherwise, always before the wrapper transaction begins.
     #[test]
     fn the_session_setup_carries_the_agent_defaults() {
         let ssms = SESSION_SETUP;
+        let committed = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;";
         // R14, spelled out: the whole first batch of a read-only run, with XACT_ABORT OFF
         // before the wrapper transaction begins (and in an --allow-write run, which has no
         // wrapper, all the same).
@@ -1229,7 +1240,7 @@ mod tests {
             "SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; SET ARITHABORT ON; \
              SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; SET NUMERIC_ROUNDABORT OFF; \
              SET XACT_ABORT OFF; SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; \
-             BEGIN TRANSACTION;"
+             SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN TRANSACTION;"
         );
         for read_uncommitted in [false, true] {
             let setup = session_setup(10, read_uncommitted, true);
@@ -1243,19 +1254,24 @@ mod tests {
         assert!(session_setup(10, false, false).contains(" SET XACT_ABORT OFF; "));
         assert_eq!(
             session_setup(10, false, true),
-            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; BEGIN TRANSACTION;")
+            format!(
+                "{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; {committed} \
+                 BEGIN TRANSACTION;"
+            )
         );
-        // --allow-write: no wrapper transaction, same defaults.
+        // --allow-write: no wrapper transaction, same defaults, the isolation level included.
         assert_eq!(
             session_setup(10, false, false),
-            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000;")
+            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 10000; {committed}")
         );
         // A changed timeout, and 0 = no limit, which is -1 on the server.
         assert!(session_setup(3, false, true).contains(" SET LOCK_TIMEOUT 3000; "));
-        assert!(session_setup(0, false, false).ends_with(" SET LOCK_TIMEOUT -1;"));
+        assert!(
+            session_setup(0, false, false).ends_with(&format!(" SET LOCK_TIMEOUT -1; {committed}"))
+        );
         assert_eq!(
             session_setup(2_147_483, false, false),
-            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 2147483000;")
+            format!("{ssms} SET DEADLOCK_PRIORITY LOW; SET LOCK_TIMEOUT 2147483000; {committed}")
         );
         // Dirty reads: after the lock timeout, before the transaction is opened.
         assert_eq!(
@@ -1265,7 +1281,24 @@ mod tests {
                  SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; BEGIN TRANSACTION;"
             )
         );
-        assert!(!session_setup(10, false, true).contains("ISOLATION"));
+        // The isolation level is always set, exactly once, and always before the wrapper:
+        // the connection reset doesn't restore it, so a reused connection would otherwise keep
+        // whatever level the call before set (`session_setup`).
+        for read_uncommitted in [false, true] {
+            for wrap in [false, true] {
+                let setup = session_setup(10, read_uncommitted, wrap);
+                assert_eq!(setup.matches("ISOLATION LEVEL").count(), 1, "{setup}");
+                let level = if read_uncommitted {
+                    "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"
+                } else {
+                    committed
+                };
+                let at = setup.find(level).expect("the isolation level is set");
+                if let Some(begin) = setup.find("BEGIN TRANSACTION;") {
+                    assert!(at < begin, "{setup}");
+                }
+            }
+        }
     }
 
     // PLAN.md 2.15, decision 6 (DESIGN.md §4.4): which runs stop their count, and which let `-t`

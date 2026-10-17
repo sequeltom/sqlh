@@ -289,17 +289,27 @@ impl Engine {
     /// Puts a connection back in the pool after a call, if the driver kept it: a wrapper a
     /// cancel left open is rolled back first, so an idle connection holds no transaction.
     /// Anything that fails here drops the connection instead.
+    ///
+    /// A `check` call that was cancelled or timed out left `SET NOEXEC ON` in force (only its
+    /// normal end turns it off), and under NOEXEC the rollback would only be compiled: the
+    /// wrapper would stay open and the connection be dropped. So NOEXEC goes off first, in a
+    /// request of its own, so that the rollback is a batch NOEXEC no longer covers; both within
+    /// `ROLLBACK_WAIT`. Without NOEXEC in force, the extra `SET` changes nothing.
     async fn put_back(&self, pool: &Pool, mut session: Session) {
         if session.is_retired() || session.connection_dead() {
             return;
         }
         if session.in_transaction() {
-            let cancel = Cancel::new();
-            let rollback = session.exec_internal(
-                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
-                ROLLBACK_WAIT.as_secs() as u32,
-                &cancel,
-            );
+            let rollback = async {
+                let cancel = Cancel::new();
+                let wait = ROLLBACK_WAIT.as_secs() as u32;
+                session
+                    .exec_internal("SET NOEXEC OFF;", wait, &cancel)
+                    .await?;
+                session
+                    .exec_internal("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", wait, &cancel)
+                    .await
+            };
             // Past the wait the request is abandoned midway, so the connection, in no known
             // state, is dropped (the return below).
             let rolled_back = matches!(
@@ -425,11 +435,9 @@ mod tests {
         elapsed: Duration,
     }
 
-    /// Runs `sql` as one call on the engine's profile, with `-t timeout`, into text.
-    async fn call(engine: &Engine, sql: &str, timeout: u32, cancel: &Cancel) -> Called {
-        let started = Instant::now();
-        let settings = engine.settings(0);
-        let request = Request {
+    /// A call's request for `sql`, as the MCP front end makes it for a plain `query`.
+    fn request(sql: &str) -> Request {
+        Request {
             input: Input::Query(sql.into()),
             vars: None,
             terminator: "GO".into(),
@@ -437,7 +445,18 @@ mod tests {
             continue_on_error: false,
             report: Report::Off,
             database: None,
-        };
+        }
+    }
+
+    /// Runs `sql` as one call on the engine's profile, with `-t timeout`, into text.
+    async fn call(engine: &Engine, sql: &str, timeout: u32, cancel: &Cancel) -> Called {
+        call_with(engine, request(sql), timeout, cancel).await
+    }
+
+    /// `call`, for any request (a `check`, a `database`).
+    async fn call_with(engine: &Engine, request: Request, timeout: u32, cancel: &Cancel) -> Called {
+        let started = Instant::now();
+        let settings = engine.settings(0);
         let prepared = match run::prepare(request, settings, QueryOrigin::User) {
             Ok(prepared) => prepared,
             Err(failure) => panic!("prepare: {}", failure.message),
@@ -469,13 +488,18 @@ mod tests {
     /// `call`, cancelled from outside `after` it starts, as an MCP client's
     /// `notifications/cancelled` would cancel it.
     async fn cancelled(engine: &Engine, after: Duration) -> Called {
+        cancelled_with(engine, request("SELECT 1"), after).await
+    }
+
+    /// `cancelled`, for any request.
+    async fn cancelled_with(engine: &Engine, request: Request, after: Duration) -> Called {
         let root = Cancel::new();
         let cancel = root.child();
         let canceller = async move {
             tokio::time::sleep(after).await;
             root.cancel();
         };
-        let (called, ()) = tokio::join!(call(engine, "SELECT 1", 30, &cancel), canceller);
+        let (called, ()) = tokio::join!(call_with(engine, request, 30, &cancel), canceller);
         called
     }
 
@@ -532,6 +556,10 @@ mod tests {
 
     /// The wrapper's rollback, from `run_opened` or `put_back`.
     const ROLLBACK: &str = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;";
+
+    /// What `put_back` sends ahead of its rollback, and `run_opened` after a `check` call's
+    /// batches.
+    const NOEXEC_OFF: &str = "SET NOEXEC OFF;";
 
     // Decisions 14 and 15: calls on one profile share its connection, and each starts fresh:
     // the second call reuses the first's connection, its first request carries the reset, and
@@ -740,17 +768,18 @@ mod tests {
     // mid-result and never acknowledges the attention; the driver gives up after its own 5 s
     // wait for the acknowledgement and marks the connection dead (unless the engine's grace,
     // which starts within microseconds of it, ends the call first). In the second the attention
-    // is acknowledged, but the server goes silent at the rollback `put_back` sends, which gives
-    // up after `ROLLBACK_WAIT` (2 s), so the call ends with its own result, well inside the
-    // settle grace. Either way the connection is discarded, never put back, and the next call
-    // reconnects. The one slow test (the first case's bounds are 5 s), so the two run at once.
+    // is acknowledged, but the server goes silent at the rollback `put_back` sends (after its
+    // `SET NOEXEC OFF`, answered), which gives up after `ROLLBACK_WAIT` (2 s), so the call ends
+    // with its own result, well inside the settle grace. Either way the connection is
+    // discarded, never put back, and the next call reconnects. The one slow test (the first
+    // case's bounds are 5 s), so the two run at once.
     #[test]
     fn a_cancel_that_does_not_settle_discards_the_connection() {
         let unacknowledged = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
         let rollback_unanswered = serve_pool(vec![
             Conn::new()
                 .at(2, Turn::Hang { ack: true })
-                .at(3, Turn::Silent),
+                .at(4, Turn::Silent),
         ]);
         let (by_driver, by_grace) = (
             serving(&unacknowledged, DEFAULT_POOL, None),
@@ -802,7 +831,7 @@ mod tests {
             assert_eq!(fake.accepted(), 2);
             assert_eq!(fake.resets(1), [false, false, false]);
         }
-        assert_eq!(rollback_unanswered.sql(0)[2], ROLLBACK);
+        assert_eq!(rollback_unanswered.sql(0)[2..], [NOEXEC_OFF, ROLLBACK]);
     }
 
     // Decision 17 (amended): a cancel the server acknowledges (DONE ATTN) leaves the driver's
@@ -833,9 +862,13 @@ mod tests {
         assert_eq!(idle, 1, "the connection was put back");
         assert_ok(&next);
         assert_eq!(fake.accepted(), 1);
-        // The cancelled call's setup, its SELECT and the rollback `put_back` sent; then the
-        // next call, reset first.
-        assert_eq!(fake.resets(0), [false, false, false, true, false, false]);
+        // The cancelled call's setup, its SELECT, and the NOEXEC OFF and rollback `put_back`
+        // sent; then the next call, reset first.
+        assert_eq!(
+            fake.resets(0),
+            [false, false, false, false, true, false, false]
+        );
+        assert_eq!(fake.sql(0)[2..4], [NOEXEC_OFF, ROLLBACK]);
         assert_eq!(engine.idle_count(0), 1);
     }
 
@@ -961,7 +994,7 @@ mod tests {
         );
         let sql = fake.sql(0);
         assert!(is_setup(&sql[0]), "{sql:?}");
-        assert_eq!(sql[1..], ["SELECT 1", ROLLBACK]);
+        assert_eq!(sql[1..], ["SELECT 1", NOEXEC_OFF, ROLLBACK]);
         assert!(!fake.in_transaction(0));
         {
             let idle = engine.pools[0].idle.borrow();
@@ -969,11 +1002,12 @@ mod tests {
             assert!(!idle[0].session.in_transaction());
         }
 
-        // The rollback (request 3) meets a lost connection: dropped, not pooled.
+        // The rollback (request 4, after the NOEXEC OFF) meets a lost connection: dropped, not
+        // pooled.
         let fake = serve_pool(vec![
             Conn::new()
                 .at(2, Turn::Hang { ack: true })
-                .at(3, Turn::Drop),
+                .at(4, Turn::Drop),
         ]);
         let engine = serving(&fake, DEFAULT_POOL, None);
         let (cancelled, idle, next) = block_on(async {
@@ -982,9 +1016,209 @@ mod tests {
             (cancelled, idle, plain(&engine).await)
         });
         assert_eq!(cancelled.exit, Exit::Cancelled, "{}", cancelled.text);
-        assert_eq!(fake.sql(0)[2], ROLLBACK);
+        assert_eq!(fake.sql(0)[2..], [NOEXEC_OFF, ROLLBACK]);
         assert_eq!(idle, 0, "the connection whose rollback failed was dropped");
         assert_ok(&next);
         assert_eq!(fake.accepted(), 2);
+    }
+
+    // A `check` call cancelled or timed out mid-batch leaves `SET NOEXEC ON` in force (only its
+    // normal end turns it off), and under NOEXEC a rollback is compiled, not run. So `put_back`
+    // turns NOEXEC off first, in a request of its own; the rollback then ends the wrapper, the
+    // connection goes back to the pool, and the next call reuses it.
+    #[test]
+    fn a_check_call_cut_short_turns_noexec_off_before_the_rollback() {
+        /// A `check` call cut short, by a cancel or else by its -t 1, how many connections
+        /// were idle right after it, and the next call.
+        async fn cut_short_then_next(engine: &Engine, by_cancel: bool) -> (Called, usize, Called) {
+            let check = Request {
+                check: true,
+                ..request("SELECT 1")
+            };
+            let called = if by_cancel {
+                cancelled_with(engine, check, Duration::from_millis(100)).await
+            } else {
+                call_with(engine, check, 1, &Cancel::new()).await
+            };
+            let idle = engine.idle_count(0);
+            (called, idle, plain(engine).await)
+        }
+        // Requests 1 to 3 are the setup, SET NOEXEC ON and the batch, which hangs until the
+        // cancel (or the -t 1), whose attention is acknowledged.
+        let conn = || Conn::new().at(3, Turn::Hang { ack: true });
+        let (by_cancel, by_timeout) = (serve_pool(vec![conn()]), serve_pool(vec![conn()]));
+        let (cancelling, timing_out) = (
+            serving(&by_cancel, DEFAULT_POOL, None),
+            serving(&by_timeout, DEFAULT_POOL, None),
+        );
+        let (first, second) = block_on(async {
+            tokio::join!(
+                cut_short_then_next(&cancelling, true),
+                cut_short_then_next(&timing_out, false)
+            )
+        });
+        for ((called, idle, next), fake, exit) in [
+            (first, &by_cancel, Exit::Cancelled),
+            (second, &by_timeout, Exit::Timeout),
+        ] {
+            assert_eq!(called.exit, exit, "{}", called.text);
+            assert_eq!(
+                idle, 1,
+                "the connection was put back, its wrapper rolled back"
+            );
+            let sql = fake.sql(0);
+            assert!(is_setup(&sql[0]), "{sql:?}");
+            assert_eq!(
+                sql[1..5],
+                ["SET NOEXEC ON;", "SELECT 1", NOEXEC_OFF, ROLLBACK],
+                "{sql:?}"
+            );
+            assert_ok(&next);
+            assert_eq!(fake.accepted(), 1);
+            assert_eq!(
+                fake.resets(0),
+                [false, false, false, false, false, true, false, false]
+            );
+            assert!(!fake.in_transaction(0));
+        }
+    }
+
+    // On all but Azure SQL Database, the connection reset doesn't restore the isolation level,
+    // so a call that sets one (the guard allows it) would hand it to the next call on its
+    // connection. Every call's setup names the level, a reused connection's too, ahead of the
+    // wrapper's BEGIN TRANSACTION: READ COMMITTED, or READ UNCOMMITTED when the profile reads
+    // that way.
+    #[test]
+    fn every_call_sets_the_isolation_level_the_reset_leaves_alone() {
+        for (read_uncommitted, level) in [(false, "READ COMMITTED"), (true, "READ UNCOMMITTED")] {
+            let fake = serve_pool(Vec::new());
+            let profile = Settings {
+                read_uncommitted,
+                ..settings(&fake)
+            };
+            let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+            let serializable = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;";
+            let (first, second) = block_on(async {
+                let first = call(&engine, serializable, 30, &Cancel::new()).await;
+                (first, plain(&engine).await)
+            });
+            assert_eq!(first.exit, Exit::Ok, "{}", first.text);
+            assert_eq!(second.exit, Exit::Ok, "{}", second.text);
+            if !read_uncommitted {
+                assert_ok(&second);
+            }
+            assert_eq!(fake.accepted(), 1);
+            assert_eq!(fake.resets(0), [false, false, false, true, false, false]);
+            let sql = fake.sql(0);
+            assert_eq!(sql[1], serializable);
+            let wanted = format!(" SET TRANSACTION ISOLATION LEVEL {level}; BEGIN TRANSACTION;");
+            for setup in [&sql[0], &sql[3]] {
+                assert!(is_setup(setup) && setup.ends_with(&wanted), "{setup}");
+            }
+        }
+    }
+
+    // An MCP call's `database` is switched to with a USE of its own, after the setup and
+    // before the call's SQL, the name bracketed with its `]` doubled: that escaping is what
+    // stops a database argument from injecting SQL. The reset restores the login's database,
+    // so the next call on the connection, naming none, gets the reset and no USE.
+    #[test]
+    fn a_calls_database_is_used_bracketed_and_the_next_call_gets_the_reset_alone() {
+        let fake = serve_pool(Vec::new());
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let named = Request {
+            database: Some("a]b".into()),
+            ..request("SELECT 1")
+        };
+        let (first, second) = block_on(async {
+            let first = call_with(&engine, named, 30, &Cancel::new()).await;
+            (first, plain(&engine).await)
+        });
+        assert_ok(&first);
+        assert_ok(&second);
+        assert_eq!(masked(&first.text), masked(&second.text));
+        assert_eq!(fake.accepted(), 1);
+        let sql = fake.sql(0);
+        assert!(is_setup(&sql[0]) && is_setup(&sql[4]), "{sql:?}");
+        assert_eq!(sql[1..4], ["USE [a]]b];", "SELECT 1", ROLLBACK], "{sql:?}");
+        assert_eq!(sql[5..], ["SELECT 1", ROLLBACK], "{sql:?}");
+        assert_eq!(
+            fake.resets(0),
+            [false, false, false, false, true, false, false]
+        );
+    }
+
+    // A call cancelled while it waits for a connection (the pool's only one held by a slow
+    // call) ends at once, exit 6, saying what it was waiting for. It took no permit, so once
+    // the slow call ends, the next call reuses the one connection.
+    #[test]
+    fn a_call_cancelled_while_waiting_for_a_connection_ends_promptly() {
+        let fake = serve_pool(vec![
+            Conn::new().at(2, Turn::Delay(Duration::from_millis(800))),
+        ]);
+        let engine = Rc::new(serving(&fake, 1, None));
+        let (slow, waiting, next) = block_on_local(async {
+            let slow = tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30));
+            let waiting = tokio::task::spawn_local({
+                let engine = Rc::clone(&engine);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancelled(&engine, Duration::from_millis(100)).await
+                }
+            });
+            let waiting = waiting.await.expect("waiting");
+            let slow = slow.await.expect("slow");
+            (slow, waiting, plain(&engine).await)
+        });
+        assert_ok(&slow);
+        assert_eq!(waiting.exit, Exit::Cancelled, "{}", waiting.text);
+        assert_eq!(
+            masked(&waiting.text),
+            "-- error: cancelled while waiting for a free connection\n\
+             -- failed (exit N): cancelled, N ms\n"
+        );
+        assert!(waiting.text.contains("(exit 6)"), "{}", waiting.text);
+        assert!(
+            waiting.elapsed >= Duration::from_millis(100)
+                && waiting.elapsed < Duration::from_millis(500),
+            "it ended at the cancel, not when the connection came free: {:?}",
+            waiting.elapsed
+        );
+        assert_ok(&next);
+        assert_eq!(fake.accepted(), 1);
+        assert_eq!(fake.resets(0), [false, false, false, true, false, false]);
+        assert_eq!(engine.idle_count(0), 1);
+        assert_eq!(engine.pools[0].permits.available_permits(), 1);
+    }
+
+    // The end of the server's life: `close_all` closes every idle connection (the fake sees the
+    // client close each one), sends them nothing more, and leaves the pool empty.
+    #[test]
+    fn close_all_closes_the_idle_connections() {
+        let both = || Conn::new().at(2, Turn::Delay(Duration::from_millis(50)));
+        let fake = serve_pool(vec![both(), both()]);
+        let engine = Rc::new(serving(&fake, DEFAULT_POOL, None));
+        let (calls, idle, closed) = block_on_local(async {
+            let a = tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30));
+            let b = tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30));
+            let calls = [a.await.expect("a"), b.await.expect("b")];
+            let idle = engine.idle_count(0);
+            engine.close_all().await;
+            let closed = fake
+                .wait_for(Duration::from_secs(2), |f| {
+                    f.ended(0) == Some(End::Client) && f.ended(1) == Some(End::Client)
+                })
+                .await;
+            (calls, idle, closed)
+        });
+        for called in &calls {
+            assert_ok(called);
+        }
+        assert_eq!(idle, 2, "both connections were idle");
+        assert!(closed, "the client closed both connections");
+        assert_eq!(engine.idle_count(0), 0);
+        for conn in 0..2 {
+            assert_eq!(fake.requests(conn).len(), 3, "connection {conn}");
+        }
     }
 }

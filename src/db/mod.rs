@@ -2387,6 +2387,8 @@ pub(crate) mod fake_server {
         requests: Vec<Seen>,
         /// For each connection, the descriptor of its open transaction; 0 when none is.
         transactions: Vec<u64>,
+        /// For each connection, whether `SET NOEXEC ON` is in force (`answer`).
+        noexec: Vec<bool>,
         ended: Vec<(usize, End)>,
     }
 
@@ -2480,6 +2482,7 @@ pub(crate) mod fake_server {
                     let mut log = shared.lock().unwrap();
                     log.accepted += 1;
                     log.transactions.push(0);
+                    log.noexec.push(false);
                     log.accepted - 1
                 };
                 let script = conns.get(conn).cloned().unwrap_or_default();
@@ -2530,11 +2533,14 @@ pub(crate) mod fake_server {
                 sql: sql.clone(),
             });
             // The server resets the session before it runs the request, so the acknowledgement
-            // leads the reply; the reset rolls back an open transaction, which needs no token.
+            // leads the reply; the reset restores the login's SET options (NOEXEC among them)
+            // and rolls back an open transaction, which needs no token.
             let mut reply = Vec::new();
             if message.reset() || message.reset_keeping_transaction() {
+                let mut log = log.lock().unwrap();
+                log.noexec[conn] = false;
                 if message.reset() {
-                    log.lock().unwrap().transactions[conn] = 0;
+                    log.transactions[conn] = 0;
                 }
                 if !script.no_reset_ack {
                     reply.extend(env_reset());
@@ -2588,13 +2594,20 @@ pub(crate) mod fake_server {
     /// The reply to one of the batches sqlh sends, as SQL Server gives it: the session setup
     /// ends in the wrapper's `BEGIN TRANSACTION`, which opens a transaction (ENVCHANGE 8, then
     /// DONE); the rollback ends the open one (ENVCHANGE 10, then DONE); a `SELECT` returns one
-    /// row (`int_rows`); anything else (a `SET`, a `USE`) only a DONE. Connection `conn`'s
-    /// transaction is tracked in the log, where the test can see it.
+    /// row (`int_rows`); anything else (a `SET`, a `USE`) only a DONE. Under `SET NOEXEC ON`
+    /// a batch is compiled, not run: only a DONE, so a rollback leaves the transaction open,
+    /// until a `SET NOEXEC OFF` (or a reset). Connection `conn`'s transaction is tracked in
+    /// the log, where the test can see it.
     fn answer(sql: &str, conn: usize, log: &Mutex<Log>) -> Vec<u8> {
         let mut log = log.lock().unwrap();
         let open = log.transactions[conn];
         let mut reply = Vec::new();
-        if sql.contains("BEGIN TRANSACTION") {
+        if sql.contains("SET NOEXEC") {
+            log.noexec[conn] = sql.contains("SET NOEXEC ON");
+            reply.extend(done_empty());
+        } else if log.noexec[conn] {
+            reply.extend(done_empty());
+        } else if sql.contains("BEGIN TRANSACTION") {
             // A nested BEGIN only counts up @@TRANCOUNT, which the client isn't told.
             if open == 0 {
                 // Unique to the connection, and never 0.
@@ -3025,7 +3038,9 @@ pub(crate) mod fake_server {
 
 /// Spike 5.1 (PLAN.md Phase 5): what the connection reset clears, and what each kind of cancel
 /// leaves behind (docs/notes/mcp-reuse-spike.md). Live: every state after a reset must equal a fresh
-/// login's, and no kind of cancel may lose the connection. `--nocapture` prints what it saw:
+/// login's but for the isolation level, which the reset leaves as the last call set it (so
+/// sqlh's session setup sets it, step 1), and no kind of cancel may lose the connection.
+/// `--nocapture` prints what it saw:
 /// `SQLH_TEST_PROFILE=test cargo test --lib spike_reset -- --ignored --nocapture`.
 #[cfg(test)]
 mod spike {
@@ -3089,10 +3104,26 @@ mod spike {
     const STATE: &str = "SELECT OBJECT_ID(N'tempdb..#spike') AS temp, @@TRANCOUNT AS trancount, \
         DB_NAME() AS db, @@LOCK_TIMEOUT AS lock_timeout, @@OPTIONS & 16384 AS xact_abort, \
         (SELECT deadlock_priority FROM sys.dm_exec_sessions WHERE session_id = @@SPID) \
-        AS deadlock_priority, @@SPID AS spid;";
+        AS deadlock_priority, \
+        (SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID) \
+        AS isolation, @@SPID AS spid;";
+
+    /// STATE's `isolation` column, and the values of it the spike meets
+    /// (`sys.dm_exec_sessions.transaction_isolation_level`: 2 READ COMMITTED, 4 SERIALIZABLE).
+    const ISOLATION: usize = 6;
+    const READ_COMMITTED: &str = "Int(2)";
+    const SERIALIZABLE: &str = "Int(4)";
 
     const DIRTY: &str = "CREATE TABLE #spike (i int); SET LOCK_TIMEOUT 1234; SET XACT_ABORT ON; \
-        SET DEADLOCK_PRIORITY HIGH; BEGIN TRANSACTION; USE master;";
+        SET DEADLOCK_PRIORITY HIGH; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; \
+        BEGIN TRANSACTION; USE master;";
+
+    /// A state without its isolation level.
+    fn but_isolation(state: &[String]) -> Vec<String> {
+        let mut rest = state.to_vec();
+        rest.remove(ISOLATION);
+        rest
+    }
 
     async fn run(
         s: &mut Session,
@@ -3158,8 +3189,9 @@ mod spike {
             let mut s = Session::connect(&settings.connect, &Cancel::new())
                 .await
                 .expect("connected");
-            println!("-- 1. what the reset clears");
+            println!("-- 1. what the reset clears, and what it doesn't");
             let fresh = state(&mut s, "fresh login").await;
+            assert_eq!(fresh[ISOLATION], READ_COMMITTED, "a fresh login's level");
             run(
                 &mut s,
                 "dirty batch",
@@ -3169,21 +3201,57 @@ mod spike {
                 &Cancel::new(),
             )
             .await;
+            let dirty = state(&mut s, "after the dirty batch, no reset").await;
             assert_ne!(
-                state(&mut s, "after the dirty batch, no reset").await,
-                fresh,
+                but_isolation(&dirty),
+                but_isolation(&fresh),
                 "after the dirty batch, no reset: the state is still there"
             );
+            assert_eq!(dirty[ISOLATION], SERIALIZABLE, "the dirty batch's level");
+            // The reset restores everything else, but not the isolation level: on SQL Server
+            // (all but Azure SQL Database) sp_reset_connection leaves it as the last call set
+            // it, so a reused connection must set its own (`run::session_setup`). This drives
+            // the session directly, without sqlh's setup.
             s.reset_before_next();
+            let reset = state(&mut s, "after the dirty batch, reset").await;
             assert_eq!(
-                state(&mut s, "after the dirty batch, reset").await,
-                fresh,
-                "after the dirty batch, reset"
+                but_isolation(&reset),
+                but_isolation(&fresh),
+                "after the dirty batch, reset: all but the isolation level"
+            );
+            assert_eq!(
+                reset[ISOLATION], SERIALIZABLE,
+                "after the dirty batch, reset: the isolation level is the dirty batch's still \
+                 (if this fails, the server's reset restores it, and the setup's SET is only a \
+                 safeguard)"
             );
             assert_eq!(
                 state(&mut s, "the call after that").await,
-                fresh,
+                reset,
                 "the call after that"
+            );
+            // sqlh's session setup, as a read-only call sends it after the reset: it sets the
+            // level, and the reset after it leaves a state equal to a fresh login's again.
+            let setup = crate::run::session_setup(settings.lock_timeout, false, true);
+            run(
+                &mut s,
+                "sqlh's session setup",
+                &setup,
+                30,
+                Counting::EXACT,
+                &Cancel::new(),
+            )
+            .await;
+            assert_eq!(
+                state(&mut s, "after sqlh's session setup").await[ISOLATION],
+                READ_COMMITTED,
+                "after sqlh's session setup"
+            );
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after sqlh's session setup, reset"
             );
 
             println!("-- 2. what the reset costs");
