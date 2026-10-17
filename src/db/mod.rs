@@ -1186,17 +1186,27 @@ impl Session {
         let _ = self.client.close_connection().await;
     }
 
-    /// Spike 5.1 (PLAN.md Phase 5): asks the server to reset the session before the next
-    /// request, as a pool does (`prepare_reset_connection`, RESETCONNECTION).
-    #[cfg(test)]
-    pub(crate) fn reset_before_next(&mut self) {
+    #[allow(dead_code)] // until sqlh mcp (Phase 5.3) calls the engine
+    /// Asks the server to reset the session before it processes the next request, as a pool
+    /// does (`prepare_reset_connection`, the RESETCONNECTION bit): login defaults restored,
+    /// temp tables dropped, an open transaction rolled back, the login's database back
+    /// (docs/notes/mcp-reuse-spike.md). The driver verifies the server's acknowledgement on
+    /// that request, and fails it and marks the connection dead when it is missing, so a
+    /// session that wasn't reset is never used (owner decision 17, amended).
+    pub fn reset_before_next(&mut self) {
         self.client.prepare_reset_connection(false);
     }
 
-    /// Spike 5.1: whether the driver marked the connection dead.
-    #[cfg(test)]
-    pub(crate) fn connection_dead(&self) -> bool {
+    /// Whether the driver marked the connection dead: it does when an attention goes
+    /// unacknowledged, when a reset isn't acknowledged, and when the connection breaks.
+    pub fn connection_dead(&self) -> bool {
         self.client.is_connection_dead()
+    }
+
+    /// Whether a batch's work was abandoned past its settle bound (`run`): nothing more may be
+    /// sent on the connection.
+    pub fn is_retired(&self) -> bool {
+        self.retired
     }
 
     fn flush_messages(&mut self, sink: &mut dyn BatchSink) -> io::Result<()> {

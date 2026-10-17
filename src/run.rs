@@ -18,7 +18,7 @@ use crate::db::{
 };
 use crate::error::{Exit, Failure};
 use crate::guard;
-use crate::output::{self, BatchInfo, Output, Section};
+use crate::output::{self, BatchInfo, Output, Section, Summary};
 use crate::script::{self, Batch, Source};
 use crate::signals::{Signal, Signals};
 
@@ -225,6 +225,98 @@ impl RunOutcome {
             Ok(_) => Exit::SqlError,
             Err(failure) => failure.exit,
         }
+    }
+}
+
+/// How a run ends: its exit code, the status line, and the error that stopped it, if any.
+pub(crate) struct Closing {
+    pub(crate) exit: Exit,
+    pub(crate) status: String,
+    pub(crate) error: Option<String>,
+    elapsed_ms: u128,
+}
+
+impl Closing {
+    /// `ok: <detail>, N ms`.
+    pub(crate) fn ok(detail: &str, started: Instant) -> Closing {
+        let elapsed_ms = started.elapsed().as_millis();
+        Closing {
+            exit: Exit::Ok,
+            status: format!("ok: {detail}, {elapsed_ms} ms"),
+            error: None,
+            elapsed_ms,
+        }
+    }
+
+    pub(crate) fn of(outcome: RunOutcome, started: Instant) -> Closing {
+        let ms = started.elapsed().as_millis();
+        let exit = outcome.exit();
+        // A stopped count is in the status line, so that a reader of that line alone learns
+        // that part of the input was cancelled (DESIGN.md §5.1).
+        let stopped = match outcome.stopped_batches {
+            0 => String::new(),
+            n => format!(", counting stopped in {n}"),
+        };
+        let errors = outcome.errors;
+        match outcome.result {
+            Ok(stats) if exit == Exit::Ok => {
+                let s = if stats.batches_run == 1 { "" } else { "es" };
+                Closing::ok(&format!("{} batch{s}{stopped}", stats.batches_run), started)
+            }
+            Ok(stats) => {
+                let s = if errors == 1 { "" } else { "s" };
+                let mut status = format!("failed (exit 1): {errors} error{s}");
+                if let Some(batch) = stats.first_failed {
+                    status.push_str(&format!(", first in batch {batch}"));
+                }
+                if stats.batches_skipped > 0 {
+                    status.push_str(&format!(
+                        "; {} later batches not run (--continue-on-error runs them)",
+                        stats.batches_skipped
+                    ));
+                }
+                status.push_str(&format!("{stopped}, {ms} ms"));
+                Closing {
+                    exit,
+                    status,
+                    error: None,
+                    elapsed_ms: ms,
+                }
+            }
+            Err(failure) => {
+                let code = exit as u8;
+                Closing {
+                    exit,
+                    status: format!(
+                        "failed (exit {code}): {}{stopped}, {ms} ms",
+                        failure.exit.label()
+                    ),
+                    error: (!failure.message.is_empty()).then_some(failure.message),
+                    elapsed_ms: ms,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Summary<'_> {
+        Summary {
+            exit: self.exit as u8,
+            status: &self.status,
+            error: self.error.as_deref(),
+            elapsed_ms: self.elapsed_ms,
+        }
+    }
+}
+
+#[allow(dead_code)] // until sqlh mcp (Phase 5.3) uses it
+/// Ends `out` with the outcome's closing lines (the error, the limit notes and the status
+/// line), for an output with no delivery to wait for: an MCP call's, in memory. Returns the
+/// exit code; an output that refused the closing lines out of order is an internal error.
+pub(crate) fn close(out: &mut dyn Output, outcome: RunOutcome, started: Instant) -> Exit {
+    let closing = Closing::of(outcome, started);
+    match out.finish(&closing.summary()).and_then(|()| out.flush()) {
+        Ok(()) => closing.exit,
+        Err(error) => output_failure(error).exit,
     }
 }
 

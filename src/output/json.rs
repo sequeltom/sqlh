@@ -83,6 +83,14 @@ impl<W: Write> JsonSink<W> {
         Self::with_meta(out, Box::new(io::sink()), limits)
     }
 
+    #[allow(dead_code)] // until sqlh mcp (Phase 5.3) uses it
+    /// The writer back, once the output is finished (`finish` drains the buffer): an MCP
+    /// call's document, in memory.
+    pub fn into_inner(self) -> W {
+        debug_assert!(self.buf.is_empty(), "taken before finish drained it");
+        self.out
+    }
+
     pub fn with_meta(out: W, meta: Box<dyn Write>, limits: Limits) -> Self {
         JsonSink {
             out,

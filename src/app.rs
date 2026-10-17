@@ -14,7 +14,9 @@ use crate::cli::{self, Command, Opts};
 use crate::config::{self, Settings};
 use crate::error::{Exit, Failure};
 use crate::output::{self, Format, Limits, Summary};
-use crate::run::{self, Input, Prepared, QueryOrigin, Report, Request, RunOutcome, output_failure};
+use crate::run::{
+    self, Closing, Input, Prepared, QueryOrigin, Report, Request, RunOutcome, output_failure,
+};
 use crate::script::Source;
 use crate::signals::{Signal, Signals};
 use crate::{console, files, profile};
@@ -301,87 +303,6 @@ fn flag_limits(opts: &Opts) -> Limits {
     }
 }
 
-/// How a run ends: its exit code, the status line, and the error that stopped it, if any.
-struct Closing {
-    exit: Exit,
-    status: String,
-    error: Option<String>,
-    elapsed_ms: u128,
-}
-
-impl Closing {
-    /// `ok: <detail>, N ms`.
-    fn ok(detail: &str, started: Instant) -> Closing {
-        let elapsed_ms = started.elapsed().as_millis();
-        Closing {
-            exit: Exit::Ok,
-            status: format!("ok: {detail}, {elapsed_ms} ms"),
-            error: None,
-            elapsed_ms,
-        }
-    }
-
-    fn of(outcome: RunOutcome, started: Instant) -> Closing {
-        let ms = started.elapsed().as_millis();
-        let exit = outcome.exit();
-        // A stopped count is in the status line, so that a reader of that line alone learns
-        // that part of the input was cancelled (DESIGN.md §5.1).
-        let stopped = match outcome.stopped_batches {
-            0 => String::new(),
-            n => format!(", counting stopped in {n}"),
-        };
-        let errors = outcome.errors;
-        match outcome.result {
-            Ok(stats) if exit == Exit::Ok => {
-                let s = if stats.batches_run == 1 { "" } else { "es" };
-                Closing::ok(&format!("{} batch{s}{stopped}", stats.batches_run), started)
-            }
-            Ok(stats) => {
-                let s = if errors == 1 { "" } else { "s" };
-                let mut status = format!("failed (exit 1): {errors} error{s}");
-                if let Some(batch) = stats.first_failed {
-                    status.push_str(&format!(", first in batch {batch}"));
-                }
-                if stats.batches_skipped > 0 {
-                    status.push_str(&format!(
-                        "; {} later batches not run (--continue-on-error runs them)",
-                        stats.batches_skipped
-                    ));
-                }
-                status.push_str(&format!("{stopped}, {ms} ms"));
-                Closing {
-                    exit,
-                    status,
-                    error: None,
-                    elapsed_ms: ms,
-                }
-            }
-            Err(failure) => {
-                let code = exit as u8;
-                Closing {
-                    exit,
-                    status: format!(
-                        "failed (exit {code}): {}{stopped}, {ms} ms",
-                        failure.exit.label()
-                    ),
-                    error: (!failure.message.is_empty()).then_some(failure.message),
-                    elapsed_ms: ms,
-                }
-            }
-        }
-    }
-
-    fn summary(&self) -> Summary<'_> {
-        Summary {
-            exit: self.exit as u8,
-            status: &self.status,
-            error: self.error.as_deref(),
-            elapsed_ms: self.elapsed_ms,
-        }
-    }
-}
-
-/// Ends the output with `ok: <detail>, N ms` and returns success, or exit 7 if the output
 /// couldn't be delivered. For commands without a runtime (`sqlh profile ...`).
 pub(crate) fn finish_ok(out: &mut Out, detail: &str, started: Instant) -> Exit {
     let closing = Closing::ok(detail, started);

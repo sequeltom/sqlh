@@ -8,6 +8,8 @@ mod config;
 mod console;
 mod credman;
 mod db;
+#[allow(dead_code)] // until sqlh mcp (Phase 5.3) calls it
+mod engine;
 mod error;
 mod files;
 mod guard;
