@@ -37,8 +37,10 @@ use crate::run::{self, Accounting, Opened, Prepared, RunOutcome, Stats};
 /// the driver's own wait for an attention's acknowledgement.
 const SETTLE_GRACE: Duration = Duration::from_secs(5);
 
-/// The longest a rollback of a connection being put back may take.
-const ROLLBACK_SECS: u32 = 5;
+/// The longest a rollback of a connection being put back may take, the driver's own
+/// timeout and attention wait included: past it the connection is dropped, so a server gone
+/// silent can't hold up the call's reply (the engine tests' finding).
+const ROLLBACK_WAIT: Duration = Duration::from_secs(2);
 
 /// The default number of connections a profile's pool may hold (decision 19).
 pub(crate) const DEFAULT_POOL: usize = 2;
@@ -171,8 +173,8 @@ impl Engine {
                     Err(_) => Err(Failure::new(
                         Exit::Cancelled,
                         format!(
-                            "cancelled: nothing confirmed the cancel within {} s, so the \
-                             connection was closed",
+                            "cancelled: the call didn't finish within {} s of the cancel, so \
+                             its connection was closed",
                             SETTLE_GRACE.as_secs()
                         ),
                     )),
@@ -292,14 +294,19 @@ impl Engine {
             return;
         }
         if session.in_transaction() {
-            let rolled_back = session
-                .exec_internal(
-                    "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
-                    ROLLBACK_SECS,
-                    &Cancel::new(),
-                )
-                .await;
-            if rolled_back.is_err() || session.connection_dead() || session.in_transaction() {
+            let cancel = Cancel::new();
+            let rollback = session.exec_internal(
+                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
+                ROLLBACK_WAIT.as_secs() as u32,
+                &cancel,
+            );
+            // Past the wait the request is abandoned midway, so the connection, in no known
+            // state, is dropped (the return below).
+            let rolled_back = matches!(
+                tokio::time::timeout(ROLLBACK_WAIT, rollback).await,
+                Ok(Ok(()))
+            );
+            if !rolled_back || session.connection_dead() || session.in_transaction() {
                 return;
             }
         }
@@ -733,10 +740,10 @@ mod tests {
     // mid-result and never acknowledges the attention; the driver gives up after its own 5 s
     // wait for the acknowledgement and marks the connection dead (unless the engine's grace,
     // which starts within microseconds of it, ends the call first). In the second the attention
-    // is acknowledged, but the server goes silent at the rollback `put_back` sends, and the
-    // engine's settle grace drops the call where it stands. Either way the call ends about 5 s
-    // after the cancel, the connection is discarded, never put back, and the next call
-    // reconnects. The one slow test (both bounds are 5 s), so the two cases run at once.
+    // is acknowledged, but the server goes silent at the rollback `put_back` sends, which gives
+    // up after `ROLLBACK_WAIT` (2 s), so the call ends with its own result, well inside the
+    // settle grace. Either way the connection is discarded, never put back, and the next call
+    // reconnects. The one slow test (the first case's bounds are 5 s), so the two run at once.
     #[test]
     fn a_cancel_that_does_not_settle_discards_the_connection() {
         let unacknowledged = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
@@ -756,13 +763,25 @@ mod tests {
             )
         });
         let grace = format!(
-            "cancelled: nothing confirmed the cancel within {} s, so the connection was closed",
+            "cancelled: the call didn't finish within {} s of the cancel, so its connection was \
+             closed",
             SETTLE_GRACE.as_secs()
         );
         let driver = "the server didn't confirm the cancel, so the connection was closed";
-        for ((stuck, idle, next), fake, messages) in [
-            (first, &unacknowledged, vec![driver, grace.as_str()]),
-            (second, &rollback_unanswered, vec![grace.as_str()]),
+        let kept = "the statement was cancelled; the connection stayed usable";
+        for ((stuck, idle, next), fake, messages, (from, until)) in [
+            (
+                first,
+                &unacknowledged,
+                vec![driver, grace.as_str()],
+                (SETTLE_GRACE, SETTLE_GRACE + Duration::from_secs(2)),
+            ),
+            (
+                second,
+                &rollback_unanswered,
+                vec![kept],
+                (ROLLBACK_WAIT, SETTLE_GRACE),
+            ),
         ] {
             assert_eq!(stuck.exit, Exit::Cancelled, "{}", stuck.text);
             assert!(
@@ -773,8 +792,7 @@ mod tests {
                 stuck.text
             );
             assert!(
-                stuck.elapsed >= SETTLE_GRACE
-                    && stuck.elapsed < SETTLE_GRACE + Duration::from_secs(2),
+                stuck.elapsed >= from && stuck.elapsed < until,
                 "{:?}",
                 stuck.elapsed
             );
