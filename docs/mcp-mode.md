@@ -11,6 +11,7 @@ Product direction (2026-10-10): [VISION.md](VISION.md) makes low repeated-call o
 - **17:** a connection is reused after a cancel only when the server confirmed it; anything unclear discards it.
 - **18:** a server reaches the profiles listed at its launch, and tools take an optional `profile` among them.
 - **19:** up to 2 connections per profile (`--pool`), closed after 15 idle minutes (`--idle`), and a dead reused connection reconnected and the call retried once.
+- **20:** MCP ships in the one exe, `sqlh mcp`, behind a size gate: its cost stays within 300 KB, or the decision is reopened.
 
 ## 1. Why
 
@@ -21,6 +22,7 @@ The one-shot CLI starts a process, connects, logs in and sets up the session on 
 - **Native tools:** harnesses such as Claude Code discover the tools natively, with schemas and descriptions.
 - **Lifecycle and cancellation belong to the harness:** it starts sqlh with the session and ends it with the session, and cancels a call in the protocol (decision 14).
 - **Read-only:** every tool is a read, in the rolled-back wrapper with the guard (decision 16), so a harness can allow the tools freely.
+- **In the same exe, and free when unused** (decision 20): `sqlh mcp` is a subcommand of `sqlh.exe`. Its code runs only when a harness launches `sqlh mcp`, so using sqlh only as a CLI costs nothing for it at run time: no startup time, no memory, no open connections. The cost is on disk, about 0.2 MB, held to a budget (§8).
 
 Fast cancellation and retry are essential; bulk analytics throughput is secondary. Exact total row-count usefulness remains unresolved, so the CLI's counting semantics (decision 6) carry over unchanged rather than becoming a new MCP requirement.
 
@@ -182,7 +184,7 @@ Prerequisites, done: the execution correctness findings (Phase 1), dependable ou
    - `mod.rs`: an async stdin line reader and a single stdout writer task fed by a channel, so responses never interleave; request dispatch; the cancellation map, request id → `Cancel`
    - `protocol.rs`: JSON-RPC envelopes, per-request `_meta` and era handling; `server/discover`, `initialize`, `ping`, `tools/list`, errors
    - `tools.rs`: tool definitions (names, schemas, annotations, descriptions) as static JSON; argument validation, the profile allowlist, and the mapping to `run` and `schema`
-3. **Dependency:** `serde_json`, already a test-only dependency, becomes a normal one for parsing untrusted JSON safely. Use `serde_json::Value` without serde derive, to keep size down. Budget: under 300 KB of extra exe size, measured after the first build.
+3. **Dependency and the size gate** (decision 20): `serde_json`, already a test-only dependency, becomes a normal one for parsing untrusted JSON safely. Use `serde_json::Value` without serde derive, to keep size down; it costs 65 KB (spike 5.1). All of MCP must stay within 300 KB of extra exe size, measured with `cargo bloat --release --crates` and the exe size before and after, and the exe within the 3 MB budget; past either, decision 20 (one exe) is reopened.
 4. **Driver check:** confirm `prepare_reset_connection` behaves as expected: temp tables gone, database restored, open transaction rolled back, `SET`s back to the login's defaults. If it doesn't, fall back to reconnecting for every call, which is slower but correct, and tell the owner.
 5. **Docs:** DESIGN.md §10 points here; `--help` gets an MCP line; the README gets the Claude Code setup snippet and its "Built for agents" entries.
 

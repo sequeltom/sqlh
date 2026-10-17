@@ -600,6 +600,7 @@ The commands are canned SQL run through the normal pipeline, with lists aggregat
 The detailed design and plan is [mcp-mode.md](mcp-mode.md); its shape is owner decisions 14–19 (PLAN.md §6). Summary:
 
 - `sqlh mcp --profile A [--profile B ...]` is a stdio MCP server, the first front end of a connection-reuse engine built as a library module (decision 14).
+  - **In the same exe** (decision 20): `sqlh mcp` is a subcommand of `sqlh.exe`, and its code runs only when a harness launches it, so CLI-only use pays nothing for it at run time (no startup time, no memory, no open connections). Its size is gated: within 300 KB, or decision 20 is reopened.
   - **Dual-era protocol:** it serves revision 2026-07-28 statelessly, with per-request `_meta` and `server/discover`, and also serves legacy clients that open with `initialize`.
   - **Fixed reach:** it serves only the profiles listed at launch, and each tool takes an optional `profile` among them (decision 18). Connection settings and credentials are fixed at launch, so no tool argument can choose a server or carry a secret.
 - **Tools, read-only** (decision 16): `query` (guarded, in the rolled-back wrapper), `check`, `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps`. No write tool: writes stay on the CLI, and an `execute` tool comes with Phase 6's command categorization.

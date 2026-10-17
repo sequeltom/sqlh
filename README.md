@@ -107,7 +107,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 ### Planned
 
-- **Connection reuse.** An MCP server or a local daemon, so repeated calls skip the connect, with native tools and read/write permissions the harness can gate. *(Phase 5)*
+- **Connection reuse.** An MCP server, `sqlh mcp`, keeps connections open, so an agent's repeated calls skip the 150–250 ms login each time, and gets sqlh's commands as native, read-only tools. It is part of the same exe, and its code runs only when a harness starts it: using sqlh only as a command-line tool costs nothing for it at run time (no startup time, no memory, no open connections). *(Phase 5)*
 - **A wider read-only allowlist** for DBA workflows (`xp_readerrorlog`, `xp_instance_regread`, showplans) from a categorization of commands, not a longer blocklist. *(Phase 6)*
 - **A skill and a plugin** that teach agents the investigation workflow and install it in one step. *(Phase 8)*
 
