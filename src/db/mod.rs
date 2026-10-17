@@ -1186,6 +1186,19 @@ impl Session {
         let _ = self.client.close_connection().await;
     }
 
+    /// Spike 5.1 (PLAN.md Phase 5): asks the server to reset the session before the next
+    /// request, as a pool does (`prepare_reset_connection`, RESETCONNECTION).
+    #[cfg(test)]
+    pub(crate) fn reset_before_next(&mut self) {
+        self.client.prepare_reset_connection(false);
+    }
+
+    /// Spike 5.1: whether the driver marked the connection dead.
+    #[cfg(test)]
+    pub(crate) fn connection_dead(&self) -> bool {
+        self.client.is_connection_dead()
+    }
+
     fn flush_messages(&mut self, sink: &mut dyn BatchSink) -> io::Result<()> {
         for message in self.client.take_info_messages() {
             sink.message(&from_info(&message))?;
@@ -2535,6 +2548,273 @@ pub(crate) mod fake_server {
                 .await,
                 Some(8)
             );
+        });
+    }
+}
+
+/// Spike 5.1 (PLAN.md Phase 5): what the connection reset clears, and what each kind of cancel
+/// leaves behind (docs/notes/mcp-reuse-spike.md). Live: every state after a reset must equal a fresh
+/// login's, and no kind of cancel may lose the connection. `--nocapture` prints what it saw:
+/// `SQLH_TEST_PROFILE=test cargo test --lib spike_reset -- --ignored --nocapture`.
+#[cfg(test)]
+mod spike {
+    use super::*;
+
+    #[derive(Default)]
+    struct Collect {
+        rows: Vec<Vec<String>>,
+        errors: Vec<String>,
+        stopped: bool,
+    }
+
+    impl BatchSink for Collect {
+        fn columns(&mut self, _: &[Column]) -> io::Result<()> {
+            Ok(())
+        }
+        fn wants_values(&self) -> bool {
+            self.rows.len() < 5
+        }
+        fn cell_limit(&self) -> usize {
+            200
+        }
+        fn row(&mut self, values: &[Value]) -> io::Result<()> {
+            self.rows
+                .push(values.iter().map(|v| format!("{v:?}")).collect());
+            Ok(())
+        }
+        fn skipped_row(&mut self) {}
+        fn counting_stopped(&mut self, _: Stop) {
+            self.stopped = true;
+        }
+        fn end_rows(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn end_rows_incomplete(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn rows_affected(&mut self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn message(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, e: &ServerMessage) -> io::Result<()> {
+            self.errors.push(format!("{} {}", e.number, e.text));
+            Ok(())
+        }
+    }
+
+    struct Open;
+
+    impl Backpressure for Open {
+        fn is_full(&self) -> bool {
+            false
+        }
+        fn room(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    const STATE: &str = "SELECT OBJECT_ID(N'tempdb..#spike') AS temp, @@TRANCOUNT AS trancount, \
+        DB_NAME() AS db, @@LOCK_TIMEOUT AS lock_timeout, @@OPTIONS & 16384 AS xact_abort, \
+        (SELECT deadlock_priority FROM sys.dm_exec_sessions WHERE session_id = @@SPID) \
+        AS deadlock_priority, @@SPID AS spid;";
+
+    const DIRTY: &str = "CREATE TABLE #spike (i int); SET LOCK_TIMEOUT 1234; SET XACT_ABORT ON; \
+        SET DEADLOCK_PRIORITY HIGH; BEGIN TRANSACTION; USE master;";
+
+    async fn run(
+        s: &mut Session,
+        label: &str,
+        sql: &str,
+        timeout: u32,
+        counting: Counting,
+        cancel: &Cancel,
+    ) -> Option<Vec<String>> {
+        let mut sink = Collect::default();
+        let started = Instant::now();
+        let outcome = s
+            .run(sql.into(), timeout, counting, cancel, &mut sink, &Open)
+            .await;
+        println!(
+            "{label:<40} {:>5} ms  outcome {:<60} rows {:?} errors {:?} stopped {} dead {}",
+            started.elapsed().as_millis(),
+            format!("{:?}", outcome.err()),
+            sink.rows.first(),
+            sink.errors,
+            sink.stopped,
+            s.connection_dead()
+        );
+        assert!(!s.connection_dead(), "{label}: the connection was kept");
+        sink.rows.into_iter().next()
+    }
+
+    async fn state(s: &mut Session, label: &str) -> Vec<String> {
+        run(s, label, STATE, 30, Counting::EXACT, &Cancel::new())
+            .await
+            .expect("a state row")
+    }
+
+    /// Runs `sql` and cancels it from outside after `after`.
+    async fn cancelled(s: &mut Session, label: &str, sql: &str, after: Duration) {
+        let root = Cancel::new();
+        let call = root.child();
+        let canceller = async move {
+            tokio::time::sleep(after).await;
+            root.cancel();
+        };
+        tokio::join!(run(s, label, sql, 30, Counting::EXACT, &call), canceller);
+    }
+
+    #[test]
+    #[ignore = "live spike: needs SQLH_TEST_PROFILE"]
+    fn spike_reset() {
+        let profile = std::env::var("SQLH_TEST_PROFILE").expect("SQLH_TEST_PROFILE");
+        let opts = crate::cli::Opts {
+            profile: Some(profile),
+            database: Some("sqlh_test".into()),
+            ..Default::default()
+        };
+        let settings = match crate::config::resolve(&opts) {
+            Ok(settings) => settings,
+            Err(failure) => panic!("settings: {}", failure.message),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut s = Session::connect(&settings.connect, &Cancel::new())
+                .await
+                .expect("connected");
+            println!("-- 1. what the reset clears");
+            let fresh = state(&mut s, "fresh login").await;
+            run(
+                &mut s,
+                "dirty batch",
+                DIRTY,
+                30,
+                Counting::EXACT,
+                &Cancel::new(),
+            )
+            .await;
+            assert_ne!(
+                state(&mut s, "after the dirty batch, no reset").await,
+                fresh,
+                "after the dirty batch, no reset: the state is still there"
+            );
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after the dirty batch, reset").await,
+                fresh,
+                "after the dirty batch, reset"
+            );
+            assert_eq!(
+                state(&mut s, "the call after that").await,
+                fresh,
+                "the call after that"
+            );
+
+            println!("-- 2. what the reset costs");
+            for _ in 0..4 {
+                assert_eq!(state(&mut s, "no reset").await, fresh, "no reset");
+            }
+            for _ in 0..4 {
+                s.reset_before_next();
+                assert_eq!(state(&mut s, "reset").await, fresh, "reset");
+            }
+
+            println!("-- 3. a cancel from outside, mid-wait, in an open transaction");
+            cancelled(
+                &mut s,
+                "cancelled wait",
+                "BEGIN TRANSACTION; CREATE TABLE #spike (i int); WAITFOR DELAY '00:00:10';",
+                Duration::from_millis(400),
+            )
+            .await;
+            assert_ne!(
+                state(&mut s, "after it, no reset").await,
+                fresh,
+                "after it, no reset: the state is still there"
+            );
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after it, reset"
+            );
+
+            println!("-- 4. the bounded count of hidden rows stops (sqlh's own attention)");
+            run(
+                &mut s,
+                "count stop",
+                "BEGIN TRANSACTION; CREATE TABLE #spike (i int); \
+                 SELECT a.object_id FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b;",
+                30,
+                Counting::BOUNDED,
+                &Cancel::new(),
+            )
+            .await;
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after it, reset"
+            );
+
+            println!("-- 5. -t expires mid-wait");
+            run(
+                &mut s,
+                "timeout",
+                "BEGIN TRANSACTION; CREATE TABLE #spike (i int); WAITFOR DELAY '00:00:05';",
+                1,
+                Counting::EXACT,
+                &Cancel::new(),
+            )
+            .await;
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after it, reset"
+            );
+
+            println!("-- 6. a cancel before the request is sent");
+            let root = Cancel::new();
+            let call = root.child();
+            root.cancel();
+            run(
+                &mut s,
+                "cancelled before sending",
+                STATE,
+                30,
+                Counting::EXACT,
+                &call,
+            )
+            .await;
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after it, reset"
+            );
+
+            println!("-- 7. a cancel while rows are streaming");
+            cancelled(
+                &mut s,
+                "cancelled mid-rows",
+                "BEGIN TRANSACTION; CREATE TABLE #spike (i int); \
+                 SELECT a.object_id FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b;",
+                Duration::from_millis(300),
+            )
+            .await;
+            s.reset_before_next();
+            assert_eq!(
+                state(&mut s, "after it, reset").await,
+                fresh,
+                "after it, reset"
+            );
+            s.close().await;
         });
     }
 }

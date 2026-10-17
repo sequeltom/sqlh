@@ -1,6 +1,6 @@
 # MCP mode: design and plan
 
-Status: proposed 2026-10-09; its shape decided by the owner on 2026-10-15 to 2026-10-17 (PLAN.md §6, decisions 14–19), to be built in Phase 5. This doc expands DESIGN.md §10 and becomes the spec once built. It targets MCP revision **2026-07-28** and also serves clients on the older handshake revisions; the protocol details in §2 are to be checked against the published revision before they are built. The tools it exposes are the CLI's query path and the schema commands (`docs/schema-commands.md`).
+Status: proposed 2026-10-09; its shape decided by the owner on 2026-10-15 to 2026-10-17 (PLAN.md §6, decisions 14–19), to be built in Phase 5. This doc expands DESIGN.md §10 and becomes the spec once built. It targets MCP revision **2026-07-28** and also serves clients on the older handshake revisions; the protocol details in §2 were checked against the published revision on 2026-10-17 (docs/notes/mcp-reuse-spike.md §3); the tools, results and caching pages are checked when 5.3 is built. The tools it exposes are the CLI's query path and the schema commands (`docs/schema-commands.md`).
 
 Product direction (2026-10-10): [VISION.md](VISION.md) makes low repeated-call overhead and quick cancellation priorities for human-led DBA/developer investigations. First-release validation targets SQL Server 2025 Standard on Windows Server 2025 Standard; a 2016 floor and Azure support are separate compatibility assessments.
 
@@ -47,7 +47,7 @@ The era is picked by how the client opens, as the spec describes. An `initialize
   - `ttlMs` and `cacheScope: "private"`. The instructions name the local profiles, so shared caches must not keep them.
 - **Every result** carries `resultType: "complete"` and our `serverInfo` in `_meta`.
 - **`tools/list`** returns the tools in a fixed order, with `ttlMs` and `cacheScope: "private"`. The set is the same for every launch (§4), never dependent on earlier calls, as the spec requires.
-- **`notifications/cancelled`** for an in-flight `tools/call` cancels it with a TDS attention through the call's `Cancel`. Afterwards no response is sent for that request id, as the spec requires.
+- **`notifications/cancelled`** for an in-flight `tools/call` cancels it with a TDS attention through the call's `Cancel`. Afterwards no response is sent for that request id, as the spec recommends (a SHOULD; checked against the published revision in docs/notes/mcp-reuse-spike.md §3).
 
 **Legacy behavior (initialize-based revisions)**
 - `initialize` gets back the negotiated `protocolVersion` (the client's, if we support it, else our newest legacy version), `capabilities`, `serverInfo` and `instructions`.

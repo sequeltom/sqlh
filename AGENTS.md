@@ -75,7 +75,7 @@ README.md        human-facing intro, build, quick start, safety note, the runnin
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
 docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, harness kill, drain
-                 experiment, memory, Windows shells, agent trials)
+                 experiment, memory, Windows shells, agent trials, the MCP reuse spike))
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   MCP's spec (decided, not built)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
                  (findings F.., R01–R19; PLAN.md records each one and its fix)
