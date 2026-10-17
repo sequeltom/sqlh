@@ -3594,7 +3594,7 @@ mod mcp {
         assert_eq!(unknown, format!("Method not found: {}…", "m".repeat(100)));
         assert!(
             messages.iter().any(|m| m.get("id").is_none()
-                && m["error"]["message"] == "Invalid request: an id is at most 1024 bytes"),
+                && m["error"]["message"] == "Invalid request: an id is at most 1024 bytes as JSON"),
             "{messages:?}"
         );
         // The ack, six refusals, the method, the long id, and 5's answer and teardown at the

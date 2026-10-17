@@ -199,6 +199,10 @@ impl Engine {
     ) -> Result<Stats, Failure> {
         let _permit = wait_for_connection(pool, timeout, cancel, started).await?;
         let mut retried = false;
+        // The connect time a call reports runs from here to the open that worked: a reused
+        // connection that opened at once reports 0, and one that took a probe, a second
+        // setup or a replacement reports what that took, not hiding it in the total.
+        let first_started = Instant::now();
         loop {
             let connect_started = Instant::now();
             // A retry connects afresh: the connection it replaces died while idle, and so,
@@ -221,31 +225,62 @@ impl Engine {
                     false,
                 ),
             };
-            let connect_ms = if reused {
-                0
-            } else {
-                connect_started.elapsed().as_millis()
-            };
-            // A reused connection's first request gets the probe's few seconds, not the call's
-            // whole timeout: one that went silent while idle shows up quickly, and the call
-            // runs again on a new connection with all of its timeout.
-            let probe = reused && (timeout == 0 || timeout > REUSE_PROBE);
-            let open_timeout = if probe { REUSE_PROBE } else { timeout };
-            let setup_ms =
-                match run::open(&mut session, &pool.settings, prepared, open_timeout, cancel).await
+            // A reused connection's setup (which carries the reset) gets the probe's few
+            // seconds, not the call's whole timeout, so one that went silent while idle shows
+            // up quickly. If the probe cuts a setup the server still answers (it acknowledged
+            // the attention), the connection is alive, only slow: it is kept and set up again,
+            // reset first to undo what the cut setup did, with the call's own timeout.
+            let mut probe = reused && (timeout == 0 || timeout > REUSE_PROBE);
+            let mut probed = false;
+            let mut open_started = Instant::now();
+            let opened = loop {
+                let limit = probe.then_some(REUSE_PROBE);
+                match run::open(
+                    &mut session,
+                    &pool.settings,
+                    prepared,
+                    timeout,
+                    limit,
+                    cancel,
+                )
+                .await
                 {
-                    Ok(setup_ms) => setup_ms,
-                    Err(error) if reused && !retried && retry_after(&error, &session, probe) => {
-                        // Nothing of the call ran: replace the connection and run it again.
-                        retried = true;
-                        drop(session);
-                        continue;
+                    Err(DbError::Timeout(_))
+                        if probe && !session.connection_dead() && !cancel.is_cancelled() =>
+                    {
+                        probe = false;
+                        probed = true;
+                        session.reset_before_next();
+                        open_started = Instant::now();
                     }
-                    Err(error) => {
-                        self.put_back(pool, session).await;
-                        return Err(run::db_failure(error, pool.settings.limits.advice));
-                    }
-                };
+                    opened => break opened,
+                }
+            };
+            let setup_ms = match opened {
+                Ok(setup_ms) => setup_ms,
+                Err(error)
+                    if reused
+                        && !retried
+                        && !cancel.is_cancelled()
+                        && dead_before_work(&error, &session) =>
+                {
+                    // Nothing of the call ran: replace the connection and run it again.
+                    retried = true;
+                    drop(session);
+                    continue;
+                }
+                Err(error) => {
+                    self.put_back(pool, session).await;
+                    return Err(run::db_failure(error, pool.settings.limits.advice));
+                }
+            };
+            let connect_ms = if reused && !probed && !retried {
+                0
+            } else if reused || retried {
+                open_started.duration_since(first_started).as_millis()
+            } else {
+                open_started.duration_since(connect_started).as_millis()
+            };
             let result = match out.connected(&session.connection(), connect_ms) {
                 Ok(()) => {
                     let opened = Opened {
@@ -408,27 +443,23 @@ fn more_connections(settings: &Settings, timeout: u32) -> String {
     }
 }
 
-/// How long a reused connection's first request (`run::open`: the setup, which carries the
-/// reset, and the call's `USE`) may take before the call stops waiting on that connection, in
-/// seconds. That request answers in milliseconds on a live connection; one that went silent
-/// while idle (a firewall's idle cut, a half-open socket) would otherwise hold the call for
-/// its whole timeout and then the driver's 5 s wait for the attention.
+/// How long a reused connection's setup (the first request of `run::open`, which carries the
+/// reset) may take before the call stops waiting on it, in seconds. It answers in
+/// milliseconds on a live connection; one that went silent while idle (a firewall's idle cut,
+/// a half-open socket) would otherwise hold the call for its whole timeout and then the
+/// driver's 5 s wait for the attention. A setup the probe cuts on a live connection runs again
+/// on that connection (`run_pooled`): a slow server keeps its connection.
 const REUSE_PROBE: u32 = 5;
 
-/// Whether a reused connection's failed first request leaves the call to run again on a new
-/// connection, once (decision 19). Nothing of the call ran, since that request is sqlh's own
-/// setup and `USE`, so it may when the connection is gone: the driver marked it dead (it
-/// broke while idle, `Lost`; the server didn't acknowledge the reset, `Protocol`; it went
-/// silent, a `Timeout` whose attention went unanswered) or it was retired. It may too when
-/// `REUSE_PROBE` cut the request short (`probed`): the server may only have been slow, which
-/// a new connection with the call's whole timeout settles. A SQL error or a cancel is the
-/// call's own, and so is a timeout at the call's own limit on a live connection.
-fn retry_after(error: &DbError, session: &Session, probed: bool) -> bool {
-    match error {
-        DbError::Cancelled(_) | DbError::Sql(_) => false,
-        DbError::Timeout(_) => probed || session.connection_dead(),
-        _ => session.connection_dead() || session.is_retired(),
-    }
+/// Whether a reused connection's failed first request (`run::open`: sqlh's own setup and
+/// `USE`, so nothing of the call ran) means the connection was gone, so the call runs again
+/// on a new one, once (decision 19): the driver marked it dead (it broke while idle, `Lost`;
+/// the server didn't acknowledge the reset, `Protocol`; it went silent, a `Timeout` whose
+/// attention went unanswered) or it was retired. A SQL error or a cancel is the call's own,
+/// and so is a timeout on a live connection.
+fn dead_before_work(error: &DbError, session: &Session) -> bool {
+    (session.connection_dead() || session.is_retired())
+        && !matches!(error, DbError::Cancelled(_) | DbError::Sql(_))
 }
 
 /// The engine against the fake TDS server's pooled session (`db::fake_server::serve_pool`):
@@ -710,13 +741,27 @@ mod tests {
             "the retry is silent"
         );
         assert_eq!(engine.idle_count(0), 1);
+        // The time the dead connection took is the call's connect time, not hidden in its
+        // total.
+        assert!(connect_ms(&second.text) >= 9_000, "{}", second.text);
+    }
+
+    /// The `connect N ms` of a call's status line.
+    fn connect_ms(text: &str) -> u64 {
+        let at = text.rfind("connect ").expect("a connect time") + "connect ".len();
+        text[at..]
+            .split(' ')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("a number")
     }
 
     // A reused connection whose setup is slow but alive: the probe cuts it, the server
-    // acknowledges the attention, and the call runs on a new connection with its whole
-    // timeout, since nothing of it had run.
+    // acknowledges the attention, so the connection is kept, reset again and set up with the
+    // call's own timeout. A slow server keeps its connection: no new login, which under load
+    // is the step most likely to fail.
     #[test]
-    fn a_setup_the_probe_cuts_short_runs_again_on_a_new_connection() {
+    fn a_setup_the_probe_cuts_short_keeps_its_live_connection() {
         let fake = serve_pool(vec![Conn::new().at(4, Turn::Delay(Duration::from_secs(7)))]);
         let engine = serving(&fake, DEFAULT_POOL, None);
         let (first, second) = block_on(async {
@@ -730,7 +775,32 @@ mod tests {
             "{:?}",
             second.elapsed
         );
-        assert_eq!(fake.accepted(), 2);
+        assert_eq!(fake.accepted(), 1, "the same connection");
+        // The cut setup, then the setup again, reset first, then the call.
+        let resets = fake.resets(0);
+        assert_eq!(resets[3..6], [true, true, false], "{resets:?}");
+        assert!(connect_ms(&second.text) >= 5_000, "{}", second.text);
+        assert_eq!(engine.idle_count(0), 1);
+    }
+
+    // The probe bounds only the setup, which carries the reset; a call's `USE` comes after the
+    // connection has shown it is alive, so a slow one (a database being opened) gets the call's
+    // own timeout on the same connection.
+    #[test]
+    fn a_slow_use_is_not_probed() {
+        let fake = serve_pool(vec![Conn::new().at(5, Turn::Delay(Duration::from_secs(6)))]);
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let (first, second) = block_on(async {
+            let first = plain(&engine).await;
+            let mut use_db = request("SELECT 1");
+            use_db.database = Some("d".into());
+            (first, call_with(&engine, use_db, 60, &Cancel::new()).await)
+        });
+        assert_ok(&first);
+        assert_ok(&second);
+        assert_eq!(fake.accepted(), 1, "no retry");
+        assert_eq!(fake.sql(0)[4], "USE [d];");
+        assert_eq!(connect_ms(&second.text), 0, "{}", second.text);
     }
 
     // The probe applies only to a reused connection, and only when it is shorter than the

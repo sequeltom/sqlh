@@ -118,7 +118,7 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
                 None,
                 ProtocolError::new(
                     INVALID_REQUEST,
-                    format!("Invalid request: an id is at most {MAX_ID_BYTES} bytes"),
+                    format!("Invalid request: an id is at most {MAX_ID_BYTES} bytes as JSON"),
                 ),
             ));
         }

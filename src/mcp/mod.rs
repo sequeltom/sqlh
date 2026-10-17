@@ -11,11 +11,14 @@
 //!   it.
 //! - **Subscriptions:** `subscriptions/listen` is acknowledged with none of what it asks
 //!   for (the tool list never changes) and stays open until the client cancels it or the
-//!   server ends, which answers it.
+//!   server ends, which answers it and then tears it down with `notifications/cancelled`.
 //! - **The end:** when stdin closes, the calls in flight get `END_GRACE` to finish and answer;
 //!   when stdout breaks or a console event arrives, they get none. What is still running is
-//!   cancelled and given `END_GRACE` to settle, open subscriptions are answered, the idle
-//!   connections are closed, the writer gets its flush wait, and the process exits 0.
+//!   cancelled and given time to settle, open subscriptions are answered, the idle
+//!   connections are closed, the writer gets its flush wait, and the process exits 0, without
+//!   waiting for anything the runtime still runs. Each of those waits is `END_GRACE`, or a
+//!   console event's own grace (`Signal::grace`), since Windows ends the process about 5 s
+//!   after a close, logoff or shutdown.
 
 mod protocol;
 mod tools;
@@ -61,7 +64,9 @@ const MAX_IN_FLIGHT: usize = 64;
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 /// How long calls in flight get when the server ends: to finish after stdin closes, and then,
-/// once cancelled, to settle (on top of the engine's own settle grace inside each call).
+/// once cancelled, to settle (on top of the engine's own settle grace inside each call); the
+/// closing of idle connections and the writer's flush are held to it too. A console event
+/// gives its own grace instead (`Signal::grace`).
 const END_GRACE: Duration = Duration::from_secs(6);
 
 /// How long the last responses get to reach stdout before the process exits.
@@ -114,7 +119,12 @@ pub(crate) fn run(opts: McpOpts) -> Exit {
         }
     };
     let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, serve(engine, launch, opts.verbose))
+    let exit = local.block_on(&runtime, serve(engine, launch, opts.verbose));
+    // `serve` has bounded the end; what the runtime still runs (a name lookup the driver left
+    // on a blocking thread) is abandoned, not waited for, as dropping the runtime would.
+    drop(local);
+    runtime.shutdown_background();
+    exit
 }
 
 /// Each listed profile's settings, resolved as a run's would be with the launch flags, and
