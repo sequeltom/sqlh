@@ -171,7 +171,7 @@ Short guidance the model sees once:
 
 > sqlh runs read-only T-SQL against SQL Server. Profiles: {name — description, for each listed profile}{; pass `profile` to choose one, if several}. Use `describe`, `find` or `deps` before writing queries against unfamiliar tables. Results come in a compact text format: `-- ` lines are metadata, the header is `name:type`, rows are tab-separated, NULL is `NULL`, and the last line is the status. Results are capped at {max_rows} rows and {max_cell} characters per value; raise `max_rows` only when you need more. Every call is read-only (writes are refused and rolled back) and starts fresh: temp tables last only within one call.
 
-The profile names and descriptions come from the profiles file at launch, without connecting. Server version details appear only after a call, via `info`. Profile descriptions are the owner's text (4.1), escaped like any metadata field.
+The profile names and descriptions come from the profiles file at launch, without connecting. Server version details appear only after a call, via `info`. Profile descriptions are the owner's text (4.1), which the profiles file already holds to one line of at most 300 characters with no control or bidi characters; they go into the instructions as they are, JSON-encoded like the rest of the response.
 
 ## 7. Security
 
