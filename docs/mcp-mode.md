@@ -1,6 +1,6 @@
 # MCP mode: design and plan
 
-Status: proposed 2026-10-09; its shape decided by the owner on 2026-10-15 to 2026-10-17 (PLAN.md §6, decisions 14–19), to be built in Phase 5. This doc expands DESIGN.md §10 and becomes the spec once built. It targets MCP revision **2026-07-28** and also serves clients on the older handshake revisions; the protocol details in §2 were checked against the published revision on 2026-10-17 (docs/notes/mcp-reuse-spike.md §3); the tools, results and caching pages are checked when 5.3 is built. The tools it exposes are the CLI's query path and the schema commands (`docs/schema-commands.md`).
+Status: proposed 2026-10-09; its shape decided by the owner on 2026-10-15 to 2026-10-17 (PLAN.md §6, decisions 14–20, decision 17 amended after spike 5.1), to be built in Phase 5. This doc expands DESIGN.md §10 and becomes the spec once built. It targets MCP revision **2026-07-28** and also serves clients on the older handshake revisions; the protocol details in §2 were checked against the published revision on 2026-10-17 (docs/notes/mcp-reuse-spike.md §3); the tools, results and caching pages are checked when 5.3 is built. The tools it exposes are the CLI's query path and the schema commands (`docs/schema-commands.md`).
 
 Product direction (2026-10-10): [VISION.md](VISION.md) makes low repeated-call overhead and quick cancellation priorities for human-led DBA/developer investigations. First-release validation targets SQL Server 2025 Standard on Windows Server 2025 Standard; a 2016 floor and Azure support are separate compatibility assessments.
 
@@ -8,7 +8,7 @@ Product direction (2026-10-10): [VISION.md](VISION.md) makes low repeated-call o
 - **14:** connection reuse comes through MCP first, on a reuse engine built as a library module; a per-profile daemon behind the CLI waits for evidence that Bash-driven use stays the main path.
 - **15:** calls are stateless: each runs on a reset connection with its own wrapper, exactly like one CLI run. No session handles.
 - **16:** read tools only. Writes stay on the CLI; an `execute` tool comes with Phase 6's command categorization.
-- **17:** a connection is reused after a cancel only when the server confirmed it; anything unclear discards it.
+- **17** (amended after spike 5.1): after a cancel, a connection the driver kept is reused, and the next call's verified reset is the check that it is clean; one the driver marked dead is discarded. (The driver gives no receipt for an acknowledged attention.)
 - **18:** a server reaches the profiles listed at its launch, and tools take an optional `profile` among them.
 - **19:** up to 2 connections per profile (`--pool`), closed after 15 idle minutes (`--idle`), and a dead reused connection reconnected and the call retried once.
 - **20:** MCP ships in the one exe, `sqlh mcp`, behind a size gate: its cost stays within 300 KB, or the decision is reopened.
@@ -145,8 +145,9 @@ Every call is stateless (decision 15): MCP 2026-07-28 has no protocol sessions, 
 
 **After a cancel** (decision 17)
 - A call ends with a TDS attention when the client cancels it (`notifications/cancelled`), when its timeout fires, or when the bounded count of hidden rows stops at its budget (decision 6). Count stops end any query with many hidden rows, so this is routine.
-- When the server acknowledged the attention within the settle bound (R15 B), the connection goes back to the pool, and the reset before the next call clears what the cancelled call left.
-- Anything less discards the connection: no acknowledgement (today's `COUNT_STOP_UNCONFIRMED`), the settle grace running out, a protocol error, a lost connection. The next call reconnects.
+- When the driver kept the connection (it settled the cancel within sqlh's settle bound, R15 B, and didn't mark it dead), the connection goes back to the pool, and the reset before the next call clears what the cancelled call left. mssql-tds 0.2.0 gives no receipt for an acknowledged attention: a kept connection also follows a cancel before the request was sent and a half-sent request it withdrew (upstream-issues U4), all in step with the server.
+- **The check is the reset itself:** the driver verifies that the reply to the next request starts with the server's ResetConnection acknowledgement, or fails that request (`ConnectionResetNotAcknowledged`) and marks the connection dead, so a session in an unknown state is never trusted. Then the connection is discarded and the call retried once on a new one (§5 Pool).
+- A connection the driver marked dead is discarded: an attention the server never acknowledged (today's `COUNT_STOP_UNCONFIRMED`), a protocol error, a lost connection; so is one past sqlh's settle grace. The next call reconnects.
 
 **Concurrency**
 - Requests are read and dispatched concurrently on the current-thread runtime. Database work is serialized per connection.
@@ -166,7 +167,7 @@ Database permissions are expected to be configured appropriately. The tool's che
 
 - **Fixed reach:** the profiles listed at launch are the only targets, connection settings and credentials are fixed at launch (§3), and tool arguments never carry secrets.
 - **Read-only:** every tool runs under the guard and in the rolled-back wrapper; there is no write tool, and `--allow-write` isn't accepted (decision 16).
-- **Isolation between calls:** the reset before every call (§5), and a connection discarded whenever a cancel wasn't confirmed.
+- **Isolation between calls:** the reset before every call (§5), and a connection discarded whenever the driver lost track of it, with the reset's acknowledgement verified on every reuse.
 - **Input limits:** a JSON message over 4 MB is answered with a protocol error and its connection state is left untouched. SQL text over 1 MB is refused. Pattern and object arguments are passed as literals (`docs/schema-commands.md` §3).
 - **Output limits:** limits always apply. Control characters are escaped by the text format, so database contents can't forge protocol framing; results are JSON-encoded inside the response anyway.
 - **Prompt injection through data:** rows can contain text that reads like instructions. sqlh can't prevent that, and the instructions don't pretend otherwise. The harness's tool-result handling is the defense.
@@ -178,7 +179,7 @@ Prerequisites, done: the execution correctness findings (Phase 1), dependable ou
 
 1. **The reuse engine** (decision 14), a library module with no MCP in it:
    - a pool per profile: lazy connect, at most `--pool` connections, idle close, the dead-connection retry (decision 19)
-   - reset on reuse, and the confirmed-cancel rule (decision 17); `src/db/` reports whether a call's attention was acknowledged, and the engine discards on anything less
+   - reset on reuse, and the cancel rule (decision 17, amended): a connection the driver kept is reused, one it marked dead is discarded, and a reset the server didn't acknowledge discards the connection and retries the call once
    - runs a call through `run` into any `Output`; the MCP front end renders into a `TextSink<Vec<u8>>` (or the JSON sink) and returns the bytes as the tool text
 2. **`src/mcp/`**, the front end:
    - `mod.rs`: an async stdin line reader and a single stdout writer task fed by a channel, so responses never interleave; request dispatch; the cancellation map, request id → `Cancel`
@@ -197,12 +198,12 @@ Prerequisites, done: the execution correctness findings (Phase 1), dependable ou
   - an unknown method or tool, bad arguments, a profile outside the list
   - a cancel for an unknown id (ignored)
   - stdin EOF leading to exit
-- **Engine tests against a fake TDS server** (the loopback server `src/db` already uses): an unacknowledged or stalled attention discards the connection and the next call reconnects; a connection dropped while idle is reconnected and the call retried once; a failure mid-run is not retried; the pool's bound and its idle close.
+- **Engine tests against a fake TDS server** (the loopback server `src/db` already uses): an unacknowledged or stalled attention discards the connection and the next call reconnects; a reset the server doesn't acknowledge discards the connection and retries the call once; a connection dropped while idle is reconnected and the call retried once; a failure mid-run is not retried; the pool's bound and its idle close.
 - **Tool tests against the test server:**
   - `query` happy path, SQL error leading to `isError`, a blocked write
   - timeout and cancellation (send `notifications/cancelled` mid-query)
   - reset hygiene: a `USE`, a `SET` and a temp table in one call don't leak into the next
-  - a confirmed cancel leaves the next call clean: `@@TRANCOUNT` 0, the cancelled call's temp table gone, the agent session's `SET`s restored (decision 17's requirement)
+  - a cancel the driver kept leaves the next call clean: `@@TRANCOUNT` 0, the cancelled call's temp table gone, the agent session's `SET`s restored (decision 17's requirement)
   - two listed profiles, each reached by `profile`; a profile not listed refused
 - **Client interop:** connect from Claude Code (`claude mcp add`, then use the tools in a session) and from the MCP Inspector, as both a modern and a legacy client.
 

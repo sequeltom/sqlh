@@ -100,11 +100,7 @@ Where rows are big (a text column of a kilobyte or more) or have no PLP column, 
 
 ## Upstream issues worth filing
 
-Read in 0.2.0; check `main` (0.3.0) first. Upstream takes issues, not PRs.
-
-1. **`DiscardRowWriter` allocates what it discards.** A `RowWriter` can't decline a PLP value without the decoder allocating its declared length (`value_destination` has no way to say "skip"), and `DiscardRowWriter`, `drain_rows` and every consumer that wants a prefix of a large value pay for all of it. A skip or a limit in the writer's contract, or `drain_rows` using `ColumnPolicy::SkipAll` as `drain_result_set_rows` does, would fix the common case.
-2. **`text`, `ntext` and `image` have no streaming path**: the pull cursor returns them as `CursorColumn::Value`, fully decoded, and the decoder refuses over 100 MB (`MAX_ALLOC_SIZE`), a limit the PLP types don't have.
-3. **`SqlString::decode` panics on malformed UTF-8** under a UTF-8 collation (`String::from_utf8(...).unwrap()`, the driver's own #310). The cutter decodes with replacement, so a malformed value now shows U+FFFD where the old path would have panicked.
+Moved to [upstream-issues.md](upstream-issues.md) (2026-10-17), the one list the owner files from: `DiscardRowWriter` is U2, `text`/`ntext`/`image` U3, and the UTF-8 panic U6 (upstream's own #310).
 
 ## The read-only guard (PLAN.md 2.14)
 

@@ -42,6 +42,7 @@ The risk is that it is a preview (0.x): its API may churn and upstream takes no 
 - Pin an exact version.
 - Keep all driver use inside `src/db/`.
 - Keep tiberius-ng as the fallback.
+- Record driver problems worth raising in [notes/upstream-issues.md](notes/upstream-issues.md), which the owner files from.
 
 Milestone 0 is a spike meant to find any deal-breakers early.
 
@@ -604,7 +605,7 @@ The detailed design and plan is [mcp-mode.md](mcp-mode.md); its shape is owner d
   - **Dual-era protocol:** it serves revision 2026-07-28 statelessly, with per-request `_meta` and `server/discover`, and also serves legacy clients that open with `initialize`.
   - **Fixed reach:** it serves only the profiles listed at launch, and each tool takes an optional `profile` among them (decision 18). Connection settings and credentials are fixed at launch, so no tool argument can choose a server or carry a secret.
 - **Tools, read-only** (decision 16): `query` (guarded, in the rolled-back wrapper), `check`, `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps`. No write tool: writes stay on the CLI, and an `execute` tool comes with Phase 6's command categorization.
-- **Connections:** every call is stateless (decision 15), on a pooled connection reset (TDS RESETCONNECTION) before the call, so it behaves exactly like one CLI run. Up to 2 connections per profile, closed after 15 idle minutes, and a dead reused connection reconnected and the call retried once (decision 19). After a cancel, timeout or count stop, a connection is reused only if the server acknowledged the attention (decision 17).
+- **Connections:** every call is stateless (decision 15), on a pooled connection reset (TDS RESETCONNECTION) before the call, so it behaves exactly like one CLI run. Up to 2 connections per profile, closed after 15 idle minutes, and a dead reused connection reconnected and the call retried once (decision 19). After a cancel, timeout or count stop, a connection the driver kept is reused, and the next call's reset, whose acknowledgement the driver verifies, is the check that it is clean; one the driver marked dead is discarded (decision 17, amended).
 - **Results:** the text format as a single text content item (`format: "json"` for the JSON document). `isError` is set when the exit code isn't 0.
 
 ## 11. Performance targets

@@ -44,8 +44,5 @@ Measured later the same day, for the refusal of remote Named Pipes (the first co
 
 ## Upstream issues worth filing
 
-Read in 0.2.0; check `main` (0.3.0) first. Upstream takes issues, not PRs.
+Moved to [upstream-issues.md](upstream-issues.md) (2026-10-17), the one list the owner files from: the remote Named Pipe open that blocks the runtime is U1, and the withdrawn cancel-during-connect issue is listed there as withdrawn.
 
-1. **The first open of a remote Named Pipe blocks the async runtime.** `open_named_pipe_with_retry` calls tokio's `ClientOptions::open`, a synchronous `CreateFileW`, inside the async fn, whether the pipe came from the protocol waterfall, an `np:` prefix or a UNC path. For an unreachable host that stalls every timer, cancellation and task for about 21 s (SMB's own timeout), and the error that comes back is the pipe's instead of the TCP timeout. The retry that follows `ERROR_PIPE_BUSY` is not part of this: its `WaitNamedPipeW` already runs on `spawn_blocking`. Possible fixes: run the first open on a blocking thread too and bound it by the connect timeout (the open itself can't be cancelled, but the runtime and its timers stay free), or leave remote names on TCP unless Named Pipes are asked for. Related: an IPv6 address can't take a `tcp:` prefix, so without a port it gets the waterfall and the same freeze.
-
-An earlier draft had a second issue, that a pending connect attempt ignores its cancel token. It is withdrawn: 0.2.0 stops the attempt (see "Cancel during connect" above).

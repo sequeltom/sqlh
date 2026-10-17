@@ -22,7 +22,7 @@ Don't trade these away.
 - **TDS driver:** Microsoft [`mssql-tds`](https://github.com/microsoft/mssql-rs), MIT, a preview.
   - Its default features provide SSPI and SChannel TLS, so there is no OpenSSL.
   - Pin an exact version (`=x.y.z`) and read the changelog before bumping.
-  - Upstream takes no PRs. File issues there and keep workarounds in our code.
+  - Upstream takes no PRs, only issues, and agents never file them: a driver problem worth raising goes in `docs/notes/upstream-issues.md`, the one list the owner files from (owner, 2026-10-17). Keep workarounds in our code.
 - **Only `src/db/` may use `mssql-tds` types.** All other code uses our own types, so the driver can be upgraded, or swapped for the tiberius-ng fallback, in one place.
 - **Other crates:**
   - Tokio with the `current_thread` runtime.
@@ -75,7 +75,8 @@ README.md        human-facing intro, build, quick start, safety note, the runnin
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan of attack: review triage, phases, owner decisions
 docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect latency, connect failures, harness kill, drain
-                 experiment, memory, Windows shells, agent trials, the MCP reuse spike))
+                 experiment, memory, Windows shells, agent trials, the MCP reuse spike;
+                 upstream-issues.md, the driver problems for the owner to raise upstream))
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   MCP's spec (decided, not built)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
                  (findings F.., R01–R19; PLAN.md records each one and its fix)
