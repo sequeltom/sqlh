@@ -292,15 +292,42 @@ fn type_sql(owner: &str) -> String {
     )
 }
 
+/// How `describe` aggregates its lists, by the database's compatibility level (found while
+/// building 5.3: StackOverflow2010, at level 100, refused `WITHIN GROUP`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Aggregate {
+    /// `STRING_AGG ... WITHIN GROUP`, at level 130 and up: takes any character.
+    StringAgg,
+    /// `FOR XML PATH`, below that: ordered at any level, but a name with a control character
+    /// makes XML fail, so such a `describe` fails there.
+    ForXml,
+}
+
+impl Aggregate {
+    /// The aggregation for a database at `compat`. `WITHIN GROUP` parses from level 110 by
+    /// the evidence found (level 100 refuses it); 130 is the conservative line, since the
+    /// older form is correct at every level.
+    fn for_level(compat: Option<i64>) -> Aggregate {
+        match compat {
+            Some(level) if level >= 130 => Aggregate::StringAgg,
+            _ => Aggregate::ForXml,
+        }
+    }
+}
+
 /// A list aggregated server-side (schema-commands.md §3): `item` for each row of `from`
 /// (`FROM ... WHERE ...`), in `order`, joined with `, `; NULL when there are none.
-/// `STRING_AGG` (SQL Server 2017+) takes any character, where `FOR XML PATH` fails on a
-/// control character in a name.
-fn joined(item: &str, from: &str, order: &str) -> String {
-    format!(
-        "(SELECT STRING_AGG(CAST({item} AS nvarchar(max)), N', ') \
-         WITHIN GROUP (ORDER BY {order}) {from})"
-    )
+fn joined(aggregate: Aggregate, item: &str, from: &str, order: &str) -> String {
+    match aggregate {
+        Aggregate::StringAgg => format!(
+            "(SELECT STRING_AGG(CAST({item} AS nvarchar(max)), N', ') \
+             WITHIN GROUP (ORDER BY {order}) {from})"
+        ),
+        Aggregate::ForXml => format!(
+            "STUFF((SELECT N', ' + CAST({item} AS nvarchar(max)) {from} ORDER BY {order} \
+             FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')"
+        ),
+    }
 }
 
 const DBS_SQL: &str = "SELECT name, state_desc AS state, HAS_DBACCESS(name) AS accessible, \
@@ -536,7 +563,8 @@ fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
          DECLARE @id int = CASE WHEN @scope = 1 \
          THEN OBJECT_ID(ISNULL(QUOTENAME(@schema) + N'.', N'') + QUOTENAME(@object)) END;\n\
          SELECT @scope AS scope, DB_NAME() AS db, \
-         HAS_PERMS_BY_NAME(NULL, N'DATABASE', N'VIEW DEFINITION') AS view_definition;\n\
+         HAS_PERMS_BY_NAME(NULL, N'DATABASE', N'VIEW DEFINITION') AS view_definition, \
+         (SELECT compatibility_level FROM sys.databases WHERE database_id = DB_ID()) AS compat;\n\
          SELECT TOP ({CANDIDATES}) o.object_id, s.name AS [schema], o.name, \
          RTRIM(o.type) AS type, o.type_desc, \
          CASE WHEN OBJECT_DEFINITION(o.object_id) IS NULL THEN 0 ELSE 1 END AS visible, \
@@ -557,7 +585,7 @@ fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
     let then = move |found: &Found| -> Result<Vec<Step>, Failure> {
         let object = resolve(&asked, &name, found)?;
         match shows {
-            Shows::Describe => Ok(describe_steps(&object)),
+            Shows::Describe => Ok(describe_steps(&object, Aggregate::for_level(compat(found)))),
             Shows::Def => def_steps(&object),
             Shows::Deps => deps_steps(&object, view_definition(found)),
         }
@@ -682,7 +710,7 @@ fn resolve(asked: &str, name: &Name, found: &Found) -> Result<Object, Failure> {
 }
 
 /// What `describe` shows of an object, by its type (schema-commands.md §6.4).
-fn describe_steps(object: &Object) -> Vec<Step> {
+fn describe_steps(object: &Object, aggregate: Aggregate) -> Vec<Step> {
     let id = object.id;
     let mut sql = format!("DECLARE @id int = {id};\n");
     let mut sections = Vec::new();
@@ -696,15 +724,21 @@ fn describe_steps(object: &Object) -> Vec<Step> {
     match object.kind.as_str() {
         _ if table => {
             add(Section::rows("columns"), columns_sql());
-            add(Section::rows("indexes"), indexes_sql());
-            add(Section::rows("foreign_keys"), foreign_keys_sql(false));
-            add(Section::rows("referenced_by"), foreign_keys_sql(true));
+            add(Section::rows("indexes"), indexes_sql(aggregate));
+            add(
+                Section::rows("foreign_keys"),
+                foreign_keys_sql(aggregate, false),
+            );
+            add(
+                Section::rows("referenced_by"),
+                foreign_keys_sql(aggregate, true),
+            );
             add(Section::rows("check_constraints"), CHECKS_SQL.to_owned());
-            add(Section::rows("triggers"), triggers_sql());
+            add(Section::rows("triggers"), triggers_sql(aggregate));
         }
         "V" => {
             add(Section::rows("columns"), columns_sql());
-            add(Section::rows("indexes"), indexes_sql());
+            add(Section::rows("indexes"), indexes_sql(aggregate));
         }
         "P" | "PC" | "X" | "RF" | "FN" | "FS" | "AF" => {
             add(Section::rows("parameters"), parameters_sql());
@@ -777,11 +811,12 @@ fn columns_sql() -> String {
 /// has key columns, in key order, and included ones; every other type (columnstore, XML,
 /// spatial, JSON) lists the columns it covers as its keys, since the catalog gives them no
 /// key order (`key_ordinal` 0).
-fn indexes_sql() -> String {
+fn indexes_sql(aggregate: Aggregate) -> String {
     let from = "FROM sys.index_columns AS ic JOIN sys.all_columns AS c \
          ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
          WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id";
     let keys = joined(
+        aggregate,
         &format!(
             "{} + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N'' END",
             shown("c.name")
@@ -790,6 +825,7 @@ fn indexes_sql() -> String {
         "ic.key_ordinal, ic.index_column_id",
     );
     let includes = joined(
+        aggregate,
         &shown("c.name"),
         &format!("{from} AND ic.is_included_column = 1 AND i.type IN (1, 2, 7)"),
         "ic.index_column_id",
@@ -803,9 +839,10 @@ fn indexes_sql() -> String {
 }
 
 /// The table's foreign keys, or (`referenced_by`) the ones that point at it; names `quoted`.
-fn foreign_keys_sql(referenced_by: bool) -> String {
+fn foreign_keys_sql(aggregate: Aggregate, referenced_by: bool) -> String {
     let columns = |table: &str, column: &str| {
         joined(
+            aggregate,
             &shown("c.name"),
             &format!(
                 "FROM sys.foreign_key_columns AS k JOIN sys.all_columns AS c \
@@ -847,8 +884,9 @@ const CHECKS_SQL: &str = "SELECT name, ISNULL(definition, N'(hidden)') AS defini
     CASE WHEN is_not_trusted = 0 AND is_disabled = 0 THEN 1 ELSE 0 END AS trusted \
     FROM sys.check_constraints WHERE parent_object_id = @id ORDER BY name;";
 
-fn triggers_sql() -> String {
+fn triggers_sql(aggregate: Aggregate) -> String {
     let events = joined(
+        aggregate,
         "te.type_desc",
         "FROM sys.trigger_events AS te WHERE te.object_id = tr.object_id",
         "te.type",
@@ -922,6 +960,15 @@ fn def_steps(object: &Object) -> Result<Vec<Step>, Failure> {
         ),
         sections: vec![Section::definition("definition")],
     }])
+}
+
+/// The current database's compatibility level (the lookup's first row), which decides how
+/// `describe` aggregates its lists (`Aggregate`).
+fn compat(found: &Found) -> Option<i64> {
+    found
+        .first()
+        .and_then(|rows| rows.first())
+        .and_then(|row| int(row.get(3)))
 }
 
 /// Whether the login has VIEW DEFINITION on the database (the lookup's first row). Without it
@@ -1494,19 +1541,52 @@ mod tests {
             ("SN", &["object"][..]),
             ("TR", &["object"][..]),
         ] {
-            let steps = describe_steps(&object(kind));
-            assert_eq!(labels(&steps), wanted, "{kind}");
-            let sql = &steps[0].sql;
-            assert!(sql.starts_with("DECLARE @id int = -5;\n"), "{sql}");
-            assert_eq!(
-                sql.matches(";\n").count(),
-                wanted.len() + 1,
-                "{kind}: {sql}"
-            );
+            for aggregate in [Aggregate::StringAgg, Aggregate::ForXml] {
+                let steps = describe_steps(&object(kind), aggregate);
+                assert_eq!(labels(&steps), wanted, "{kind}");
+                let sql = &steps[0].sql;
+                assert!(sql.starts_with("DECLARE @id int = -5;\n"), "{sql}");
+                assert_eq!(
+                    sql.matches(";\n").count(),
+                    wanted.len() + 1,
+                    "{kind}: {sql}"
+                );
+            }
         }
         assert!(object_sql("SN").contains("base_object"));
         assert!(object_sql("U").contains("AS rows") && object_sql("U").contains("AS flags"));
         assert!(!object_sql("V").contains("AS rows"));
+    }
+
+    // A database below compatibility level 130 gets the FOR XML lists, which every level
+    // parses: WITHIN GROUP failed on StackOverflow2010, at level 100 (found while building
+    // 5.3). Both keep the list's order.
+    #[test]
+    fn lists_are_aggregated_as_the_database_level_allows() {
+        assert_eq!(Aggregate::for_level(Some(170)), Aggregate::StringAgg);
+        assert_eq!(Aggregate::for_level(Some(130)), Aggregate::StringAgg);
+        assert_eq!(Aggregate::for_level(Some(120)), Aggregate::ForXml);
+        assert_eq!(Aggregate::for_level(Some(100)), Aggregate::ForXml);
+        assert_eq!(Aggregate::for_level(None), Aggregate::ForXml);
+        let modern = joined(Aggregate::StringAgg, "c.name", "FROM t AS c", "c.id");
+        assert_eq!(
+            modern,
+            "(SELECT STRING_AGG(CAST(c.name AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY \
+             c.id) FROM t AS c)"
+        );
+        let old = joined(Aggregate::ForXml, "c.name", "FROM t AS c", "c.id");
+        assert_eq!(
+            old,
+            "STUFF((SELECT N', ' + CAST(c.name AS nvarchar(max)) FROM t AS c ORDER BY c.id FOR \
+             XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')"
+        );
+        let found: Found = vec![vec![vec![
+            Value::Int(1),
+            Value::Text("AppDb".into()),
+            Value::Int(1),
+            Value::Int(100),
+        ]]];
+        assert_eq!(compat(&found), Some(100));
     }
 
     // schema-commands.md §6.7: two sections, the object's names as literals, and a refusal
