@@ -595,18 +595,16 @@ Catalog SQL must be validated on SQL Server 2025 Standard for the first release.
 
 The commands are canned SQL run through the normal pipeline, with lists aggregated server-side by `STRING_AGG` (SQL Server 2017+); schema-commands.md §3 explains why.
 
-## 10. MCP mode (M3)
+## 10. MCP mode (Phase 5; decided 2026-10-15 to 2026-10-17, not built yet)
 
-The detailed design and plan is [mcp-mode.md](mcp-mode.md). Summary:
+The detailed design and plan is [mcp-mode.md](mcp-mode.md); its shape is owner decisions 14–19 (PLAN.md §6). Summary:
 
-- `sqlh mcp [--profile X]` is a stdio MCP server.
+- `sqlh mcp --profile A [--profile B ...]` is a stdio MCP server, the first front end of a connection-reuse engine built as a library module (decision 14).
   - **Dual-era protocol:** it serves revision 2026-07-28 statelessly, with per-request `_meta` and `server/discover`, and also serves legacy clients that open with `initialize`.
-  - **Fixed target:** the connection target and credentials are fixed at launch, so no tool argument can choose a server or carry a secret.
-- **Tools:**
-  - `query` (read-only, guarded), `check`, `info`, `databases`, `tables`, `describe`, `find`, `definition`, and `session_open`/`session_close`
-  - `execute` for writes, listed only when launched with `--allow-write` and the policy allows it. Keeping it separate means harness permission prompts can gate writes.
-- **Connections:** stateless calls run on pooled connections that are reset (TDS RESETCONNECTION) before each call. Explicit session handles get a dedicated connection where temp tables persist, inside one rolled-back transaction for read-only sessions.
-- **Results:** the text format as a single text content item. `isError` is set when the exit code isn't 0.
+  - **Fixed reach:** it serves only the profiles listed at launch, and each tool takes an optional `profile` among them (decision 18). Connection settings and credentials are fixed at launch, so no tool argument can choose a server or carry a secret.
+- **Tools, read-only** (decision 16): `query` (guarded, in the rolled-back wrapper), `check`, `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps`. No write tool: writes stay on the CLI, and an `execute` tool comes with Phase 6's command categorization.
+- **Connections:** every call is stateless (decision 15), on a pooled connection reset (TDS RESETCONNECTION) before the call, so it behaves exactly like one CLI run. Up to 2 connections per profile, closed after 15 idle minutes, and a dead reused connection reconnected and the call retried once (decision 19). After a cancel, timeout or count stop, a connection is reused only if the server acknowledged the attention (decision 17).
+- **Results:** the text format as a single text content item (`format: "json"` for the JSON document). `isError` is set when the exit code isn't 0.
 
 ## 11. Performance targets
 

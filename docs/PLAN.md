@@ -426,6 +426,18 @@ Decide the mechanism using the 2.1 results:
   - **(a) MCP** as designed in `docs/mcp-mode.md`, with the review's prerequisites: a response byte cap, bounded request queues, reset-hygiene tests, and discarding any connection whose cancellation can't be proven clean.
   - **(b) A local per-profile daemon** that the CLI talks to over a named pipe, which gives reuse to Bash-driven agents without MCP.
   - **Decided 2026-10-15 (decision 14): (a) first,** on a reuse engine built as a library module so (b) can be added later on the same engine if an agent trial shows Bash-driven use stays the main path.
+- **Decided 2026-10-15 to 2026-10-17 (decisions 14–19)**, and docs/mcp-mode.md rewritten to match: MCP first on a library engine; stateless calls; read tools only; reuse after a confirmed cancel only; a launch allowlist of profiles; 2 connections per profile, 15 idle minutes, one silent retry on a dead connection.
+- **Tasks**, in order:
+
+| # | Task | Acceptance |
+|---|---|---|
+| 5.1 | **Spike: the two things the design rests on.** Live, on the test server: `prepare_reset_connection` drops a temp table, rolls back an open transaction, restores the database and the login's `SET`s (mcp-mode.md §8 item 4). And `src/db/` can tell a call's caller whether its attention was acknowledged (decision 17). Check mcp-mode.md §2 against the published 2026-07-28 revision. | A note in `docs/notes/` with what was observed; if the reset falls short, the owner hears it before 5.2 (the fallback is a reconnect per call). |
+| 5.2 | **The reuse engine** (decisions 14, 15, 17, 19): a library module with no MCP in it. | Fake-server tests: an unacknowledged or stalled attention discards; a dead idle connection is reconnected and the call retried once; a mid-run failure isn't retried; the pool bound and idle close. |
+| 5.3 | **`sqlh mcp`**: protocol, tools, the profile allowlist (decisions 16, 18). | Protocol unit tests with no database (mcp-mode.md §9); `serde_json` within its 300 KB budget. |
+| 5.4 | **Live tool tests.** | mcp-mode.md §9's list, including the reset hygiene and the clean next call after a confirmed cancel. |
+| 5.5 | **Interop and docs.** | Claude Code and the MCP Inspector, modern and legacy; DESIGN.md §10, `--help`, README. |
+| 5.6 | **Agent trial 3 with MCP.** | Evidence for the deferred daemon and sessions (decisions 14, 15), and for the limits. |
+
 - **Either way:** replace the hour-long read-only session transaction with per-call wrappers, unless 2.5 and 2.6 show that a long transaction is cheap. **Decided 2026-10-15 (decision 15): calls are stateless,** each on a reset connection with its own wrapper; no sessions for now. **Decided 2026-10-16 (decision 16): read tools only;** writes stay on the CLI until Phase 6. (L)
 
 ### Phase 6: command categorization (VISION priority 4)
