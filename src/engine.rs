@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 use crate::config::Settings;
 use crate::db::{Backpressure, Cancel, DbError, Session};
 use crate::error::{Exit, Failure};
-use crate::output::Output;
+use crate::output::{Advice, Output};
 use crate::run::{self, Accounting, Opened, Prepared, RunOutcome, Stats};
 
 /// How long a cancelled call may take to settle before it is dropped, closing its connection:
@@ -375,10 +375,21 @@ async fn wait_for_connection<'p>(
             Exit::Timeout,
             format!(
                 "query timeout after {timeout} s waiting for a free connection (all {} of the \
-                 profile's connections were busy); raise -t, or --pool for more connections",
-                pool.max
+                 profile's connections were busy); {}",
+                pool.max,
+                more_connections(&pool.settings)
             ),
         )),
+    }
+}
+
+/// The advice when every connection was busy: more time, or more connections. In `sqlh mcp`
+/// the pool's size is the server's launch flag, which the client can't pass.
+fn more_connections(settings: &Settings) -> String {
+    let raise = run::raise_timeout(settings);
+    match settings.limits.advice {
+        Advice::Cli => format!("{raise}, or --pool for more connections"),
+        Advice::Mcp => format!("{raise}, or start sqlh mcp with a larger --pool"),
     }
 }
 
@@ -560,6 +571,28 @@ mod tests {
     /// What `put_back` sends ahead of its rollback, and `run_opened` after a `check` call's
     /// batches.
     const NOEXEC_OFF: &str = "SET NOEXEC OFF;";
+
+    // A wait for a free connection that times out advises what its reader can change: in
+    // sqlh mcp, the call's timeout up to the server's, and the server's own --pool.
+    #[test]
+    fn the_wait_advice_names_what_its_reader_can_change() {
+        let fake = serve_pool(Vec::new());
+        let mut settings = settings(&fake);
+        assert_eq!(
+            more_connections(&settings),
+            "raise -t, or --pool for more connections"
+        );
+        settings.limits.advice = Advice::Mcp;
+        assert_eq!(
+            more_connections(&settings),
+            "raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger --pool"
+        );
+        settings.query_timeout = 0;
+        assert_eq!(
+            more_connections(&settings),
+            "raise timeout, or start sqlh mcp with a larger --pool"
+        );
+    }
 
     // Decisions 14 and 15: calls on one profile share its connection, and each starts fresh:
     // the second call reuses the first's connection, its first request carries the reset, and

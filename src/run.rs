@@ -733,7 +733,7 @@ fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> C
 
 /// The advice for a timeout: `raise -t` on the command line; in `sqlh mcp`, the call's
 /// `timeout`, which can go up to the server's own (`output::Advice`).
-fn raise_timeout(settings: &Settings) -> String {
+pub(crate) fn raise_timeout(settings: &Settings) -> String {
     match (settings.limits.advice, settings.query_timeout) {
         (output::Advice::Cli, _) => "raise -t".into(),
         (output::Advice::Mcp, 0) => "raise timeout".into(),
