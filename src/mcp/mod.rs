@@ -257,6 +257,9 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let mut signals = Signals::new().ok();
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     let running = Rc::new(std::cell::Cell::new(0usize));
+    // How long the end may take at each step. A console event's own grace (`Signal::grace`):
+    // Windows ends the process about 5 s after a close, logoff or shutdown event.
+    let mut grace = END_GRACE;
     let ended_by = loop {
         if server.broken.load(Ordering::Relaxed) {
             break "stdout closed";
@@ -283,7 +286,10 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
                     Some(signals) => signals.recv().await,
                     None => std::future::pending().await,
                 }
-            } => break signal.name(),
+            } => {
+                grace = signal.grace();
+                break signal.name();
+            }
         }
     };
     server.log(format!("sqlh mcp: ending ({ended_by})"));
@@ -303,7 +309,7 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     for cancel in cancels {
         cancel.cancel();
     }
-    wait_for_calls(&running, END_GRACE).await;
+    wait_for_calls(&running, grace).await;
     // An open subscription ends gracefully: its request is answered (the subscriptions page's
     // Graceful Closure), so the client can tell this end from a dropped transport.
     // The stream is then torn down with `notifications/cancelled`, which the cancellation page
@@ -313,13 +319,13 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     for id in open {
         end_subscription(&server, &id, "the server is ending");
     }
-    server.engine.close_all().await;
+    let _ = tokio::time::timeout(grace, server.engine.close_all()).await;
     // The writer ends once every sender is gone and the last lines are out. It gets as long
-    // as it keeps writing (FLUSH_WAIT with no progress ends the wait), up to END_GRACE.
+    // as it keeps writing (FLUSH_WAIT with no progress ends the wait), up to the grace.
     let unwritten = Arc::clone(&server.unwritten);
     let log = server.log.clone();
     drop(server);
-    let (deadline, mut stalled_at) = (Instant::now() + END_GRACE, Instant::now() + FLUSH_WAIT);
+    let (deadline, mut stalled_at) = (Instant::now() + grace, Instant::now() + FLUSH_WAIT);
     let mut left = unwritten.load(Ordering::Relaxed);
     while !writer.is_finished() && Instant::now() < deadline && Instant::now() < stalled_at {
         thread::sleep(Duration::from_millis(10));
@@ -361,7 +367,14 @@ fn dispatch(server: &Rc<Server>, running: &Rc<std::cell::Cell<usize>>, bytes: &[
         return;
     }
     match protocol::parse(line) {
-        Err((id, error)) => server.send(protocol::error_line(id.as_ref(), &error)),
+        Err((id, error)) => {
+            // A malformed request reusing an open id gets the same refusal as a well-formed one.
+            let error = id
+                .as_ref()
+                .and_then(|id| in_use(server, id))
+                .unwrap_or(error);
+            server.send(protocol::error_line(id.as_ref(), &error));
+        }
         Ok(Incoming::Response) => {}
         Ok(Incoming::Notification { method, params }) => notification(server, &method, &params),
         Ok(Incoming::Request { id, method, params }) => {
@@ -398,6 +411,12 @@ fn request(
     method: &str,
     params: &Map<String, Value>,
 ) {
+    // An id still open (a call in flight or settling, a subscription) gets only this refusal,
+    // whatever the method, so no request is ever answered twice under one id.
+    if let Some(error) = in_use(server, &id) {
+        server.send(protocol::error_line(Some(&id), &error));
+        return;
+    }
     if method == "initialize" {
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let version = protocol::negotiate(requested);
@@ -466,7 +485,7 @@ fn request(
             Some(&id),
             &ProtocolError::new(
                 protocol::METHOD_NOT_FOUND,
-                format!("Method not found: {method}"),
+                format!("Method not found: {}", tools::echo(method)),
             ),
         )),
     }
@@ -494,10 +513,6 @@ fn listen(server: &Server, id: Value, params: &Map<String, Value>) {
             Some(&id),
             &ProtocolError::invalid_params("Invalid params: notifications must be an object"),
         ));
-        return;
-    }
-    if let Some(error) = in_use(server, &id) {
-        server.send(protocol::error_line(Some(&id), &error));
         return;
     }
     if server.subscriptions.borrow().len() >= MAX_SUBSCRIPTIONS {
@@ -546,12 +561,6 @@ fn call(
     era: Era,
     params: &Map<String, Value>,
 ) {
-    // The id first: a request reusing one still open gets only that refusal, never a second
-    // answer under the same id.
-    if let Some(error) = in_use(server, &id) {
-        server.send(protocol::error_line(Some(&id), &error));
-        return;
-    }
     let planned = match tools::plan(params, &server.launch) {
         Ok(planned) => planned,
         Err(tools::Refused::Protocol(error)) => {

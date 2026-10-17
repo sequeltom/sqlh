@@ -855,12 +855,23 @@ pub(crate) async fn open(
         Ok(prefix) => format!("{prefix} {setup}"),
         Err(_) => setup,
     };
+    // A timeout here says where it struck: no query of the run's own was running.
+    let timed_out = |error: DbError, at: &str| match error {
+        DbError::Timeout(_) => DbError::Timeout(format!("query timeout after {timeout} s {at}")),
+        error => error,
+    };
     let setup_started = Instant::now();
-    session.exec_internal(&setup, timeout, cancel).await?;
+    session
+        .exec_internal(&setup, timeout, cancel)
+        .await
+        .map_err(|e| timed_out(e, "in the session setup"))?;
     let setup_ms = setup_started.elapsed().as_millis();
     if let Some(database) = &prepared.database {
         let sql = format!("USE [{}];", database.replace(']', "]]"));
-        session.exec_internal(&sql, timeout, cancel).await?;
+        session
+            .exec_internal(&sql, timeout, cancel)
+            .await
+            .map_err(|e| timed_out(e, "changing to the call's database"))?;
     }
     Ok(setup_ms)
 }

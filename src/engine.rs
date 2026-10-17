@@ -226,10 +226,16 @@ impl Engine {
             } else {
                 connect_started.elapsed().as_millis()
             };
+            // A reused connection's first request gets the probe's few seconds, not the call's
+            // whole timeout: one that went silent while idle shows up quickly, and the call
+            // runs again on a new connection with all of its timeout.
+            let probe = reused && (timeout == 0 || timeout > REUSE_PROBE);
+            let open_timeout = if probe { REUSE_PROBE } else { timeout };
             let setup_ms =
-                match run::open(&mut session, &pool.settings, prepared, timeout, cancel).await {
+                match run::open(&mut session, &pool.settings, prepared, open_timeout, cancel).await
+                {
                     Ok(setup_ms) => setup_ms,
-                    Err(error) if reused && !retried && dead_before_work(&error, &session) => {
+                    Err(error) if reused && !retried && retry_after(&error, &session, probe) => {
                         // Nothing of the call ran: replace the connection and run it again.
                         retried = true;
                         drop(session);
@@ -374,9 +380,11 @@ async fn wait_for_connection<'p>(
         () = deadline => Err(Failure::new(
             Exit::Timeout,
             format!(
-                "query timeout after {timeout} s waiting for a free connection (all {} of the \
-                 profile's connections were busy); {}",
-                pool.max,
+                "query timeout after {timeout} s waiting for a free connection ({}); {}",
+                match pool.max {
+                    1 => "the profile's only connection was busy".to_owned(),
+                    max => format!("all {max} of the profile's connections were busy"),
+                },
                 more_connections(&pool.settings, timeout)
             ),
         )),
@@ -400,16 +408,27 @@ fn more_connections(settings: &Settings, timeout: u32) -> String {
     }
 }
 
-/// Whether an error at a reused connection's first request means the connection was dead
-/// before any of the call could run: the driver marked it dead (it broke while idle, which
-/// shows as `Lost`, or the server didn't acknowledge the reset, which shows as `Protocol`), or
-/// it was retired. A SQL error, a timeout or a cancel is the call's own, whatever the state.
-fn dead_before_work(error: &DbError, session: &Session) -> bool {
-    (session.connection_dead() || session.is_retired())
-        && !matches!(
-            error,
-            DbError::Timeout(_) | DbError::Cancelled(_) | DbError::Sql(_)
-        )
+/// How long a reused connection's first request (`run::open`: the setup, which carries the
+/// reset, and the call's `USE`) may take before the call stops waiting on that connection, in
+/// seconds. That request answers in milliseconds on a live connection; one that went silent
+/// while idle (a firewall's idle cut, a half-open socket) would otherwise hold the call for
+/// its whole timeout and then the driver's 5 s wait for the attention.
+const REUSE_PROBE: u32 = 5;
+
+/// Whether a reused connection's failed first request leaves the call to run again on a new
+/// connection, once (decision 19). Nothing of the call ran, since that request is sqlh's own
+/// setup and `USE`, so it may when the connection is gone: the driver marked it dead (it
+/// broke while idle, `Lost`; the server didn't acknowledge the reset, `Protocol`; it went
+/// silent, a `Timeout` whose attention went unanswered) or it was retired. It may too when
+/// `REUSE_PROBE` cut the request short (`probed`): the server may only have been slow, which
+/// a new connection with the call's whole timeout settles. A SQL error or a cancel is the
+/// call's own, and so is a timeout at the call's own limit on a live connection.
+fn retry_after(error: &DbError, session: &Session, probed: bool) -> bool {
+    match error {
+        DbError::Cancelled(_) | DbError::Sql(_) => false,
+        DbError::Timeout(_) => probed || session.connection_dead(),
+        _ => session.connection_dead() || session.is_retired(),
+    }
 }
 
 /// The engine against the fake TDS server's pooled session (`db::fake_server::serve_pool`):
@@ -662,6 +681,79 @@ mod tests {
         assert_eq!(fake.resets(1), [false, false, false]);
         assert_eq!(fake.ended(0), Some(End::Client));
         assert_eq!(engine.idle_count(0), 1);
+    }
+
+    // Decision 19, and REUSE_PROBE: a reused connection that went silent while idle (a
+    // firewall's idle cut) holds the call for the probe and the driver's wait for the
+    // attention, not for the call's whole timeout; nothing of the call ran, so it runs again,
+    // once, on a new connection, and succeeds.
+    #[test]
+    fn a_reused_connection_gone_silent_is_retried_after_the_probe() {
+        let fake = serve_pool(vec![Conn::new().at(4, Turn::Silent)]);
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let (first, second) = block_on(async {
+            let first = plain(&engine).await;
+            (first, call(&engine, "SELECT 1", 60, &Cancel::new()).await)
+        });
+        assert_ok(&first);
+        assert_ok(&second);
+        // The probe's 5 s and the driver's 5 s for the attention, then a new connection.
+        assert!(
+            second.elapsed >= Duration::from_secs(9) && second.elapsed < Duration::from_secs(20),
+            "{:?}",
+            second.elapsed
+        );
+        assert_eq!(fake.accepted(), 2);
+        assert_eq!(
+            masked(&first.text),
+            masked(&second.text),
+            "the retry is silent"
+        );
+        assert_eq!(engine.idle_count(0), 1);
+    }
+
+    // A reused connection whose setup is slow but alive: the probe cuts it, the server
+    // acknowledges the attention, and the call runs on a new connection with its whole
+    // timeout, since nothing of it had run.
+    #[test]
+    fn a_setup_the_probe_cuts_short_runs_again_on_a_new_connection() {
+        let fake = serve_pool(vec![Conn::new().at(4, Turn::Delay(Duration::from_secs(7)))]);
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let (first, second) = block_on(async {
+            let first = plain(&engine).await;
+            (first, call(&engine, "SELECT 1", 60, &Cancel::new()).await)
+        });
+        assert_ok(&first);
+        assert_ok(&second);
+        assert!(
+            second.elapsed >= Duration::from_secs(5) && second.elapsed < Duration::from_secs(15),
+            "{:?}",
+            second.elapsed
+        );
+        assert_eq!(fake.accepted(), 2);
+    }
+
+    // The probe applies only to a reused connection, and only when it is shorter than the
+    // call's timeout; a call at a short timeout of its own keeps it, and a timeout on a live
+    // connection at that limit is the call's own, not retried.
+    #[test]
+    fn the_probe_is_never_longer_than_the_call() {
+        let fake = serve_pool(vec![Conn::new().at(4, Turn::Delay(Duration::from_secs(3)))]);
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let (first, second) = block_on(async {
+            let first = plain(&engine).await;
+            (first, call(&engine, "SELECT 1", 1, &Cancel::new()).await)
+        });
+        assert_ok(&first);
+        assert_eq!(second.exit, Exit::Timeout, "{}", second.text);
+        assert!(
+            second
+                .text
+                .starts_with("-- error: query timeout after 1 s in the session setup\n"),
+            "{}",
+            second.text
+        );
+        assert_eq!(fake.accepted(), 1, "no retry at the call's own limit");
     }
 
     // Decision 19: a connection the server closed while it sat idle (a network drop, a session

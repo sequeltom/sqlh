@@ -1489,8 +1489,8 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
                 ),
                 Some(4060) => hints.pick(
                     "the database may not exist or the login may lack access; check -d",
-                    "the database may not exist or the login may lack access; check the call's \
-                     database, or the profile's",
+                    "the database may not exist or the login may lack access; check the \
+                     profile's database",
                 ),
                 Some(18452) => hints.pick(
                     "the server rejected Windows auth for this login; use -U with a SQL login",

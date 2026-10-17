@@ -74,7 +74,15 @@ pub(crate) enum Era {
     Legacy(&'static str),
 }
 
+/// The longest id sqlh takes, as JSON text: a request id is held while the request is open
+/// and echoed in every answer, so it is bounded on its own, far below the message size.
+pub(crate) const MAX_ID_BYTES: usize = 1024;
+
 /// Parses one line. An error comes with the request's id when it could be read.
+///
+/// What must not be answered isn't: a response (anything with `result` or `error` and no
+/// `method`, whatever its id, since sqlh sends no requests), and a notification (a string
+/// `method` and no `id`), whose `params` are taken as none when they aren't an object.
 pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolError)> {
     let value: Value = serde_json::from_str(line)
         .map_err(|_| (None, ProtocolError::new(PARSE_ERROR, "Parse error")))?;
@@ -86,12 +94,17 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
         };
         return Err((None, ProtocolError::new(INVALID_REQUEST, what)));
     };
-    // An id is a string or a number. One that is there but is anything else (null included)
-    // can't be answered by, so the error leaves it out.
+    if !message.contains_key("method")
+        && (message.contains_key("result") || message.contains_key("error"))
+    {
+        return Ok(Incoming::Response);
+    }
+    // An id is a string or a number, of at most MAX_ID_BYTES. One that is there but is
+    // anything else (null included), or longer, can't be answered by, so the error leaves it
+    // out.
     let id = match message.remove("id") {
         None => None,
-        Some(id) if id.is_string() || id.is_number() => Some(id),
-        Some(_) => {
+        Some(id) if !(id.is_string() || id.is_number()) => {
             return Err((
                 None,
                 ProtocolError::new(
@@ -100,6 +113,16 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
                 ),
             ));
         }
+        Some(id) if id.to_string().len() > MAX_ID_BYTES => {
+            return Err((
+                None,
+                ProtocolError::new(
+                    INVALID_REQUEST,
+                    format!("Invalid request: an id is at most {MAX_ID_BYTES} bytes"),
+                ),
+            ));
+        }
+        Some(id) => Some(id),
     };
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err((
@@ -108,11 +131,7 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
         ));
     }
     let Some(method) = message.get("method") else {
-        // A response (sqlh sends no requests, so it has nothing to match); anything else
-        // without a method isn't a message.
-        if message.contains_key("result") || message.contains_key("error") {
-            return Ok(Incoming::Response);
-        }
+        // Not a request, a notification or (above) a response.
         return Err((
             id,
             ProtocolError::new(INVALID_REQUEST, "Invalid request: a message needs a method"),
@@ -127,6 +146,8 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
     let params = match message.remove("params") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(params)) => params,
+        // A notification is never answered: what it can't use, it goes without.
+        Some(_) if id.is_none() => Map::new(),
         Some(_) => {
             return Err((
                 id,
@@ -319,6 +340,32 @@ mod tests {
             code(r#"{"jsonrpc":"2.0","id":4}"#),
             Some((Some(json!(4)), INVALID_REQUEST))
         );
+        // Never answered: a response, whatever its id, and a notification, whatever its params.
+        for line in [
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":[1],"result":{}}"#,
+            r#"{"error":{"code":1,"message":"x"}}"#,
+        ] {
+            assert_eq!(parse(line), Ok(Incoming::Response), "{line}");
+        }
+        assert_eq!(
+            parse(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":[3]}"#),
+            Ok(Incoming::Notification {
+                method: "notifications/cancelled".into(),
+                params: Map::new(),
+            })
+        );
+        // An id is held and echoed, so it has a bound of its own.
+        let long = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"ping"}}"#,
+            "x".repeat(MAX_ID_BYTES)
+        );
+        assert_eq!(code(&long), Some((None, INVALID_REQUEST)));
+        let fits = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"ping"}}"#,
+            "x".repeat(MAX_ID_BYTES - 2)
+        );
+        assert!(parse(&fits).is_ok());
     }
 
     // docs/mcp-mode.md §2: modern requests carry the version and the client's capabilities;

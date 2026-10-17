@@ -3543,6 +3543,65 @@ mod mcp {
         assert_eq!(messages.len(), 9 + 3 + 2 + 1 + 16, "{messages:?}");
     }
 
+    /// docs/mcp-mode.md §2: an open id gets only its refusal, whatever the method or however
+    /// malformed the request; what must not be answered isn't (a response, whatever its id; a
+    /// notification, whatever its params); a long method name is echoed cut short, and an id
+    /// past its bound is refused without it.
+    #[test]
+    fn an_open_id_gets_only_its_refusal() {
+        let config = profiles("mcp_open_id");
+        let request = |method: &str, params: &str| {
+            format!(r#"{{"jsonrpc":"2.0","id":5,"method":"{method}","params":{params}}}"#)
+        };
+        let with_meta = |extra: &str| format!("{{{META}{extra}}}");
+        let long_method = "m".repeat(300);
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win"],
+            &[
+                request("subscriptions/listen", &with_meta("")),
+                request("ping", &with_meta("")),
+                request("tools/list", &with_meta("")),
+                request("subscriptions/listen", &with_meta(r#","notifications":3"#)),
+                request("initialize", r#"{"protocolVersion":"2025-06-18"}"#),
+                request("ping", "[1]"),
+                request("nope", &with_meta("")),
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#.into(),
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":[3]}"#.into(),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":6,"method":"{long_method}","params":{{{META}}}}}"#
+                ),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":"{}","method":"ping","params":{{{META}}}}}"#,
+                    "i".repeat(2000)
+                ),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let refusals: Vec<_> = messages
+            .iter()
+            .filter(|m| m["id"] == 5 && m.get("error").is_some())
+            .collect();
+        assert_eq!(refusals.len(), 6, "{messages:?}");
+        for refusal in refusals {
+            assert_eq!(refusal["error"]["code"], -32600);
+            assert_eq!(
+                refusal["error"]["message"],
+                "Invalid request: a subscription with this id is still open"
+            );
+        }
+        let unknown = by_id(&messages, 6)["error"]["message"].as_str().unwrap();
+        assert_eq!(unknown, format!("Method not found: {}…", "m".repeat(100)));
+        assert!(
+            messages.iter().any(|m| m.get("id").is_none()
+                && m["error"]["message"] == "Invalid request: an id is at most 1024 bytes"),
+            "{messages:?}"
+        );
+        // The ack, six refusals, the method, the long id, and 5's answer and teardown at the
+        // end: nothing for the response or the notification.
+        assert_eq!(messages.len(), 1 + 6 + 1 + 1 + 2, "{messages:?}");
+    }
+
     /// docs/mcp-mode.md §2: a client that goes away (its end of stdout closed) ends the server,
     /// though stdin stays open and requests keep coming, with more of them than may wait
     /// unwritten. Before the fix a full queue left the process running for good.

@@ -284,7 +284,7 @@ pub(crate) enum Refused {
 
 /// What a refusal shows of a name the client sent (a tool, an argument, a profile): enough to
 /// recognize it, so a huge one can't make the answer huge.
-fn echo(name: &str) -> String {
+pub(crate) fn echo(name: &str) -> String {
     const SHOWN: usize = 100;
     match name.char_indices().nth(SHOWN) {
         Some((at, _)) => format!("{}…", &name[..at]),
@@ -396,7 +396,8 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
         Some(name) => launch
             .profiles
             .iter()
-            .position(|p| p.name == name)
+            // In any ASCII case, as `--profile` and the CLI's profiles match.
+            .position(|p| p.name.eq_ignore_ascii_case(&name))
             .ok_or_else(|| {
                 let names: Vec<&str> = launch.profiles.iter().map(|p| p.name.as_str()).collect();
                 invalid(&format!(
@@ -668,6 +669,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(planned.profile, 1);
+        let any_case = plan(
+            &call(json!({"name": "query", "arguments": {"sql": "x", "profile": "Reporting"}})),
+            &two,
+        )
+        .unwrap();
+        assert_eq!(any_case.profile, 1, "a profile's name in any ASCII case");
         assert_eq!(planned.max_rows, Some(5));
         assert_eq!(planned.format, Format::Json);
         // A whole number written as 30.0 is a whole number.
