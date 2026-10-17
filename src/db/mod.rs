@@ -164,6 +164,10 @@ pub enum DbError {
     /// stayed usable, or it was closed instead. Never that the server confirmed the cancel
     /// (see `Session::failure`).
     Cancelled(String),
+    /// A count of hidden rows that sqlh itself stopped, and the server never acknowledged the
+    /// stop, so the connection was closed (`COUNT_STOP_UNCONFIRMED`). The run says how to read
+    /// every row instead, in the words of its reader (`run::db_failure`).
+    CountStopUnconfirmed,
     /// A statement the tool itself sent failed.
     Sql(String),
     /// Writing output failed (e.g. the reader closed the pipe).
@@ -1262,10 +1266,11 @@ fn sql_errors(errors: &[SqlErrorInfo]) -> String {
 /// What a count that sqlh itself stopped says when the server never acknowledged the cancel
 /// (the driver waits 5 s, then marks the connection dead and the run ends with exit 6). It
 /// names the count, because the user cancelled nothing: the rows shown are complete, since the
-/// clock starts only after them, and `--exact-count` is the way to read on without cancelling.
-const COUNT_STOP_UNCONFIRMED: &str = "stopped counting the rows that are not shown, but the \
-    server didn't confirm the cancel, so the connection was closed; the rows shown are \
-    complete (--exact-count reads every row instead)";
+/// clock starts only after them. The run adds the way to read on without cancelling
+/// (`DbError::CountStopUnconfirmed`).
+pub const COUNT_STOP_UNCONFIRMED: &str = "stopped counting the rows that are not shown, but \
+    the server didn't confirm the cancel, so the connection was closed; the rows shown are \
+    complete";
 
 /// A driver error mid-run, as `DbError` (see `Session::failure`). `dead` is whether the driver
 /// marked the connection dead. `own_stop` is whether the error ends a count that sqlh itself
@@ -1275,9 +1280,7 @@ fn classify(error: TdsError, dead: bool, own_stop: bool) -> DbError {
         TdsError::OperationCancelledError(_) if !dead => {
             DbError::Cancelled("the statement was cancelled; the connection stayed usable".into())
         }
-        TdsError::OperationCancelledError(_) if own_stop => {
-            DbError::Cancelled(COUNT_STOP_UNCONFIRMED.into())
-        }
+        TdsError::OperationCancelledError(_) if own_stop => DbError::CountStopUnconfirmed,
         TdsError::OperationCancelledError(_) => DbError::Cancelled(
             "the server didn't confirm the cancel, so the connection was closed".into(),
         ),
@@ -1776,8 +1779,8 @@ mod tests {
 
     // PLAN.md 2.15: what a cancel is called depends only on what sqlh observed. A count that
     // sqlh itself stopped and the server never acknowledged (the driver marked the connection
-    // dead) names the count and the way round it; the user's cancel, and any other error,
-    // keep their words.
+    // dead) is its own error, which the run words (`run::db_failure`); the user's cancel, and
+    // any other error, keep their words.
     #[test]
     fn a_count_stop_the_server_did_not_confirm_names_the_count() {
         let cancelled = || TdsError::OperationCancelledError("x".into());
@@ -1792,14 +1795,16 @@ mod tests {
         assert_eq!(words(classify(cancelled(), false, true)), usable);
         // A dead one: the user's cancel, and sqlh's own stop of the count.
         assert_eq!(words(classify(cancelled(), true, false)), closed);
-        let own = words(classify(cancelled(), true, true));
-        assert_eq!(own, COUNT_STOP_UNCONFIRMED);
+        assert!(matches!(
+            classify(cancelled(), true, true),
+            DbError::CountStopUnconfirmed
+        ));
         assert!(
-            own.starts_with("stopped counting the rows that are not shown, but the server didn't")
-                && own.contains("the connection was closed")
-                && own.contains("the rows shown are complete")
-                && own.contains("--exact-count"),
-            "{own}"
+            COUNT_STOP_UNCONFIRMED
+                .starts_with("stopped counting the rows that are not shown, but the server didn't")
+                && COUNT_STOP_UNCONFIRMED.contains("the connection was closed")
+                && COUNT_STOP_UNCONFIRMED.ends_with("the rows shown are complete"),
+            "{COUNT_STOP_UNCONFIRMED}"
         );
         // Not a cancel: unchanged.
         assert!(matches!(
@@ -2915,7 +2920,7 @@ pub(crate) mod fake_server {
             Sink::new(false, Duration::ZERO),
         );
         match &ran.outcome {
-            Err(DbError::Cancelled(message)) => assert_eq!(message, super::COUNT_STOP_UNCONFIRMED),
+            Err(DbError::CountStopUnconfirmed) => {}
             other => panic!("{other:?}"),
         }
         assert!(

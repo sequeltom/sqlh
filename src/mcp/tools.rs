@@ -460,7 +460,7 @@ pub(crate) async fn execute(
         }
         Err(failure) => RunOutcome::new(Err(failure)),
     };
-    let exit = run::close(out.output(), outcome, started);
+    let exit = run::close(out.output(), outcome, started, settings.limits.advice);
     (out.into_text(), exit)
 }
 
@@ -488,7 +488,7 @@ fn prepare(
         }
         // `info` says how the connection was made, in a note, as `sqlh info` does.
         What::Command(command) => (
-            command.input()?,
+            command.input(settings.limits.advice)?,
             false,
             QueryOrigin::Generated,
             command.report(),

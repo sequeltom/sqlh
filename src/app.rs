@@ -210,7 +210,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
 fn request(opts: &Opts) -> Result<Request, Failure> {
     if let Some(command) = &opts.command {
         return Ok(Request {
-            input: command.input()?,
+            input: command.input(output::Advice::Cli)?,
             vars: None,
             terminator: "GO".into(),
             check: false,
@@ -330,7 +330,7 @@ pub(crate) fn finish_ok(out: &mut Out, detail: &str, started: Instant) -> Exit {
 /// blocks the thread and nothing can cut it short but its limit, so this is for what runs
 /// without a runtime: early usage errors and `sqlh profile ...`. A run uses `finish_async`.
 pub(crate) fn finish(out: &mut Out, outcome: RunOutcome, started: Instant) -> Exit {
-    let closing = Closing::of(outcome, started);
+    let closing = Closing::of(outcome, started, output::Advice::Cli);
     deliver(out, &closing.summary(), closing.exit)
 }
 
@@ -343,7 +343,7 @@ async fn finish_async(
     started: Instant,
     signals: Option<&mut Signals>,
 ) -> Exit {
-    let closing = Closing::of(outcome, started);
+    let closing = Closing::of(outcome, started, output::Advice::Cli);
     deliver_async(out, &closing.summary(), closing.exit, late, signals).await
 }
 
@@ -717,14 +717,22 @@ mod tests {
             errors,
             stopped_batches,
         };
-        let clean = Closing::of(outcome(Ok(stats()), 0, 0), Instant::now());
+        let clean = Closing::of(
+            outcome(Ok(stats()), 0, 0),
+            Instant::now(),
+            output::Advice::Cli,
+        );
         assert!(
             clean.status.starts_with("ok: 3 batches, ") && !clean.status.contains("stopped"),
             "{}",
             clean.status
         );
         let timeout = || Failure::new(Exit::Timeout, "query timeout");
-        let clean = Closing::of(outcome(Err(timeout()), 0, 0), Instant::now());
+        let clean = Closing::of(
+            outcome(Err(timeout()), 0, 0),
+            Instant::now(),
+            output::Advice::Cli,
+        );
         assert!(
             clean.status.starts_with("failed (exit 4): timeout, ")
                 && !clean.status.contains("stopped"),
@@ -733,7 +741,11 @@ mod tests {
         );
         // A failure that is not a SQL error keeps its exit code and first words, and adds the
         // same words, before the time.
-        let failed = Closing::of(outcome(Err(timeout()), 0, 2), Instant::now());
+        let failed = Closing::of(
+            outcome(Err(timeout()), 0, 2),
+            Instant::now(),
+            output::Advice::Cli,
+        );
         assert_eq!(failed.exit, Exit::Timeout);
         assert!(
             failed
@@ -743,7 +755,11 @@ mod tests {
             failed.status
         );
         assert_eq!(failed.error.as_deref(), Some("query timeout"));
-        let stopped = Closing::of(outcome(Ok(stats()), 0, 2), Instant::now());
+        let stopped = Closing::of(
+            outcome(Ok(stats()), 0, 2),
+            Instant::now(),
+            output::Advice::Cli,
+        );
         assert!(
             stopped
                 .status
@@ -753,7 +769,11 @@ mod tests {
         );
         assert_eq!(stopped.exit, Exit::Ok);
         // A failure keeps its own exit code and first words, and adds the same words.
-        let failed = Closing::of(outcome(Ok(stats()), 1, 2), Instant::now());
+        let failed = Closing::of(
+            outcome(Ok(stats()), 1, 2),
+            Instant::now(),
+            output::Advice::Cli,
+        );
         assert_eq!(failed.exit, Exit::SqlError);
         assert!(
             failed.status.starts_with("failed (exit 1): 1 error")
@@ -761,6 +781,44 @@ mod tests {
             "{}",
             failed.status
         );
+    }
+
+    // In sqlh mcp the status line names no command-line flag: a usage error doesn't point at
+    // --help, and the batches a SQL error left unrun don't offer --continue-on-error.
+    #[test]
+    fn the_status_line_in_mcp_names_no_flag() {
+        let skipped = || RunOutcome {
+            result: Ok(Stats {
+                batches_run: 1,
+                batches_skipped: 2,
+                first_failed: Some(1),
+            }),
+            errors: 1,
+            stopped_batches: 0,
+        };
+        let usage = || RunOutcome::new(Err(Failure::usage("bad")));
+        for (advice, skip_tail, usage_label) in [
+            (
+                output::Advice::Cli,
+                " (--continue-on-error runs them)",
+                "usage error (see sqlh --help)",
+            ),
+            (output::Advice::Mcp, "", "usage error"),
+        ] {
+            let status = Closing::of(skipped(), Instant::now(), advice).status;
+            assert!(
+                status.starts_with(&format!(
+                    "failed (exit 1): 1 error, first in batch 1; 2 later batches not run\
+                     {skip_tail}, "
+                )),
+                "{status}"
+            );
+            let status = Closing::of(usage(), Instant::now(), advice).status;
+            assert!(
+                status.starts_with(&format!("failed (exit 3): {usage_label}, ")),
+                "{status}"
+            );
+        }
     }
 
     /// A reader that never reads: every write blocks until the test lets go (drops

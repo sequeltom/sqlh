@@ -217,7 +217,7 @@ impl Engine {
                 None => (
                     Session::connect(&pool.settings.connect, cancel)
                         .await
-                        .map_err(run::db_failure)?,
+                        .map_err(|e| run::db_failure(e, pool.settings.limits.advice))?,
                     false,
                 ),
             };
@@ -237,7 +237,7 @@ impl Engine {
                     }
                     Err(error) => {
                         self.put_back(pool, session).await;
-                        return Err(run::db_failure(error));
+                        return Err(run::db_failure(error, pool.settings.limits.advice));
                     }
                 };
             let result = match out.connected(&session.connection(), connect_ms) {
@@ -483,7 +483,7 @@ mod tests {
                 started,
             })
             .await;
-        let exit = run::close(&mut out, outcome, started);
+        let exit = run::close(&mut out, outcome, started, settings.limits.advice);
         Called {
             exit,
             text: String::from_utf8(out.into_inner()).expect("text output is UTF-8"),
@@ -606,6 +606,8 @@ mod tests {
         assert_ok(&first);
         assert_ok(&second);
         assert_eq!(masked(&first.text), masked(&second.text));
+        // A reused connection made no connect of its own (DESIGN.md §5.1).
+        assert!(second.text.contains(", connect 0 ms\n"), "{}", second.text);
         assert_eq!(fake.accepted(), 1);
         assert_eq!(fake.resets(0), [false, false, false, true, false, false]);
         let sql = fake.sql(0);

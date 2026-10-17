@@ -258,7 +258,8 @@ impl Closing {
         }
     }
 
-    pub(crate) fn of(outcome: RunOutcome, started: Instant) -> Closing {
+    /// The closing lines of `outcome`; `advice` words what they suggest (`output::Advice`).
+    pub(crate) fn of(outcome: RunOutcome, started: Instant, advice: output::Advice) -> Closing {
         let ms = started.elapsed().as_millis();
         let exit = outcome.exit();
         // A stopped count is in the status line, so that a reader of that line alone learns
@@ -281,8 +282,12 @@ impl Closing {
                 }
                 if stats.batches_skipped > 0 {
                     status.push_str(&format!(
-                        "; {} later batches not run (--continue-on-error runs them)",
-                        stats.batches_skipped
+                        "; {} later batches not run{}",
+                        stats.batches_skipped,
+                        match advice {
+                            output::Advice::Cli => " (--continue-on-error runs them)",
+                            output::Advice::Mcp => "",
+                        }
                     ));
                 }
                 status.push_str(&format!("{stopped}, {ms} ms"));
@@ -299,7 +304,10 @@ impl Closing {
                     exit,
                     status: format!(
                         "failed (exit {code}): {}{stopped}, {ms} ms",
-                        failure.exit.label()
+                        match (failure.exit, advice) {
+                            (Exit::Usage, output::Advice::Mcp) => "usage error",
+                            (exit, _) => exit.label(),
+                        }
                     ),
                     error: (!failure.message.is_empty()).then_some(failure.message),
                     elapsed_ms: ms,
@@ -321,8 +329,13 @@ impl Closing {
 /// Ends `out` with the outcome's closing lines (the error, the limit notes and the status
 /// line), for an output with no delivery to wait for: an MCP call's, in memory. Returns the
 /// exit code; an output that refused the closing lines out of order is an internal error.
-pub(crate) fn close(out: &mut dyn Output, outcome: RunOutcome, started: Instant) -> Exit {
-    let closing = Closing::of(outcome, started);
+pub(crate) fn close(
+    out: &mut dyn Output,
+    outcome: RunOutcome,
+    started: Instant,
+    advice: output::Advice,
+) -> Exit {
+    let closing = Closing::of(outcome, started, advice);
     match out.finish(&closing.summary()).and_then(|()| out.flush()) {
         Ok(()) => closing.exit,
         Err(error) => output_failure(error).exit,
@@ -766,7 +779,8 @@ async fn run_session(
     } else {
         Vec::new()
     };
-    let mut session = connected.map_err(db_failure)?;
+    let advice = settings.limits.advice;
+    let mut session = connected.map_err(|e| db_failure(e, advice))?;
     let connect_ms = connect_started.elapsed().as_millis();
     // The output says where the run went, from what the login already told us: JSON in its
     // head, text and csv at the end of the status line (owner decision 10). Not said when
@@ -775,7 +789,7 @@ async fn run_session(
         .map_err(output_failure)?;
     let setup_ms = open(&mut session, settings, prepared, timeout, cancel)
         .await
-        .map_err(db_failure)?;
+        .map_err(|e| db_failure(e, advice))?;
     let opened = Opened {
         connect_ms,
         steps,
@@ -889,8 +903,7 @@ pub(crate) async fn run_opened(
         Some((sql, then)) => {
             // Boxed: its state would otherwise add to the session's future, which a debug
             // build lays out big enough to overflow the main thread's stack.
-            let raise = raise_timeout(settings);
-            let found = Box::pin(look_up(session, sql, timeout, &raise, cancel, gate)).await?;
+            let found = Box::pin(look_up(session, sql, timeout, settings, cancel, gate)).await?;
             looked_up = step_batches(then(&found)?);
             (&looked_up.0, &looked_up.1)
         }
@@ -925,7 +938,7 @@ pub(crate) async fn run_opened(
                 session
                     .exec_internal("SET NOEXEC ON;", timeout, cancel)
                     .await
-                    .map_err(db_failure)?;
+                    .map_err(|e| db_failure(e, settings.limits.advice))?;
             }
             out.begin_batch(&BatchInfo {
                 number,
@@ -955,7 +968,7 @@ pub(crate) async fn run_opened(
                             raise_timeout(settings)
                         ),
                     ),
-                    e => db_failure(e),
+                    e => db_failure(e, settings.limits.advice),
                 })?;
             stats.batches_run += 1;
             out.end_batch(started.elapsed().as_millis())
@@ -1006,7 +1019,7 @@ async fn look_up(
     session: &mut Session,
     sql: &str,
     timeout: u32,
-    raise: &str,
+    settings: &Settings,
     cancel: &Cancel,
     gate: &dyn Backpressure,
 ) -> Result<Found, Failure> {
@@ -1025,9 +1038,12 @@ async fn look_up(
         .map_err(|e| match e {
             DbError::Timeout(_) => Failure::new(
                 Exit::Timeout,
-                format!("query timeout after {timeout} s while looking the name up; {raise}"),
+                format!(
+                    "query timeout after {timeout} s while looking the name up; {}",
+                    raise_timeout(settings)
+                ),
             ),
-            e => db_failure(e),
+            e => db_failure(e, settings.limits.advice),
         })?;
     capture.finish()
 }
@@ -1126,7 +1142,9 @@ impl BatchSink for Capture {
     }
 }
 
-pub(crate) fn db_failure(error: DbError) -> Failure {
+/// A driver error as the run's failure; `advice` words what the run can do about a count stop
+/// the server didn't confirm.
+pub(crate) fn db_failure(error: DbError, advice: output::Advice) -> Failure {
     match error {
         DbError::Connect(message) => Failure::new(Exit::Connect, message),
         DbError::Lost(message) => {
@@ -1134,6 +1152,16 @@ pub(crate) fn db_failure(error: DbError) -> Failure {
         }
         DbError::Timeout(message) => Failure::new(Exit::Timeout, message),
         DbError::Cancelled(detail) => Failure::new(Exit::Cancelled, detail),
+        DbError::CountStopUnconfirmed => {
+            let instead = match advice {
+                output::Advice::Cli => "--exact-count reads every row instead",
+                output::Advice::Mcp => "the profile's exact_count = true reads every row instead",
+            };
+            Failure::new(
+                Exit::Cancelled,
+                format!("{} ({instead})", crate::db::COUNT_STOP_UNCONFIRMED),
+            )
+        }
         DbError::Sql(message) => Failure::new(Exit::SqlError, message),
         DbError::Output(e) => output_failure(e),
         DbError::Protocol(message) => Failure::new(Exit::Internal, message),

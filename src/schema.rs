@@ -9,7 +9,7 @@
 
 use crate::db::Value;
 use crate::error::{Exit, Failure};
-use crate::output::{Limits, Section};
+use crate::output::{Advice, Limits, Section};
 use crate::run::{Found, Input, Plan, Report, Step};
 
 /// The `profile test` and `info` query. Runs on SQL Server 2012+ and Azure SQL DB without extra
@@ -136,7 +136,8 @@ impl Command {
     }
 
     /// The run's input: the command's SQL and the sections it fills.
-    pub fn input(&self) -> Result<Input, Failure> {
+    /// The run's input; `advice` words the hints of a name that resolves to nothing usable.
+    pub fn input(&self, advice: Advice) -> Result<Input, Failure> {
         let plan = match self {
             Command::Info => steps(INFO_SQL.to_owned(), &[Section::rows("server")]),
             Command::Dbs => steps(DBS_SQL.to_owned(), &[Section::rows("databases")]),
@@ -152,9 +153,9 @@ impl Command {
                 }
                 steps(find_sql(&pattern, *text), &sections)
             }
-            Command::Describe(name) => lookup(name, Shows::Describe)?,
-            Command::Def(name) => lookup(name, Shows::Def)?,
-            Command::Deps(name) => lookup(name, Shows::Deps)?,
+            Command::Describe(name) => lookup(name, Shows::Describe, advice)?,
+            Command::Def(name) => lookup(name, Shows::Def, advice)?,
+            Command::Deps(name) => lookup(name, Shows::Deps, advice)?,
         };
         Ok(Input::Command {
             name: self.name(),
@@ -542,7 +543,7 @@ enum Shows {
 ///    explicit schema is never set aside), compared case-insensitively, so a case-sensitive
 ///    database still finds `Users` for `users`, and two that differ only in case are
 ///    ambiguous.
-fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
+fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
     let name = parse_name(asked)?;
     if name.object.starts_with('#') {
         return Err(name_error(format!(
@@ -553,7 +554,11 @@ fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
     if let Some(server) = &name.server {
         return Err(Failure::usage(format!(
             "{asked} names a server ({server}); schema commands look at the current database \
-             on the server sqlh connects to (-S)"
+             on the server sqlh connects to{}",
+            match advice {
+                Advice::Cli => " (-S)",
+                Advice::Mcp => " (the profile's)",
+            }
         )));
     }
     let sql = format!(
@@ -583,7 +588,7 @@ fn lookup(asked: &str, shows: Shows) -> Result<Plan, Failure> {
     );
     let asked = asked.to_owned();
     let then = move |found: &Found| -> Result<Vec<Step>, Failure> {
-        let object = resolve(&asked, &name, found)?;
+        let object = resolve(&asked, &name, found, advice)?;
         match shows {
             Shows::Describe => Ok(describe_steps(&object, Aggregate::for_level(compat(found)))),
             Shows::Def => def_steps(&object),
@@ -630,7 +635,7 @@ fn int(value: Option<&Value>) -> Option<i64> {
 
 /// The lookup's rows (`lookup`) as one object, or the error for a name that names none, more
 /// than one, or one outside the current database.
-fn resolve(asked: &str, name: &Name, found: &Found) -> Result<Object, Failure> {
+fn resolve(asked: &str, name: &Name, found: &Found, advice: Advice) -> Result<Object, Failure> {
     let unexpected = || Failure::new(Exit::Internal, "the name lookup returned unexpected rows");
     let scope_row = found
         .first()
@@ -649,7 +654,11 @@ fn resolve(asked: &str, name: &Name, found: &Found) -> Result<Object, Failure> {
         (0, Some(db)) => {
             return Err(Failure::usage(format!(
                 "{asked} is in database {db}; schema commands look at the current database \
-                 ({current}): run with -d {db}"
+                 ({current}): {}",
+                match advice {
+                    Advice::Cli => format!("run with -d {db}"),
+                    Advice::Mcp => format!("call with database {db}"),
+                }
             )));
         }
         _ => return Err(unexpected()),
@@ -685,7 +694,11 @@ fn resolve(asked: &str, name: &Name, found: &Found) -> Result<Object, Failure> {
     }
     match candidates.len() {
         0 => Err(name_error(format!(
-            "no object named {asked} in database {current}; try: sqlh find {}",
+            "no object named {asked} in database {current}; try: {} {}",
+            match advice {
+                Advice::Cli => "sqlh find",
+                Advice::Mcp => "find with pattern",
+            },
             name.object
         ))),
         1 => Ok(candidates.into_iter().next().ok_or_else(unexpected)?),
@@ -1216,7 +1229,7 @@ mod tests {
         assert_eq!(literal("[a]]b]"), "N'[a]]b]'");
         let sql = tables_sql(Some("x'; SELECT 1 --"));
         assert!(sql.contains("LIKE N'%x''; SELECT 1 --%'"), "{sql}");
-        let Plan::Lookup { sql, .. } = lookup("it's", Shows::Describe).unwrap() else {
+        let Plan::Lookup { sql, .. } = lookup("it's", Shows::Describe, Advice::Cli).unwrap() else {
             panic!("a lookup");
         };
         assert!(
@@ -1225,7 +1238,9 @@ mod tests {
             ),
             "{sql}"
         );
-        let Plan::Lookup { sql, .. } = lookup("[a'b].\"c.d\"", Shows::Describe).unwrap() else {
+        let Plan::Lookup { sql, .. } =
+            lookup("[a'b].\"c.d\"", Shows::Describe, Advice::Cli).unwrap()
+        else {
             panic!("a lookup");
         };
         assert!(
@@ -1297,7 +1312,7 @@ mod tests {
         }
         // Refused before connecting, with exit 3, through the command too.
         for input in [format!("[{long}].p"), "srv.db.dbo.p".into()] {
-            let Err(failure) = lookup(&input, Shows::Def) else {
+            let Err(failure) = lookup(&input, Shows::Def, Advice::Cli) else {
                 panic!("{input} refused");
             };
             assert_eq!(failure.exit, Exit::Usage, "{input}");
@@ -1399,7 +1414,7 @@ mod tests {
     }
 
     fn resolved(asked: &str, found: &Found) -> Result<Object, Failure> {
-        resolve(asked, &parse_name(asked).unwrap(), found)
+        resolve(asked, &parse_name(asked).unwrap(), found, Advice::Cli)
     }
 
     // schema-commands.md §5 with the reviews' corrections: one candidate is the object; none
@@ -1469,6 +1484,31 @@ mod tests {
              (AppDb): run with -d Other"
         );
         assert_eq!(other.exit, Exit::Usage);
+        // In sqlh mcp the hints name the tools' arguments, not the command line's.
+        let mcp = |asked: &str, found: &Found| {
+            resolve(asked, &parse_name(asked).unwrap(), found, Advice::Mcp)
+                .unwrap_err()
+                .message
+        };
+        assert_eq!(
+            mcp("Other.dbo.T", &found(0, &[], 0)),
+            "Other.dbo.T is in database Other; schema commands look at the current database \
+             (AppDb): call with database Other"
+        );
+        assert_eq!(
+            mcp("Usrs", &found(1, &[], 0)),
+            "no object named Usrs in database AppDb; try: find with pattern Usrs"
+        );
+        let Err(server) = lookup("srv.db.dbo.T", Shows::Describe, Advice::Mcp) else {
+            panic!("refused");
+        };
+        assert!(
+            server
+                .message
+                .ends_with("on the server sqlh connects to (the profile's)"),
+            "{}",
+            server.message
+        );
         let missing = resolved("Nope.dbo.T", &found(2, &[], 0)).unwrap_err();
         assert_eq!(missing.exit, Exit::Usage);
         assert!(
@@ -1488,7 +1528,7 @@ mod tests {
 
     #[test]
     fn a_temporary_table_is_refused_before_anything_runs() {
-        let Err(failure) = lookup("#orders", Shows::Describe) else {
+        let Err(failure) = lookup("#orders", Shows::Describe, Advice::Cli) else {
             panic!("refused");
         };
         assert!(

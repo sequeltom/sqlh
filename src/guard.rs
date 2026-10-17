@@ -22,7 +22,8 @@ pub struct Blocked {
     /// Whether `--allow-write` lifts the refusal (it skips the classifier). `advice` then
     /// offers it, which is no use under a profile that refuses it (`advice_for`).
     pub lifted_by_write: bool,
-    /// What to do short of writing, where there is something (`Use a #temp table`).
+    /// What to do short of writing, where there is something (`Use a #temp table`). For a
+    /// refusal writing doesn't lift, the advice in `sqlh mcp`, which names no flag.
     pub instead: Option<String>,
 }
 
@@ -58,6 +59,9 @@ impl Blocked {
         // The reason, as a clause after what to try instead, and as a sentence on its own (the
         // program's name keeps its lower case).
         let (clause, sentence) = match off {
+            Some(WritesOff::Mcp) if !self.lifted_by_write => {
+                return self.instead.clone().unwrap_or_else(|| self.advice.clone());
+            }
             Some(_) if !self.lifted_by_write => return self.advice.clone(),
             Some(WritesOff::Profile(profile)) => (
                 format!("profile {profile} doesn't allow writes (write_policy = \"deny\")"),
@@ -479,7 +483,11 @@ impl<'a> Guard<'a> {
                          NOEXEC as [NOEXEC]. --allow-write doesn't lift this"
                     .into(),
                 lifted_by_write: false,
-                instead: None,
+                instead: Some(
+                    "Remove SET NOEXEC (the check tool sets it already); write a column named \
+                     NOEXEC as [NOEXEC]"
+                        .into(),
+                ),
             }),
             None => Ok(()),
         }
@@ -1473,6 +1481,12 @@ mod tests {
         assert_eq!(
             blocked("INSERT ##shared VALUES (1)").advice_for(mcp),
             "Use a #temp table; sqlh mcp is read-only"
+        );
+        // The check tool's refusal names no flag.
+        assert_eq!(
+            b.advice_for(mcp),
+            "Remove SET NOEXEC (the check tool sets it already); write a column named NOEXEC as \
+             [NOEXEC]"
         );
     }
 
