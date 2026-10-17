@@ -201,6 +201,7 @@ fn request(opts: &Opts) -> Result<Request, Failure> {
             } else {
                 command.report()
             },
+            database: None,
         });
     }
     let input = match (&opts.query, opts.inputs.is_empty()) {
@@ -223,6 +224,7 @@ fn request(opts: &Opts) -> Result<Request, Failure> {
         check: opts.check,
         continue_on_error: opts.continue_on_error,
         report,
+        database: None,
     })
 }
 

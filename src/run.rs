@@ -80,6 +80,9 @@ pub(crate) struct Request {
     /// `--continue-on-error`.
     pub(crate) continue_on_error: bool,
     pub(crate) report: Report,
+    /// A database to switch to for this run (`USE`), after the session setup: an MCP call's
+    /// `database`. The CLI connects to its database instead (`-d`), so it passes `None`.
+    pub(crate) database: Option<String>,
 }
 
 /// Session options matching SSMS, so plans and filtered/computed-column indexes behave as
@@ -230,7 +233,7 @@ impl RunOutcome {
 /// count of hidden rows was stopped. The exit code and the closing lines come from these, so
 /// they don't depend on what the output kept.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Accounting {
+pub(crate) struct Accounting {
     errors: u32,
     batch_max_severity: i32,
     batch_stopped: bool,
@@ -238,6 +241,15 @@ struct Accounting {
 }
 
 impl Accounting {
+    /// The run's outcome: `result`, with the counts the run kept.
+    pub(crate) fn outcome(self, result: Result<Stats, Failure>) -> RunOutcome {
+        RunOutcome {
+            result,
+            errors: self.errors,
+            stopped_batches: self.stopped_batches,
+        }
+    }
+
     fn begin_batch(&mut self) {
         self.batch_max_severity = 0;
         self.batch_stopped = false;
@@ -313,6 +325,8 @@ pub(crate) struct Prepared {
     report: Report,
     /// Where and why the guard refused the input, if it did.
     blocked: Option<(String, guard::Blocked)>,
+    /// `Request::database`.
+    database: Option<String>,
 }
 
 /// A command's steps as batches of its one source, with their sections.
@@ -359,6 +373,7 @@ pub(crate) fn prepare(
             policy,
             report: request.report,
             blocked: None,
+            database: request.database,
         });
     }
     let sources = load_sources(&request.input)?;
@@ -385,6 +400,7 @@ pub(crate) fn prepare(
         policy,
         report: request.report,
         blocked,
+        database: request.database,
     })
 }
 
@@ -403,12 +419,31 @@ pub(crate) async fn execute(
     let mut counts = Accounting::default();
     let (result, late) =
         execute_inner(settings, prepared, out, gate, signals, &mut counts, started).await;
-    let outcome = RunOutcome {
-        result,
-        errors: counts.errors,
-        stopped_batches: counts.stopped_batches,
-    };
-    (outcome, late)
+    (counts.outcome(result), late)
+}
+
+/// What a run ends with before it needs a connection, if it does: the guard's refusal (exit 5),
+/// or a note that there is no SQL to run. Shared by the CLI and the engine.
+pub(crate) fn preflight(
+    settings: &Settings,
+    prepared: &Prepared,
+    out: &mut dyn Output,
+) -> Option<Result<Stats, Failure>> {
+    if let Some((location, blocked)) = &prepared.blocked {
+        let advice = blocked.advice_for(settings.write_denied_by.as_deref());
+        if let Err(e) = out.blocked(location, &blocked.reason, &advice) {
+            return Some(Err(output_failure(e)));
+        }
+        return Some(Err(Failure::new(Exit::Blocked, "")));
+    }
+    if prepared.batches.is_empty() && prepared.lookup.is_none() {
+        let noted = out
+            .note("no SQL to run")
+            .map(|()| Stats::default())
+            .map_err(output_failure);
+        return Some(noted);
+    }
+    None
 }
 
 async fn execute_inner(
@@ -420,19 +455,8 @@ async fn execute_inner(
     counts: &mut Accounting,
     started: Instant,
 ) -> (Result<Stats, Failure>, Option<Signal>) {
-    if let Some((location, blocked)) = &prepared.blocked {
-        let advice = blocked.advice_for(settings.write_denied_by.as_deref());
-        if let Err(e) = out.blocked(location, &blocked.reason, &advice) {
-            return (Err(output_failure(e)), None);
-        }
-        return (Err(Failure::new(Exit::Blocked, "")), None);
-    }
-    if prepared.batches.is_empty() && prepared.lookup.is_none() {
-        let noted = out
-            .note("no SQL to run")
-            .map(|()| Stats::default())
-            .map_err(output_failure);
-        return (noted, None);
+    if let Some(early) = preflight(settings, prepared, out) {
+        return (early, None);
     }
     // Running without being able to cancel isn't an option, so a failure to listen ends the
     // run here (its output still gets delivered).
@@ -606,6 +630,7 @@ fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> C
     }
 }
 
+/// The CLI's session: connected for this run, `open`ed, run and closed.
 async fn run_session(
     settings: &Settings,
     prepared: &Prepared,
@@ -615,7 +640,6 @@ async fn run_session(
     counts: &mut Accounting,
     started: Instant,
 ) -> Result<Stats, Failure> {
-    let (sources, batches, policy) = (&prepared.sources, &prepared.batches, prepared.policy);
     let timeout = settings.query_timeout;
     // --verbose and `profile test` say where the time to the first batch went (PLAN.md 2.1).
     let report = prepared.report != Report::Off;
@@ -636,10 +660,56 @@ async fn run_session(
     // nothing connected, which is every path that returns before this point.
     out.connected(&session.connection(), connect_ms)
         .map_err(output_failure)?;
-    let wrap = policy.wrap();
+    let setup_ms = open(&mut session, settings, prepared, timeout, cancel)
+        .await
+        .map_err(db_failure)?;
+    let opened = Opened {
+        connect_ms,
+        steps,
+        setup_ms,
+    };
+    let stats = run_opened(
+        &mut session,
+        &opened,
+        settings,
+        timeout,
+        prepared,
+        out,
+        gate,
+        cancel,
+        counts,
+        started,
+    )
+    .await?;
+    session.close().await;
+    Ok(stats)
+}
+
+/// How a session came to be ready for a run, for the `--verbose` line: the connect (0 ms for
+/// a pooled connection that was reused) with its steps, and the session setup.
+pub(crate) struct Opened {
+    pub(crate) connect_ms: u128,
+    pub(crate) steps: Vec<(&'static str, std::time::Duration)>,
+    pub(crate) setup_ms: u128,
+}
+
+/// The first request of a run on a connection, and the only one before anything is shown:
+/// the session setup (`session_setup`), and the call's `USE` when it names a database
+/// (`Prepared::database`). On a reused connection it carries the reset
+/// (`Session::reset_before_next`), so this is where a connection that died while idle, or a
+/// reset the server didn't acknowledge, shows up: before any of the run's own work, which the
+/// engine relies on to retry (owner decision 19). Returns the setup's milliseconds.
+pub(crate) async fn open(
+    session: &mut Session,
+    settings: &Settings,
+    prepared: &Prepared,
+    timeout: u32,
+    cancel: &Cancel,
+) -> Result<u128, DbError> {
+    let policy = prepared.policy;
     // `--check` reads nothing, so there is no read to make uncommitted and none to report.
     let read_uncommitted = settings.read_uncommitted && !policy.check;
-    let setup = session_setup(settings.lock_timeout, read_uncommitted, wrap);
+    let setup = session_setup(settings.lock_timeout, read_uncommitted, policy.wrap());
     // Debug builds only: SQL sent ahead of the setup in the same batch, so that a test can
     // start from a session whose `XACT_ABORT` is ON (as a server's `user options` would make
     // it) without touching the server's configuration. The setup's OFF has to undo it (R14).
@@ -649,10 +719,36 @@ async fn run_session(
         Err(_) => setup,
     };
     let setup_started = Instant::now();
-    session
-        .exec_internal(&setup, timeout, cancel)
-        .await
-        .map_err(db_failure)?;
+    session.exec_internal(&setup, timeout, cancel).await?;
+    let setup_ms = setup_started.elapsed().as_millis();
+    if let Some(database) = &prepared.database {
+        let sql = format!("USE [{}];", database.replace(']', "]]"));
+        session.exec_internal(&sql, timeout, cancel).await?;
+    }
+    Ok(setup_ms)
+}
+
+/// Everything a run does on a session that is `open`: its notes, its lookup and batches, the
+/// read-only checks after them and the rollback of the wrapper. The connection stays open
+/// for the caller to close (the CLI) or keep (the engine). `timeout` is the run's `-t`,
+/// which a call may set below its settings' (an MCP call's `timeout`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_opened(
+    session: &mut Session,
+    opened: &Opened,
+    settings: &Settings,
+    timeout: u32,
+    prepared: &Prepared,
+    out: &mut dyn Output,
+    gate: &dyn Backpressure,
+    cancel: &Cancel,
+    counts: &mut Accounting,
+    started: Instant,
+) -> Result<Stats, Failure> {
+    let (sources, batches, policy) = (&prepared.sources, &prepared.batches, prepared.policy);
+    let report = prepared.report != Report::Off;
+    let wrap = policy.wrap();
+    let read_uncommitted = settings.read_uncommitted && !policy.check;
     if read_uncommitted {
         // Said once, up front, where an output cut short by --max-output still has it.
         out.note(READ_UNCOMMITTED_NOTE).map_err(output_failure)?;
@@ -660,9 +756,10 @@ async fn run_session(
     if report {
         let profile = settings.profile.as_deref().unwrap_or("(none)");
         let line = format!(
-            "profile {profile}; connected in {connect_ms} ms{}, session setup {} ms; {}",
-            db::phases::describe(&steps),
-            setup_started.elapsed().as_millis(),
+            "profile {profile}; connected in {} ms{}, session setup {} ms; {}",
+            opened.connect_ms,
+            db::phases::describe(&opened.steps),
+            opened.setup_ms,
             session.describe()
         );
         if prepared.report == Report::Note {
@@ -679,7 +776,7 @@ async fn run_session(
         Some((sql, then)) => {
             // Boxed: its state would otherwise add to the session's future, which a debug
             // build lays out big enough to overflow the main thread's stack.
-            let found = Box::pin(look_up(&mut session, sql, timeout, cancel, gate)).await?;
+            let found = Box::pin(look_up(session, sql, timeout, cancel, gate)).await?;
             looked_up = step_batches(then(&found)?);
             (&looked_up.0, &looked_up.1)
         }
@@ -784,7 +881,6 @@ async fn run_session(
             .exec_internal("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", timeout, cancel)
             .await;
     }
-    session.close().await;
     Ok(stats)
 }
 
@@ -1148,6 +1244,7 @@ mod tests {
             check: false,
             continue_on_error: false,
             report: Report::Off,
+            database: None,
         }
     }
 
