@@ -58,6 +58,18 @@ pub struct Limits {
     /// Seconds the reader may take no output before delivery fails (exit 7); 0 = wait as
     /// long as it takes. It follows the query timeout, `-t` (DESIGN.md §6).
     pub stall_secs: u32,
+    /// Whose flags the output's advice names.
+    pub advice: Advice,
+}
+
+/// Whose flags a run's advice names: the command line's (`--exact-count`, `-t`), or, in
+/// `sqlh mcp`, a call's arguments and the profile's settings (docs/mcp-mode.md §4), so a
+/// result never offers a flag its reader can't pass (as 2.16 found for `deny` profiles).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Advice {
+    #[default]
+    Cli,
+    Mcp,
 }
 
 impl Default for Limits {
@@ -69,6 +81,7 @@ impl Default for Limits {
             max_messages: 100,
             max_output: 1_000_000,
             stall_secs: 60,
+            advice: Advice::Cli,
         }
     }
 }
@@ -1061,6 +1074,7 @@ impl Tally {
                 &self.stopped_batches,
                 self.stopped_by_budget,
                 self.stopped_by_timeout,
+                self.limits.advice,
             ));
         }
         if self.exhausted {
@@ -1126,7 +1140,7 @@ const NOTE_BATCHES: usize = 5;
 /// later statements didn't run. The advice follows what stopped the counts: the budget, which
 /// `--exact-count` lifts (a run that has it can't be stopped by the budget, so it is never
 /// advised to it again), or `-t`, which only raising it lifts. A run with both kinds gets both.
-fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool) -> String {
+fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool, advice: Advice) -> String {
     let shown: Vec<String> = batches
         .iter()
         .take(NOTE_BATCHES)
@@ -1151,13 +1165,17 @@ fn stopped_note(batches: &[usize], by_budget: bool, by_timeout: bool) -> String 
             shown.join(", ")
         )
     };
-    for advice in [
-        (by_budget, "--exact-count counts every row"),
-        (by_timeout, "raise -t to count longer"),
-    ]
-    .iter()
-    .filter(|(applies, _)| *applies)
-    .map(|(_, advice)| advice)
+    let (exact, longer) = match advice {
+        Advice::Cli => ("--exact-count counts every row", "raise -t to count longer"),
+        Advice::Mcp => (
+            "the profile's exact_count = true counts every row",
+            "a larger timeout counts longer",
+        ),
+    };
+    for advice in [(by_budget, exact), (by_timeout, longer)]
+        .iter()
+        .filter(|(applies, _)| *applies)
+        .map(|(_, advice)| advice)
     {
         note.push_str("; ");
         note.push_str(advice);
@@ -1427,7 +1445,7 @@ mod tests {
 
     #[test]
     fn the_note_names_the_batches_where_counting_stopped() {
-        let note = |batches: &[usize]| stopped_note(batches, true, false);
+        let note = |batches: &[usize]| stopped_note(batches, true, false, Advice::Cli);
         let tail = "; --exact-count counts every row";
         assert_eq!(
             note(&[4]),
@@ -1461,16 +1479,24 @@ mod tests {
         let first = "counting stopped in batch 2: the rest of that batch was cancelled, so its \
                      later statements did not run";
         assert_eq!(
-            stopped_note(&[2], true, false),
+            stopped_note(&[2], true, false, Advice::Cli),
             format!("{first}; --exact-count counts every row")
         );
         assert_eq!(
-            stopped_note(&[2], false, true),
+            stopped_note(&[2], false, true, Advice::Cli),
             format!("{first}; raise -t to count longer")
         );
         assert_eq!(
-            stopped_note(&[2], true, true),
+            stopped_note(&[2], true, true, Advice::Cli),
             format!("{first}; --exact-count counts every row; raise -t to count longer")
+        );
+        // sqlh mcp names what its reader can change: the profile, and the call's timeout.
+        assert_eq!(
+            stopped_note(&[2], true, true, Advice::Mcp),
+            format!(
+                "{first}; the profile's exact_count = true counts every row; a larger timeout \
+                 counts longer"
+            )
         );
         // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
         let batch = |number| BatchInfo {
@@ -1653,6 +1679,7 @@ mod tests {
             max_messages: 0,
             max_output: 0,
             stall_secs: 0,
+            ..Limits::default()
         };
         let columns = [
             crate::db::Column {

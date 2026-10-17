@@ -582,6 +582,7 @@ mod tests {
             // 33 bytes of row counts, 28 of header, room for two 10-byte rows.
             max_output: crate::output::OUTPUT_RESERVE + 81,
             stall_secs: 0,
+            ..Limits::default()
         };
         let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), limits);
         s.rows_affected(2).unwrap();

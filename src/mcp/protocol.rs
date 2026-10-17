@@ -85,9 +85,21 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
         };
         return Err((None, ProtocolError::new(INVALID_REQUEST, what)));
     };
-    let id = message.remove("id");
-    // An id is a string or a number; anything else can't be answered by it.
-    let id = id.filter(|id| id.is_string() || id.is_number());
+    // An id is a string or a number. One that is there but is anything else (null included)
+    // can't be answered by, so the error leaves it out.
+    let id = match message.remove("id") {
+        None => None,
+        Some(id) if id.is_string() || id.is_number() => Some(id),
+        Some(_) => {
+            return Err((
+                None,
+                ProtocolError::new(
+                    INVALID_REQUEST,
+                    "Invalid request: id must be a string or a number",
+                ),
+            ));
+        }
+    };
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err((
             id,
@@ -95,7 +107,15 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
         ));
     }
     let Some(method) = message.get("method") else {
-        return Ok(Incoming::Response);
+        // A response (sqlh sends no requests, so it has nothing to match); anything else
+        // without a method isn't a message.
+        if message.contains_key("result") || message.contains_key("error") {
+            return Ok(Incoming::Response);
+        }
+        return Err((
+            id,
+            ProtocolError::new(INVALID_REQUEST, "Invalid request: a message needs a method"),
+        ));
     };
     let Some(method) = method.as_str().map(str::to_owned) else {
         return Err((
@@ -281,8 +301,17 @@ mod tests {
         );
         // An id that is neither a string nor a number can't be answered by it.
         assert_eq!(
-            code(r#"{"jsonrpc":"2.0","id":null,"method":5}"#),
+            code(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#),
             Some((None, INVALID_REQUEST))
+        );
+        assert_eq!(
+            code(r#"{"jsonrpc":"2.0","id":[1],"method":"ping"}"#),
+            Some((None, INVALID_REQUEST))
+        );
+        // Neither a request nor a response.
+        assert_eq!(
+            code(r#"{"jsonrpc":"2.0","id":4}"#),
+            Some((Some(json!(4)), INVALID_REQUEST))
         );
     }
 

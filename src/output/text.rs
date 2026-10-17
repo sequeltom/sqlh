@@ -634,6 +634,7 @@ pub(super) mod tests {
             max_messages: 1,
             max_output: 0,
             stall_secs: 0,
+            ..Limits::default()
         }
     }
 
@@ -942,6 +943,7 @@ pub(super) mod tests {
             max_messages: 0,
             max_output,
             stall_secs: 0,
+            ..Limits::default()
         }
     }
 
@@ -2057,6 +2059,7 @@ pub(super) mod tests {
             max_messages: 0,
             max_output: crate::output::OUTPUT_RESERVE + body,
             stall_secs: 0,
+            ..Limits::default()
         }
     }
 

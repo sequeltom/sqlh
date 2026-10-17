@@ -721,6 +721,18 @@ fn counting_for(allow_write: bool, exact_requested: bool, xact_abort: bool) -> C
     }
 }
 
+/// The advice for a timeout: `raise -t` on the command line; in `sqlh mcp`, the call's
+/// `timeout`, which can go up to the server's own (`output::Advice`).
+fn raise_timeout(settings: &Settings) -> String {
+    match (settings.limits.advice, settings.query_timeout) {
+        (output::Advice::Cli, _) => "raise -t".into(),
+        (output::Advice::Mcp, 0) => "raise timeout".into(),
+        (output::Advice::Mcp, limit) => {
+            format!("raise timeout (the server allows up to {limit} s)")
+        }
+    }
+}
+
 /// The CLI's session: connected for this run, `open`ed, run and closed.
 async fn run_session(
     settings: &Settings,
@@ -867,7 +879,8 @@ pub(crate) async fn run_opened(
         Some((sql, then)) => {
             // Boxed: its state would otherwise add to the session's future, which a debug
             // build lays out big enough to overflow the main thread's stack.
-            let found = Box::pin(look_up(session, sql, timeout, cancel, gate)).await?;
+            let raise = raise_timeout(settings);
+            let found = Box::pin(look_up(session, sql, timeout, &raise, cancel, gate)).await?;
             looked_up = step_batches(then(&found)?);
             (&looked_up.0, &looked_up.1)
         }
@@ -928,7 +941,8 @@ pub(crate) async fn run_opened(
                     DbError::Timeout(_) => Failure::new(
                         Exit::Timeout,
                         format!(
-                            "query timeout after {timeout} s in batch {number}; raise -t or narrow the query"
+                            "query timeout after {timeout} s in batch {number}; {} or narrow the query",
+                            raise_timeout(settings)
                         ),
                     ),
                     e => db_failure(e),
@@ -982,6 +996,7 @@ async fn look_up(
     session: &mut Session,
     sql: &str,
     timeout: u32,
+    raise: &str,
     cancel: &Cancel,
     gate: &dyn Backpressure,
 ) -> Result<Found, Failure> {
@@ -1000,7 +1015,7 @@ async fn look_up(
         .map_err(|e| match e {
             DbError::Timeout(_) => Failure::new(
                 Exit::Timeout,
-                format!("query timeout after {timeout} s while looking the name up; raise -t"),
+                format!("query timeout after {timeout} s while looking the name up; {raise}"),
             ),
             e => db_failure(e),
         })?;
@@ -1489,6 +1504,7 @@ mod tests {
             max_messages: 0,
             max_output: output::OUTPUT_RESERVE + 50,
             stall_secs: 0,
+            ..Limits::default()
         };
         let mut out = output::create(Format::Text, Box::new(written.clone()), limits);
         let mut counts = Accounting::default();

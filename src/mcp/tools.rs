@@ -135,18 +135,19 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 let (name, schema, needed) = match arg {
                     Arg::Sql => (
                         "sql",
-                        json!({"type": "string", "description": "The T-SQL to run."}),
+                        json!({"type": "string", "minLength": 1, "description": "The T-SQL to run."}),
                         true,
                     ),
                     Arg::Object => (
                         "object",
-                        json!({"type": "string", "description":
+                        json!({"type": "string", "minLength": 1, "description":
                             "The object's name: Orders, dbo.Orders, [My Table], db..t"}),
                         true,
                     ),
                     Arg::Pattern => (
                         "pattern",
-                        json!({"type": "string", "description": "A substring or a * ? glob."}),
+                        json!({"type": "string", "minLength": 1,
+                            "description": "A substring or a * ? glob."}),
                         true,
                     ),
                     Arg::OptionalPattern => (
@@ -177,7 +178,7 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
             );
             properties.insert(
                 "database".into(),
-                json!({"type": "string", "description":
+                json!({"type": "string", "minLength": 1, "maxLength": 128, "description":
                     "A database to run in, instead of the profile's."}),
             );
             properties.insert(
@@ -205,6 +206,10 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 "properties": properties,
                 "additionalProperties": false,
             });
+            // With several profiles a call must name one, as `plan` enforces.
+            if names.len() > 1 {
+                required.push("profile");
+            }
             if !required.is_empty() {
                 schema["required"] = json!(required);
             }
@@ -304,7 +309,13 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
     let number = |key: &str, min: u64, max: u64| -> Result<Option<u64>, ProtocolError> {
         match args.get(key) {
             None => Ok(None),
-            Some(value) => match value.as_u64() {
+            // A whole number, whichever way JSON wrote it (`30` or `30.0`).
+            Some(value) => match value.as_u64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= max as f64)
+                    .map(|f| f as u64)
+            }) {
                 Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
                 _ => Err(invalid(
                     tool,
@@ -314,7 +325,11 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
         }
     };
     let required = |key: &str| -> Result<String, ProtocolError> {
-        text(key)?.ok_or_else(|| invalid(tool, &format!("missing required property {key}")))
+        match text(key)? {
+            None => Err(invalid(tool, &format!("missing required property {key}"))),
+            Some(value) if value.is_empty() => Err(invalid(tool, &format!("{key} is empty"))),
+            Some(value) => Ok(value),
+        }
     };
 
     let profile = match text("profile")? {
@@ -456,7 +471,7 @@ fn prepare(
     planned: &Planned,
     settings: &crate::config::Settings,
 ) -> Result<run::Prepared, crate::error::Failure> {
-    let (input, check, origin) = match &planned.what {
+    let (input, check, origin, report) = match &planned.what {
         What::Sql { sql, check } => {
             if sql.len() > MAX_SQL_BYTES {
                 return Err(crate::error::Failure::usage(format!(
@@ -464,9 +479,20 @@ fn prepare(
                     sql.len()
                 )));
             }
-            (Input::Query(sql.clone()), *check, QueryOrigin::User)
+            (
+                Input::Query(sql.clone()),
+                *check,
+                QueryOrigin::User,
+                Report::Off,
+            )
         }
-        What::Command(command) => (command.input()?, false, QueryOrigin::Generated),
+        // `info` says how the connection was made, in a note, as `sqlh info` does.
+        What::Command(command) => (
+            command.input()?,
+            false,
+            QueryOrigin::Generated,
+            command.report(),
+        ),
     };
     let request = Request {
         input,
@@ -474,7 +500,7 @@ fn prepare(
         terminator: "GO".into(),
         check,
         continue_on_error: false,
-        report: Report::Off,
+        report,
         database: planned.database.clone(),
     };
     run::prepare(request, settings, origin)
@@ -537,8 +563,19 @@ mod tests {
                 json!(["test", "reporting"])
             );
         }
-        assert_eq!(tools[0]["inputSchema"]["required"], json!(["sql"]));
-        assert_eq!(tools[2]["inputSchema"].get("required"), None);
+        // With several profiles, a call must name one; with one, it is the default.
+        assert_eq!(
+            tools[0]["inputSchema"]["required"],
+            json!(["sql", "profile"])
+        );
+        assert_eq!(tools[2]["inputSchema"]["required"], json!(["profile"]));
+        let one = definitions(&launch(&["test"]));
+        assert_eq!(one[0]["inputSchema"]["required"], json!(["sql"]));
+        assert_eq!(one[2]["inputSchema"].get("required"), None);
+        assert_eq!(
+            one[0]["inputSchema"]["properties"]["database"]["maxLength"],
+            128
+        );
         let text = instructions(&launch(&["test", "reporting"]));
         assert!(
             text.contains(
@@ -568,6 +605,13 @@ mod tests {
         assert_eq!(planned.profile, 1);
         assert_eq!(planned.max_rows, Some(5));
         assert_eq!(planned.format, Format::Json);
+        // A whole number written as 30.0 is a whole number.
+        let planned = plan(
+            &call(json!({"name": "query", "arguments": {"sql": "x", "timeout": 30.0}})),
+            &one,
+        )
+        .unwrap();
+        assert_eq!(planned.timeout, Some(30));
         for (params, wanted, launch) in [
             (json!({}), "needs a tool name", &one),
             (json!({"name": "drop"}), "Unknown tool: drop", &one),
@@ -614,6 +658,26 @@ mod tests {
             (
                 json!({"name": "query", "arguments": {"sql": "x", "format": "csv"}}),
                 "format must be text or json",
+                &one,
+            ),
+            (
+                json!({"name": "find", "arguments": {"pattern": ""}}),
+                "pattern is empty",
+                &one,
+            ),
+            (
+                json!({"name": "describe", "arguments": {"object": ""}}),
+                "object is empty",
+                &one,
+            ),
+            (
+                json!({"name": "query", "arguments": {"sql": ""}}),
+                "sql is empty",
+                &one,
+            ),
+            (
+                json!({"name": "query", "arguments": {"sql": "x", "max_rows": 2.5}}),
+                "max_rows must be a whole number",
                 &one,
             ),
             (

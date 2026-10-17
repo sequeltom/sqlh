@@ -847,6 +847,7 @@ mod tests {
             max_messages: 0,
             max_output,
             stall_secs: 0,
+            ..Limits::default()
         };
         let mut s = JsonSink::new(Vec::new(), limits);
         s.begin_batch(&BatchInfo {

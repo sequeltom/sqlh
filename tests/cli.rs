@@ -3217,6 +3217,12 @@ mod mcp {
             assert_eq!(r.code, 3, "{args:?}: {}", r.stderr);
             assert_eq!(r.stdout, "", "{args:?}: stdout carries protocol only");
             assert!(r.stderr.contains(wanted), "{args:?}: {}", r.stderr);
+            assert_eq!(
+                r.stderr.trim_end().lines().count(),
+                1,
+                "{args:?}: one line: {}",
+                r.stderr
+            );
         }
         // The subcommand comes first, or it would have run as SQL.
         let r = sqlh_args(&["--profile", "win", "mcp"]);
@@ -3364,6 +3370,140 @@ mod mcp {
         assert_eq!(call["isError"], true);
         assert!(call.get("resultType").is_none());
         assert_eq!(messages.len(), 5, "{messages:?}");
+    }
+
+    /// docs/mcp-mode.md §4: the server is read-only whatever the profile says, substitutes no
+    /// `$(var)` (the environment is the server's, not the caller's), and takes at most 1 MB of
+    /// SQL in a call. Each is refused before anything connects, as a tool error.
+    #[test]
+    fn the_server_stays_read_only_and_reads_no_variables() {
+        let config = scratch("mcp_read_only").join("profiles.toml");
+        fs::write(
+            &config,
+            "[profiles.rw]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+             write_policy = \"allow\"\n",
+        )
+        .unwrap();
+        let call = |id: u32, sql: &str| {
+            let arguments = serde_json::json!({ "sql": sql }).to_string();
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{arguments}}}}}"#
+            )
+        };
+        let big = format!("SELECT 1 -- {}", "x".repeat(1 << 20));
+        let mut input = [
+            call(1, "DELETE FROM dbo.T"),
+            call(2, "DELETE FROM $(SQLH_TEST_LEAK)"),
+            call(3, &big),
+        ]
+        .join("\n");
+        input.push('\n');
+        let r = run_with_stdin(
+            sqlh()
+                .args(["mcp", "--profile", "rw"])
+                .env("SQLH_CONFIG", &config)
+                .env("SQLH_TEST_LEAK", "leak_marker"),
+            input.as_bytes(),
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let messages: Vec<serde_json::Value> = r
+            .stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        let text = |id| {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{result}");
+            result["content"][0]["text"].as_str().unwrap().to_owned()
+        };
+
+        // The profile allows writes; the server doesn't, and says so.
+        let blocked = text(1);
+        assert!(blocked.contains("-- blocked: "), "{blocked}");
+        assert!(blocked.contains("sqlh mcp is read-only"), "{blocked}");
+        assert!(blocked.contains("-- failed (exit 5)"), "{blocked}");
+        assert!(!blocked.contains("--allow-write"), "{blocked}");
+
+        let unsubstituted = text(2);
+        assert!(
+            unsubstituted.contains("-- failed (exit 5)"),
+            "{unsubstituted}"
+        );
+        assert!(!unsubstituted.contains("leak_marker"), "{unsubstituted}");
+
+        let too_big = text(3);
+        assert!(
+            too_big.contains("a call takes at most 1048576"),
+            "{too_big}"
+        );
+        assert!(too_big.contains("-- failed (exit 3)"), "{too_big}");
+    }
+
+    /// docs/mcp-mode.md §3: a cancelled call gets no response (stdio MUST NOT send one), and its
+    /// id stays taken until the call has settled. The server accepts the connection and never
+    /// answers it, so the call is still connecting when the cancel arrives.
+    #[test]
+    fn a_cancelled_call_gets_no_response() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let config = scratch("mcp_cancel").join("profiles.toml");
+        fs::write(
+            &config,
+            format!(
+                "[profiles.slow]\nserver = \"127.0.0.1,{port}\"\nauth = \"windows\"\n\
+                 login_timeout = 2\n"
+            ),
+        )
+        .unwrap();
+        let query = |id: u32| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1"}}}}}}"#
+            )
+        };
+        let started = Instant::now();
+        let (r, messages) = session(
+            &config,
+            &["--profile", "slow", "--verbose"],
+            &[
+                query(1),
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#
+                    .into(),
+                // Reusing the id at once: refused while the first call settles, or, if it
+                // already has, run as a call of its own (which fails at the login timeout).
+                query(1),
+                format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{{META}}}}}"#),
+            ],
+        );
+        drop(silent);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancel ended the call: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            r.stderr.contains("request 1 cancelled")
+                && r.stderr.contains("query on slow: exit 6 (cancelled)"),
+            "{}",
+            r.stderr
+        );
+        // One answer for id 1, from the second call; none for the cancelled one.
+        let ones: Vec<_> = messages.iter().filter(|m| m["id"] == 1).collect();
+        assert_eq!(ones.len(), 1, "{messages:?}");
+        let second = ones[0];
+        assert!(
+            second["error"]["code"] == -32600 || second["result"]["isError"] == true,
+            "{second}"
+        );
+        assert_eq!(
+            by_id(&messages, 2)["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
+        assert_eq!(messages.len(), 2, "{messages:?}");
     }
 }
 

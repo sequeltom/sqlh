@@ -155,7 +155,7 @@ fn parse_mcp(mut p: lexopt::Parser) -> Result<Command, String> {
                 let bytes: u64 = number(p.value(), "--max-output")?;
                 if bytes < MIN_MAX_OUTPUT {
                     return Err(format!(
-                        "--max-output {bytes}: sqlh mcp holds each result in memory, so it \n                         takes at least {MIN_MAX_OUTPUT} bytes"
+                        "--max-output {bytes}: sqlh mcp holds each result in memory, so it takes at least {MIN_MAX_OUTPUT} bytes"
                     ));
                 }
                 o.max_output = Some(bytes);
@@ -175,7 +175,7 @@ fn parse_mcp(mut p: lexopt::Parser) -> Result<Command, String> {
             Long("verbose") => o.verbose = true,
             Long("allow-write") => {
                 return Err(
-                    "sqlh mcp is read-only (owner decision 16): it takes no --allow-write; use \n                     the sqlh command line for writes"
+                    "sqlh mcp is read-only: it takes no --allow-write (writes go through the sqlh command line)"
                         .to_owned(),
                 );
             }

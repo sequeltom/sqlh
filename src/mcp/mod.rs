@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use protocol::{Era, Incoming, ProtocolError};
 use tools::{Launch, Profile};
@@ -45,6 +45,10 @@ const MAX_MESSAGE: usize = 4 << 20;
 /// How many responses may wait for stdout before the server stops reading stdin.
 const MAX_UNWRITTEN: usize = 64;
 
+/// How many calls may run at once; one more is answered at once with a tool error, so stdin
+/// keeps being read (and cancels keep arriving) whatever a client sends.
+const MAX_IN_FLIGHT: usize = 64;
+
 /// How often idle connections are checked against `--idle`.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
@@ -61,8 +65,6 @@ enum Line {
     TooLong,
     /// stdin closed, or failed.
     End,
-    /// stdout failed: the client is gone.
-    StdoutBroken,
 }
 
 /// Runs the server until its input ends. Launch errors go to stderr, exit 3.
@@ -126,8 +128,12 @@ fn resolve(opts: &McpOpts) -> Result<(Vec<(String, config::Settings)>, Launch), 
         let mut settings = config::resolve(&run_opts)?;
         settings.allow_write = false;
         settings.writes_off = Some(crate::guard::WritesOff::Mcp);
+        settings.limits.advice = crate::output::Advice::Mcp;
         // The profile's name as the file has it (`--profile` matches it in any case).
         let profile = config.find(name);
+        // `resolve` drops a profile's read_uncommitted when the profile allows writes (a write
+        // must not rest on a dirty read); here nothing can write, so the profile's choice holds.
+        settings.read_uncommitted = profile.and_then(|p| p.read_uncommitted).unwrap_or(false);
         let name = profile.map_or_else(|| name.clone(), |p| p.name.clone());
         described.push(Profile {
             name: name.clone(),
@@ -154,16 +160,22 @@ struct Server {
     /// waits, so a client that stops reading can't make the server's memory grow.
     unwritten: Arc<AtomicUsize>,
     log: Option<std_mpsc::SyncSender<String>>,
-    /// The calls in flight, by request id (as JSON text), with the cancel that ends each.
-    calls: RefCell<HashMap<String, Cancel>>,
+    /// The calls in flight, by request id (as JSON text), with the cancel that ends each:
+    /// taken out when the call is cancelled, so the id stays taken until the call has settled.
+    calls: RefCell<HashMap<String, Option<Cancel>>>,
+    /// The stdout thread failed: the client is gone, and nothing more is sent.
+    broken: Arc<AtomicBool>,
     /// The legacy version `initialize` agreed, if a legacy client opened.
     agreed: RefCell<Option<&'static str>>,
 }
 
 impl Server {
     fn send(&self, line: String) {
-        // A closed channel means the stdout thread ended: the client is gone, and the
-        // server is ending already.
+        // Once stdout has failed, the client is gone and the server is ending: nothing is
+        // queued for it.
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
         self.unwritten.fetch_add(1, Ordering::Relaxed);
         if self.out.send(line).is_err() {
             self.unwritten.fetch_sub(1, Ordering::Relaxed);
@@ -192,9 +204,15 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let (out, out_rx) = std_mpsc::channel::<String>();
     let unwritten = Arc::new(AtomicUsize::new(0));
     let written = Arc::clone(&unwritten);
+    // stdout's failure reaches the server outside the stdin channel, which may be full and
+    // unread while stdout is behind (the review's orphan-process finding).
+    let broken = Arc::new(AtomicBool::new(false));
+    let gone = Arc::new(Notify::new());
+    let (writer_broken, writer_gone) = (Arc::clone(&broken), Arc::clone(&gone));
+    drop(lines_tx);
     let writer = match thread::Builder::new()
         .name("sqlh-mcp-stdout".into())
-        .spawn(move || write_stdout(&out_rx, &lines_tx, &written))
+        .spawn(move || write_stdout(&out_rx, &written, &writer_broken, &writer_gone))
     {
         Ok(writer) => writer,
         Err(_) => {
@@ -212,6 +230,7 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         unwritten,
         log,
         calls: RefCell::new(HashMap::new()),
+        broken,
         agreed: RefCell::new(None),
     });
     let names: Vec<&str> = server.engine.profiles().collect();
@@ -220,6 +239,9 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     let running = Rc::new(std::cell::Cell::new(0usize));
     let ended_by = loop {
+        if server.broken.load(Ordering::Relaxed) {
+            break "stdout closed";
+        }
         let behind = server.unwritten.load(Ordering::Relaxed) >= MAX_UNWRITTEN;
         tokio::select! {
             line = lines.recv(), if !behind => match line {
@@ -232,8 +254,8 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
                     ),
                 )),
                 Some(Line::End) | None => break "stdin closed",
-                Some(Line::StdoutBroken) => break "stdout closed",
             },
+            () = gone.notified() => break "stdout closed",
             // While stdout is behind, look again soon; stdin waits meanwhile.
             () = tokio::time::sleep(Duration::from_millis(10)), if behind => {}
             _ = sweep.tick() => server.engine.sweep(),
@@ -253,17 +275,38 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         wait_for_calls(&running, END_GRACE).await;
     }
     // What is still running is cancelled; nothing more is sent for it.
-    let cancels: Vec<Cancel> = server.calls.borrow_mut().drain().map(|(_, c)| c).collect();
+    let cancels: Vec<Cancel> = server
+        .calls
+        .borrow_mut()
+        .values_mut()
+        .filter_map(Option::take)
+        .collect();
     for cancel in cancels {
         cancel.cancel();
     }
     wait_for_calls(&running, END_GRACE).await;
     server.engine.close_all().await;
-    // The writer ends once every sender is gone and the last lines are out.
+    // The writer ends once every sender is gone and the last lines are out. It gets as long
+    // as it keeps writing (FLUSH_WAIT with no progress ends the wait), up to END_GRACE.
+    let unwritten = Arc::clone(&server.unwritten);
+    let log = server.log.clone();
     drop(server);
-    let flushed_by = Instant::now() + FLUSH_WAIT;
-    while !writer.is_finished() && Instant::now() < flushed_by {
+    let (deadline, mut stalled_at) = (Instant::now() + END_GRACE, Instant::now() + FLUSH_WAIT);
+    let mut left = unwritten.load(Ordering::Relaxed);
+    while !writer.is_finished() && Instant::now() < deadline && Instant::now() < stalled_at {
         thread::sleep(Duration::from_millis(10));
+        let now = unwritten.load(Ordering::Relaxed);
+        if now < left {
+            left = now;
+            stalled_at = Instant::now() + FLUSH_WAIT;
+        }
+    }
+    let dropped = unwritten.load(Ordering::Relaxed);
+    if dropped > 0
+        && let Some(log) = log
+    {
+        let _ = log.try_send(format!("sqlh mcp: {dropped} responses were never written"));
+        thread::sleep(Duration::from_millis(50));
     }
     Exit::Ok
 }
@@ -303,7 +346,13 @@ fn notification(server: &Server, method: &str, params: &Map<String, Value>) {
     if method == "notifications/cancelled"
         && let Some(id) = params.get("requestId")
     {
-        let cancel = server.calls.borrow_mut().remove(&id.to_string());
+        // Taken out, not removed: the id stays taken until the call has settled, so a call
+        // reusing it is refused rather than left uncancellable.
+        let cancel = server
+            .calls
+            .borrow_mut()
+            .get_mut(&id.to_string())
+            .and_then(Option::take);
         if let Some(cancel) = cancel {
             server.log(format!("sqlh mcp: request {id} cancelled"));
             cancel.cancel();
@@ -408,6 +457,18 @@ fn call(
             return;
         }
     };
+    if running.get() >= MAX_IN_FLIGHT {
+        let text = format!(
+            "-- error: {MAX_IN_FLIGHT} calls are already running; wait for one to finish\n\
+             -- failed (exit 3): too many calls\n"
+        );
+        let result = protocol::object(json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": true,
+        }));
+        server.send(protocol::result_line(&id, era, result));
+        return;
+    }
     let key = id.to_string();
     if server.calls.borrow().contains_key(&key) {
         server.send(protocol::error_line(
@@ -421,7 +482,7 @@ fn call(
     }
     let root = Cancel::new();
     let cancel = root.child();
-    server.calls.borrow_mut().insert(key.clone(), root);
+    server.calls.borrow_mut().insert(key.clone(), Some(root));
     running.set(running.get() + 1);
     let server = Rc::clone(server);
     let running = Rc::clone(running);
@@ -507,8 +568,9 @@ fn read_line(reader: &mut impl BufRead, max: usize) -> io::Result<Option<Option<
 /// and the server is told.
 fn write_stdout(
     lines: &std_mpsc::Receiver<String>,
-    server: &mpsc::Sender<Line>,
     unwritten: &AtomicUsize,
+    broken: &AtomicBool,
+    gone: &Notify,
 ) {
     let stdout = io::stdout();
     for line in lines {
@@ -519,7 +581,9 @@ fn write_stdout(
             .and_then(|()| out.flush());
         unwritten.fetch_sub(1, Ordering::Relaxed);
         if written.is_err() {
-            let _ = server.blocking_send(Line::StdoutBroken);
+            broken.store(true, Ordering::Relaxed);
+            // A permit is kept if the server isn't waiting yet.
+            gone.notify_one();
             return;
         }
     }
