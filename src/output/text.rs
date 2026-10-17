@@ -96,9 +96,10 @@ impl<W: Write> TextSink<W> {
         let read = lines.len();
         // The read stopped inside a line: the last line read is only its start.
         let partial = more.is_some() && !body.is_empty() && !body.ends_with('\n');
+        let advice = self.tally.limits().advice;
         let read_cut = more.map(|_| match self.tally.limits().max_cell {
-            0 => "--max-output".to_owned(),
-            cell => format!("--max-cell {cell}"),
+            0 => advice.max_output().to_owned(),
+            cell => format!("{} {cell}", advice.max_cell()),
         });
         let header = |shown: usize| {
             let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -117,7 +118,7 @@ impl<W: Write> TextSink<W> {
             }
             let mut why = Vec::new();
             let rest = if shown < read {
-                why.push("--max-output");
+                why.push(advice.max_output());
                 let left = read - shown;
                 let at_least = if more.is_some() { "≥" } else { "" };
                 format!("{at_least}{left} more line{}", plural(left))

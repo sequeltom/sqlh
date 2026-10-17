@@ -3299,14 +3299,17 @@ mod mcp {
             by_id(&messages, 4)["error"]["message"],
             "Unknown tool: drop"
         );
-        let missing = &by_id(&messages, 5)["error"];
-        assert_eq!(missing["code"], -32602);
+        // An unknown tool is a protocol error; arguments the tool can't take are a tool error
+        // the model can read and correct (the spec's Error Handling).
+        let missing = &by_id(&messages, 5)["result"];
+        assert_eq!(missing["isError"], true, "{missing}");
+        let text = missing["content"][0]["text"].as_str().unwrap();
         assert!(
-            missing["message"]
-                .as_str()
-                .unwrap()
-                .contains("missing required property profile: one of win, other"),
-            "{missing}"
+            text.starts_with(
+                "-- error: invalid arguments for query: missing required property profile: one \
+                 of win, other\n-- failed (exit 3): usage error, "
+            ),
+            "{text}"
         );
         assert_eq!(by_id(&messages, 6)["error"]["code"], -32022);
         assert_eq!(
@@ -3352,6 +3355,7 @@ mod mcp {
                 r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.into(),
                 r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#.into(),
                 r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tables","arguments":{"pattern":"Ord*"}}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{"notifications":{}}}"#.into(),
             ],
         );
         assert_eq!(r.code, 0, "{}", r.stderr);
@@ -3369,7 +3373,9 @@ mod mcp {
         let call = &by_id(&messages, 4)["result"];
         assert_eq!(call["isError"], true);
         assert!(call.get("resultType").is_none());
-        assert_eq!(messages.len(), 5, "{messages:?}");
+        // A 2026-07-28 method: a legacy session doesn't have it.
+        assert_eq!(by_id(&messages, 5)["error"]["code"], -32601);
+        assert_eq!(messages.len(), 6, "{messages:?}");
     }
 
     /// docs/mcp-mode.md §4: the server is read-only whatever the profile says, substitutes no
@@ -3440,7 +3446,168 @@ mod mcp {
         assert!(too_big.contains("-- failed (exit 3)"), "{too_big}");
     }
 
-    /// docs/mcp-mode.md §3: a cancelled call gets no response (stdio MUST NOT send one), and its
+    /// docs/mcp-mode.md §2: `subscriptions/listen` is acknowledged with none of what it asks
+    /// for (the tool list never changes), holds its id while open, ends without a word when the
+    /// client cancels it, and is answered when the server ends (Graceful Closure).
+    #[test]
+    fn a_subscription_is_acknowledged_and_answered_at_the_end() {
+        let config = profiles("mcp_listen");
+        let listen = |id: u32| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"subscriptions/listen","params":{{{META},"notifications":{{"toolsListChanged":true}}}}}}"#
+            )
+        };
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win"],
+            &[
+                listen(20),
+                listen(21),
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":21}}"#
+                    .into(),
+                listen(20),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{{META},"name":"databases","arguments":{{}}}}}}"#
+                ),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":22,"method":"subscriptions/listen","params":{{{META},"notifications":[]}}}}"#
+                ),
+                r#"{"jsonrpc":"2.0","id":23,"method":"subscriptions/listen","params":{"protocolVersion":"x"}}"#
+                    .into(),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let acks: Vec<_> = messages
+            .iter()
+            .filter(|m| m["method"] == "notifications/subscriptions/acknowledged")
+            .collect();
+        assert_eq!(acks.len(), 2, "{messages:?}");
+        for (ack, id) in acks.iter().zip([20, 21]) {
+            assert_eq!(
+                ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                id
+            );
+            assert_eq!(ack["params"]["notifications"], serde_json::json!({}));
+            assert!(ack.get("id").is_none());
+        }
+        // While 20 is open its id is taken, by another subscription or a call.
+        let taken: Vec<_> = messages
+            .iter()
+            .filter(|m| m["id"] == 20 && m.get("error").is_some())
+            .collect();
+        assert_eq!(taken.len(), 2, "{messages:?}");
+        for error in taken {
+            assert_eq!(error["error"]["code"], -32600);
+            assert_eq!(
+                error["error"]["message"],
+                "Invalid request: a subscription with this id is still open"
+            );
+        }
+        assert_eq!(by_id(&messages, 22)["error"]["code"], -32602);
+        // No _meta and no initialize: refused before anything else is looked at.
+        assert_eq!(by_id(&messages, 23)["error"]["code"], -32602);
+        // At the end, 20 is answered; 21, cancelled, never is.
+        let end = messages
+            .iter()
+            .find(|m| m["id"] == 20 && m.get("result").is_some())
+            .unwrap_or_else(|| panic!("20 not answered: {messages:?}"));
+        assert_eq!(end["result"]["resultType"], "complete");
+        assert_eq!(
+            end["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            20
+        );
+        assert!(!messages.iter().any(|m| m["id"] == 21), "{messages:?}");
+        assert_eq!(messages.len(), 7, "{messages:?}");
+    }
+
+    /// docs/mcp-mode.md §2: a client that goes away (its end of stdout closed) ends the server,
+    /// though stdin stays open and requests keep coming, with more of them than may wait
+    /// unwritten. Before the fix a full queue left the process running for good.
+    #[test]
+    fn a_gone_client_ends_the_server_with_stdin_still_open() {
+        let config = profiles("mcp_gone");
+        let mut child = sqlh()
+            .args(["mcp", "--profile", "win", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped())
+            .stdout(closed())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sqlh starts");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let (done, keep_open) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let ping = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{{META}}}}}"#);
+            for _ in 0..500 {
+                if writeln!(stdin, "{ping}").is_err() {
+                    break;
+                }
+            }
+            // stdin stays open until the test is done, so only stdout can end the server.
+            let _ = keep_open.recv();
+        });
+        let status = wait_within(&mut child, Duration::from_secs(15), "a gone client");
+        drop(done);
+        writer.join().unwrap();
+        assert_eq!(status.code(), Some(0));
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            stderr.contains("sqlh mcp: ending (stdout closed)"),
+            "{stderr}"
+        );
+    }
+
+    /// docs/mcp-mode.md §2: at most 64 calls run at once; one more is a tool error at once,
+    /// and the 64 still finish and answer.
+    #[test]
+    fn calls_past_the_in_flight_limit_are_refused_at_once() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let config = scratch("mcp_in_flight").join("profiles.toml");
+        fs::write(
+            &config,
+            format!(
+                "[profiles.slow]\nserver = \"127.0.0.1,{port}\"\nauth = \"windows\"\n\
+                 login_timeout = 1\nquery_timeout = 1\n"
+            ),
+        )
+        .unwrap();
+        let lines: Vec<String> = (1..=65)
+            .map(|id| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1"}}}}}}"#
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "slow"], &lines);
+        drop(silent);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert_eq!(messages.len(), 65, "{messages:?}");
+        let refused = &by_id(&messages, 65)["result"];
+        assert_eq!(refused["isError"], true);
+        assert_eq!(
+            refused["content"][0]["text"],
+            "-- error: 64 calls are already running; wait for one to finish\n\
+             -- failed (exit 3): too many calls\n"
+        );
+        // Answered first, while the others still wait on the silent server.
+        assert_eq!(messages[0]["id"], 65, "{:?}", messages[0]);
+        for id in 1..=64 {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(!text.contains("calls are already running"), "{id}: {text}");
+        }
+    }
+
+    /// docs/mcp-mode.md §2: a cancelled call gets no response (stdio MUST NOT send one), and its
     /// id stays taken until the call has settled. The server accepts the connection and never
     /// answers it, so the call is still connecting when the cancel arrives.
     #[test]
@@ -7239,6 +7406,98 @@ mod live {
         assert!(
             !denied.stdout.contains(&reader.password) && !denied.stderr.contains(&reader.password),
             "the password never appears in the output"
+        );
+    }
+
+    // docs/mcp-mode.md §5, through sqlh mcp and the test server: calls on one profile share a
+    // connection (--pool 1, so they queue and run in order), and nothing one call sets reaches
+    // the next. The isolation level is the case the reset doesn't cover (the self-review's
+    // P1): a call that sets SERIALIZABLE is followed, on the same session, by READ COMMITTED.
+    // A call's database lasts for that call only; info carries its connection note.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn mcp_calls_share_a_connection_and_nothing_else() {
+        let (p, db) = target();
+        const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+        let state = "SELECT @@SPID AS spid, transaction_isolation_level AS level, DB_NAME() AS db \
+                     FROM sys.dm_exec_sessions WHERE session_id = @@SPID";
+        let call = |id: u32, tool: &str, arguments: serde_json::Value| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"{tool}","arguments":{arguments}}}}}"#
+            )
+        };
+        let lines = [
+            call(
+                1,
+                "query",
+                serde_json::json!({"sql": state, "format": "json"}),
+            ),
+            call(
+                2,
+                "query",
+                serde_json::json!({
+                    "sql": format!("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; {state}"),
+                    "database": db,
+                    "format": "json",
+                }),
+            ),
+            call(
+                3,
+                "query",
+                serde_json::json!({"sql": state, "format": "json"}),
+            ),
+            call(4, "info", serde_json::json!({})),
+        ];
+        let mut input = lines.join("\n");
+        input.push('\n');
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command.args(["mcp", "--profile", &p, "--pool", "1"]);
+        let r = run_with_stdin(&mut command, input.as_bytes());
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let messages: Vec<serde_json::Value> = r
+            .stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let text = |id: i64| {
+            let message = messages
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("no response {id}: {messages:?}"));
+            assert_eq!(message["result"]["isError"], false, "{message}");
+            message["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let row = |id: i64| {
+            let document: serde_json::Value = serde_json::from_str(text(id).trim_end()).unwrap();
+            document["batches"][0]["events"]
+                .as_array()
+                .and_then(|events| events.iter().find(|e| e["type"] == "result"))
+                .unwrap_or_else(|| panic!("no result in {document}"))["rows"][0]
+                .clone()
+        };
+        let (before, first, second) = (row(1), row(2), row(3));
+        assert!(
+            before[0] == first[0] && first[0] == second[0],
+            "one session: {before} {first} {second}"
+        );
+        assert_eq!(before[1], 2, "a fresh login reads committed: {before}");
+        assert_eq!(first[1], 4, "the call's own SERIALIZABLE: {first}");
+        assert_eq!(
+            second[1], 2,
+            "READ COMMITTED again on the reused session: {second}"
+        );
+        assert_eq!(first[2], db.as_str(), "the call's database: {first}");
+        assert_eq!(
+            second[2], before[2],
+            "the next call is back in the profile's database: {second}"
+        );
+        let info = text(4);
+        assert!(
+            info.contains(&format!("-- note: profile {p}; connected in 0 ms")),
+            "{info}"
         );
     }
 }

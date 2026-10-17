@@ -9,9 +9,13 @@
 //! - **Concurrency:** calls run concurrently on the current-thread runtime (`LocalSet`), each
 //!   with its own cancel; `notifications/cancelled` cancels one, and nothing more is sent for
 //!   it.
-//! - **The end:** when stdin closes, stdout breaks or a console event arrives, the calls in
-//!   flight are cancelled and given the engine's settle grace, the idle connections are
-//!   closed, and the process exits 0.
+//! - **Subscriptions:** `subscriptions/listen` is acknowledged with none of what it asks
+//!   for (the tool list never changes) and stays open until the client cancels it or the
+//!   server ends, which answers it.
+//! - **The end:** when stdin closes, the calls in flight get `END_GRACE` to finish and answer;
+//!   when stdout breaks or a console event arrives, they get none. What is still running is
+//!   cancelled and given `END_GRACE` to settle, open subscriptions are answered, the idle
+//!   connections are closed, the writer gets its flush wait, and the process exits 0.
 
 mod protocol;
 mod tools;
@@ -129,6 +133,7 @@ fn resolve(opts: &McpOpts) -> Result<(Vec<(String, config::Settings)>, Launch), 
         settings.allow_write = false;
         settings.writes_off = Some(crate::guard::WritesOff::Mcp);
         settings.limits.advice = crate::output::Advice::Mcp;
+        settings.connect.hints = crate::db::Hints::Profile;
         // The profile's name as the file has it (`--profile` matches it in any case).
         let profile = config.find(name);
         // `resolve` drops a profile's read_uncommitted when the profile allows writes (a write
@@ -163,6 +168,9 @@ struct Server {
     /// The calls in flight, by request id (as JSON text), with the cancel that ends each:
     /// taken out when the call is cancelled, so the id stays taken until the call has settled.
     calls: RefCell<HashMap<String, Option<Cancel>>>,
+    /// The open `subscriptions/listen` requests, by id: answered when the server ends, unless
+    /// the client cancelled them first.
+    subscriptions: RefCell<Vec<Value>>,
     /// The stdout thread failed: the client is gone, and nothing more is sent.
     broken: Arc<AtomicBool>,
     /// The legacy version `initialize` agreed, if a legacy client opened.
@@ -230,6 +238,7 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         unwritten,
         log,
         calls: RefCell::new(HashMap::new()),
+        subscriptions: RefCell::new(Vec::new()),
         broken,
         agreed: RefCell::new(None),
     });
@@ -285,6 +294,16 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         cancel.cancel();
     }
     wait_for_calls(&running, END_GRACE).await;
+    // An open subscription ends gracefully: its request is answered (the subscriptions page's
+    // Graceful Closure), so the client can tell this end from a dropped transport.
+    for id in server.subscriptions.borrow_mut().drain(..) {
+        let meta = json!({"_meta": {protocol::META_SUBSCRIPTION: id}});
+        server.send(protocol::result_line(
+            &id,
+            Era::Modern,
+            protocol::object(meta),
+        ));
+    }
     server.engine.close_all().await;
     // The writer ends once every sender is gone and the last lines are out. It gets as long
     // as it keeps writing (FLUSH_WAIT with no progress ends the wait), up to END_GRACE.
@@ -348,6 +367,8 @@ fn notification(server: &Server, method: &str, params: &Map<String, Value>) {
     {
         // Taken out, not removed: the id stays taken until the call has settled, so a call
         // reusing it is refused rather than left uncancellable.
+        // A subscription the client cancels just ends: nothing more is sent for it.
+        server.subscriptions.borrow_mut().retain(|open| open != id);
         let cancel = server
             .calls
             .borrow_mut()
@@ -431,6 +452,7 @@ fn request(
             server.send(protocol::result_line(&id, era, result));
         }
         "tools/call" => call(server, running, id, era, params),
+        "subscriptions/listen" if era == Era::Modern => listen(server, id, params),
         _ => server.send(protocol::error_line(
             Some(&id),
             &ProtocolError::new(
@@ -439,6 +461,42 @@ fn request(
             ),
         )),
     }
+}
+
+/// Whether a request with `id` is still open: a call in flight (until it settles) or a
+/// subscription. A request reusing it is refused, with the error this returns.
+fn in_use(server: &Server, id: &Value) -> Option<ProtocolError> {
+    let why = if server.calls.borrow().contains_key(&id.to_string()) {
+        "Invalid request: a call with this id is still running"
+    } else if server.subscriptions.borrow().contains(id) {
+        "Invalid request: a subscription with this id is still open"
+    } else {
+        return None;
+    };
+    Some(ProtocolError::new(protocol::INVALID_REQUEST, why))
+}
+
+/// `subscriptions/listen` (2026-07-28, the subscriptions page): acknowledged at once with the
+/// subset the server honors, which is none (the tool list never changes, and sqlh has no
+/// prompts or resources), then held open until the client cancels it or the server ends.
+fn listen(server: &Server, id: Value, params: &Map<String, Value>) {
+    if !matches!(params.get("notifications"), None | Some(Value::Object(_))) {
+        server.send(protocol::error_line(
+            Some(&id),
+            &ProtocolError::invalid_params("Invalid params: notifications must be an object"),
+        ));
+        return;
+    }
+    if let Some(error) = in_use(server, &id) {
+        server.send(protocol::error_line(Some(&id), &error));
+        return;
+    }
+    let ack = json!({"_meta": {protocol::META_SUBSCRIPTION: id}, "notifications": {}});
+    server.send(protocol::notification_line(
+        "notifications/subscriptions/acknowledged",
+        protocol::object(ack),
+    ));
+    server.subscriptions.borrow_mut().push(id);
 }
 
 /// Starts a tool call on the runtime; its response goes out when it ends, unless it was
@@ -452,8 +510,16 @@ fn call(
 ) {
     let planned = match tools::plan(params, &server.launch) {
         Ok(planned) => planned,
-        Err(error) => {
+        Err(tools::Refused::Protocol(error)) => {
             server.send(protocol::error_line(Some(&id), &error));
+            return;
+        }
+        Err(tools::Refused::Arguments { message, format }) => {
+            let result = protocol::object(json!({
+                "content": [{"type": "text", "text": tools::refusal(message, format)}],
+                "isError": true,
+            }));
+            server.send(protocol::result_line(&id, era, result));
             return;
         }
     };
@@ -470,14 +536,8 @@ fn call(
         return;
     }
     let key = id.to_string();
-    if server.calls.borrow().contains_key(&key) {
-        server.send(protocol::error_line(
-            Some(&id),
-            &ProtocolError::new(
-                protocol::INVALID_REQUEST,
-                "Invalid request: a call with this id is still running",
-            ),
-        ));
+    if let Some(error) = in_use(server, &id) {
+        server.send(protocol::error_line(Some(&id), &error));
         return;
     }
     let root = Cancel::new();

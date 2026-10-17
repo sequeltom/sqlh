@@ -16,6 +16,7 @@ pub(crate) const LEGACY: &[&str] = &["2025-11-25", "2025-06-18"];
 pub(crate) const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub(crate) const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 pub(crate) const META_SERVER: &str = "io.modelcontextprotocol/serverInfo";
+pub(crate) const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 
 pub(crate) const PARSE_ERROR: i64 = -32700;
 pub(crate) const INVALID_REQUEST: i64 = -32600;
@@ -218,6 +219,11 @@ pub(crate) fn result_line(id: &Value, era: Era, mut result: Map<String, Value>) 
         }
     }
     json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+}
+
+/// A notification line (a message with no id, which gets no answer).
+pub(crate) fn notification_line(method: &str, params: Map<String, Value>) -> String {
+    json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
 }
 
 /// An error line, for request `id` when it is known (the MCP schema leaves `id` out when it

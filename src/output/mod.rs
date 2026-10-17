@@ -72,6 +72,40 @@ pub enum Advice {
     Mcp,
 }
 
+impl Advice {
+    /// The row limit as a result names it: the flag, or in `sqlh mcp` the call's argument.
+    pub fn max_rows(self) -> &'static str {
+        match self {
+            Advice::Cli => "--max-rows",
+            Advice::Mcp => "max_rows",
+        }
+    }
+
+    /// The value limit, as `max_rows` names the row limit.
+    pub fn max_cell(self) -> &'static str {
+        match self {
+            Advice::Cli => "--max-cell",
+            Advice::Mcp => "max_cell",
+        }
+    }
+
+    /// The output limit: in `sqlh mcp` a launch flag, which a call can't change.
+    pub fn max_output(self) -> &'static str {
+        match self {
+            Advice::Cli => "--max-output",
+            Advice::Mcp => "the server's --max-output",
+        }
+    }
+
+    /// The result-set limit, `n`: in `sqlh mcp` it is fixed.
+    pub fn max_results(self, n: usize) -> String {
+        match self {
+            Advice::Cli => format!("--max-results {n}"),
+            Advice::Mcp => format!("at most {n} per call"),
+        }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Limits {
@@ -1013,10 +1047,11 @@ impl Tally {
         let total = self.rows_total();
         let mut footer = if self.stopped || (incomplete && self.rows_shown != total) {
             // A lower bound: `≥`, and what ended the count after the limit that hid the rows.
+            let advice = self.limits.advice;
             let limit = if self.cut {
-                "--max-output".to_owned()
+                advice.max_output().to_owned()
             } else {
-                format!("--max-rows {}", self.limits.max_rows)
+                format!("{} {}", advice.max_rows(), self.limits.max_rows)
             };
             let why = match (self.stopped, incomplete) {
                 (true, true) => "counting stopped; interrupted",
@@ -1034,19 +1069,27 @@ impl Tally {
             let s = if total == 1 { "" } else { "s" };
             format!("{total} row{s}")
         } else if self.cut {
-            format!("{} of {total} rows shown (--max-output)", self.rows_shown)
+            format!(
+                "{} of {total} rows shown ({})",
+                self.rows_shown,
+                self.limits.advice.max_output()
+            )
         } else {
             format!(
-                "{} of {total} rows shown (--max-rows {})",
-                self.rows_shown, self.limits.max_rows
+                "{} of {total} rows shown ({} {})",
+                self.rows_shown,
+                self.limits.advice.max_rows(),
+                self.limits.max_rows
             )
         };
         if self.cells_cut > 0 {
             let s = if self.cells_cut == 1 { "" } else { "s" };
             let _ = write!(
                 footer,
-                "; {} value{s} cut (--max-cell {})",
-                self.cells_cut, self.limits.max_cell
+                "; {} value{s} cut ({} {})",
+                self.cells_cut,
+                self.limits.advice.max_cell(),
+                self.limits.max_cell
             );
         }
         footer
@@ -1058,8 +1101,9 @@ impl Tally {
         let max_results = self.limits.max_results;
         if max_results > 0 && self.results_seen > max_results {
             notes.push(format!(
-                "{} more result sets not shown (--max-results {max_results})",
-                self.results_seen - max_results
+                "{} more result sets not shown ({})",
+                self.results_seen - max_results,
+                self.limits.advice.max_results(max_results)
             ));
         }
         let max_messages = self.limits.max_messages;
@@ -1110,7 +1154,8 @@ impl Tally {
             }))
             .collect();
             let mut note = format!(
-                "output stopped at the --max-output limit of {} bytes; the run continued",
+                "output stopped at the {} limit of {} bytes; the run continued",
+                self.limits.advice.max_output(),
                 self.limits.max_output
             );
             if !counts.is_empty() {

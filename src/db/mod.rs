@@ -59,6 +59,27 @@ pub struct ConnectOptions {
     pub login_timeout: u32,
     pub read_only_intent: bool,
     pub multi_subnet_failover: bool,
+    /// What a failed connect's hint names: the command line's flags, or the profile's keys.
+    pub hints: Hints,
+}
+
+/// What a failed connect's hint tells its reader to change (`connect_error`): the command
+/// line's flags (`-C`, `-l`), or, in `sqlh mcp`, which connects only through profiles, the
+/// profile's keys (`trust_server_certificate`, `login_timeout`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Hints {
+    #[default]
+    Flags,
+    Profile,
+}
+
+impl Hints {
+    fn pick(self, flags: &'static str, profile: &'static str) -> &'static str {
+        match self {
+            Hints::Flags => flags,
+            Hints::Profile => profile,
+        }
+    }
 }
 
 pub struct Column {
@@ -1435,6 +1456,7 @@ fn tcp_form(unc: &str) -> String {
 }
 
 fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
+    let hints = options.hints;
     let auth = match &options.auth {
         Auth::Integrated => "Windows auth".to_owned(),
         Auth::Sql { user, .. } => format!("SQL login '{user}'"),
@@ -1449,8 +1471,9 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
         TdsError::TimeoutError(_) => {
             return DbError::Timeout(format!(
                 "login timeout: {target} didn't complete the login within {} s; check that it \
-                 is a reachable SQL Server and not overloaded, or raise -l",
-                options.login_timeout.saturating_add(1)
+                 is a reachable SQL Server and not overloaded, or raise {}",
+                options.login_timeout.saturating_add(1),
+                hints.pick("-l", "the profile's login_timeout")
             ));
         }
         TdsError::OperationCancelledError(_) => {
@@ -1459,13 +1482,21 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
         TdsError::SqlServerError { diagnostics } => {
             let detail = sql_errors(&diagnostics.errors);
             let hint = match diagnostics.errors.first().map(|e| e.number) {
-                Some(18456) => {
-                    "check the login and password (SQLCMDPASSWORD), and that the login may use this database"
-                }
-                Some(4060) => "the database may not exist or the login may lack access; check -d",
-                Some(18452) => {
-                    "the server rejected Windows auth for this login; use -U with a SQL login"
-                }
+                Some(18456) => hints.pick(
+                    "check the login and password (SQLCMDPASSWORD), and that the login may use this database",
+                    "check the profile's login and its saved password (sqlh profile add), and that \
+                     the login may use this database",
+                ),
+                Some(4060) => hints.pick(
+                    "the database may not exist or the login may lack access; check -d",
+                    "the database may not exist or the login may lack access; check the call's \
+                     database, or the profile's",
+                ),
+                Some(18452) => hints.pick(
+                    "the server rejected Windows auth for this login; use -U with a SQL login",
+                    "the server rejected Windows auth for this login; use a profile with a SQL \
+                     login (auth = \"sql\")",
+                ),
                 _ => "",
             };
             (detail, hint)
@@ -1474,15 +1505,26 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
         | TdsError::TlsHandshakeError { .. }
         | TdsError::NoServerCertificate => (
             error.to_string(),
-            "if the server uses a self-signed certificate, pass -C to trust it; old servers without TLS 1.2 may need -No",
+            hints.pick(
+                "if the server uses a self-signed certificate, pass -C to trust it; old servers without TLS 1.2 may need -No",
+                "if the server uses a self-signed certificate, set trust_server_certificate = true \
+                 in the profile; old servers without TLS 1.2 may need encrypt = \"optional\"",
+            ),
         ),
         TdsError::CertificateExpired | TdsError::CertificateMismatch => (
             error.to_string(),
-            "pass -C to trust the server certificate anyway",
+            hints.pick(
+                "pass -C to trust the server certificate anyway",
+                "set trust_server_certificate = true in the profile to trust the server \
+                 certificate anyway",
+            ),
         ),
         TdsError::Security(_) => (
             error.to_string(),
-            "Windows auth failed; check Kerberos/SPN setup, or use -U with a SQL login",
+            hints.pick(
+                "Windows auth failed; check Kerberos/SPN setup, or use -U with a SQL login",
+                "Windows auth failed; check Kerberos/SPN setup, or use a profile with a SQL login",
+            ),
         ),
         TdsError::Io(_) | TdsError::ConnectionError(_) | TdsError::ConnectionClosed(_) => (
             error.to_string(),
@@ -1492,7 +1534,7 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     // The direct Schannel path reports TLS failures as generic errors carrying SSPI status
     // names, so match the text too.
-    let hint = tls_hint(&detail).unwrap_or(hint);
+    let hint = tls_hint(&detail, hints).unwrap_or(hint);
     let mut message = format!("cannot connect to {target}: {detail}");
     if !hint.is_empty() {
         message.push_str("; ");
@@ -1501,29 +1543,39 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     DbError::Connect(message)
 }
 
-fn tls_hint(detail: &str) -> Option<&'static str> {
+fn tls_hint(detail: &str, hints: Hints) -> Option<&'static str> {
     let has = |needles: &[&str]| needles.iter().any(|n| detail.contains(n));
     if has(&[
         "SEC_E_UNTRUSTED_ROOT",
         "CERT_E_UNTRUSTEDROOT",
         "CERT_E_CHAINING",
     ]) {
-        Some(
+        Some(hints.pick(
             "this machine doesn't trust the server's certificate (typical for a self-signed one): \
              pass -C, or save it in the profile with: sqlh profile add NAME -C",
-        )
+            "this machine doesn't trust the server's certificate (typical for a self-signed one): \
+             set trust_server_certificate = true in the profile",
+        ))
     } else if has(&["SEC_E_WRONG_PRINCIPAL", "CERT_E_CN_NO_MATCH"]) {
-        Some(
+        Some(hints.pick(
             "the server's certificate names a different host: connect by the name on the \
              certificate, or pass -C",
-        )
+            "the server's certificate names a different host: connect by the name on the \
+             certificate, or set trust_server_certificate = true in the profile",
+        ))
     } else if has(&["SEC_E_CERT_EXPIRED", "CERT_E_EXPIRED"]) {
-        Some("the server's certificate has expired: pass -C to trust it anyway")
+        Some(hints.pick(
+            "the server's certificate has expired: pass -C to trust it anyway",
+            "the server's certificate has expired: set trust_server_certificate = true in the \
+             profile to trust it anyway",
+        ))
     } else if has(&["Schannel", "SEC_E_", "TLS"]) {
-        Some(
+        Some(hints.pick(
             "the TLS handshake failed: a self-signed certificate needs -C; an old server without \
              TLS 1.2 may need -No",
-        )
+            "the TLS handshake failed: a self-signed certificate needs trust_server_certificate = \
+             true in the profile; an old server without TLS 1.2 may need encrypt = \"optional\"",
+        ))
     } else {
         None
     }
@@ -1532,9 +1584,9 @@ fn tls_hint(detail: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, PACE_TICKS,
-        TdsError, check, classify, data_source, filled, split_protocol, tcp_form, tls_hint,
-        wait_for_output,
+        Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
+        PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
+        split_protocol, tcp_form, tls_hint, wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
@@ -2004,14 +2056,60 @@ mod tests {
     fn tls_hints_from_schannel_status() {
         let untrusted = "Unexpected Implementation Error: Schannel TLS handshake failed: \
                          InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)";
-        assert!(tls_hint(untrusted).unwrap().contains("pass -C"));
+        let flags = |detail| tls_hint(detail, Hints::Flags);
+        assert!(flags(untrusted).unwrap().contains("pass -C"));
         assert!(
-            tls_hint("SEC_E_WRONG_PRINCIPAL")
+            flags("SEC_E_WRONG_PRINCIPAL")
                 .unwrap()
                 .contains("different host")
         );
-        assert!(tls_hint("SEC_E_ILLEGAL_MESSAGE").unwrap().contains("-No"));
-        assert_eq!(tls_hint("Connection refused"), None);
+        assert!(flags("SEC_E_ILLEGAL_MESSAGE").unwrap().contains("-No"));
+        assert_eq!(flags("Connection refused"), None);
+        // sqlh mcp connects only through profiles: its hints name the profile's keys, no flag.
+        for detail in [
+            untrusted,
+            "SEC_E_WRONG_PRINCIPAL",
+            "SEC_E_CERT_EXPIRED",
+            "SEC_E_ILLEGAL_MESSAGE",
+        ] {
+            let hint = tls_hint(detail, Hints::Profile).unwrap();
+            assert!(
+                hint.contains("trust_server_certificate = true") && !hint.contains(" -"),
+                "{hint}"
+            );
+        }
+        assert!(
+            tls_hint("SEC_E_ILLEGAL_MESSAGE", Hints::Profile)
+                .unwrap()
+                .contains("encrypt = \"optional\"")
+        );
+    }
+
+    // The hints of a failed connect, in sqlh mcp, name no command-line flag (`Hints`).
+    #[test]
+    fn connect_hints_in_mcp_name_the_profile() {
+        let mut options = fake_server::options("db01".into());
+        options.hints = Hints::Profile;
+        let words = |error: TdsError| match connect_error(error, &options) {
+            DbError::Connect(words) | DbError::Timeout(words) => words,
+            other => panic!("{other:?}"),
+        };
+        let timeout = words(TdsError::TimeoutError(
+            mssql_tds::error::TimeoutErrorType::String("x".into()),
+        ));
+        assert!(
+            timeout.ends_with("or raise the profile's login_timeout"),
+            "{timeout}"
+        );
+        for hint in [
+            words(TdsError::CertificateExpired),
+            words(TdsError::Security(
+                mssql_tds::security::SecurityError::LoadLibraryFailed("x".into()),
+            )),
+            words(TdsError::NoServerCertificate),
+        ] {
+            assert!(!hint.contains(" -C") && !hint.contains(" -U"), "{hint}");
+        }
     }
 }
 
@@ -2753,6 +2851,7 @@ pub(crate) mod fake_server {
             login_timeout: 5,
             read_only_intent: false,
             multi_subnet_failover: false,
+            hints: super::Hints::Flags,
         }
     }
 

@@ -119,7 +119,15 @@ fn wrapper_lost_unreported(
 const AGENT_DEFAULTS: &str = "SET DEADLOCK_PRIORITY LOW;";
 
 /// Said once, as a note, in a run whose reads were uncommitted (DESIGN.md §4.3).
-const READ_UNCOMMITTED_NOTE: &str = "reads were uncommitted (--read-uncommitted): rows may include uncommitted, duplicated or missing data";
+fn read_uncommitted_note(advice: output::Advice) -> String {
+    let asked = match advice {
+        output::Advice::Cli => "--read-uncommitted",
+        output::Advice::Mcp => "the profile's read_uncommitted = true",
+    };
+    format!(
+        "reads were uncommitted ({asked}): rows may include uncommitted, duplicated or missing data"
+    )
+}
 
 /// The batch sent first on every connection: the SSMS options, the agent defaults, the lock
 /// timeout, the isolation level, and last the wrapper transaction of a read-only run. The
@@ -878,7 +886,8 @@ pub(crate) async fn run_opened(
     let read_uncommitted = settings.read_uncommitted && !policy.check;
     if read_uncommitted {
         // Said once, up front, where an output cut short by --max-output still has it.
-        out.note(READ_UNCOMMITTED_NOTE).map_err(output_failure)?;
+        out.note(&read_uncommitted_note(settings.limits.advice))
+            .map_err(output_failure)?;
     }
     if report {
         let profile = settings.profile.as_deref().unwrap_or("(none)");
@@ -995,10 +1004,14 @@ pub(crate) async fn run_opened(
     }
 
     if policy.check {
-        out.note(
-            "--check compiled each batch without running it. Missing tables are only reported \
-             when a query runs (SQL Server defers their name resolution)",
-        )
+        let checker = match settings.limits.advice {
+            output::Advice::Cli => "--check",
+            output::Advice::Mcp => "check",
+        };
+        out.note(&format!(
+            "{checker} compiled each batch without running it. Missing tables are only reported \
+             when a query runs (SQL Server defers their name resolution)"
+        ))
         .map_err(output_failure)?;
         let _ = session
             .exec_internal("SET NOEXEC OFF;", timeout, cancel)
@@ -1391,6 +1404,7 @@ mod tests {
                 login_timeout: 1,
                 read_only_intent: false,
                 multi_subnet_failover: false,
+                hints: db::Hints::Flags,
             },
             limits: output::Limits::default(),
             query_timeout: 60,

@@ -618,6 +618,7 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
             login_timeout: opts.login_timeout.or(p.login_timeout).unwrap_or(15),
             read_only_intent: opts.read_only_intent,
             multi_subnet_failover: opts.multi_subnet_failover,
+            hints: crate::db::Hints::Flags,
         },
         limits: Limits {
             max_rows: opts.max_rows.or(p.max_rows).unwrap_or(defaults.max_rows),
