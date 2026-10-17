@@ -34,7 +34,6 @@ impl<W: Write> TextSink<W> {
         Self::with_meta(out, Box::new(io::sink()), limits)
     }
 
-    #[allow(dead_code)] // until sqlh mcp (Phase 5.3) uses it
     /// The writer back, once the output is finished: an MCP call's text, in memory.
     pub fn into_inner(self) -> W {
         self.out

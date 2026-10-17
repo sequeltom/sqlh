@@ -124,11 +124,6 @@ impl Engine {
         self.pools.iter().map(|pool| pool.name.as_str())
     }
 
-    /// The index of the profile called `name`, if the engine serves it.
-    pub(crate) fn profile(&self, name: &str) -> Option<usize> {
-        self.pools.iter().position(|pool| pool.name == name)
-    }
-
     /// A profile's settings.
     pub(crate) fn settings(&self, profile: usize) -> &Settings {
         &self.pools[profile].settings
@@ -136,6 +131,7 @@ impl Engine {
 
     /// How many connections a profile's pool holds idle now.
     #[cfg(test)]
+    #[allow(dead_code)] // for the engine's tests
     pub(crate) fn idle_count(&self, profile: usize) -> usize {
         self.pools[profile].idle.borrow().len()
     }
@@ -363,7 +359,7 @@ async fn wait_for_connection<'p>(
             format!(
                 "query timeout after {timeout} s waiting for a free connection (all {} of the \
                  profile's connections were busy); raise -t, or --pool for more connections",
-                pool.permits.available_permits().max(1)
+                pool.max
             ),
         )),
     }

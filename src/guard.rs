@@ -50,23 +50,40 @@ impl Blocked {
         }
     }
 
-    /// The advice to print. Under a profile whose `write_policy` is `deny` (`denied_by`, the
-    /// profile's name), `--allow-write` is a usage error, so the advice never offers it: it
-    /// says that the profile doesn't allow writes, after what can be done instead (PLAN.md
-    /// 2.16, from agent trial 2).
-    pub fn advice_for(&self, denied_by: Option<&str>) -> String {
-        match denied_by {
-            Some(profile) if self.lifted_by_write => match &self.instead {
-                Some(instead) => format!(
-                    "{instead}; profile {profile} doesn't allow writes (write_policy = \"deny\")"
-                ),
-                None => {
-                    format!("Profile {profile} doesn't allow writes (write_policy = \"deny\")")
-                }
-            },
-            _ => self.advice.clone(),
+    /// The advice to print. Where writes are off for good (`off`), `--allow-write` can't help,
+    /// so the advice never offers it: it says why writes are off, after what can be done
+    /// instead. Under a profile whose `write_policy` is `deny`, `--allow-write` is a usage error
+    /// (PLAN.md 2.16, from agent trial 2); `sqlh mcp` is read-only (owner decision 16).
+    pub fn advice_for(&self, off: Option<&WritesOff>) -> String {
+        // The reason, as a clause after what to try instead, and as a sentence on its own (the
+        // program's name keeps its lower case).
+        let (clause, sentence) = match off {
+            Some(_) if !self.lifted_by_write => return self.advice.clone(),
+            Some(WritesOff::Profile(profile)) => (
+                format!("profile {profile} doesn't allow writes (write_policy = \"deny\")"),
+                format!("Profile {profile} doesn't allow writes (write_policy = \"deny\")"),
+            ),
+            Some(WritesOff::Mcp) => (
+                "sqlh mcp is read-only".into(),
+                "sqlh mcp is read-only".into(),
+            ),
+            None => return self.advice.clone(),
+        };
+        match &self.instead {
+            Some(instead) => format!("{instead}; {clause}"),
+            None => sentence,
         }
     }
+}
+
+/// Why writes are off for a run, so that a refusal doesn't offer `--allow-write`
+/// (`Blocked::advice_for`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritesOff {
+    /// The profile's `write_policy` is `deny` (its name).
+    Profile(String),
+    /// `sqlh mcp`, which only reads.
+    Mcp,
 }
 
 /// Advice for the refusals that `--allow-write` resolves.
@@ -1419,14 +1436,22 @@ mod tests {
             ),
         ] {
             let b = blocked(sql);
-            assert_eq!(b.advice_for(Some("p")), expected, "{sql}");
-            assert!(!b.advice_for(Some("p")).contains("--allow-write"), "{sql}");
+            assert_eq!(
+                b.advice_for(Some(&WritesOff::Profile("p".into()))),
+                expected,
+                "{sql}"
+            );
+            assert!(
+                !b.advice_for(Some(&WritesOff::Profile("p".into())))
+                    .contains("--allow-write"),
+                "{sql}"
+            );
             assert_eq!(b.advice_for(None), b.advice, "{sql}");
         }
         // Too complex to classify: simplify, nothing about writes.
         let b = too_complex(1, "test");
         assert_eq!(
-            b.advice_for(Some("p")),
+            b.advice_for(Some(&WritesOff::Profile("p".into()))),
             format!("Simplify it or split it into smaller batches with GO; {denied}")
         );
         // A refusal --allow-write doesn't lift keeps its own advice.
@@ -1435,7 +1460,20 @@ mod tests {
             compile_only: true,
         };
         let b = check("SET NOEXEC OFF", check_mode).expect_err("refused");
-        assert_eq!(b.advice_for(Some("p")), b.advice);
+        assert_eq!(
+            b.advice_for(Some(&WritesOff::Profile("p".into()))),
+            b.advice
+        );
+        // sqlh mcp is read-only: the same shape, its own reason (owner decision 16).
+        let mcp = Some(&WritesOff::Mcp);
+        assert_eq!(
+            blocked("DELETE FROM dbo.T").advice_for(mcp),
+            "sqlh mcp is read-only"
+        );
+        assert_eq!(
+            blocked("INSERT ##shared VALUES (1)").advice_for(mcp),
+            "Use a #temp table; sqlh mcp is read-only"
+        );
     }
 
     #[test]

@@ -292,6 +292,50 @@ fn create_with(
     }
 }
 
+/// An output held in memory, with no delivery thread: an MCP call's result, which is sent as
+/// one message once the call is over (docs/mcp-mode.md §4). Its size is bounded by the
+/// limits' `max_output`, which `sqlh mcp` never lets be 0. Diagnostics go nowhere: MCP calls
+/// run without `--verbose` lines (`Report::Off`).
+pub enum Collected {
+    Text(text::TextSink<Vec<u8>>),
+    Json(json::JsonSink<Vec<u8>>),
+}
+
+impl Collected {
+    /// An empty output in `format` (text or json; csv has no place in a tool result).
+    pub fn new(format: Format, limits: Limits) -> Collected {
+        match format {
+            Format::Json => Collected::Json(json::JsonSink::with_meta(
+                Vec::new(),
+                Box::new(io::sink()),
+                limits,
+            )),
+            Format::Text | Format::Csv => Collected::Text(text::TextSink::with_meta(
+                Vec::new(),
+                Box::new(io::sink()),
+                limits,
+            )),
+        }
+    }
+
+    pub fn output(&mut self) -> &mut dyn Output {
+        match self {
+            Collected::Text(sink) => sink,
+            Collected::Json(sink) => sink,
+        }
+    }
+
+    /// What was written, once the output is finished. The sinks write UTF-8, so a lossy
+    /// conversion changes nothing.
+    pub fn into_text(self) -> String {
+        let bytes = match self {
+            Collected::Text(sink) => sink.into_inner(),
+            Collected::Json(sink) => sink.into_inner(),
+        };
+        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into())
+    }
+}
+
 /// A run's output: the sink for its format, the thread that delivers what it writes
 /// (`delivery`), and in text and json the diagnostics' own thread (`side`). Derefs to the
 /// sink.

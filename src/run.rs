@@ -308,7 +308,6 @@ impl Closing {
     }
 }
 
-#[allow(dead_code)] // until sqlh mcp (Phase 5.3) uses it
 /// Ends `out` with the outcome's closing lines (the error, the limit notes and the status
 /// line), for an output with no delivery to wait for: an MCP call's, in memory. Returns the
 /// exit code; an output that refused the closing lines out of order is an internal error.
@@ -522,7 +521,7 @@ pub(crate) fn preflight(
     out: &mut dyn Output,
 ) -> Option<Result<Stats, Failure>> {
     if let Some((location, blocked)) = &prepared.blocked {
-        let advice = blocked.advice_for(settings.write_denied_by.as_deref());
+        let advice = blocked.advice_for(settings.writes_off.as_ref());
         if let Err(e) = out.blocked(location, &blocked.reason, &advice) {
             return Some(Err(output_failure(e)));
         }
@@ -1320,7 +1319,7 @@ mod tests {
             limits: output::Limits::default(),
             query_timeout: 60,
             allow_write,
-            write_denied_by: None,
+            writes_off: None,
             lock_timeout: 10,
             read_uncommitted: false,
             exact_count: false,

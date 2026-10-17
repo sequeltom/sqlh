@@ -1186,7 +1186,6 @@ impl Session {
         let _ = self.client.close_connection().await;
     }
 
-    #[allow(dead_code)] // until sqlh mcp (Phase 5.3) calls the engine
     /// Asks the server to reset the session before it processes the next request, as a pool
     /// does (`prepare_reset_connection`, the RESETCONNECTION bit): login defaults restored,
     /// temp tables dropped, an open transaction rolled back, the login's database back

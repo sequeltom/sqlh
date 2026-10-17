@@ -3133,6 +3133,237 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     assert!(config.exists() && !elsewhere.join("sqlh").exists());
 }
 
+// docs/mcp-mode.md §2 and §3 (PLAN.md 5.3), through the real binary with no server: launch
+// errors are exit 3 on stderr with nothing on stdout; a scripted session gets one JSON-RPC
+// message per line, in both eras; a call to a server that isn't there is a tool error (the
+// run's own output, exit 2), never a protocol error; and the server ends when stdin closes.
+mod mcp {
+    use super::*;
+
+    const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+    /// A profiles file with Windows-auth profiles on a closed port, so nothing needs a password.
+    fn profiles(test: &str) -> PathBuf {
+        let config = scratch(test).join("profiles.toml");
+        fs::write(
+            &config,
+            "[profiles.win]\ndescription = \"closed port for tests\"\nserver = \"127.0.0.1,1\"\n\
+             auth = \"windows\"\nlogin_timeout = 1\n\n\
+             [profiles.other]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n",
+        )
+        .unwrap();
+        config
+    }
+
+    /// Runs `sqlh mcp` with `args`, feeds it `lines` and closes stdin; returns the run and the
+    /// messages on stdout, each of which must be one JSON object.
+    fn session(config: &Path, args: &[&str], lines: &[String]) -> (Run, Vec<serde_json::Value>) {
+        let mut input = lines.join("\n");
+        input.push('\n');
+        let r = run_with_stdin(
+            sqlh().arg("mcp").args(args).env("SQLH_CONFIG", config),
+            input.as_bytes(),
+        );
+        let messages = r
+            .stdout
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|e| panic!("not a JSON message ({e}): {line:?}"))
+            })
+            .collect();
+        (r, messages)
+    }
+
+    fn by_id(messages: &[serde_json::Value], id: i64) -> &serde_json::Value {
+        messages
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("no response {id} in {messages:?}"))
+    }
+
+    #[test]
+    fn launch_errors_go_to_stderr_with_exit_3() {
+        let config = profiles("mcp_launch");
+        for (args, wanted) in [
+            (&[][..], "needs at least one --profile"),
+            (&["--profile", "nope"][..], "no profile named \"nope\""),
+            (
+                &["--profile", "win", "--allow-write"][..],
+                "sqlh mcp is read-only",
+            ),
+            (
+                &["--profile", "win", "--profile", "WIN"][..],
+                "listed twice",
+            ),
+            (
+                &["--profile", "win", "--pool", "9"][..],
+                "--pool 9: expected 1 to 8",
+            ),
+            (
+                &["--profile", "win", "--max-output", "0"][..],
+                "takes at least 4096 bytes",
+            ),
+            (
+                &["--profile", "win", "-S", "x"][..],
+                "invalid option '-S' (sqlh mcp takes its connections from its profiles)",
+            ),
+        ] {
+            let r = run(sqlh()
+                .arg("mcp")
+                .args(args)
+                .env("SQLH_CONFIG", &config)
+                .stdin(Stdio::piped()));
+            assert_eq!(r.code, 3, "{args:?}: {}", r.stderr);
+            assert_eq!(r.stdout, "", "{args:?}: stdout carries protocol only");
+            assert!(r.stderr.contains(wanted), "{args:?}: {}", r.stderr);
+        }
+        // The subcommand comes first, or it would have run as SQL.
+        let r = sqlh_args(&["--profile", "win", "mcp"]);
+        assert_eq!(r.code, 3, "{}", r.stdout);
+        assert!(r.stdout.contains("mcp must come first"), "{}", r.stdout);
+    }
+
+    #[test]
+    fn a_modern_session_discovers_lists_and_calls() {
+        let config = profiles("mcp_modern");
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win", "--profile", "other"],
+            &[
+                format!(r#"{{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{{{META}}}}}"#),
+                format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{{META}}}}}"#),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1","profile":"other"}}}}}}"#
+                ),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{{META},"name":"drop","arguments":{{}}}}}}"#
+                ),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1"}}}}}}"#
+                ),
+                r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#.into(),
+                format!(r#"{{"jsonrpc":"2.0","id":8,"method":"resources/list","params":{{{META}}}}}"#),
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#.into(),
+                "not json".into(),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"DELETE FROM dbo.T","profile":"win"}}}}}}"#
+                ),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+
+        let discover = &by_id(&messages, 1)["result"];
+        assert_eq!(discover["resultType"], "complete");
+        assert_eq!(discover["supportedVersions"][0], "2026-07-28");
+        assert_eq!(discover["cacheScope"], "private");
+        assert_eq!(
+            discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "sqlh"
+        );
+        let instructions = discover["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("Profiles: win (closed port for tests); other."),
+            "{instructions}"
+        );
+
+        let tools = by_id(&messages, 2)["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 9);
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["profile"]["enum"],
+            serde_json::json!(["win", "other"])
+        );
+
+        // Nothing listens on the port: the run's own output, exit 2, as a tool error.
+        let call = &by_id(&messages, 3)["result"];
+        assert_eq!(call["isError"], true);
+        let text = call["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("-- error: cannot connect to 127.0.0.1,1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("-- failed (exit 2): connection failed"),
+            "{text}"
+        );
+
+        assert_eq!(by_id(&messages, 4)["error"]["code"], -32602);
+        assert_eq!(
+            by_id(&messages, 4)["error"]["message"],
+            "Unknown tool: drop"
+        );
+        let missing = &by_id(&messages, 5)["error"];
+        assert_eq!(missing["code"], -32602);
+        assert!(
+            missing["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing required property profile: one of win, other"),
+            "{missing}"
+        );
+        assert_eq!(by_id(&messages, 6)["error"]["code"], -32022);
+        assert_eq!(
+            by_id(&messages, 6)["error"]["data"]["requested"],
+            "1900-01-01"
+        );
+        assert_eq!(by_id(&messages, 7)["error"]["code"], -32602);
+        assert_eq!(by_id(&messages, 8)["error"]["code"], -32601);
+        // The parse error has no id; the cancel for an unknown id gets nothing.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["error"]["code"] == -32700 && m.get("id").is_none())
+        );
+
+        // A write is refused by the guard before anything connects: exit 5, a tool error.
+        let blocked = &by_id(&messages, 9)["result"];
+        assert_eq!(blocked["isError"], true);
+        let text = blocked["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("-- blocked: "), "{text}");
+        assert!(text.contains("-- failed (exit 5)"), "{text}");
+        assert!(
+            !text.contains("--allow-write"),
+            "no advice the server can't follow: {text}"
+        );
+        assert_eq!(
+            messages.len(),
+            10,
+            "one message per answered request: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_session_initializes_and_calls() {
+        let config = profiles("mcp_legacy");
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win"],
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#.into(),
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.into(),
+                r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.into(),
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#.into(),
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tables","arguments":{"pattern":"Ord*"}}}"#.into(),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let init = &by_id(&messages, 1)["result"];
+        assert_eq!(init["protocolVersion"], "2025-06-18");
+        assert_eq!(init["capabilities"], serde_json::json!({"tools": {}}));
+        assert_eq!(init["serverInfo"]["name"], "sqlh");
+        assert_eq!(by_id(&messages, 2)["result"], serde_json::json!({}));
+        let list = &by_id(&messages, 3)["result"];
+        assert_eq!(list["tools"].as_array().unwrap().len(), 9);
+        assert!(list.get("ttlMs").is_none() && list.get("resultType").is_none());
+        // The only profile is the default; the run fails to connect, as a tool error.
+        let call = &by_id(&messages, 4)["result"];
+        assert_eq!(call["isError"], true);
+        assert!(call.get("resultType").is_none());
+        assert_eq!(messages.len(), 4, "{messages:?}");
+    }
+}
+
 mod live {
     //! Against the owner's dev/test server, through a local profile. They are ignored by a
     //! plain `cargo test`, which reports them as ignored, and fail if asked for without a

@@ -408,9 +408,10 @@ pub struct Settings {
     pub limits: Limits,
     pub query_timeout: u32,
     pub allow_write: bool,
-    /// The profile's name when its `write_policy` is `deny`, so `--allow-write` is refused:
-    /// a guard refusal then doesn't offer it (`guard::Blocked::advice_for`).
-    pub write_denied_by: Option<String>,
+    /// Why writes are off for good, when they are: a profile whose `write_policy` is `deny`
+    /// (so `--allow-write` is refused), or `sqlh mcp`. A guard refusal then doesn't offer
+    /// `--allow-write` (`guard::Blocked::advice_for`).
+    pub writes_off: Option<crate::guard::WritesOff>,
     /// Seconds a statement waits for a lock; 0 means no limit.
     pub lock_timeout: u32,
     /// Whether reads run under READ UNCOMMITTED: asked for by `--read-uncommitted` or the
@@ -572,7 +573,8 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
         .into());
     }
     let allow_write = opts.allow_write || policy == WritePolicy::Allow;
-    let write_denied_by = (policy == WritePolicy::Deny).then(|| p.name.clone());
+    let writes_off =
+        (policy == WritePolicy::Deny).then(|| crate::guard::WritesOff::Profile(p.name.clone()));
     // READ UNCOMMITTED is for reads that nothing is written from: a write based on a dirty
     // read could store rows that never existed. Asked for on the command line in a run that
     // can write, it is refused; saved in a profile, it just doesn't apply to that run
@@ -627,7 +629,7 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
         },
         query_timeout,
         allow_write,
-        write_denied_by,
+        writes_off,
         lock_timeout: opts
             .lock_timeout
             .or(p.lock_timeout)

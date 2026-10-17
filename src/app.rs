@@ -44,14 +44,31 @@ static TEXT_ON_STDOUT: AtomicBool = AtomicBool::new(true);
 pub(crate) fn main() -> ExitCode {
     let started = Instant::now();
     install_panic_hook();
+    // `sqlh mcp`'s stdout carries only protocol messages (docs/mcp-mode.md §2): its usage
+    // errors, and the panic hook's lines, go to stderr only.
+    let mcp = std::env::args_os().nth(1).is_some_and(|a| a == "mcp");
+    if mcp {
+        TEXT_ON_STDOUT.store(false, Ordering::Relaxed);
+    }
     let exit = match cli::parse() {
         Ok(Command::Run(opts)) => run_command(*opts, QueryOrigin::User, started),
         Ok(Command::Profile(command)) => profile::run(command, started),
+        Ok(Command::Mcp(opts)) => crate::mcp::run(*opts),
         Ok(Command::Help) => print_plain(HELP),
         Ok(Command::Version) => print_plain(&version_line()),
+        Err(message) if mcp => {
+            diag(format_args!("sqlh mcp: usage error: {message}"));
+            Exit::Usage
+        }
         Err(message) => fail(Failure::usage(message), Format::Text, started),
     };
     exit.into()
+}
+
+/// A line on stderr for `sqlh mcp`, which has no output of its own there: `--verbose`
+/// logging and launch errors (docs/mcp-mode.md §2). Bounded, like every last-resort line.
+pub(crate) fn mcp_log(line: &str) {
+    diag(format_args!("{line}"));
 }
 
 /// What `--version` prints: the program's version, and the version of the JSON document it
@@ -67,7 +84,7 @@ fn version_line() -> String {
 /// sqlh's version: the release's, given at build time by the release workflow (`SQLH_VERSION`,
 /// PLAN.md 3.6: `0.1.0` from the tag `v0.1.0`, or `0.1.0-dev.<run>` for a build without a
 /// tag), else `Cargo.toml`'s.
-const VERSION: &str = match option_env!("SQLH_VERSION") {
+pub(crate) const VERSION: &str = match option_env!("SQLH_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };

@@ -14,8 +14,28 @@ pub use crate::schema::Command as SchemaCommand;
 pub enum Command {
     Run(Box<Opts>),
     Profile(ProfileCommand),
+    /// `sqlh mcp`: the MCP server (docs/mcp-mode.md).
+    Mcp(Box<McpOpts>),
     Help,
     Version,
+}
+
+/// `sqlh mcp --profile A [--profile B ...] [limits]` (docs/mcp-mode.md §3; owner decisions 16,
+/// 18 and 19): the profiles the server may reach, in order, and the launch limits every call
+/// starts from. No server, login or write flag: those come from the profiles, and the server
+/// is read-only.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct McpOpts {
+    pub profiles: Vec<String>,
+    pub max_rows: Option<u64>,
+    pub max_cell: Option<usize>,
+    pub max_output: Option<u64>,
+    pub query_timeout: Option<u32>,
+    /// `--pool N`: connections per profile, 1 to `engine::MAX_POOL`.
+    pub pool: Option<usize>,
+    /// `--idle MINUTES`: how long a connection may stay idle; 0 keeps them open.
+    pub idle_minutes: Option<u64>,
+    pub verbose: bool,
 }
 
 pub enum ProfileCommand {
@@ -96,12 +116,83 @@ fn parse_all(args: Vec<OsString>) -> Result<Command, String> {
     if args.first().is_some_and(|a| a == "profile") {
         return parse_profile(args.into_iter().skip(1).collect());
     }
+    if args.first().is_some_and(|a| a == "mcp") {
+        return parse_mcp(lexopt::Parser::from_args(args.into_iter().skip(1)));
+    }
     parse_from(lexopt::Parser::from_args(args))
 }
 
 #[cfg(test)]
 fn parse_args(args: &[&str]) -> Result<Command, String> {
     parse_all(args.iter().map(OsString::from).collect())
+}
+
+const MCP_USAGE: &str = "usage: sqlh mcp --profile NAME [--profile NAME ...] [--max-rows N] [--max-cell N] [--max-output N] [-t seconds] [--pool N] [--idle MINUTES] [--verbose]";
+
+/// `sqlh mcp`'s own flags (`McpOpts`). Shared limits are parsed as for a run.
+fn parse_mcp(mut p: lexopt::Parser) -> Result<Command, String> {
+    use lexopt::prelude::*;
+    let mut o = McpOpts::default();
+    while let Some(arg) = p.next().map_err(|e| e.to_string())? {
+        match arg {
+            Long("help") | Short('?') => return Ok(Command::Help),
+            Long("profile") => {
+                let name = string(p.value())?;
+                if !valid_name(&name) {
+                    return Err(format!(
+                        "profile name {name:?} may only use letters, digits, _ and -"
+                    ));
+                }
+                if o.profiles.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+                    return Err(format!("profile {name} is listed twice"));
+                }
+                o.profiles.push(name);
+            }
+            Long("max-rows") => o.max_rows = Some(number(p.value(), "--max-rows")?),
+            Long("max-cell") => o.max_cell = Some(number(p.value(), "--max-cell")?),
+            Long("max-output") => {
+                // 0 (no limit) isn't offered here: a call's result is held in memory.
+                let bytes: u64 = number(p.value(), "--max-output")?;
+                if bytes < MIN_MAX_OUTPUT {
+                    return Err(format!(
+                        "--max-output {bytes}: sqlh mcp holds each result in memory, so it \n                         takes at least {MIN_MAX_OUTPUT} bytes"
+                    ));
+                }
+                o.max_output = Some(bytes);
+            }
+            Short('t') | Long("query-timeout") => o.query_timeout = Some(number(p.value(), "-t")?),
+            Long("pool") => {
+                let pool: usize = number(p.value(), "--pool")?;
+                if !(1..=crate::engine::MAX_POOL).contains(&pool) {
+                    return Err(format!(
+                        "--pool {pool}: expected 1 to {} connections per profile",
+                        crate::engine::MAX_POOL
+                    ));
+                }
+                o.pool = Some(pool);
+            }
+            Long("idle") => o.idle_minutes = Some(number(p.value(), "--idle")?),
+            Long("verbose") => o.verbose = true,
+            Long("allow-write") => {
+                return Err(
+                    "sqlh mcp is read-only (owner decision 16): it takes no --allow-write; use \n                     the sqlh command line for writes"
+                        .to_owned(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "{} (sqlh mcp takes its connections from its profiles); {MCP_USAGE}",
+                    arg.unexpected()
+                ));
+            }
+        }
+    }
+    if o.profiles.is_empty() {
+        return Err(format!(
+            "sqlh mcp needs at least one --profile; {MCP_USAGE}"
+        ));
+    }
+    Ok(Command::Mcp(Box::new(o)))
 }
 
 const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] | test NAME | rm NAME";
@@ -307,6 +398,13 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             o.command = Some(command?);
         }
         None if text => return Err("--text only applies to sqlh find".to_owned()),
+        None if words.first().is_some_and(|w| w == "mcp" || w == "profile") => {
+            // `sqlh --profile x mcp`: the subcommand has to come first, or it would run as SQL.
+            return Err(format!(
+                "{} must come first: sqlh {} ...",
+                words[0], words[0]
+            ));
+        }
         None => {
             for word in words {
                 set_query(&mut o, word)?;
