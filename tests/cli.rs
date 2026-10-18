@@ -4651,10 +4651,11 @@ mod mcp {
         );
     }
 
-    /// R38: an id is a string or an integer that serde_json reads exactly (i64 or u64); every
-    /// other number is refused without an id, so two ids never become one. Ids are compared as
-    /// they are written, for calls, subscriptions and cancels alike: `1` and `"1"` are two ids,
-    /// and a cancel whose `requestId` is a number past 64 bits matches nothing.
+    /// R38: an id is a string or an integer within 64 bits; a fraction or a number past 64 bits
+    /// is refused without an id, so two ids never become one (an integer written another way
+    /// is that integer, R40, below). Ids are compared by one rule for calls, subscriptions and
+    /// cancels alike: `1` and `"1"` are two ids, and a cancel whose `requestId` is a number
+    /// past 64 bits matches nothing.
     #[test]
     fn ids_are_kept_exactly_and_compared_as_written() {
         let config = profiles("mcp_ids");
@@ -4705,7 +4706,7 @@ mod mcp {
                 lines[at]
             );
         }
-        for refused in &messages[3..8] {
+        for refused in &messages[3..6] {
             assert!(refused.get("id").is_none(), "{refused}");
             assert_eq!(refused["error"]["code"], -32600);
             assert_eq!(
@@ -4720,6 +4721,17 @@ mod mcp {
         let refused = |m: &serde_json::Value, id: serde_json::Value| {
             m["id"] == id && m["error"]["message"] == open
         };
+        // R40: `1e2` and `1.0` are the integers 100 and 1, answered and echoed as such.
+        assert!(
+            answered(&messages[6], serde_json::json!(100)) && lines[6].contains(r#""id":100,"#),
+            "{}",
+            lines[6]
+        );
+        assert!(
+            answered(&messages[7], serde_json::json!(1)) && lines[7].contains(r#""id":1,"#),
+            "{}",
+            lines[7]
+        );
         let one = serde_json::json!("1");
         let max: serde_json::Value = serde_json::from_str(max_u64).unwrap();
         assert_eq!(
@@ -4754,6 +4766,90 @@ mod mcp {
         );
         assert_eq!(messages[18]["params"]["requestId"], max);
         assert_eq!(messages.len(), 19, "{messages:?}");
+    }
+
+    /// R40: an integral number is one id however it is written, decided from its text so that
+    /// nothing rounds: `1`, `1.0` and `1e0` are one request, `-0` and `0` another, a cancel's
+    /// `1e2` names the request 100, `"1"` stays a request of its own, and a fraction or a
+    /// number past 64 bits is still refused (R38).
+    #[test]
+    fn an_integral_id_is_one_request_however_it_is_written() {
+        let config = profiles("mcp_integral_ids");
+        let listen = |id: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"subscriptions/listen","params":{{{META},"notifications":{{}}}}}}"#
+            )
+        };
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win"],
+            &[
+                listen("1.0"),
+                ping("1"),
+                ping("1e0"),
+                ping(r#""1""#),
+                listen("-0"),
+                ping("0"),
+                listen("100"),
+                cancel("1e2"),
+                ping("100"),
+                ping("1.0000000000000001"),
+                ping("1e20"),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let subscription = |m: &serde_json::Value| {
+            m["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"].clone()
+        };
+        let open = |m: &serde_json::Value, id: serde_json::Value| {
+            m["id"] == id
+                && m["error"]["message"]
+                    == "Invalid request: a subscription with this id is still open"
+        };
+        let answered = |m: &serde_json::Value, id: serde_json::Value| {
+            m["id"] == id && m.get("result").is_some()
+        };
+        // Held open as the integer 1: 1 and 1e0 are the same request; "1" is another.
+        assert_eq!(subscription(&messages[0]), serde_json::json!(1));
+        assert!(open(&messages[1], serde_json::json!(1)), "{}", messages[1]);
+        assert!(open(&messages[2], serde_json::json!(1)), "{}", messages[2]);
+        assert!(
+            answered(&messages[3], serde_json::json!("1")),
+            "{}",
+            messages[3]
+        );
+        // -0 is 0.
+        assert_eq!(subscription(&messages[4]), serde_json::json!(0));
+        assert!(open(&messages[5], serde_json::json!(0)), "{}", messages[5]);
+        // The cancel's 1e2 ends subscription 100, so 100 is free again.
+        assert_eq!(subscription(&messages[6]), serde_json::json!(100));
+        assert!(
+            answered(&messages[7], serde_json::json!(100)),
+            "{}",
+            messages[7]
+        );
+        // A fraction a float would round to 1, and a number past 64 bits: refused, no id.
+        for refused in &messages[8..10] {
+            assert!(refused.get("id").is_none(), "{refused}");
+            assert_eq!(
+                refused["error"]["message"],
+                "Invalid request: id must be a string or an integer within 64 bits"
+            );
+        }
+        // At the end, 1 and 0 are answered and torn down; 100, cancelled, is not.
+        assert!(
+            answered(&messages[10], serde_json::json!(1)),
+            "{}",
+            messages[10]
+        );
+        assert_eq!(messages[11]["params"]["requestId"], 1);
+        assert!(
+            answered(&messages[12], serde_json::json!(0)),
+            "{}",
+            messages[12]
+        );
+        assert_eq!(messages[13]["params"]["requestId"], 0);
+        assert_eq!(messages.len(), 14, "{messages:?}");
     }
 
     /// R39: the members a method's params declare are checked before anything runs, a

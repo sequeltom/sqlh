@@ -96,10 +96,11 @@ pub(crate) const MAX_ID_BYTES: usize = 1024;
 
 /// What an id is known by, for every rule that compares ids (the calls in flight, the
 /// requests held back, the open subscriptions and the cancels that name them): its JSON text
-/// as serde_json writes it again. `parse` takes only ids it reads exactly (strings, and
-/// integers within 64 bits), so two ids share a key only when they are the same id, and `1`
-/// and `"1"` never do. A cancel's `requestId` that isn't such an id has a key no open request
-/// has.
+/// as serde_json writes it again. `parse` takes only strings and integers within 64 bits, a
+/// number written another way (`1.0`, `1e2`, `-0`) as the integer it is (`exact_id`), so two
+/// ids share a key only when they are the same id: `1`, `1.0` and `1e0` one, `"1"` another.
+/// A cancel's `requestId` is taken the same way; one that isn't such an id has a key no open
+/// request has.
 pub(crate) fn key(id: &Value) -> String {
     id.to_string()
 }
@@ -128,20 +129,28 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
     }
     // An id is a string or an integer, of at most MAX_ID_BYTES. One that is there but is
     // anything else (null included), or longer, can't be answered by, so the error leaves it
-    // out. An integer is taken only as serde_json reads it exactly, an i64 or a u64: past that
-    // range it reads a number as the nearest f64, so two ids could become one (R38), and a
-    // fraction or an exponent form (`1.5`, `1e2`) is no integer id at all.
+    // out. An integer is what it is however it is written: serde_json reads `1` as an i64 but
+    // `1.0`, `1e2` and `-0` as floats, and past 64 bits a whole number too, so those are
+    // decided from the number as the line writes it (`exact_id`, R40), never from the float,
+    // which would round a fraction or a larger number onto an id (R38).
     let id = match message.remove("id") {
         None => None,
-        Some(id) if !(id.is_string() || id.is_i64() || id.is_u64()) => {
-            return Err((
-                None,
-                ProtocolError::new(
-                    INVALID_REQUEST,
-                    "Invalid request: id must be a string or an integer within 64 bits",
-                ),
-            ));
-        }
+        Some(id) if id.is_string() || id.is_i64() || id.is_u64() => Some(id),
+        Some(other) => match (&other, raw_member(line, &["id"]).and_then(exact_id)) {
+            (Value::Number(_), Some(exact)) => Some(exact),
+            _ => {
+                return Err((
+                    None,
+                    ProtocolError::new(
+                        INVALID_REQUEST,
+                        "Invalid request: id must be a string or an integer within 64 bits",
+                    ),
+                ));
+            }
+        },
+    };
+    let id = match id {
+        None => None,
         Some(id) if key(&id).len() > MAX_ID_BYTES => {
             return Err((
                 None,
@@ -174,7 +183,7 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
     };
     // Only `params` left out is none: present, JSON-RPC 2.0 §4.2 has it a structured value, and
     // MCP an object, so a request's `null` is refused as any other non-object is.
-    let params = match message.remove("params") {
+    let mut params = match message.remove("params") {
         None => Map::new(),
         Some(Value::Object(params)) => params,
         // A notification is never answered: what it can't use, `null` included, it goes
@@ -187,10 +196,244 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
             ));
         }
     };
+    // A cancel names its request by the same rule: `1e2` names the request whose id is 100.
+    // A number that is no integer id names none, so the cancel is ignored, as an invalid one
+    // should be.
+    if id.is_none()
+        && method == "notifications/cancelled"
+        && let Some(Value::Number(n)) = params.get("requestId")
+        && !(n.is_i64() || n.is_u64())
+    {
+        match raw_member(line, &["params", "requestId"]).and_then(exact_id) {
+            Some(exact) => params.insert("requestId".into(), exact),
+            None => params.remove("requestId"),
+        };
+    }
     Ok(match id {
         Some(id) => Incoming::Request { id, method, params },
         None => Incoming::Notification { method, params },
     })
+}
+
+/// The integer a JSON number is, from its text (`number`, as the line writes it), when it is
+/// one within i64 or u64: `1.0` and `1e0` are 1, `1e2` is 100, `-0` is 0. Not a fraction
+/// (`1.5`, `1.0000000000000001`, `5e-3`), nor a larger magnitude (`1e20`, `18446744073709551616`),
+/// which sqlh refuses as an implementation limit (MCP asks only for an integer). Exact: the
+/// digits are shifted by the exponent as text, never through a float, so nothing rounds.
+pub(crate) fn exact_id(number: &str) -> Option<Value> {
+    let (negative, unsigned) = match number.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, number),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], Some(&unsigned[at + 1..])),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        // Zero, however written (`-0`, `0.0`, `0e9`).
+        return Some(json!(0));
+    }
+    // A huge exponent can't make a nonzero integer within 64 bits: past i64, refuse.
+    let exponent: i64 = match exponent {
+        None => 0,
+        Some(e) => e.strip_prefix('+').unwrap_or(e).parse().ok()?,
+    };
+    let fraction_digits = i64::try_from(fraction.len()).ok()?;
+    let scale = exponent.checked_sub(fraction_digits)?;
+    let integer = if scale >= 0 {
+        // u64::MAX has 20 digits.
+        let zeros = usize::try_from(scale).ok()?;
+        if significant.len().checked_add(zeros)? > 20 {
+            return None;
+        }
+        format!("{significant}{}", "0".repeat(zeros))
+    } else {
+        let cut = usize::try_from(scale.checked_neg()?).ok()?;
+        let at = significant.len().checked_sub(cut)?;
+        if at == 0 || !significant[at..].bytes().all(|b| b == b'0') {
+            return None;
+        }
+        significant[..at].to_owned()
+    };
+    if integer.len() > 20 {
+        return None;
+    }
+    let magnitude: u128 = integer.parse().ok()?;
+    if negative {
+        let value = i128::try_from(magnitude).ok()?.checked_neg()?;
+        i64::try_from(value).ok().map(Value::from)
+    } else {
+        u64::try_from(magnitude).ok().map(Value::from)
+    }
+}
+
+/// The text of the value at `path` (member names, from the top object down), as the line
+/// writes it: the last member of that name, as serde_json keeps the last of a duplicate. For
+/// a line serde_json has already read whole, so it only needs to find its way, decoding the
+/// names it compares (`"id"` is `id`).
+fn raw_member<'a>(line: &'a str, path: &[&str]) -> Option<&'a str> {
+    let mut scan = Scan {
+        bytes: line.as_bytes(),
+        at: 0,
+    };
+    let (start, end) = scan.find(path)?;
+    line.get(start..end)
+}
+
+/// A reader of a JSON text already known to be valid (`raw_member`).
+struct Scan<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Scan<'_> {
+    fn space(&mut self) {
+        while self
+            .bytes
+            .get(self.at)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            self.at += 1;
+        }
+    }
+
+    /// The span of the value at `path` in the object that starts here.
+    fn find(&mut self, path: &[&str]) -> Option<(usize, usize)> {
+        let (name, rest) = path.split_first()?;
+        self.space();
+        if self.bytes.get(self.at) != Some(&b'{') {
+            return None;
+        }
+        self.at += 1;
+        let mut found = None;
+        loop {
+            self.space();
+            match self.bytes.get(self.at)? {
+                b'}' => break,
+                b',' => {
+                    self.at += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let key = self.string()?;
+            self.space();
+            if self.bytes.get(self.at) != Some(&b':') {
+                return None;
+            }
+            self.at += 1;
+            self.space();
+            let start = self.at;
+            if key == *name {
+                found = if rest.is_empty() {
+                    self.value()?;
+                    Some((start, self.at))
+                } else {
+                    // Found in the last one of the name, as serde_json keeps it.
+                    let inner = self.find(rest);
+                    self.at = start;
+                    self.value()?;
+                    inner
+                };
+            } else {
+                self.value()?;
+            }
+        }
+        found
+    }
+
+    /// A string, decoded; `at` is left past its closing quote.
+    fn string(&mut self) -> Option<String> {
+        if self.bytes.get(self.at) != Some(&b'"') {
+            return None;
+        }
+        self.at += 1;
+        let mut units: Vec<u16> = Vec::new();
+        loop {
+            let b = *self.bytes.get(self.at)?;
+            self.at += 1;
+            match b {
+                b'"' => return Some(String::from_utf16_lossy(&units)),
+                b'\\' => {
+                    let escape = *self.bytes.get(self.at)?;
+                    self.at += 1;
+                    let unit = match escape {
+                        b'"' => u16::from(b'"'),
+                        b'\\' => u16::from(b'\\'),
+                        b'/' => u16::from(b'/'),
+                        b'b' => 0x08,
+                        b'f' => 0x0c,
+                        b'n' => u16::from(b'\n'),
+                        b'r' => u16::from(b'\r'),
+                        b't' => u16::from(b'\t'),
+                        b'u' => {
+                            let hex =
+                                std::str::from_utf8(self.bytes.get(self.at..self.at + 4)?).ok()?;
+                            self.at += 4;
+                            u16::from_str_radix(hex, 16).ok()?
+                        }
+                        _ => return None,
+                    };
+                    units.push(unit);
+                }
+                _ => {
+                    // The rest of a UTF-8 character, kept as it is.
+                    let start = self.at - 1;
+                    let mut end = self.at;
+                    while self
+                        .bytes
+                        .get(end)
+                        .is_some_and(|b| !matches!(b, b'"' | b'\\'))
+                    {
+                        end += 1;
+                    }
+                    let text = std::str::from_utf8(self.bytes.get(start..end)?).ok()?;
+                    units.extend(text.encode_utf16());
+                    self.at = end;
+                }
+            }
+        }
+    }
+
+    /// Steps over one value of any kind.
+    fn value(&mut self) -> Option<()> {
+        match *self.bytes.get(self.at)? {
+            b'"' => self.string().map(|_| ()),
+            open @ (b'{' | b'[') => {
+                let close = if open == b'{' { b'}' } else { b']' };
+                self.at += 1;
+                loop {
+                    self.space();
+                    match *self.bytes.get(self.at)? {
+                        b if b == close => {
+                            self.at += 1;
+                            return Some(());
+                        }
+                        b',' | b':' => self.at += 1,
+                        _ => self.value()?,
+                    }
+                }
+            }
+            _ => {
+                // A number, true, false or null.
+                let start = self.at;
+                while self
+                    .bytes
+                    .get(self.at)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
+                {
+                    self.at += 1;
+                }
+                (self.at > start).then_some(())
+            }
+        }
+    }
 }
 
 /// The era to serve a request in: modern when it carries the modern `_meta` (checked: the
@@ -407,6 +650,65 @@ pub(crate) fn object(value: Value) -> Map<String, Value> {
 
 #[cfg(test)]
 mod tests {
+    // R40: a number is the integer it is, however it is written, decided from its text so
+    // that nothing rounds (R38); a fraction or a magnitude past 64 bits is no id.
+    #[test]
+    fn an_integral_number_is_its_integer_however_it_is_written() {
+        for (text, wanted) in [
+            ("1", Some(json!(1))),
+            ("1.0", Some(json!(1))),
+            ("1e0", Some(json!(1))),
+            ("1E+0", Some(json!(1))),
+            ("10e-1", Some(json!(1))),
+            ("1e2", Some(json!(100))),
+            ("100e-2", Some(json!(1))),
+            ("-0", Some(json!(0))),
+            ("-0.0", Some(json!(0))),
+            ("0e999999999999999999999", Some(json!(0))),
+            ("1e19", Some(json!(10_000_000_000_000_000_000u64))),
+            ("18446744073709551615.0", Some(json!(u64::MAX))),
+            ("1.8446744073709551615e19", Some(json!(u64::MAX))),
+            ("-9223372036854775808.0", Some(json!(i64::MIN))),
+            (
+                "-9.223372036854775807e18",
+                Some(json!(-9_223_372_036_854_775_807i64)),
+            ),
+            ("1.5", None),
+            ("1.0000000000000001", None),
+            ("5e-3", None),
+            ("1e20", None),
+            ("18446744073709551616", None),
+            ("18446744073709551616.0", None),
+            ("-9223372036854775809", None),
+            ("1e999999999999999999999", None),
+            ("1e-999999999999999999999", None),
+        ] {
+            assert_eq!(exact_id(text), wanted, "{text}");
+        }
+    }
+
+    // R40: the text of a member, found as serde_json would: names decoded, the last of a
+    // duplicate, strings and nesting stepped over.
+    #[test]
+    fn a_members_text_is_found_as_the_line_writes_it() {
+        let line =
+            r#"{"params":{"x":"}{\"id\":7","requestId":1e2},"id":1.0,"id":[1,{"id":2}],"id":2.0}"#;
+        assert_eq!(raw_member(line, &["id"]), Some("2.0"));
+        assert_eq!(raw_member(line, &["params", "requestId"]), Some("1e2"));
+        assert_eq!(raw_member(line, &["params", "id"]), None);
+        // An escaped name is the name it decodes to, and the last of the name still wins.
+        // (The escape is built from its backslash, U+005C, so the source shows it plainly.)
+        let escaped = format!(
+            r#"{{"id":1.5,"{}u0069d":2.0,"i\"d":3.0}}"#,
+            char::from(0x5c)
+        );
+        assert!(escaped.contains(r#",""#) && !escaped.contains(r#""id":2.0"#));
+        assert_eq!(raw_member(&escaped, &["id"]), Some("2.0"));
+        assert_eq!(raw_member(r#"{"id": -0 }"#, &["id"]), Some("-0"));
+        assert_eq!(raw_member(r#"{"é":"ü","id":1E2}"#, &["id"]), Some("1E2"));
+        assert_eq!(raw_member("[1]", &["id"]), None);
+    }
+
     use super::*;
 
     fn modern(extra: Value) -> Map<String, Value> {
@@ -533,14 +835,25 @@ mod tests {
                 other => panic!("{id}: {other:?}"),
             }
         }
+        // R40: an integer written another way is that integer.
+        for (written, id) in [
+            ("1e2", json!(100)),
+            ("1.0", json!(1)),
+            ("-0", json!(0)),
+            ("18446744073709551615.0", json!(u64::MAX)),
+        ] {
+            match parse(&ping(written)) {
+                Ok(Incoming::Request { id: read, .. }) => assert_eq!(read, id, "{written}"),
+                other => panic!("{written}: {other:?}"),
+            }
+        }
         for id in [
             "18446744073709551616",
             "18446744073709551617",
             "-9223372036854775809",
             "1.5",
-            "1e2",
-            "1.0",
-            "-0",
+            "1.0000000000000001",
+            "1e20",
         ] {
             let refused = parse(&ping(id)).unwrap_err();
             assert_eq!(refused.0, None, "{id}");
