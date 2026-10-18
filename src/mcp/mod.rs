@@ -13,20 +13,23 @@
 //!   stdout. A notification (a cancel) is acted on at once; a request is held back
 //!   (`Deferred`) until stdout catches up, and only once those held back reach their bound does
 //!   the server stop reading stdin. While it is behind, a stdout that takes no byte for the
-//!   stall limit (the query timeout, as the CLI's delivery has it) means a client that stopped
-//!   reading: the server ends as if stdout had broken.
+//!   stall limit (the query timeout, as the CLI's delivery has it, or `STALL_WHEN_NO_TIMEOUT`
+//!   for a query timeout of 0: never none) means a client that stopped reading: the server ends
+//!   as if stdout had broken.
 //! - **Subscriptions:** `subscriptions/listen` is acknowledged with none of what it asks
 //!   for (the tool list never changes) and stays open until the client cancels it or the
 //!   server ends, which answers it and then tears it down with `notifications/cancelled`.
-//! - **The end** (`end`): when stdin closes, the calls in flight and the requests held back
-//!   get `END_GRACE` to finish and answer; when stdout breaks or stalls, or a console event
-//!   arrives, they get none. What is still running is cancelled and given time to settle, open
-//!   subscriptions are answered, the idle connections are closed, and the writer gets its flush
-//!   wait; then the process exits 0, without waiting for anything the runtime still runs. Each
-//!   wait is at most `END_GRACE`, and console events are taken throughout (R36): one cancels
-//!   what is left at once and makes the end due within its grace (`Signal::grace`), which a
-//!   later one can only bring nearer, since Windows ends the process about 5 s after a close,
-//!   logoff or shutdown. The closing writes still get up to `FLUSH_WAIT` past it.
+//! - **The end** (`end`): when stdin closes, the requests held back run as stdout drains, for
+//!   as long as it keeps taking bytes (the stall rule ends a client that stops), and then the
+//!   calls in flight get `END_GRACE` to finish and answer; when stdout breaks or stalls, or a
+//!   console event arrives, they get none. What is still running is cancelled and given time
+//!   to settle, what is still held back is dropped (counted as never run), open subscriptions
+//!   are answered, the idle connections are closed, and the writer gets its flush wait; then
+//!   the process exits 0, without waiting for anything the runtime still runs. Each later wait
+//!   is at most `END_GRACE`, and console events are taken throughout (R36): one cancels what
+//!   is left at once and makes the end due within its grace (`Signal::grace`), which a later
+//!   one can only bring nearer, since Windows ends the process about 5 s after a close, logoff
+//!   or shutdown. The closing writes still get up to `FLUSH_WAIT` past it.
 
 mod protocol;
 mod tools;
@@ -81,10 +84,21 @@ const MAX_IN_FLIGHT: usize = 64;
 /// How often idle connections are checked against `--idle`.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
-/// The longest each wait of the end may take: for the calls in flight and the requests held
-/// back to finish after stdin closes, for what is then cancelled to settle (on top of the
-/// engine's own settle grace inside each call), for the idle connections to close, and for the
-/// writer's flush. A console event makes the whole end due sooner (`End`).
+/// The stall limit that stands for a query timeout of 0 (`-t 0`, or a profile's
+/// `query_timeout = 0`), for the stall rule alone (`Stall`, `stall_limit`): the default query
+/// timeout's 60 s. A run at `-t 0` may take as long as it takes, but the transport must end
+/// under a finite bound whatever the query timeout (R35's acceptance): with stdout unread and
+/// the requests held back at their bound, stdin isn't read, so a cancel or the end of the input
+/// can reach the server only through this rule's end. A query's own timeout is unchanged.
+/// Debug builds take `SQLH_DEBUG_MCP_STALL_MS` in its place, so a test needn't wait 60 s.
+const STALL_WHEN_NO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The longest each wait of the end may take, but the replay of the requests held back after
+/// stdin closes, which goes on as long as stdout keeps taking bytes (the stall rule bounds
+/// it): for the calls in flight to finish after stdin closes, once nothing is held back, for
+/// what is then cancelled to settle (on top of the engine's own settle grace inside each
+/// call), for the idle connections to close, and for the writer's flush. A console event makes
+/// the whole end due sooner (`End`).
 const END_GRACE: Duration = Duration::from_secs(6);
 
 /// How long the end's flush wait goes on with no byte reaching stdout before it stops; the
@@ -93,8 +107,8 @@ const END_GRACE: Duration = Duration::from_secs(6);
 /// subscriptions).
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
 
-/// How often the serving loop looks at stdout again while it is behind, and the end at what
-/// it waits for.
+/// How often the serving loop looks at stdout again while it is behind or requests are held
+/// back, and the end at what it waits for.
 const POLL: Duration = Duration::from_millis(10);
 
 /// How much of a line the stdout thread writes at a time, so that the flush wait sees a long
@@ -411,31 +425,28 @@ impl Why {
 }
 
 /// R35's rule for a client that stops reading without closing stdout: while the server is
-/// behind, a stdout that takes no byte for the limit (`stall_limit`; none, no limit) means the
+/// behind, a stdout that takes no byte for the limit (`stall_limit`, always finite) means the
 /// client is gone.
 struct Stall {
-    limit: Option<Duration>,
+    limit: Duration,
     /// What stdout had taken when the server was last seen behind with no progress, and since
     /// when.
     seen: Option<(u64, Instant)>,
 }
 
 impl Stall {
-    fn new(limit: Option<Duration>) -> Stall {
+    fn new(limit: Duration) -> Stall {
         Stall { limit, seen: None }
     }
 
     fn stalled(&mut self, server: &Server) -> bool {
-        let Some(limit) = self.limit else {
-            return false;
-        };
         if !server.behind() {
             self.seen = None;
             return false;
         }
         let taken = server.progress.load(Ordering::Relaxed);
         match self.seen {
-            Some((at, since)) if at == taken => since.elapsed() >= limit,
+            Some((at, since)) if at == taken => since.elapsed() >= self.limit,
             _ => {
                 self.seen = Some((taken, Instant::now()));
                 false
@@ -444,18 +455,32 @@ impl Stall {
     }
 }
 
-/// The stall limit: the query timeout, as the CLI's delivery has it (`Limits::stall_secs`,
-/// which follows `-t`): the launch's `-t` when it set one, else the longest of the listed
-/// profiles' timeouts, and none when it, or any of them, is 0.
-fn stall_limit(engine: &Engine) -> Option<Duration> {
-    let mut longest = 0;
-    for profile in 0..engine.profiles().count() {
-        match engine.settings(profile).limits.stall_secs {
-            0 => return None,
-            secs => longest = longest.max(secs),
-        }
+/// The stall limit, from the listed profiles' stall seconds (`Limits::stall_secs`, which
+/// follows the query timeout, as the CLI's delivery has it: the launch's `-t` when it set one,
+/// else each profile's own): the longest of them, a 0 (no query timeout) counting as
+/// `no_timeout` (`STALL_WHEN_NO_TIMEOUT`), so the limit is never none (R35).
+fn stall_limit(stall_secs: impl IntoIterator<Item = u32>, no_timeout: Duration) -> Duration {
+    stall_secs
+        .into_iter()
+        .map(|secs| match secs {
+            0 => no_timeout,
+            secs => Duration::from_secs(secs.into()),
+        })
+        .max()
+        .unwrap_or(no_timeout)
+}
+
+/// What stands for a query timeout of 0 in the stall limit: `STALL_WHEN_NO_TIMEOUT`, or in a
+/// debug build `SQLH_DEBUG_MCP_STALL_MS` when it is set (a release build takes no variable).
+fn stall_when_no_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SQLH_DEBUG_MCP_STALL_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse().ok())
+    {
+        return Duration::from_millis(ms);
     }
-    (longest > 0).then(|| Duration::from_secs(longest.into()))
+    STALL_WHEN_NO_TIMEOUT
 }
 
 async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
@@ -501,7 +526,9 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
         }
     };
     let running = Rc::new(Cell::new(0usize));
-    let mut stall = Stall::new(stall_limit(&server.engine));
+    let stall_secs = (0..server.engine.profiles().count())
+        .map(|profile| server.engine.settings(profile).limits.stall_secs);
+    let mut stall = Stall::new(stall_limit(stall_secs, stall_when_no_timeout()));
     let why = serving(
         &server,
         &running,
@@ -533,7 +560,12 @@ async fn serving(
         if stall.stalled(server) {
             return Why::StdoutStalled;
         }
-        let behind = server.behind();
+        // While stdout is behind, or requests are held back, the loop looks again every POLL.
+        // Read once: requests are held back only while stdout is behind when `replay` last
+        // looked, but the stdout thread can catch up a moment later without waking the loop,
+        // and polling on `behind` alone would then leave them held back until the next sweep
+        // (up to SWEEP_EVERY).
+        let poll = server.behind() || !server.deferred.borrow().is_empty();
         // Only a full queue of requests held back stops stdin: until then a cancel, or the
         // end of the input, is taken whatever stdout does.
         let full = server.deferred.borrow().full();
@@ -550,9 +582,9 @@ async fn serving(
                 Some(Line::End) | None => return Why::StdinClosed,
             },
             () = gone.notified() => return Why::StdoutClosed,
-            // While stdout is behind, look again soon: for its progress, to let the requests
-            // held back through, and for the stall rule.
-            () = tokio::time::sleep(POLL), if behind => {}
+            // Look again soon: for stdout's progress, to let the requests held back through,
+            // and for the stall rule.
+            () = tokio::time::sleep(POLL), if poll => {}
             _ = sweep.tick() => server.engine.sweep(),
             signal = events.recv() => return Why::Event(signal),
         }
@@ -592,27 +624,30 @@ impl End<'_> {
         self.never_ran += server.deferred.borrow_mut().clear();
     }
 
-    /// Waits until `done` (looked at every `POLL`), for at most `limit` and, once a console
-    /// event has set one, the end's deadline, which can't end the wait within `floor` of its
-    /// start (the closing writes' due); an event meanwhile is taken at once.
+    /// Waits until `done` (looked at every `POLL`), for at most `limit` (none: until `done`)
+    /// and, once a console event has set one, the end's deadline, which can't end the wait
+    /// within `floor` of its start (the closing writes' due); an event meanwhile is taken at
+    /// once.
     async fn wait(
         &mut self,
         server: &Server,
-        limit: Duration,
+        limit: Option<Duration>,
         floor: Duration,
         done: &mut dyn FnMut() -> bool,
     ) {
         let start = Instant::now();
-        let (until, floor) = (start + limit, start + floor);
+        let (until, floor) = (limit.map(|limit| start + limit), start + floor);
         while !done() {
-            let due = self
-                .deadline
-                .map_or(until, |deadline| until.min(deadline.max(floor)));
+            let due = match (until, self.deadline) {
+                (Some(until), Some(deadline)) => Some(until.min(deadline.max(floor))),
+                (until, None) => until,
+                (None, Some(deadline)) => Some(deadline.max(floor)),
+            };
             let now = Instant::now();
-            if now >= due {
+            if due.is_some_and(|due| now >= due) {
                 return;
             }
-            let tick = due.min(now + POLL).into();
+            let tick = due.map_or(now + POLL, |due| due.min(now + POLL)).into();
             if let Ok(signal) = tokio::time::timeout_at(tick, self.events.recv()).await {
                 server.log(format!("sqlh mcp: {} during the end", signal.name()));
                 self.event(server, signal);
@@ -622,8 +657,9 @@ impl End<'_> {
 }
 
 /// The end (docs/mcp-mode.md §2, The end), from where the serving stopped. Every step is
-/// bounded by `END_GRACE`; a console event at any of them cuts what is left and bounds the
-/// rest by its grace, the closing writes getting up to `FLUSH_WAIT` past it, so after a close,
+/// bounded by `END_GRACE`, but the replay of the requests held back after stdin closed, which
+/// the stall rule bounds; a console event at any of them cuts what is left and bounds the rest
+/// by its grace, the closing writes getting up to `FLUSH_WAIT` past it, so after a close,
 /// logoff or shutdown the whole end takes about 2 s at most, inside Windows' 5 s.
 async fn end(
     server: &Rc<Server>,
@@ -642,26 +678,41 @@ async fn end(
         Why::Event(signal) => end.event(server, signal),
         // The client is gone, or taken for gone: nothing more is queued for it.
         Why::StdoutClosed | Why::StdoutStalled => server.broken.store(true, Ordering::Relaxed),
-        // At the end of the input, the calls in flight may still finish and answer, and the
-        // requests held back run as stdout drains, so a client that pipes its requests, closes
+        // At the end of the input, the requests held back run as stdout drains, and the calls
+        // in flight may still finish and answer, so a client that pipes its requests, closes
         // stdin and reads slowly gets its results; a stdout that breaks or stalls ends that.
         Why::StdinClosed => {
-            end.wait(server, END_GRACE, Duration::ZERO, &mut || {
+            let mut gone = || {
+                if server.broken.load(Ordering::Relaxed) {
+                    return true;
+                }
                 replay(server, running);
                 if stall.stalled(server) {
                     server.log("sqlh mcp: stdout stalled during the end".into());
                     server.broken.store(true, Ordering::Relaxed);
                 }
                 server.broken.load(Ordering::Relaxed)
-                    || (running.get() == 0 && server.deferred.borrow().is_empty())
+            };
+            // First the requests held back, with no limit of its own: they run as fast as the
+            // client reads, and the stall rule (always finite) ends a client that has stopped.
+            // A console event drops them (`End::event`). END_GRACE would charge their
+            // dispatch, not only their work, to the calls' grace: a steady slow reader lost
+            // the answers of what was still held back when it ran out.
+            end.wait(server, None, Duration::ZERO, &mut || {
+                gone() || server.deferred.borrow().is_empty()
+            })
+            .await;
+            // Then, nothing being held back, the calls in flight get END_GRACE to finish.
+            end.wait(server, Some(END_GRACE), Duration::ZERO, &mut || {
+                gone() || running.get() == 0
             })
             .await;
         }
     }
     // What is still running is cancelled, and nothing more is sent for it; what is still held
-    // back never runs.
+    // back never runs, and is counted so (`End::never_ran`), not as a client's cancel.
     end.cut(server);
-    end.wait(server, END_GRACE, Duration::ZERO, &mut || {
+    end.wait(server, Some(END_GRACE), Duration::ZERO, &mut || {
         running.get() == 0
     })
     .await;
@@ -679,14 +730,14 @@ async fn end(
     let mut never = || false;
     tokio::select! {
         () = server.engine.close_all() => {}
-        () = end.wait(server, END_GRACE, Duration::ZERO, &mut never) => {}
+        () = end.wait(server, Some(END_GRACE), Duration::ZERO, &mut never) => {}
     }
     // The last lines get as long as bytes keep reaching stdout (FLUSH_WAIT with none ends the
     // wait), up to END_GRACE: a long line the client is still reading counts as progress, a
     // client that has stopped reading doesn't. Done once every line queued is written.
     let mut taken = server.progress.load(Ordering::Relaxed);
     let mut stalled_at = Instant::now() + FLUSH_WAIT;
-    end.wait(server, END_GRACE, FLUSH_WAIT, &mut || {
+    end.wait(server, Some(END_GRACE), FLUSH_WAIT, &mut || {
         let now = server.progress.load(Ordering::Relaxed);
         if now > taken {
             taken = now;
@@ -1250,6 +1301,25 @@ mod tests {
         assert!(deferred.full(), "by bytes");
     }
 
+    // R35: the stall limit is never none. It is the longest of the profiles' stall seconds,
+    // which follow the query timeout, and a 0 among them (no query timeout) counts as
+    // STALL_WHEN_NO_TIMEOUT, 60 s. Before the fix a 0 anywhere meant no limit, so a client that
+    // stopped reading at -t 0 held the server, its cancels and its end of input, for good.
+    #[test]
+    fn the_stall_limit_is_always_finite() {
+        let secs = Duration::from_secs;
+        let none = STALL_WHEN_NO_TIMEOUT;
+        assert_eq!(none, secs(60));
+        assert_eq!(stall_limit([2], none), secs(2));
+        assert_eq!(stall_limit([2, 30], none), secs(30));
+        assert_eq!(stall_limit([0], none), none);
+        assert_eq!(stall_limit([0, 2], none), none);
+        assert_eq!(stall_limit([0, 120], none), secs(120));
+        let short = Duration::from_millis(1500);
+        assert_eq!(stall_limit([0, 0], short), short);
+        assert_eq!(stall_limit([], none), none);
+    }
+
     /// A test's console events: each at its time, once.
     struct Script(VecDeque<(Instant, Signal)>);
 
@@ -1335,7 +1405,7 @@ mod tests {
                 &running,
                 Why::StdinClosed,
                 &mut events,
-                Stall::new(None),
+                Stall::new(STALL_WHEN_NO_TIMEOUT),
             )
             .await;
             (started.elapsed(), running.get() == 1)

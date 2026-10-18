@@ -3987,8 +3987,9 @@ mod mcp {
     /// R35: a cancel is taken while stdout is behind. The client never reads stdout (held open,
     /// full), so the 120 pings' answers fill what may wait for it and the rest are held back;
     /// the cancel that follows still reaches the call, which is connecting to a server that
-    /// never answers: its connection is closed at once. `-t 0`: no stall limit. Before the fix
-    /// the cancel waited, unread, behind the answers.
+    /// never answers: its connection is closed at once. `-t 0`: the stall limit is 60 s
+    /// (`STALL_WHEN_NO_TIMEOUT`), far past the test. Before the fix the cancel waited, unread,
+    /// behind the answers.
     #[test]
     fn a_cancel_reaches_a_connecting_call_while_stdout_is_unread() {
         let (listener, config) = silent("mcp_cancel_behind");
@@ -4223,13 +4224,228 @@ mod mcp {
     }
 
     /// R35: the end of the input is taken while stdout is behind, and the end is bounded
-    /// without the client reading: the requests held back get END_GRACE (6 s) to run as
-    /// stdout drains, which it never does, then the flush wait gives up after FLUSH_WAIT (1 s)
-    /// with no byte taken. The answers and the requests that never ran are counted. Before the
-    /// fix the process ran until stdout was read.
+    /// without the client reading: the requests held back run as stdout drains, which it never
+    /// does, so the stall rule ends the wait once stdout has taken nothing for the stall limit
+    /// (here `-t 2`), and the flush wait has nothing more to do. The answers and the requests
+    /// that never ran are counted, and none of those is logged as a cancel. Before the fix the
+    /// process ran until stdout was read.
     #[test]
     fn the_end_of_input_ends_the_server_with_stdout_unread() {
         let config = profiles("mcp_eof_behind");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "win", "-t", "2", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let mut stdin = child.stdin.take().unwrap();
+        let started = Instant::now();
+        send(&mut stdin, &pings());
+        drop(stdin);
+        let status = wait_within(&mut child, Duration::from_secs(15), "stdin closed");
+        let elapsed = started.elapsed();
+        let r = finished(&mut child, status);
+        drop(readers);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(
+            elapsed > Duration::from_millis(1500) && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
+        assert!(
+            r.stderr.contains("sqlh mcp: ending (stdin closed)")
+                && r.stderr.contains("sqlh mcp: stdout stalled during the end")
+                && r.stderr.contains(
+                    "sqlh mcp: 120 responses were never written (56 for requests that never ran)"
+                ),
+            "{}",
+            r.stderr
+        );
+        assert!(!r.stderr.contains("cancelled"), "{}", r.stderr);
+    }
+
+    /// The stall limit that stands for `-t 0` in a debug build's tests (`SQLH_DEBUG_MCP_STALL_MS`;
+    /// 60 s, `STALL_WHEN_NO_TIMEOUT`, in a release build).
+    #[cfg(debug_assertions)]
+    const TEST_STALL_MS: &str = "1000";
+
+    /// 130 pings: 64 answers fill what may wait for stdout, 64 more are held back, which is
+    /// their bound, so the server stops reading stdin, and the last two wait in its channel.
+    #[cfg(debug_assertions)]
+    fn more_pings() -> Vec<String> {
+        (2000..2130).map(|id| ping(&id.to_string())).collect()
+    }
+
+    /// R35 at `-t 0`: once the requests held back reach their bound, stdin isn't read, so a
+    /// cancel that comes then waits unread; the stall rule's bound (60 s for `-t 0`, here
+    /// `SQLH_DEBUG_MCP_STALL_MS`) is what ends the client that stopped reading, and the end
+    /// cancels the call, which is connecting to a server that never answers: its connection is
+    /// closed within the bound. Before the fix `-t 0` meant no stall limit, and the call, the
+    /// cancel and the process waited for good.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cancel_behind_a_full_queue_at_t_0_ends_within_the_stall_bound() {
+        let (listener, config) = silent("mcp_cancel_full");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "slow", "-t", "0", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .env("SQLH_DEBUG_MCP_STALL_MS", TEST_STALL_MS)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let stderr = watch_stderr(&mut child);
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &[query(1, "SELECT 1")]);
+        let (mut held, _) = listener.accept().expect("the call connects");
+        send(&mut stdin, &more_pings());
+        send(&mut stdin, &[cancel("1")]);
+        let sent = Instant::now();
+        let closed = closed_within(&mut held, Duration::from_secs(5));
+        let took = sent.elapsed();
+        let status = wait_within(&mut child, Duration::from_secs(10), "a stalled stdout");
+        // The last line the end logs.
+        let logged = stderr_with(&stderr, "never written", Duration::from_secs(3));
+        drop((stdin, readers));
+        assert_eq!(status.code(), Some(0), "{logged}");
+        assert!(closed, "the end closed the call's connection: {logged}");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+        assert!(
+            logged.contains("sqlh mcp: ending (stdout stalled)")
+                && logged.contains("query on slow: exit 6 (cancelled)")
+                && logged.contains(
+                    "sqlh mcp: 128 responses were never written (64 for requests that never ran)"
+                ),
+            "{logged}"
+        );
+        // The cancel was never read: the stall rule ended the call, not the client.
+        assert!(!logged.contains("request 1 cancelled"), "{logged}");
+    }
+
+    /// The same for a call whose batch is running (the fake server of
+    /// `a_cancel_reaches_a_running_batch_while_stdout_is_unread`): the end that the stall rule
+    /// brings sends the batch's attention within the bound.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cancel_of_a_running_batch_behind_a_full_queue_at_t_0_ends_within_the_stall_bound() {
+        let (port, seen) = hanging_sql_server();
+        let config = scratch("mcp_cancel_batch_full").join("profiles.toml");
+        fs::write(
+            &config,
+            format!(
+                "[profiles.fake]\nserver = \"127.0.0.1,{port}\"\nuser = \"fake\"\n\
+                 encrypt = \"optional\"\nlogin_timeout = 5\n"
+            ),
+        )
+        .unwrap();
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "fake", "-t", "0", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .env("SQLCMDPASSWORD", "fake")
+            .env("SQLH_DEBUG_MCP_STALL_MS", TEST_STALL_MS)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let stderr = watch_stderr(&mut child);
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &[query(1, "SELECT 'hang'")]);
+        let running = seen.recv_timeout(Duration::from_secs(10));
+        if running != Ok("batch") {
+            kill(child);
+            panic!(
+                "the batch didn't reach the server: {}",
+                stderr.lock().unwrap()
+            );
+        }
+        send(&mut stdin, &more_pings());
+        send(&mut stdin, &[cancel("1")]);
+        let attention = seen.recv_timeout(Duration::from_secs(4));
+        let status = wait_within(&mut child, Duration::from_secs(10), "a stalled stdout");
+        let logged = stderr_with(&stderr, "never written", Duration::from_secs(3));
+        drop((stdin, readers));
+        assert_eq!(attention, Ok("attention"), "{logged}");
+        assert_eq!(status.code(), Some(0), "{logged}");
+        assert!(
+            logged.contains("sqlh mcp: ending (stdout stalled)")
+                && logged.contains("query on fake: exit 6 (cancelled)")
+                && logged.contains(
+                    "sqlh mcp: 128 responses were never written (64 for requests that never ran)"
+                ),
+            "{logged}"
+        );
+        assert!(!logged.contains("request 1 cancelled"), "{logged}");
+    }
+
+    /// R35 at `-t 0`: the end of the input behind a full queue of requests held back, full by
+    /// count (130 pings) and by bytes (64 pings, then five of 4 MB, past the 16 MiB bound), is
+    /// never read, and the stall rule's bound ends the server with stdout unread. Before the
+    /// fix the process ran for good.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_end_of_input_behind_a_full_queue_at_t_0_ends_within_the_stall_bound() {
+        let config = profiles("mcp_eof_full");
+        let pad = "p".repeat(4_000_000);
+        let large: Vec<String> = (3000..3005)
+            .map(|id| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{{META},"com.example/pad":"{pad}"}}}}"#
+                )
+            })
+            .collect();
+        let by_bytes: Vec<String> = more_pings().into_iter().take(64).chain(large).collect();
+        for (input, never_written) in [
+            (
+                more_pings(),
+                "128 responses were never written (64 for requests that never ran)",
+            ),
+            (
+                by_bytes,
+                "69 responses were never written (5 for requests that never ran)",
+            ),
+        ] {
+            let mut command = sqlh();
+            command
+                .args(["mcp", "--profile", "win", "-t", "0", "--verbose"])
+                .env("SQLH_CONFIG", &config)
+                .env("SQLH_DEBUG_MCP_STALL_MS", TEST_STALL_MS)
+                .stdin(Stdio::piped());
+            let readers = stall(&mut command, true, false);
+            let mut child = command.spawn().expect("sqlh starts");
+            let mut stdin = child.stdin.take().unwrap();
+            let started = Instant::now();
+            send(&mut stdin, &input);
+            drop(stdin);
+            let status = wait_within(&mut child, Duration::from_secs(15), "stdin closed");
+            let elapsed = started.elapsed();
+            let r = finished(&mut child, status);
+            drop(readers);
+            assert_eq!(r.code, 0, "{}", r.stderr);
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{never_written}: {elapsed:?}"
+            );
+            assert!(
+                r.stderr.contains("sqlh mcp: ending (stdout stalled)")
+                    && r.stderr.contains(&format!("sqlh mcp: {never_written}")),
+                "{}",
+                r.stderr
+            );
+        }
+    }
+
+    /// R35, a client that pipes its requests, closes stdin and reads steadily but slowly: the
+    /// requests held back run as stdout drains, for as long as it keeps taking bytes, and only
+    /// then do the calls in flight get END_GRACE (6 s), so every request is answered, the call
+    /// among the held back ones included. 135 requests behind a full pipe, the first 64
+    /// answered with about 2 KB each (a `-32022` that echoes a long version), read 2 KB every
+    /// 170 ms (at most 12 KB/s): once the end of the input is read, the call is let through
+    /// only after 48 of those long answers are taken, at least 8 s. Before the fix END_GRACE
+    /// ran from the end of the input, and the requests still held back when it ran out, the
+    /// call among them, never ran.
+    #[test]
+    fn a_steady_slow_reader_gets_every_answer_after_stdin_closes() {
+        let config = profiles("mcp_slow_eof");
         let mut command = sqlh();
         command
             .args(["mcp", "--profile", "win", "--verbose"])
@@ -4237,24 +4453,63 @@ mod mcp {
             .stdin(Stdio::piped());
         let readers = stall(&mut command, true, false);
         let mut child = command.spawn().expect("sqlh starts");
+        // The stalled pipe's writer is the child's alone now, so its end is the child's exit.
+        drop(command);
         let mut stdin = child.stdin.take().unwrap();
-        send(&mut stdin, &pings());
+        // 64 answers fill what may wait for stdout, and the next 64, the call among them, are
+        // held back; the last 7 and the end of the input wait in the server's channel.
+        let version = "v".repeat(2000);
+        let mut lines: Vec<String> = (1000..1064)
+            .map(|id| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{version}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+                )
+            })
+            .collect();
+        lines.extend((1064..1120).map(|id| ping(&id.to_string())));
+        lines.push(query(1, "SELECT 1"));
+        lines.extend((1120..1134).map(|id| ping(&id.to_string())));
+        send(&mut stdin, &lines);
         drop(stdin);
-        let started = Instant::now();
-        let status = wait_within(&mut child, Duration::from_secs(15), "stdin closed");
-        let elapsed = started.elapsed();
+        let mut stdout = readers.into_iter().next().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut got, mut buffer) = (Vec::new(), [0u8; 2048]);
+            while let Ok(n) = stdout.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buffer[..n]);
+                std::thread::sleep(Duration::from_millis(170));
+            }
+            got
+        });
+        let status = wait_within(&mut child, Duration::from_secs(60), "a steady slow reader");
+        let got = reader.join().unwrap();
         let r = finished(&mut child, status);
-        drop(readers);
         assert_eq!(r.code, 0, "{}", r.stderr);
+        let text = String::from_utf8(got).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .trim_start_matches('.')
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line whole"))
+            .collect();
+        let mut ids: Vec<i64> = messages.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+        ids.sort_unstable();
+        let mut wanted: Vec<i64> = (1000..1134).collect();
+        wanted.push(1);
+        wanted.sort_unstable();
+        assert_eq!(ids, wanted, "every request answered once: {}", r.stderr);
+        let call = &by_id(&messages, 1)["result"];
+        assert_eq!(call["isError"], true, "{call}");
+        let text = call["content"][0]["text"].as_str().unwrap();
         assert!(
-            elapsed > Duration::from_secs(5) && elapsed < Duration::from_secs(10),
-            "{elapsed:?}"
+            text.contains("-- failed (exit 2): connection failed"),
+            "{text}"
         );
         assert!(
             r.stderr.contains("sqlh mcp: ending (stdin closed)")
-                && r.stderr.contains(
-                    "sqlh mcp: 120 responses were never written (56 for requests that never ran)"
-                ),
+                && r.stderr.contains("query on win: exit 2 in")
+                && !r.stderr.contains("never written"),
             "{}",
             r.stderr
         );
