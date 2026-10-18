@@ -4504,7 +4504,9 @@ mod mcp {
     /// R39: the members a method's params declare are checked before anything runs, a
     /// malformed one `-32602` with no call started (none logged) and no subscription opened
     /// (only the well-formed one is answered at the end); members the schema doesn't declare
-    /// pass; and a wrong property inside a valid `arguments` object is still a tool error.
+    /// pass; and a wrong property inside a valid `arguments` object is still a tool error. A
+    /// request's `params` that is there, `null` included, must be an object, and `_meta`'s
+    /// declared log level a `LoggingLevel`.
     #[test]
     fn method_envelopes_are_checked_before_anything_runs() {
         let config = profiles("mcp_envelopes");
@@ -4574,6 +4576,25 @@ mod mcp {
                         r#","progressToken":"t","io.modelcontextprotocol/clientInfo":{"name":"x","version":"1"}"#,
                     ),
                 ),
+                ping_with(27, &modern_meta(r#","io.modelcontextprotocol/logLevel":5"#)),
+                ping_with(
+                    28,
+                    &modern_meta(r#","io.modelcontextprotocol/logLevel":null"#),
+                ),
+                ping_with(
+                    29,
+                    &modern_meta(r#","io.modelcontextprotocol/logLevel":"verbose""#),
+                ),
+                ping_with(
+                    40,
+                    &modern_meta(r#","io.modelcontextprotocol/logLevel":"info""#),
+                ),
+                // Only params left out is none: a request's null is refused with its id, and a
+                // notification's goes without, unanswered.
+                r#"{"jsonrpc":"2.0","id":41,"method":"ping","params":null}"#.into(),
+                r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":null}"#.into(),
+                r#"{"jsonrpc":"2.0","id":43,"method":"tools/list","params":null}"#.into(),
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":null}"#.into(),
                 initialize(30, &format!(r#"{{"capabilities":{{}},{info}}}"#)),
                 initialize(
                     31,
@@ -4656,6 +4677,17 @@ mod mcp {
              name and version strings",
         );
         assert_eq!(by_id(&messages, 26)["result"]["resultType"], "complete");
+        for id in [27, 28, 29] {
+            invalid(
+                id,
+                "Invalid params: _meta io.modelcontextprotocol/logLevel must be one of debug, \
+                 info, notice, warning, error, critical, alert, emergency",
+            );
+        }
+        assert_eq!(by_id(&messages, 40)["result"]["resultType"], "complete");
+        for id in [41, 42, 43] {
+            invalid(id, "Invalid params: params must be an object");
+        }
         invalid(30, "Invalid params: protocolVersion must be a string");
         invalid(31, "Invalid params: protocolVersion must be a string");
         invalid(32, "Invalid params: capabilities must be an object");
@@ -4695,9 +4727,10 @@ mod mcp {
             "{}",
             r.stderr
         );
-        // 8 calls, 5 refused subscriptions and one acknowledged, 7 lists and pings, 8
-        // initializes and lists, and the open subscription's answer and teardown.
-        assert_eq!(messages.len(), 8 + 6 + 7 + 8 + 2, "{messages:?}");
+        // 8 calls, 5 refused subscriptions and one acknowledged, 7 lists and pings, 4 pings
+        // with a log level, 3 requests with null params (the notification with them gets
+        // nothing), 8 initializes and lists, and the open subscription's answer and teardown.
+        assert_eq!(messages.len(), 8 + 6 + 7 + 4 + 3 + 8 + 2, "{messages:?}");
     }
 }
 

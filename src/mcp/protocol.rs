@@ -18,6 +18,21 @@ pub(crate) const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabi
 pub(crate) const META_SERVER: &str = "io.modelcontextprotocol/serverInfo";
 pub(crate) const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 pub(crate) const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+/// 2026-07-28's `RequestMetaObject` declares it (deprecated, SEP-2577); sqlh sends no log
+/// notifications, so it is only checked.
+pub(crate) const META_LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
+
+/// The schema's `LoggingLevel`, the values a `_meta` log level takes.
+const LOGGING_LEVELS: &[&str] = &[
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+];
 
 pub(crate) const PARSE_ERROR: i64 = -32700;
 pub(crate) const INVALID_REQUEST: i64 = -32600;
@@ -93,7 +108,8 @@ pub(crate) fn key(id: &Value) -> String {
 ///
 /// What must not be answered isn't: a response (anything with `result` or `error` and no
 /// `method`, whatever its id, since sqlh sends no requests), and a notification (a string
-/// `method` and no `id`), whose `params` are taken as none when they aren't an object.
+/// `method` and no `id`), whose `params` are taken as none when they aren't an object. A
+/// request's `params` that is there must be an object (`null` is not one).
 pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolError)> {
     let value: Value = serde_json::from_str(line)
         .map_err(|_| (None, ProtocolError::new(PARSE_ERROR, "Parse error")))?;
@@ -156,10 +172,13 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
             ProtocolError::new(INVALID_REQUEST, "Invalid request: method must be a string"),
         ));
     };
+    // Only `params` left out is none: present, JSON-RPC 2.0 §4.2 has it a structured value, and
+    // MCP an object, so a request's `null` is refused as any other non-object is.
     let params = match message.remove("params") {
-        None | Some(Value::Null) => Map::new(),
+        None => Map::new(),
         Some(Value::Object(params)) => params,
-        // A notification is never answered: what it can't use, it goes without.
+        // A notification is never answered: what it can't use, `null` included, it goes
+        // without.
         Some(_) if id.is_none() => Map::new(),
         Some(_) => {
             return Err((
@@ -211,9 +230,9 @@ pub(crate) fn era_of(
 
 /// A request's `_meta`, when it has one, with the members both eras declare typed (R39): an
 /// object (2026-07-28's `RequestMetaObject`, the legacy revisions' optional `_meta`), whose
-/// `progressToken` is a string or a number and whose modern client info is an
-/// `Implementation`. The version and the capabilities are `era_of`'s; any other member, an
-/// extension's, is let be.
+/// `progressToken` is a string or a number, whose modern client info is an `Implementation`
+/// and whose log level is a `LoggingLevel`. The version and the capabilities are `era_of`'s;
+/// any other member, an extension's, is let be.
 pub(crate) fn check_meta(
     params: &Map<String, Value>,
 ) -> Result<Option<&Map<String, Value>>, ProtocolError> {
@@ -230,6 +249,7 @@ pub(crate) fn check_meta(
         false,
         Kind::Implementation,
     )?;
+    member(meta, "_meta ", META_LOG_LEVEL, false, Kind::LogLevel)?;
     Ok(Some(meta))
 }
 
@@ -246,6 +266,8 @@ pub(crate) enum Kind {
     Implementation,
     /// A `ProgressToken`: a string or a number.
     Token,
+    /// A `LoggingLevel`: one of its eight strings.
+    LogLevel,
 }
 
 impl Kind {
@@ -262,6 +284,9 @@ impl Kind {
                     && value.get("version").is_some_and(Value::is_string)
             }
             Kind::Token => value.is_string() || value.is_number(),
+            Kind::LogLevel => value
+                .as_str()
+                .is_some_and(|level| LOGGING_LEVELS.contains(&level)),
         }
     }
 
@@ -273,6 +298,9 @@ impl Kind {
             Kind::Strings => "an array of strings",
             Kind::Implementation => "an object with name and version strings",
             Kind::Token => "a string or a number",
+            Kind::LogLevel => {
+                "one of debug, info, notice, warning, error, critical, alert, emergency"
+            }
         }
     }
 }
@@ -430,6 +458,25 @@ mod tests {
             code(r#"{"jsonrpc":"2.0","id":2,"method":"ping","params":[1]}"#),
             Some((Some(json!(2)), INVALID_PARAMS))
         );
+        // Only params left out is none: a request's null is no object either, and is refused
+        // with its id; a notification's goes without, unanswered.
+        for method in ["ping", "tools/list", "tools/call", "server/discover"] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":3,"method":"{method}","params":null}}"#);
+            let (id, error) = parse(&line).unwrap_err();
+            assert_eq!(id, Some(json!(3)), "{method}");
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (INVALID_PARAMS, "Invalid params: params must be an object"),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            parse(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":null}"#),
+            Ok(Incoming::Notification {
+                method: "notifications/cancelled".into(),
+                params: Map::new(),
+            })
+        );
         // An id that is neither a string nor a number can't be answered by it.
         assert_eq!(
             code(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#),
@@ -545,13 +592,34 @@ mod tests {
             json!(null),
             json!({"progressToken": {}}),
             json!({META_CLIENT_INFO: {"name": "x"}}),
+            json!({META_LOG_LEVEL: 5}),
+            json!({META_LOG_LEVEL: null}),
+            json!({META_LOG_LEVEL: "verbose"}),
+            json!({META_LOG_LEVEL: "INFO"}),
         ] {
             let error = era_of(&object(json!({"_meta": meta})), legacy).unwrap_err();
             assert_eq!(error.code, INVALID_PARAMS, "{meta}");
         }
+        // The declared log level is a `LoggingLevel`, and the refusal names the eight.
+        let meta = json!({META_VERSION: MODERN, META_CAPABILITIES: {}, META_LOG_LEVEL: "verbose"});
+        let error = era_of(&object(json!({"_meta": meta})), None);
+        let levels = LOGGING_LEVELS.join(", ");
+        assert_eq!(
+            error.unwrap_err().message,
+            format!("Invalid params: _meta {META_LOG_LEVEL} must be one of {levels}")
+        );
+        for level in LOGGING_LEVELS {
+            let meta = json!({META_VERSION: MODERN, META_CAPABILITIES: {}, META_LOG_LEVEL: level});
+            assert_eq!(
+                era_of(&object(json!({"_meta": meta})), None),
+                Ok(Era::Modern),
+                "{level}"
+            );
+        }
         let extended = object(json!({"_meta": {
             "progressToken": 7,
             META_CLIENT_INFO: {"name": "x", "version": "1", "title": "X"},
+            META_LOG_LEVEL: "info",
             "com.example/x": [1],
         }}));
         assert_eq!(era_of(&extended, legacy), Ok(Era::Legacy("2025-11-25")));
