@@ -9071,7 +9071,12 @@ mod live {
         fn on(server: Rc<dyn Server>) -> Reader {
             // The probe checks the scratch marker before anything is written.
             let mut probe = Probe::on(server);
-            let login = format!("sqlh_reader_{}", std::process::id());
+            // One login per reader: the live tests run in parallel, and two readers of one
+            // process sharing a name would refuse each other's CREATE LOGIN, or drop the
+            // login under each other.
+            static READERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = READERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let login = format!("sqlh_reader_{}_{n}", std::process::id());
             let password = random_password();
             let database = probe.database().to_owned();
             // Holds no password, so a failure report can show it.
