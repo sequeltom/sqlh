@@ -294,23 +294,27 @@ fn type_sql(owner: &str) -> String {
 }
 
 /// How `describe` aggregates its lists, by the database's compatibility level (found while
-/// building 5.3: StackOverflow2010, at level 100, refused `WITHIN GROUP`).
+/// building 5.3: StackOverflow2010, at level 100, refused `WITHIN GROUP`; the threshold is
+/// R37's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Aggregate {
-    /// `STRING_AGG ... WITHIN GROUP`, at level 130 and up: takes any character.
+    /// `STRING_AGG ... WITHIN GROUP`, at level 110 and up: takes any character.
     StringAgg,
-    /// `FOR XML PATH`, below that: ordered at any level, but a name with a control character
-    /// makes XML fail, so such a `describe` fails there.
+    /// `FOR XML PATH`, at level 100 (and at a level the lookup didn't return): ordered at any
+    /// level, but a name with a character XML can't carry (a control character such as
+    /// U+001B) makes it fail (error 6841), so such a `describe` fails there.
     ForXml,
 }
 
 impl Aggregate {
-    /// The aggregation for a database at `compat`. `WITHIN GROUP` parses from level 110 by
-    /// the evidence found (level 100 refuses it); 130 is the conservative line, since the
-    /// older form is correct at every level.
+    /// The aggregation for a database at `compat`. SQL Server takes `STRING_AGG`'s `WITHIN
+    /// GROUP` at compatibility level 110 and up (Microsoft's STRING_AGG remarks; the live test
+    /// `describe_shows_any_name_from_compatibility_level_110` runs it at 110 and 120), and
+    /// refuses it at 100, the lowest level SQL Server 2025 has. A missing level gets the form
+    /// every level parses.
     fn for_level(compat: Option<i64>) -> Aggregate {
         match compat {
-            Some(level) if level >= 130 => Aggregate::StringAgg,
+            Some(level) if level >= 110 => Aggregate::StringAgg,
             _ => Aggregate::ForXml,
         }
     }
@@ -1607,16 +1611,44 @@ mod tests {
         assert!(!object_sql("V").contains("AS rows"));
     }
 
-    // A database below compatibility level 130 gets the FOR XML lists, which every level
-    // parses: WITHIN GROUP failed on StackOverflow2010, at level 100 (found while building
-    // 5.3). Both keep the list's order.
+    // R37: ordered STRING_AGG from compatibility level 110, where SQL Server takes WITHIN
+    // GROUP, so a name XML can't carry is shown at 110 and 120 too; the FOR XML lists only at
+    // 100, which refuses WITHIN GROUP (StackOverflow2010, found while building 5.3), and when
+    // the lookup returned no level. Both keep the list's order.
     #[test]
     fn lists_are_aggregated_as_the_database_level_allows() {
         assert_eq!(Aggregate::for_level(Some(170)), Aggregate::StringAgg);
         assert_eq!(Aggregate::for_level(Some(130)), Aggregate::StringAgg);
-        assert_eq!(Aggregate::for_level(Some(120)), Aggregate::ForXml);
+        assert_eq!(Aggregate::for_level(Some(120)), Aggregate::StringAgg);
+        assert_eq!(Aggregate::for_level(Some(110)), Aggregate::StringAgg);
         assert_eq!(Aggregate::for_level(Some(100)), Aggregate::ForXml);
         assert_eq!(Aggregate::for_level(None), Aggregate::ForXml);
+        // From the lookup's reply to describe's SQL: the level is the scope row's fourth value.
+        for (level, xml) in [
+            (100, true),
+            (110, false),
+            (120, false),
+            (130, false),
+            (170, false),
+        ] {
+            let Plan::Lookup { then, .. } = lookup("t", Shows::Describe, Advice::Cli).unwrap()
+            else {
+                panic!("a lookup");
+            };
+            let reply: Found = vec![
+                vec![vec![
+                    Value::Int(1),
+                    Value::Text("AppDb".into()),
+                    Value::Int(1),
+                    Value::Int(level),
+                ]],
+                found(1, &[(5, "dbo", "t", "U", 0)], 1).remove(1),
+            ];
+            let steps = then(&reply).unwrap();
+            let sql = &steps[0].sql;
+            assert_eq!(sql.contains("FOR XML PATH"), xml, "{level}: {sql}");
+            assert_eq!(sql.contains("STRING_AGG"), !xml, "{level}: {sql}");
+        }
         let modern = joined(Aggregate::StringAgg, "c.name", "FROM t AS c", "c.id");
         assert_eq!(
             modern,

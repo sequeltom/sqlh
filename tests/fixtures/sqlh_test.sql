@@ -14,7 +14,8 @@ GO
 USE sqlh_test;
 GO
 -- The scratch marker: the live tests write only to a database that has this table, and
--- then only to tables of their own (dbo.probe_*), which they drop.
+-- then only to tables of their own (dbo.probe_*), which they drop. One test also changes
+-- sqlh_test's compatibility level, and puts it back (owner decision 21).
 IF OBJECT_ID(N'dbo.sqlh_scratch', N'U') IS NULL
     CREATE TABLE dbo.sqlh_scratch (id int NOT NULL);
 -- Replaced by the per-test tables.
