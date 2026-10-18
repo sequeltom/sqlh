@@ -24,12 +24,14 @@
 //!   calls in flight get `END_GRACE` to finish and answer; when stdout breaks or stalls, or a
 //!   console event arrives, they get none. What is still running is cancelled and given time
 //!   to settle, what is still held back is dropped (counted as never run), open subscriptions
-//!   are answered, the idle connections are closed, and the writer gets its flush wait; then
-//!   the process exits 0, without waiting for anything the runtime still runs. Each later wait
-//!   is at most `END_GRACE`, and console events are taken throughout (R36): one cancels what
-//!   is left at once and makes the end due within its grace (`Signal::grace`), which a later
-//!   one can only bring nearer, since Windows ends the process about 5 s after a close, logoff
-//!   or shutdown. The closing writes still get up to `FLUSH_WAIT` past it.
+//!   are answered, the idle connections are closed, the writer gets its flush wait, and the
+//!   stderr thread up to `delivery::SIDE_WAIT` for the last `--verbose` lines (`flush_log`);
+//!   then the process exits 0, without waiting for anything the runtime still runs. Each later
+//!   wait is at most `END_GRACE`, and console events are taken throughout but in that last one
+//!   (R36): one cancels what is left at once and makes the end due within its grace
+//!   (`Signal::grace`), which a later one can only bring nearer, since Windows ends the process
+//!   about 5 s after a close, logoff or shutdown. The closing writes still get up to
+//!   `FLUSH_WAIT` past it, and the `--verbose` lines `SIDE_WAIT` after them.
 
 mod protocol;
 mod tools;
@@ -56,6 +58,7 @@ use crate::cli::{McpOpts, Opts};
 use crate::db::Cancel;
 use crate::engine::{self, Engine};
 use crate::error::{Exit, Failure};
+use crate::output::delivery::SIDE_WAIT;
 use crate::signals::{Signal, Signals};
 use crate::{app, config, console};
 
@@ -229,7 +232,7 @@ struct Server {
     /// Bytes the stdout thread has handed to stdout: the measure of a client's reading, for
     /// the stall rule and the flush wait.
     progress: Arc<AtomicU64>,
-    log: Option<std_mpsc::SyncSender<String>>,
+    log: Option<Log>,
     /// The calls in flight, by their id's key (`protocol::key`), with the cancel that ends
     /// each: taken out when the call is cancelled, so the id stays taken until the call has
     /// settled.
@@ -250,7 +253,7 @@ impl Server {
         engine: Engine,
         launch: Launch,
         out: std_mpsc::Sender<String>,
-        log: Option<std_mpsc::SyncSender<String>>,
+        log: Option<Log>,
     ) -> Server {
         Server {
             tools: tools::definitions(&launch),
@@ -293,9 +296,12 @@ impl Server {
     }
 
     fn log(&self, line: String) {
-        if let Some(log) = &self.log {
+        // An empty line is the stderr thread's flush (`Log`), so none is logged.
+        if let Some(log) = &self.log
+            && !line.is_empty()
+        {
             // Dropped when stderr is behind: logging must never hold the server up.
-            let _ = log.try_send(line);
+            let _ = log.lines.try_send(line);
         }
     }
 }
@@ -663,7 +669,8 @@ impl End<'_> {
 /// before, so a reader too slow to take them in that time loses the rest, which `--verbose`
 /// counts. A console event at any of them cuts what is left and bounds the rest
 /// by its grace, the closing writes getting up to `FLUSH_WAIT` past it, so after a close,
-/// logoff or shutdown the whole end takes about 2 s at most, inside Windows' 5 s.
+/// logoff or shutdown the whole end takes about 2 s at most, inside Windows' 5 s, and the last
+/// `--verbose` lines up to `delivery::SIDE_WAIT` more (`flush_log`, which takes no events).
 async fn end(
     server: &Rc<Server>,
     running: &Rc<Cell<usize>>,
@@ -753,19 +760,17 @@ async fn end(
     })
     .await;
     let unwritten = server.unwritten.load(Ordering::Relaxed);
-    if unwritten + end.never_ran > 0
-        && let Some(log) = &server.log
-    {
+    if unwritten + end.never_ran > 0 && server.log.is_some() {
         let never_ran = match end.never_ran {
             0 => String::new(),
             n => format!(" ({n} for requests that never ran)"),
         };
-        let _ = log.try_send(format!(
+        server.log(format!(
             "sqlh mcp: {} responses were never written{never_ran}",
             unwritten + end.never_ran
         ));
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    flush_log(server.log.as_ref()).await;
 }
 
 /// What a line from the client is, read once.
@@ -1232,20 +1237,56 @@ fn write_stdout(
     }
 }
 
+/// The `--verbose` log: the stderr thread's lines, and the flush it answers.
+struct Log {
+    /// Lines for stderr; an empty one, which no log line is (`Server::log`), asks for a flush.
+    /// They are `String`s as stdout's are, so the two channels share one copy of the channel
+    /// code: a type of its own made the exe 8 KB larger.
+    lines: std_mpsc::SyncSender<String>,
+    /// Notified when the thread takes a flush, by which time every line handed over before it
+    /// is written.
+    flushed: Arc<Notify>,
+}
+
 /// The stderr thread for `--verbose`: lines are dropped when stderr is behind.
-fn start_log() -> Option<std_mpsc::SyncSender<String>> {
-    let (log, lines) = std_mpsc::sync_channel::<String>(256);
+fn start_log() -> Option<Log> {
+    start_log_to(io::stderr())
+}
+
+/// The stderr thread, writing to `sink`: one write and flush a line (for stderr, under one
+/// lock, so no other diagnostic splits it).
+fn start_log_to(mut sink: impl Write + Send + 'static) -> Option<Log> {
+    let (lines, taken) = std_mpsc::sync_channel::<String>(256);
+    let flushed = Arc::new(Notify::new());
+    let notify = Arc::clone(&flushed);
     thread::Builder::new()
         .name("sqlh-mcp-stderr".into())
         .spawn(move || {
-            let stderr = io::stderr();
-            for line in lines {
-                let mut err = stderr.lock();
-                let _ = writeln!(err, "{line}").and_then(|()| err.flush());
+            for line in taken {
+                if line.is_empty() {
+                    notify.notify_one();
+                } else {
+                    let _ = writeln!(sink, "{line}").and_then(|()| sink.flush());
+                }
             }
         })
         .ok()?;
-    Some(log)
+    Some(Log { lines, flushed })
+}
+
+/// Waits for the lines logged so far to reach stderr, for `delivery::SIDE_WAIT` at most, the
+/// CLI's bound for its own `--verbose` lines: the process exits as soon as `serve` returns,
+/// which would cut the stderr thread's last writes (on CI, a client gone at once ended the
+/// server before `ending (stdout closed)` was written). A stderr behind by more than the
+/// channel holds has its lines dropped, as `Server::log` has it, and isn't waited for. No
+/// console event is taken meanwhile: nothing is left to cut, and every grace is longer.
+async fn flush_log(log: Option<&Log>) {
+    let Some(log) = log else { return };
+    // A permit `notify_one` stores before the wait begins is kept, so the answer can't be
+    // missed. This is the one flush, so no earlier permit is left to be taken for it.
+    if log.lines.try_send(String::new()).is_ok() {
+        let _ = tokio::time::timeout(SIDE_WAIT, log.flushed.notified()).await;
+    }
 }
 
 #[cfg(test)]
@@ -1277,6 +1318,120 @@ mod tests {
         assert_eq!(lines(b"0123456789\nok\n", 5), [None, Some(b"ok".to_vec())]);
         assert_eq!(lines(b"", 5), Vec::<Option<Vec<u8>>>::new());
         assert_eq!(lines(b"\n", 5), [Some(Vec::new())]);
+    }
+
+    /// A stderr for the log thread: each write tells `entered`, then waits for `pace` (a slow
+    /// reader) or, with none, until the test lets it go (a stalled one), and keeps its bytes.
+    struct Sink {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        pace: Option<Duration>,
+        stalled: std_mpsc::Receiver<()>,
+        entered: std_mpsc::Sender<()>,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let _ = self.entered.send(());
+            match self.pace {
+                Some(pace) => thread::sleep(pace),
+                None => {
+                    let _ = self.stalled.recv();
+                }
+            }
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A log thread writing to a `Sink`: what it has written, the end that lets a stalled sink
+    /// go when it is dropped, and the sink's word that a write began.
+    struct Sunk {
+        log: Log,
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        _release: std_mpsc::Sender<()>,
+        entered: std_mpsc::Receiver<()>,
+    }
+
+    impl Sunk {
+        fn new(pace: Option<Duration>) -> Sunk {
+            let written = Arc::default();
+            let (release, stalled) = std_mpsc::channel();
+            let (tell, entered) = std_mpsc::channel();
+            let log = start_log_to(Sink {
+                written: Arc::clone(&written),
+                pace,
+                stalled,
+                entered: tell,
+            })
+            .unwrap();
+            Sunk {
+                log,
+                written,
+                _release: release,
+                entered,
+            }
+        }
+
+        fn text(written: &std::sync::Mutex<Vec<u8>>) -> String {
+            String::from_utf8(written.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    // The last `--verbose` lines reach stderr before the server ends (`flush_log`), a slow one
+    // included, and the thread's answer ends the wait, not its bound; a stalled stderr holds it
+    // for `SIDE_WAIT`, and one behind by a full channel isn't waited for. Before, the process
+    // could exit with them still queued: on CI a client gone at once ended the server before
+    // `ending (stdout closed)` was written.
+    #[test]
+    fn the_last_log_lines_reach_stderr_within_a_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let flush = |log: Option<&Log>| {
+            let started = Instant::now();
+            runtime.block_on(flush_log(log));
+            started.elapsed()
+        };
+
+        // 5 ms a write, two writes a line.
+        let slow = Sunk::new(Some(Duration::from_millis(5)));
+        for n in 0..5 {
+            slow.log.lines.try_send(format!("line {n}")).unwrap();
+        }
+        let took = flush(Some(&slow.log));
+        assert_eq!(
+            Sunk::text(&slow.written),
+            "line 0\nline 1\nline 2\nline 3\nline 4\n"
+        );
+        assert!(took < SIDE_WAIT / 2, "{took:?}");
+
+        let stalled = Sunk::new(None);
+        stalled.log.lines.try_send("stuck".into()).unwrap();
+        let took = flush(Some(&stalled.log));
+        assert!(took >= SIDE_WAIT && took < SIDE_WAIT * 3, "{took:?}");
+        assert_eq!(Sunk::text(&stalled.written), "");
+
+        // The thread holds a line, stuck in its write, and the channel is full behind it: the
+        // flush can't be queued, so it isn't waited for.
+        let full = Sunk::new(None);
+        full.log.lines.try_send("stuck".into()).unwrap();
+        full.entered.recv().unwrap();
+        let mut queued = 0;
+        while full.log.lines.try_send(format!("line {queued}")).is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 256);
+        let took = flush(Some(&full.log));
+        assert!(took < SIDE_WAIT / 5, "{took:?}");
+
+        // Without --verbose there is nothing to wait for.
+        let took = flush(None);
+        assert!(took < SIDE_WAIT / 5, "{took:?}");
     }
 
     // R35: what is held back is counted in requests and bytes, kept in order, and a cancel
@@ -1348,43 +1503,9 @@ mod tests {
     /// whether the call was still running when it returned, whether its connection was closed
     /// once the runtime let it go, and what was written.
     fn end_with(first: Signal) -> (Duration, bool, bool, Vec<String>) {
-        use crate::db::fake_server::{self, Conn, End as Ended, Turn, serve_pool};
+        use crate::db::fake_server::{Conn, End as Ended, Turn, serve_pool};
         let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
-        let settings = config::Settings {
-            connect: fake_server::options(fake.server.clone()),
-            limits: crate::output::Limits {
-                advice: crate::output::Advice::Mcp,
-                ..crate::output::Limits::default()
-            },
-            query_timeout: 30,
-            allow_write: false,
-            writes_off: Some(crate::guard::WritesOff::Mcp),
-            lock_timeout: 10,
-            read_uncommitted: false,
-            exact_count: false,
-            profile: Some("fake".into()),
-        };
-        let engine = Engine::new(vec![("fake".into(), settings)], 2, None);
-        let launch = Launch {
-            profiles: vec![Profile {
-                name: "fake".into(),
-                description: None,
-            }],
-            rows_given: false,
-            cell_given: false,
-        };
-        let (out, written) = std_mpsc::channel::<String>();
-        let server = Rc::new(Server::new(engine, launch, out, None));
-        // The stdout thread's part: every line written at once.
-        let unwritten = Arc::clone(&server.unwritten);
-        let writer = thread::spawn(move || {
-            let mut lines = Vec::new();
-            for line in written {
-                lines.push(line);
-                unwritten.fetch_sub(1, Ordering::Relaxed);
-            }
-            lines
-        });
+        let (server, writer) = test_server(fake.server.clone(), None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1428,6 +1549,95 @@ mod tests {
         }
         drop(server);
         (took, still_running, closed, writer.join().unwrap())
+    }
+
+    /// A server with one profile, `fake`, connecting to `server`, and `log` for `--verbose`;
+    /// and the stdout thread's part: every line written at once, all of them returned once the
+    /// server is dropped.
+    fn test_server(
+        server: String,
+        log: Option<Log>,
+    ) -> (Rc<Server>, thread::JoinHandle<Vec<String>>) {
+        let settings = config::Settings {
+            connect: crate::db::fake_server::options(server),
+            limits: crate::output::Limits {
+                advice: crate::output::Advice::Mcp,
+                ..crate::output::Limits::default()
+            },
+            query_timeout: 30,
+            allow_write: false,
+            writes_off: Some(crate::guard::WritesOff::Mcp),
+            lock_timeout: 10,
+            read_uncommitted: false,
+            exact_count: false,
+            profile: Some("fake".into()),
+        };
+        let engine = Engine::new(vec![("fake".into(), settings)], 2, None);
+        let launch = Launch {
+            profiles: vec![Profile {
+                name: "fake".into(),
+                description: None,
+            }],
+            rows_given: false,
+            cell_given: false,
+        };
+        let (out, written) = std_mpsc::channel::<String>();
+        let server = Rc::new(Server::new(engine, launch, out, log));
+        let unwritten = Arc::clone(&server.unwritten);
+        let writer = thread::spawn(move || {
+            let mut lines = Vec::new();
+            for line in written {
+                lines.push(line);
+                unwritten.fetch_sub(1, Ordering::Relaxed);
+            }
+            lines
+        });
+        (server, writer)
+    }
+
+    // The end itself waits for its last `--verbose` lines (`flush_log`), however the serving
+    // stopped. With stdout closed at once (the CI failure after `ef321ab`), or stdin closed,
+    // and nothing in flight, nothing else holds the end, so without the flush it returns before
+    // a slow stderr has `ending (...)`.
+    #[test]
+    fn the_end_waits_for_its_last_log_lines() {
+        for (why, reason) in [
+            (Why::StdoutClosed, "stdout closed"),
+            (Why::StdinClosed, "stdin closed"),
+        ] {
+            // 100 ms a write, two writes a line: 200 ms for the one line, well inside SIDE_WAIT.
+            let stderr = Sunk::new(Some(Duration::from_millis(100)));
+            let written = Arc::clone(&stderr.written);
+            // No call connects: the profile's port is never tried.
+            let (server, writer) = test_server("127.0.0.1,1".into(), Some(stderr.log));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let running = Rc::new(Cell::new(0));
+            local.block_on(
+                &runtime,
+                end(
+                    &server,
+                    &running,
+                    why,
+                    &mut Script(VecDeque::new()),
+                    Stall::new(STALL_WHEN_NO_TIMEOUT),
+                ),
+            );
+            assert_eq!(
+                Sunk::text(&written),
+                format!("sqlh mcp: ending ({reason})\n"),
+                "{reason}"
+            );
+            drop(local);
+            drop(server);
+            assert!(
+                writer.join().unwrap().is_empty(),
+                "{reason}: nothing on stdout"
+            );
+        }
     }
 
     // R36: a close, logoff or shutdown during the end, here the wait after stdin closed,
