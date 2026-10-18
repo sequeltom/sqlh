@@ -1527,9 +1527,10 @@ mod tests {
         }
     }
 
-    // Decision 19 as built, retained by the external review of Phase 5.2 and 5.3 (PLAN.md):
-    // the probe's two sides, the idle peers a retry drops, a replacement that can't log in, a
-    // cancel in the probe's attention wait, and a connection that dies at the call's USE.
+    // Decision 19 as built: the regressions the external review of Phase 5.2 and 5.3 asked to
+    // keep (PLAN.md): the probe's two sides, the idle peers a retry drops, a replacement that
+    // can't log in, a cancel in the probe's attention wait, and a connection that dies at the
+    // call's USE.
 
     /// A connection of the pooled fake that holds its first call's SELECT 50 ms, and answers the
     /// next call's setup, a reused connection's probe, after `setup`.
@@ -1817,8 +1818,9 @@ mod tests {
             "the closed connection read no USE"
         );
         assert_eq!(silent.sql(0)[4..], ["USE [d];"]);
+        // The call's 6 s and the driver's 5 s for the attention, then a new login: about 11 s.
         assert!(
-            after_silence.elapsed >= Duration::from_secs(11)
+            after_silence.elapsed >= Duration::from_secs(10)
                 && after_silence.elapsed < Duration::from_secs(16),
             "{:?}",
             after_silence.elapsed
