@@ -1358,6 +1358,36 @@ mod tests {
         );
     }
 
+    // docs/mcp-mode.md §4, exactly and in both forms: the dirty-read note and a count stop the
+    // server didn't confirm (exit 6) name what their reader can change, the CLI's flags or, in
+    // sqlh mcp, the profile's settings.
+    #[test]
+    fn the_dirty_read_note_and_an_unconfirmed_count_stop_name_what_can_change() {
+        assert_eq!(
+            read_uncommitted_note(output::Advice::Cli),
+            "reads were uncommitted (--read-uncommitted): rows may include uncommitted, \
+             duplicated or missing data"
+        );
+        assert_eq!(
+            read_uncommitted_note(output::Advice::Mcp),
+            "reads were uncommitted (the profile's read_uncommitted = true): rows may include \
+             uncommitted, duplicated or missing data"
+        );
+        let stop = "stopped counting the rows that are not shown, but the server didn't confirm \
+                    the cancel, so the connection was closed; the rows shown are complete";
+        for (advice, instead) in [
+            (output::Advice::Cli, "--exact-count reads every row instead"),
+            (
+                output::Advice::Mcp,
+                "the profile's exact_count = true reads every row instead",
+            ),
+        ] {
+            let failure = db_failure(DbError::CountStopUnconfirmed, advice);
+            assert_eq!(failure.exit, Exit::Cancelled);
+            assert_eq!(failure.message, format!("{stop} ({instead})"));
+        }
+    }
+
     // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,
     // writes allowed or not; READ UNCOMMITTED only when asked for, and READ COMMITTED
     // otherwise, always before the wrapper transaction begins.

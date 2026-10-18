@@ -2181,4 +2181,182 @@ pub(super) mod tests {
              -- error 208 (severity 16, state 1, proc dbo.p, line 3): Invalid object name 'dbo.Nope'.\n"
         );
     }
+
+    /// `limits` as `sqlh mcp` words what they hid (`Advice::Mcp`, docs/mcp-mode.md §4).
+    fn in_mcp(limits: Limits) -> Limits {
+        Limits {
+            advice: crate::output::Advice::Mcp,
+            ..limits
+        }
+    }
+
+    // docs/mcp-mode.md §4, exact output: in sqlh mcp a run's footer and notes name the call's
+    // max_rows and max_cell, the result sets a call shows at most, and the server's
+    // --max-output, which no call can change.
+    #[test]
+    fn in_mcp_the_limits_a_run_met_are_named_as_its_reader_can_change_them() {
+        let mut s = TextSink::new(Vec::new(), in_mcp(limits()));
+        for _ in 0..2 {
+            s.columns(&[col("v", "varchar(9)")]).unwrap();
+            for _ in 0..3 {
+                if s.wants_values() {
+                    s.row(&[Value::Text("abcdefg".into())]).unwrap();
+                } else {
+                    s.skipped_row();
+                }
+            }
+            s.end_rows().unwrap();
+        }
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- result 1\nv:varchar(9)\nabcde…[+2]\nabcde…[+2]\n\
+             -- 2 of 3 rows shown (max_rows 2); 2 values cut (max_cell 5)\n\
+             -- note: 1 more result sets not shown (at most 1 per call)\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+
+        // The output budget, as `output_budget_stops_the_body_and_says_what_was_withheld`.
+        let mut s = TextSink::new(Vec::new(), in_mcp(budget(50)));
+        s.columns(&[col("v", "varchar(9)")]).unwrap();
+        for _ in 0..5 {
+            if s.wants_values() {
+                s.row(&[Value::Text("aaaaaaaaa".into())]).unwrap();
+            } else {
+                s.skipped_row();
+            }
+        }
+        s.end_rows().unwrap();
+        s.message(&msg("later")).unwrap();
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- result 1\nv:varchar(9)\naaaaaaaaa\naaaaaaaaa\n\
+             -- 2 of 5 rows shown (the server's --max-output)\n\
+             -- note: output stopped at the server's --max-output limit of 1074 bytes; the run \
+             continued, and these weren't shown: 1 message\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+    }
+
+    // PLAN.md 2.15's stopped counts in sqlh mcp, exact output: the footer names max_rows, and the
+    // note offers the profile's exact_count for a count the budget stopped and a larger timeout
+    // for one -t stopped, but no larger timeout to a call that has the server's limit
+    // (`Limits::timeout_at_limit`), so a count only -t stopped gets no advice at all.
+    #[test]
+    fn in_mcp_a_stopped_count_offers_what_the_call_can_change() {
+        let rows = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        for (timeout_at_limit, advice) in [
+            (
+                false,
+                "; the profile's exact_count = true counts every row; a larger timeout counts \
+                 longer",
+            ),
+            (true, "; the profile's exact_count = true counts every row"),
+        ] {
+            let (mut s, main, _) = sink(Limits {
+                timeout_at_limit,
+                ..in_mcp(short_limits())
+            });
+            stopped_short_run(&mut s);
+            assert_eq!(
+                main.text(),
+                format!(
+                    "-- batch 1 (line 1)\n\
+                     -- result 1\n\
+                     n:int\n\
+                     {rows}\
+                     -- 10 of ≥11 rows shown (max_rows 10; counting stopped)\n\
+                     -- batch 2 (line 6)\n\
+                     -- result 2\n\
+                     n:int\n\
+                     {rows}\
+                     -- 10 of ≥10 rows shown (max_rows 10; counting stopped)\n\
+                     -- note: counting stopped in batches 1, 2: the rest of each was cancelled, so \
+                     their later statements did not run{advice}\n\
+                     -- ok: 2 batches, counting stopped in 2, 7 ms\n"
+                ),
+                "at the server's limit: {timeout_at_limit}"
+            );
+        }
+        let (mut s, main, _) = sink(Limits {
+            timeout_at_limit: true,
+            ..in_mcp(short_limits())
+        });
+        s.begin_batch(&batch("-Q", false, 1)).unwrap();
+        s.columns(&[col("n", "int")]).unwrap();
+        for i in 0..10 {
+            s.row(&[Value::Int(i)]).unwrap();
+        }
+        s.counting_stopped(Stop::Timeout);
+        s.end_rows().unwrap();
+        s.end_batch(5).unwrap();
+        s.finish(&summary("ok: 1 batch, counting stopped in 1, 7 ms"))
+            .unwrap();
+        assert_eq!(
+            main.text(),
+            format!(
+                "-- result 1\nn:int\n{rows}\
+                 -- 10 of ≥10 rows shown (max_rows 10; counting stopped)\n\
+                 -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
+                 later statements did not run\n\
+                 -- ok: 1 batch, counting stopped in 1, 7 ms\n"
+            )
+        );
+    }
+
+    // A cut definition's header in sqlh mcp (the `definition` tool), exact: the lines the output
+    // budget had no room for name the server's --max-output, and a cut while reading names the
+    // call's max_cell, or the server's --max-output when there is no cell limit (the tool's
+    // default, schema-commands.md §4). The lines shown are what the longest header leaves of
+    // the budget, so under the same budgets as the CLI's tests above their counts differ.
+    #[test]
+    fn in_mcp_a_cut_definition_names_the_servers_output_limit_and_max_cell() {
+        let cell = |max_cell, max_output| {
+            in_mcp(Limits {
+                max_cell,
+                max_output,
+                ..Limits::default()
+            })
+        };
+        let reserve = crate::output::OUTPUT_RESERVE;
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let out = definition_out(cell(0, reserve + 140), Value::Text(body.clone()));
+        assert_eq!(
+            out,
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 2 lines shown; 18 more lines \
+             not shown (the server's --max-output)\nline 1\nline 2\n\
+             -- note: output stopped at the server's --max-output limit of 1164 bytes; the run \
+             continued, and these weren't shown: 18 definition lines\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+        let out = definition_out(cell(10, 0), Value::TextCut("CREATE PRO".into(), 52));
+        assert_eq!(
+            out,
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 1 line shown, the last one cut \
+             short; 52 more characters not shown (max_cell 10)\n\
+             CREATE PRO\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+        let out = definition_out(
+            cell(150, reserve + 160),
+            Value::TextCut(body[..150].into(), 1000),
+        );
+        assert_eq!(
+            out,
+            "-- definition: dbo.p (SQL_STORED_PROCEDURE), first 3 lines shown; ≥17 more lines \
+             not shown (the server's --max-output, max_cell 150)\nline 1\nline 2\nline 3\n\
+             -- note: output stopped at the server's --max-output limit of 1184 bytes; the run \
+             continued, and these weren't shown: ≥17 definition lines\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+        let out = definition_out(
+            cell(0, reserve + 160),
+            Value::TextCut(body[..150].into(), 1000),
+        );
+        assert!(
+            out.contains(" lines not shown (the server's --max-output)\n"),
+            "{out}"
+        );
+    }
 }
