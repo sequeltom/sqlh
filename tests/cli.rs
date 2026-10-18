@@ -3661,6 +3661,49 @@ mod mcp {
         assert_eq!(by_id(&messages, 2)["result"]["resultType"], "complete");
     }
 
+    /// The same, for a reader that takes 4 KB every 100 ms (about 40 KB/s): progress is
+    /// counted in pieces small enough that it shows within FLUSH_WAIT.
+    #[test]
+    fn a_steady_slow_reader_is_not_taken_for_stopped() {
+        let config = profiles("mcp_steady_reader");
+        let mut child = sqlh()
+            .args(["mcp", "--profile", "win"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sqlh starts");
+        let version = "v".repeat(200_000);
+        let lines = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"_meta\":{{\
+             \"io.modelcontextprotocol/protocolVersion\":\"{version}\",\
+             \"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}\n\
+             {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{{{META}}}}}\n"
+        );
+        let mut stdin = child.stdin.take().expect("stdin");
+        std::io::Write::write_all(&mut stdin, lines.as_bytes()).unwrap();
+        drop(stdin);
+        let mut stdout = child.stdout.take().expect("stdout");
+        let (mut got, mut buffer) = (Vec::new(), vec![0u8; 4096]);
+        loop {
+            let n = stdout.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buffer[..n]);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let status = wait_within(&mut child, Duration::from_secs(15), "a steady slow reader");
+        assert_eq!(status.code(), Some(0));
+        let text = String::from_utf8(got).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line whole"))
+            .collect();
+        assert_eq!(messages.len(), 2, "both answers, whole");
+    }
+
     /// docs/mcp-mode.md §2: a client that goes away (its end of stdout closed) ends the server,
     /// though stdin stays open and requests keep coming, with more of them than may wait
     /// unwritten. Before the fix a full queue left the process running for good.

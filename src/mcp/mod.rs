@@ -74,8 +74,12 @@ const END_GRACE: Duration = Duration::from_secs(6);
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
 
 /// How much of a line the stdout thread writes at a time, so that the flush wait sees a long
-/// line the client is still reading make progress (`FLUSH_WAIT`).
-const WRITE_CHUNK: usize = 64 * 1024;
+/// line the client is still reading make progress (`FLUSH_WAIT`). A write to a pipe returns
+/// only once the reader has taken nearly all of it, so a reader is seen to make progress if it
+/// takes this much within `FLUSH_WAIT`: 4 KiB a second, as the CLI's writer has it
+/// (`output::delivery`'s `WRITE_UNIT`, R11). Above stdout's 1 KiB line buffer, so each piece
+/// goes straight to the pipe.
+const WRITE_CHUNK: usize = 4 * 1024;
 
 /// What the stdin thread (and the stdout thread, when it breaks) tell the server.
 enum Line {
