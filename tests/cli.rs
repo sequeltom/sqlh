@@ -9611,4 +9611,1120 @@ mod live {
             "{info}"
         );
     }
+
+    /// PLAN.md 5.4: sqlh mcp's tools against the test server, through the real binary and the
+    /// test profile (docs/mcp-mode.md §9, Still to do). A test that compares calls runs them on
+    /// one connection (`--pool 1`) and asserts that they shared it: one `@@SPID` throughout,
+    /// and no connect after the first call. A leak test across two connections proves nothing.
+    mod mcp_tools {
+        use super::*;
+        use serde_json::{Value, json};
+
+        /// The 2026-07-28 `_meta` every request carries.
+        const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+        /// A read that waits, for a call to time out or be cancelled in: it stands in for
+        /// `WAITFOR`, which the read-only guard refuses in every MCP call (DESIGN.md §7: blocked
+        /// anywhere). It reads a table of the test's own in the scratch database on which
+        /// another session holds a write (the CLI's `--allow-write`, `hold_a_write`), so it
+        /// waits for a lock, which costs the server no CPU: a CPU-bound read would take one of
+        /// its schedulers from the live tests running meanwhile, some against a deadline. It
+        /// asks for READ COMMITTED's locks whatever the session's level or the database's row
+        /// versioning. Dropping this ends the write (the holder is killed, and the server rolls
+        /// its transaction back) and then drops the table.
+        struct Blocked {
+            read: String,
+            _hold: Reaped,
+            _probe: Probe,
+        }
+
+        impl Blocked {
+            fn on(profile: &str, database: &str) -> Blocked {
+                let probe = Probe::create(profile, database);
+                let hold = hold_a_write(profile, database, &probe.name);
+                let read = format!(
+                    "SELECT COUNT(*) AS n FROM [{database}].{} WITH (READCOMMITTEDLOCK)",
+                    probe.name
+                );
+                Blocked {
+                    read,
+                    _hold: hold,
+                    _probe: probe,
+                }
+            }
+        }
+
+        /// `sqlh mcp` driven as a harness drives it: a request at a time, each answer read as
+        /// it comes, so a test can act between them (cancel a call the server is running, look
+        /// at the server meanwhile). Killed when dropped, if a failed test left it running.
+        struct Mcp {
+            child: Option<std::process::Child>,
+            stdin: Option<std::process::ChildStdin>,
+            lines: std::sync::mpsc::Receiver<String>,
+            /// Every message read so far, in the order it came.
+            seen: Vec<Value>,
+            stderr: std::sync::Arc<std::sync::Mutex<String>>,
+            stderr_reader: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Mcp {
+            /// `sqlh mcp --profile PROFILE --pool 1 --verbose -t 30` with the machine's real
+            /// profiles: one connection, so the calls queue on one session, and a server limit
+            /// of 30 s for the timeout advice to name.
+            fn on(profile: &str) -> Mcp {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+                command.args(["mcp", "--profile", profile]).args(MCP_FLAGS);
+                Mcp::start(&mut command)
+            }
+
+            fn start(command: &mut Command) -> Mcp {
+                let mut child = command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("sqlh mcp starts");
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take().expect("a piped stdout");
+                let (sender, lines) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::BufRead as _;
+                    for line in std::io::BufReader::new(stdout)
+                        .lines()
+                        .map_while(Result::ok)
+                    {
+                        if sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut pipe = child.stderr.take().expect("a piped stderr");
+                let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let shared = std::sync::Arc::clone(&stderr);
+                let stderr_reader = std::thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(n) = pipe.read(&mut buffer) {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Ok(mut text) = shared.lock() {
+                            text.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                        }
+                    }
+                });
+                Mcp {
+                    child: Some(child),
+                    stdin,
+                    lines,
+                    seen: Vec::new(),
+                    stderr,
+                    stderr_reader: Some(stderr_reader),
+                }
+            }
+
+            fn send(&mut self, line: &str) {
+                let stdin = self.stdin.as_mut().expect("stdin is open");
+                writeln!(stdin, "{line}").expect("sqlh mcp reads its stdin");
+                stdin.flush().expect("sqlh mcp reads its stdin");
+            }
+
+            /// Sends request `id`, a `tools/call` of `tool` with `arguments`.
+            fn request(&mut self, id: u64, tool: &str, arguments: &Value) {
+                self.send(&format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"{tool}","arguments":{arguments}}}}}"#
+                ));
+            }
+
+            /// Sends the client's cancel of request `id`.
+            fn cancel(&mut self, id: u64) {
+                self.send(&format!(
+                    r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#
+                ));
+            }
+
+            /// Reads one message into `seen`, waiting at most until `deadline`; whether one came.
+            fn read_until(&mut self, deadline: Instant) -> bool {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(left) {
+                    Ok(line) => {
+                        let message = serde_json::from_str(&line)
+                            .unwrap_or_else(|e| panic!("not a JSON message ({e}): {line:?}"));
+                        self.seen.push(message);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+
+            /// The message answering request `id`, waiting for it at most a minute.
+            fn answer(&mut self, id: u64) -> Value {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    if let Some(found) = self.seen.iter().find(|m| m["id"] == id) {
+                        return found.clone();
+                    }
+                    if !self.read_until(deadline) {
+                        panic!("no answer to request {id}; stderr:\n{}", self.stderr());
+                    }
+                }
+            }
+
+            /// Calls `tool` and returns the call's result (the answer must not be a JSON-RPC
+            /// error).
+            fn call(&mut self, id: u64, tool: &str, arguments: Value) -> Value {
+                self.request(id, tool, &arguments);
+                let answer = self.answer(id);
+                assert!(answer.get("result").is_some(), "{answer}");
+                answer["result"].clone()
+            }
+
+            /// The answer to a `tools/list`, as request `id`.
+            fn list(&mut self, id: u64) -> Value {
+                self.send(&format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list","params":{{{META}}}}}"#
+                ));
+                self.answer(id)
+            }
+
+            fn stderr(&self) -> String {
+                self.stderr
+                    .lock()
+                    .map(|text| text.clone())
+                    .unwrap_or_default()
+            }
+
+            /// stderr once it holds `wanted`, waiting at most `limit`.
+            fn stderr_with(&self, wanted: &str, limit: Duration) -> String {
+                let started = Instant::now();
+                loop {
+                    let text = self.stderr();
+                    if text.contains(wanted) || started.elapsed() > limit {
+                        return text;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+
+            /// Closes stdin and waits for the server to end, at most 30 s: its exit code, every
+            /// message it wrote, and its stderr.
+            fn finish(mut self) -> (i32, Vec<Value>, String) {
+                drop(self.stdin.take());
+                let mut child = self.child.take().expect("the server is running");
+                let started = Instant::now();
+                let status = loop {
+                    if let Some(status) = child.try_wait().expect("the server's status") {
+                        break status;
+                    }
+                    if started.elapsed() > Duration::from_secs(30) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "sqlh mcp didn't end within 30 s of its stdin closing; stderr:\n{}",
+                            self.stderr()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                // The reader threads end at the end of their pipes.
+                while self.read_until(Instant::now() + Duration::from_secs(5)) {}
+                if let Some(reader) = self.stderr_reader.take() {
+                    let _ = reader.join();
+                }
+                let code = status.code().expect("an exit code");
+                (code, std::mem::take(&mut self.seen), self.stderr())
+            }
+        }
+
+        impl Drop for Mcp {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        /// The flags after `--profile` of every server here.
+        const MCP_FLAGS: [&str; 5] = ["--pool", "1", "--verbose", "-t", "30"];
+
+        /// A tool result's text, and whether the result is an error (`isError`).
+        fn tool_text(result: &Value) -> (bool, String) {
+            let text = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no text in {result}"));
+            (result["isError"] == true, text.to_owned())
+        }
+
+        /// A text result's body and its status line, the last.
+        fn split_status(text: &str) -> (&str, &str) {
+            let end = text.strip_suffix('\n').unwrap_or(text);
+            text.split_at(end.rfind('\n').map_or(0, |at| at + 1))
+        }
+
+        /// The document of a `format: "json"` result that isn't an error.
+        fn ok_document(result: &Value) -> Value {
+            let (error, text) = tool_text(result);
+            assert!(!error, "{text}");
+            serde_json::from_str(text.trim_end())
+                .unwrap_or_else(|e| panic!("not a JSON document ({e}): {text}"))
+        }
+
+        /// A JSON document's events of `kind`, in order across its batches.
+        fn events<'a>(document: &'a Value, kind: &str) -> Vec<&'a Value> {
+            document["batches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|batch| batch["events"].as_array().into_iter().flatten())
+                .filter(|event| event["type"] == kind)
+                .collect()
+        }
+
+        type Row = serde_json::Map<String, Value>;
+
+        /// A JSON document's result sets, in order: each one's rows, as maps from column name
+        /// to value.
+        fn result_sets(document: &Value) -> Vec<Vec<Row>> {
+            events(document, "result")
+                .into_iter()
+                .map(|result| {
+                    let names: Vec<String> = result["columns"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|column| column["name"].as_str().unwrap_or("").to_owned())
+                        .collect();
+                    result["rows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|row| {
+                            names
+                                .iter()
+                                .cloned()
+                                .zip(row.as_array().into_iter().flatten().cloned())
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+
+        /// The first row of a JSON document's first result set.
+        fn first_row(document: &Value) -> Row {
+            result_sets(document)
+                .first()
+                .and_then(|rows| rows.first())
+                .cloned()
+                .unwrap_or_else(|| panic!("no row in {document}"))
+        }
+
+        /// What the server shows of session `spid`, read through the CLI on a session of its
+        /// own: the first row of `columns`, a select list over `sys.dm_exec_sessions AS s`.
+        fn on_server(profile: &str, database: &str, spid: i64, columns: &str) -> Row {
+            let sql = format!(
+                "SELECT {columns} FROM sys.dm_exec_sessions AS s WHERE s.session_id = {spid}"
+            );
+            let r = live(profile, database, &["--format", "json", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            first_row(&serde_json::from_str(r.stdout.trim_end()).expect("a JSON document"))
+        }
+
+        /// Waits until session `spid` waits for a lock, as the server sees it (at most 20 s):
+        /// the call is past its own short statements and in `Blocked`'s read. Each look is a
+        /// login, which costs this server about 150 ms of CPU (docs/notes/connect-latency.md),
+        /// so it looks first after the read has had time to start.
+        fn wait_until_blocked(profile: &str, database: &str, spid: i64) {
+            let columns = "(SELECT COUNT(*) FROM sys.dm_exec_requests AS r \
+                 WHERE r.session_id = s.session_id AND r.wait_type LIKE N'LCK[_]M[_]%') AS waiting";
+            let give_up = Instant::now() + Duration::from_secs(20);
+            loop {
+                std::thread::sleep(Duration::from_millis(300));
+                if on_server(profile, database, spid, columns)["waiting"] == 1 {
+                    return;
+                }
+                assert!(
+                    Instant::now() < give_up,
+                    "session {spid} never waited for the held write"
+                );
+            }
+        }
+
+        // docs/mcp-mode.md §4: the query tool through sqlh mcp and the test profile. Rows come
+        // back in the text format, its status line last, isError false. A SQL error is isError
+        // with the error's number and its line in the call's SQL (line 4, in the second
+        // batch), exit 1. Every write is refused before anything runs, exit 5, worded for MCP
+        // (`sqlh mcp is read-only`, never --allow-write), in text and in JSON, and the test's
+        // own table in the scratch database (the call's `database`) holds what it held before.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_query_answers_rows_and_errors_and_writes_nothing() {
+            let (p, db) = target();
+            let probe = Probe::create(&p, &db);
+            let t = probe.name.clone();
+            let filled = probe.server.write(&format!("INSERT {t} VALUES (1), (2)"));
+            assert_eq!(filled.code, 0, "{}", filled.stdout);
+            let contents = || {
+                let r = live(&p, &db, &["-Q", &format!("SELECT id FROM {t} ORDER BY id")]);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                split_status(&r.stdout).0.to_owned()
+            };
+            let held = "-- result 1\nid:int\n1\n2\n-- 2 rows\n";
+            assert_eq!(contents(), held);
+
+            let mut mcp = Mcp::on(&p);
+            let rows = "SELECT n FROM (VALUES (1), (2), (3)) AS v(n) ORDER BY n";
+            let (error, text) = tool_text(&mcp.call(1, "query", json!({"sql": rows})));
+            assert!(!error, "{text}");
+            let (body, status) = split_status(&text);
+            assert_eq!(body, "-- result 1\nn:int\n1\n2\n3\n-- 3 rows\n");
+            assert!(
+                status.starts_with("-- ok: 1 batch, ")
+                    && status.contains(" ms; ")
+                    && status.contains(", connect ")
+                    && status.ends_with(" ms\n"),
+                "{status}"
+            );
+
+            let failing =
+                "SELECT 1 AS one\nGO\nSELECT 2 AS two;\nSELECT * FROM dbo.sqlh_no_such_table";
+            let (error, text) = tool_text(&mcp.call(2, "query", json!({"sql": failing})));
+            assert!(error, "{text}");
+            let (body, status) = split_status(&text);
+            assert_eq!(
+                body,
+                "-- batch 1 (line 1)\n-- result 1\none:int\n1\n-- 1 row\n\
+                 -- batch 2 (line 3)\n-- result 2\ntwo:int\n2\n-- 1 row\n\
+                 -- error 208 (severity 16, state 1, line 4): Invalid object name \
+                 'dbo.sqlh_no_such_table'.\n"
+            );
+            assert!(
+                status.starts_with("-- failed (exit 1): 1 error, first in batch 2, "),
+                "{status}"
+            );
+
+            // Each write as the guard names it; the last one's first batch is a read, which
+            // doesn't run either.
+            let writes = [
+                (format!("INSERT {t} VALUES (3)"), 1, format!("INSERT {t}")),
+                (
+                    format!("UPDATE {t} SET id = id + 10"),
+                    1,
+                    format!("UPDATE {t}"),
+                ),
+                (format!("DELETE {t}"), 1, format!("DELETE {t}")),
+                (
+                    format!("TRUNCATE TABLE {t}"),
+                    1,
+                    format!("TRUNCATE TABLE {t}"),
+                ),
+                (format!("DROP TABLE {t}"), 1, format!("DROP TABLE {t}")),
+                (
+                    format!("SELECT 1 AS one\nGO\nDELETE {t}"),
+                    3,
+                    format!("DELETE {t}"),
+                ),
+            ];
+            for (id, (sql, line, what)) in (3..).zip(&writes) {
+                let result = mcp.call(id, "query", json!({"sql": sql, "database": db}));
+                let (error, text) = tool_text(&result);
+                assert!(error, "{text}");
+                let (body, status) = split_status(&text);
+                assert_eq!(
+                    body,
+                    format!(
+                        "-- blocked: line {line}: {what} would write; nothing was run. \
+                         sqlh mcp is read-only\n"
+                    )
+                );
+                assert!(
+                    status.starts_with("-- failed (exit 5): blocked by the read-only guard, "),
+                    "{status}"
+                );
+            }
+            let insert = format!("INSERT {t} VALUES (4)");
+            let result = mcp.call(
+                9,
+                "query",
+                json!({"sql": insert, "database": db, "format": "json"}),
+            );
+            let (error, text) = tool_text(&result);
+            assert!(error, "{text}");
+            let document: Value = serde_json::from_str(text.trim_end()).expect("a JSON document");
+            assert_eq!(document["exit_code"], 5, "{document}");
+            assert_eq!(document["batches"], json!([]), "{document}");
+            assert_eq!(
+                document["error"],
+                format!("line 1: INSERT {t} would write; nothing was run. sqlh mcp is read-only"),
+            );
+
+            let (code, messages, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+            assert_eq!(messages.len(), 9, "{messages:?}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.to_string().contains("--allow-write")),
+                "{messages:?}"
+            );
+            assert_eq!(contents(), held, "nothing was written");
+        }
+
+        // docs/mcp-mode.md §4 (Timeout) and §5 (After a cancel), on one connection: a call
+        // under `timeout: 1` that runs longer ends at about 1 s, exit 4, with the advice the
+        // call can follow (raise timeout, up to the server's 30 s), and the next call is
+        // answered on the same session. A call the client cancels while the server runs it
+        // gets no answer, `--verbose` logs the cancel and the call's end, and the next call is
+        // answered on the same session, at once and clean: its @@TRANCOUNT a fresh call's
+        // (the wrapper's own). WAITFOR, the natural wait, is refused in a read-only call, exit
+        // 5 (DESIGN.md §7), so a read blocked behind another session's write stands in for it
+        // (`Blocked`).
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_a_timeout_and_a_cancel_keep_the_session_and_leave_it_clean() {
+            let (p, db) = target();
+            let blocked = Blocked::on(&p, &db);
+            let mut mcp = Mcp::on(&p);
+            let waitfor = json!({"sql": "WAITFOR DELAY '00:00:05'", "timeout": 1});
+            let (error, text) = tool_text(&mcp.call(1, "query", waitfor));
+            assert!(error, "{text}");
+            assert_eq!(
+                split_status(&text).0,
+                "-- blocked: line 1: WAITFOR is not allowed in read-only mode (if it is a \
+                 column name, write it as [WAITFOR]); nothing was run. sqlh mcp is read-only\n"
+            );
+
+            let state = json!({
+                "sql": "SELECT @@SPID AS spid, @@TRANCOUNT AS trancount, @@LOCK_TIMEOUT AS lock_timeout",
+                "format": "json",
+            });
+            let fresh = ok_document(&mcp.call(2, "query", state.clone()));
+            assert!(
+                fresh["connect_ms"].as_u64() > Some(0),
+                "a new login: {fresh}"
+            );
+            let fresh = first_row(&fresh);
+            assert_eq!(fresh["trancount"], 1, "the wrapper's own transaction");
+            let lock_timeout = fresh["lock_timeout"].as_i64().expect("@@LOCK_TIMEOUT");
+            assert!(
+                lock_timeout == -1 || lock_timeout >= 5000,
+                "the profile's lock timeout must outlast the waits here: {fresh:?}"
+            );
+
+            let started = Instant::now();
+            let timed_out = mcp.call(3, "query", json!({"sql": blocked.read, "timeout": 1}));
+            let took = started.elapsed();
+            let (error, text) = tool_text(&timed_out);
+            assert!(error, "{text}");
+            let (body, status) = split_status(&text);
+            assert_eq!(
+                body,
+                "-- error: query timeout after 1 s in batch 1; raise timeout (the server allows \
+                 up to 30 s) or narrow the query\n"
+            );
+            assert!(
+                status.starts_with("-- failed (exit 4): timeout, "),
+                "{status}"
+            );
+            assert!(took < Duration::from_secs(1) + GRACE, "{took:?}");
+            let after_timeout = ok_document(&mcp.call(4, "query", state.clone()));
+            assert_eq!(after_timeout["connect_ms"], 0, "{after_timeout}");
+            assert_eq!(first_row(&after_timeout), fresh, "the same session, clean");
+
+            let spid = fresh["spid"].as_i64().expect("an SPID");
+            mcp.request(5, "query", &json!({"sql": blocked.read}));
+            wait_until_blocked(&p, &db, spid);
+            let cancelled = Instant::now();
+            mcp.cancel(5);
+            let after_cancel = ok_document(&mcp.call(6, "query", state));
+            let took = cancelled.elapsed();
+            assert!(took < GRACE, "the cancel ended the wait: {took:?}");
+            assert_eq!(after_cancel["connect_ms"], 0, "{after_cancel}");
+            assert_eq!(first_row(&after_cancel), fresh, "the same session, clean");
+            let ended = format!("query on {}: exit 6 (cancelled) in ", p.to_lowercase());
+            let stderr = mcp.stderr_with("exit 6 (cancelled)", Duration::from_secs(5));
+            assert!(
+                stderr.contains("sqlh mcp: request 5 cancelled\n"),
+                "{stderr}"
+            );
+            assert!(stderr.to_lowercase().contains(&ended), "{stderr}");
+
+            let (code, messages, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+            let ids: Vec<&Value> = messages.iter().map(|m| &m["id"]).collect();
+            assert_eq!(
+                ids,
+                [1, 2, 3, 4, 6],
+                "nothing for the cancelled call: {messages:?}"
+            );
+        }
+
+        // docs/mcp-mode.md §5 (Reset before every call), on one connection: a call that
+        // changes database with USE (to another the login can read), turns ANSI_NULLS off and
+        // NOCOUNT on, sets its language and SERIALIZABLE (and IMPLICIT_TRANSACTIONS,
+        // ARITHIGNORE, XACT_ABORT, a lock timeout and a deadlock priority of its own) and
+        // creates a #temp table sees all of that in force. The next call on the session sees
+        // none of it: the profile's database, a fresh call's @@OPTIONS (sqlh's session setup
+        // again), language, lock timeout, deadlock priority and READ COMMITTED, no #temp table;
+        // and none of their effects (NULL = NULL is unknown again, an INSERT reports its row, a
+        // month is named in the login's language, and the #temp table can't be read).
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_what_a_call_sets_is_gone_from_the_next_call() {
+            let (p, _) = target();
+            let mut mcp = Mcp::on(&p);
+            let state = "CREATE TABLE #sqlh_counted (id int);\nINSERT #sqlh_counted VALUES (1);\n\
+                 SELECT @@SPID AS spid, DB_NAME() AS db, s.transaction_isolation_level AS \
+                 isolation, @@OPTIONS AS options, @@LANGUAGE AS language_name, \
+                 @@LOCK_TIMEOUT AS lock_timeout, s.deadlock_priority, \
+                 DATENAME(month, '20200101') AS month_name, \
+                 CASE WHEN NULL = NULL THEN 1 ELSE 0 END AS null_equals_null, \
+                 OBJECT_ID(N'tempdb..#sqlh_left') AS temp_table \
+                 FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID";
+            let options = |row: &Row| row["options"].as_i64().expect("@@OPTIONS");
+            // @@OPTIONS bits: the two the setter's effects show, and three more it sets, which
+            // only the reset clears (IMPLICIT_TRANSACTIONS, ARITHIGNORE) or which sqlh's
+            // session setup sets again (XACT_ABORT, with the lock timeout and the deadlock
+            // priority).
+            let (ansi_nulls, nocount) = (32, 512);
+            let others = 2 | 128 | 16384;
+
+            let fresh_document =
+                ok_document(&mcp.call(1, "query", json!({"sql": state, "format": "json"})));
+            assert!(
+                fresh_document["connect_ms"].as_u64() > Some(0),
+                "a new login"
+            );
+            let fresh = first_row(&fresh_document);
+            assert_eq!(fresh["isolation"], 2, "READ COMMITTED: {fresh:?}");
+            assert_eq!(
+                options(&fresh) & (ansi_nulls | nocount | others),
+                ansi_nulls,
+                "{fresh:?}"
+            );
+            assert_eq!(fresh["null_equals_null"], 0, "{fresh:?}");
+            assert_eq!(fresh["temp_table"], Value::Null, "{fresh:?}");
+            let counted = events(&fresh_document, "rows_affected");
+            assert_eq!(counted, [&json!({"type": "rows_affected", "count": 1})]);
+
+            let other = if fresh["db"] == "master" {
+                "tempdb"
+            } else {
+                "master"
+            };
+            let setter = format!(
+                "USE [{other}];\nSET ANSI_NULLS OFF;\nSET NOCOUNT ON;\nSET LANGUAGE French;\n\
+                 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n\
+                 SET IMPLICIT_TRANSACTIONS ON;\nSET ARITHIGNORE ON;\nSET XACT_ABORT ON;\n\
+                 SET LOCK_TIMEOUT 5;\nSET DEADLOCK_PRIORITY HIGH;\n\
+                 CREATE TABLE #sqlh_left (id int);\nINSERT #sqlh_left VALUES (1);\n{state}"
+            );
+            let set_document =
+                ok_document(&mcp.call(2, "query", json!({"sql": setter, "format": "json"})));
+            let set = first_row(&set_document);
+            assert_eq!(set["spid"], fresh["spid"], "one session");
+            assert_eq!(set["db"], other, "{set:?}");
+            assert_eq!(set["isolation"], 4, "SERIALIZABLE: {set:?}");
+            assert_eq!(
+                options(&set) & (ansi_nulls | nocount | others),
+                nocount | others,
+                "{set:?}"
+            );
+            assert_eq!(set["lock_timeout"], 5, "{set:?}");
+            assert_eq!(set["deadlock_priority"], 5, "HIGH: {set:?}");
+            assert_ne!(set["lock_timeout"], fresh["lock_timeout"], "{fresh:?}");
+            assert_ne!(
+                set["deadlock_priority"], fresh["deadlock_priority"],
+                "{fresh:?}"
+            );
+            assert_ne!(set["language_name"], fresh["language_name"], "{set:?}");
+            assert_eq!(set["month_name"], "janvier", "{set:?}");
+            assert_eq!(set["null_equals_null"], 1, "{set:?}");
+            assert!(set["temp_table"].is_i64(), "{set:?}");
+            assert!(events(&set_document, "rows_affected").is_empty(), "NOCOUNT");
+
+            let next_document =
+                ok_document(&mcp.call(3, "query", json!({"sql": state, "format": "json"})));
+            assert_eq!(next_document["connect_ms"], 0, "no new login");
+            assert_eq!(
+                first_row(&next_document),
+                fresh,
+                "a fresh call's session again"
+            );
+            assert_eq!(
+                events(&next_document, "rows_affected"),
+                counted,
+                "NOCOUNT off"
+            );
+
+            let (error, text) =
+                tool_text(&mcp.call(4, "query", json!({"sql": "SELECT id FROM #sqlh_left"})));
+            assert!(error, "{text}");
+            let (body, status) = split_status(&text);
+            assert_eq!(
+                body,
+                "-- error 208 (severity 16, state 0, line 1): Invalid object name '#sqlh_left'.\n"
+            );
+            assert!(status.ends_with(", connect 0 ms\n"), "{status}");
+            let (code, _, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+        }
+
+        // The external review's question 3 (PLAN.md, Phase 5.2 and 5.3 external review), on
+        // one connection: a fresh login's session against the next call's, after a call that
+        // sets ROWCOUNT, TEXTSIZE, LANGUAGE, DATEFORMAT, DATEFIRST and CONTEXT_INFO and opens a
+        // GLOBAL cursor, all of which the guard lets through. Values: DBCC USEROPTIONS (which
+        // lists rowcount while it is set), @@TEXTSIZE, @@LANGUAGE, @@DATEFIRST, the session's
+        // date_format, CONTEXT_INFO() and CURSOR_STATUS. Effects: a SELECT of five rows
+        // returns five (two under ROWCOUNT 2), a 50-character value comes whole (cut to 10
+        // under TEXTSIZE 10), a month's name, a Sunday's weekday number and the reading of
+        // '01/02/03' are the fresh session's, and FETCH finds no cursor (error 16916). Each is
+        // in force in the call that set it and the fresh login's again in the next: the reset
+        // restores them all, so the session setup needs no statement for any of them. App
+        // locks and session context, the review's other two, are refused by the guard, exit 5.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_the_reset_gives_the_next_call_a_fresh_logins_session() {
+            let (p, _) = target();
+            let mut mcp = Mcp::on(&p);
+            let state = "DBCC USEROPTIONS;\n\
+                 SELECT @@SPID AS spid, @@TEXTSIZE AS text_size, @@LANGUAGE AS language_name, \
+                 @@DATEFIRST AS date_first, s.date_format, CONTEXT_INFO() AS context, \
+                 CURSOR_STATUS('global', 'sqlh_reset_cursor') AS cursor_status \
+                 FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID;\n\
+                 SELECT n FROM (VALUES (1), (2), (3), (4), (5)) AS v(n) ORDER BY n;\n\
+                 SELECT REPLICATE(CAST('x' AS varchar(max)), 50) AS long_value;\n\
+                 SELECT DATENAME(month, '20200101') AS month_name, \
+                 DATEPART(weekday, '20200105') AS sunday, \
+                 CONVERT(char(10), CAST('01/02/03' AS datetime), 23) AS read_as";
+            let fresh_document =
+                ok_document(&mcp.call(1, "query", json!({"sql": state, "format": "json"})));
+            assert!(
+                fresh_document["connect_ms"].as_u64() > Some(0),
+                "a new login"
+            );
+            let fresh = result_sets(&fresh_document);
+            assert_eq!(fresh.len(), 5, "{fresh_document}");
+            let option = |sets: &[Vec<Row>], name: &str| {
+                sets[0]
+                    .iter()
+                    .find(|row| row["Set Option"] == name)
+                    .map(|row| row["Value"].clone())
+            };
+            assert_eq!(option(&fresh, "rowcount"), None, "{fresh:?}");
+            assert_eq!(fresh[1][0]["cursor_status"], -3, "no cursor: {fresh:?}");
+            assert_eq!(fresh[1][0]["context"], Value::Null, "{fresh:?}");
+            assert_eq!(fresh[2].len(), 5, "{fresh:?}");
+            assert_eq!(fresh[3][0]["long_value"], "x".repeat(50), "{fresh:?}");
+
+            let setter = format!(
+                "SET ROWCOUNT 2;\nSET TEXTSIZE 10;\nSET LANGUAGE French;\nSET DATEFORMAT ymd;\n\
+                 SET DATEFIRST 3;\nSET CONTEXT_INFO 0x53514C48;\n\
+                 DECLARE sqlh_reset_cursor CURSOR GLOBAL FOR SELECT 1 AS one;\n\
+                 OPEN sqlh_reset_cursor;\n{state}"
+            );
+            let set_document =
+                ok_document(&mcp.call(2, "query", json!({"sql": setter, "format": "json"})));
+            let set = result_sets(&set_document);
+            assert_eq!(set.len(), 5, "{set_document}");
+            assert_eq!(option(&set, "rowcount"), Some(json!("2")), "{set:?}");
+            assert_eq!(option(&set, "textsize"), Some(json!("10")), "{set:?}");
+            assert_eq!(option(&set, "dateformat"), Some(json!("ymd")), "{set:?}");
+            assert_eq!(option(&set, "datefirst"), Some(json!("3")), "{set:?}");
+            let (was, now) = (&fresh[1][0], &set[1][0]);
+            assert_eq!(now["spid"], was["spid"], "one session");
+            assert_eq!(now["text_size"], 10, "{now:?}");
+            assert_ne!(now["language_name"], was["language_name"], "{now:?}");
+            assert_eq!(now["date_first"], 3, "{now:?}");
+            assert_eq!(now["date_format"], "ymd", "{now:?}");
+            assert!(
+                now["context"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("0x53514C48")),
+                "{now:?}"
+            );
+            assert_eq!(now["cursor_status"], 1, "an open cursor: {now:?}");
+            assert_eq!(set[2].len(), 2, "ROWCOUNT 2: {set:?}");
+            assert_eq!(
+                set[3][0]["long_value"],
+                "x".repeat(10),
+                "TEXTSIZE 10: {set:?}"
+            );
+            let effects = &set[4][0];
+            assert_eq!(effects["month_name"], "janvier", "{effects:?}");
+            assert_eq!(effects["sunday"], 5, "DATEFIRST 3: {effects:?}");
+            assert_eq!(effects["read_as"], "2001-02-03", "ymd: {effects:?}");
+            for name in ["month_name", "sunday", "read_as"] {
+                assert_ne!(effects[name], fresh[4][0][name], "{name}: {fresh:?}");
+            }
+
+            let next_document =
+                ok_document(&mcp.call(3, "query", json!({"sql": state, "format": "json"})));
+            assert_eq!(next_document["connect_ms"], 0, "no new login");
+            assert_eq!(
+                result_sets(&next_document),
+                fresh,
+                "the fresh login's options, values and effects, on its SPID"
+            );
+
+            let fetch = json!({"sql": "FETCH NEXT FROM sqlh_reset_cursor"});
+            let (error, text) = tool_text(&mcp.call(4, "query", fetch));
+            assert!(error, "{text}");
+            let (body, status) = split_status(&text);
+            assert_eq!(
+                body,
+                "-- error 16916 (severity 16, state 1): A cursor with the name \
+                 'sqlh_reset_cursor' does not exist.\n"
+            );
+            assert!(status.ends_with(", connect 0 ms\n"), "{status}");
+
+            // App locks and session context can't be set at all: the guard's EXEC allowlist
+            // admits neither procedure, so they are for the session layer to check if that
+            // changes (the review's question 3).
+            for (id, procedure, sql) in [
+                (
+                    5,
+                    "sp_getapplock",
+                    "EXEC sp_getapplock N'sqlh', N'Shared', N'Session'",
+                ),
+                (
+                    6,
+                    "sp_set_session_context",
+                    "EXEC sp_set_session_context N'sqlh', 1",
+                ),
+            ] {
+                let (error, text) = tool_text(&mcp.call(id, "query", json!({"sql": sql})));
+                assert!(error, "{text}");
+                assert_eq!(
+                    split_status(&text).0,
+                    format!(
+                        "-- blocked: line 1: EXEC {procedure} would write; nothing was run. \
+                         sqlh mcp is read-only\n"
+                    )
+                );
+            }
+            let (code, _, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+        }
+
+        // Decision 17, amended (docs/mcp-mode.md §5, After a cancel), on one connection: a call
+        // creates a #temp table, turns ANSI_NULLS off and NOCOUNT on, sets its language and
+        // SERIALIZABLE, and is cancelled by the client while it waits in a read (`Blocked`,
+        // since the guard refuses WAITFOR). The driver keeps the connection: the server shows
+        // the session idle with no open transaction (put_back rolled the wrapper back) and
+        // still at the cancelled call's level and language, which only the next call's reset
+        // clears. That call, on the same SPID with no new login, sees a fresh call's
+        // @@TRANCOUNT (1, the wrapper's own), @@OPTIONS (sqlh's session setup), language and
+        // level, and no #temp table.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_a_cancel_the_driver_kept_leaves_the_next_call_clean() {
+            let (p, db) = target();
+            let blocked = Blocked::on(&p, &db);
+            let mut mcp = Mcp::on(&p);
+            let state = "SELECT @@SPID AS spid, @@TRANCOUNT AS trancount, @@OPTIONS AS options, \
+                 @@LANGUAGE AS language_name, s.transaction_isolation_level AS isolation, \
+                 OBJECT_ID(N'tempdb..#sqlh_cancelled') AS temp_table \
+                 FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID";
+            let fresh_document =
+                ok_document(&mcp.call(1, "query", json!({"sql": state, "format": "json"})));
+            assert!(
+                fresh_document["connect_ms"].as_u64() > Some(0),
+                "a new login"
+            );
+            let fresh = first_row(&fresh_document);
+            assert_eq!(
+                fresh["trancount"], 1,
+                "the wrapper's own transaction: {fresh:?}"
+            );
+            assert_eq!(fresh["isolation"], 2, "{fresh:?}");
+            let spid = fresh["spid"].as_i64().expect("an SPID");
+
+            let cancelled = format!(
+                "CREATE TABLE #sqlh_cancelled (id int);\nINSERT #sqlh_cancelled VALUES (1);\n\
+                 SET ANSI_NULLS OFF;\nSET NOCOUNT ON;\nSET LANGUAGE French;\n\
+                 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n{}",
+                blocked.read
+            );
+            mcp.request(2, "query", &json!({"sql": cancelled}));
+            wait_until_blocked(&p, &db, spid);
+            let session = "s.transaction_isolation_level AS isolation, s.language AS \
+                 language_name, s.ansi_nulls, s.open_transaction_count AS transactions, \
+                 (SELECT COUNT(*) FROM sys.dm_exec_requests AS r \
+                 WHERE r.session_id = s.session_id) AS requests";
+            let running = on_server(&p, &db, spid, session);
+            assert_eq!(running["isolation"], 4, "{running:?}");
+            assert_eq!(running["ansi_nulls"], 0, "{running:?}");
+            assert_ne!(
+                running["language_name"], fresh["language_name"],
+                "{running:?}"
+            );
+            assert_eq!(running["requests"], 1, "{running:?}");
+
+            mcp.cancel(2);
+            let stderr = mcp.stderr_with("exit 6 (cancelled)", Duration::from_secs(10));
+            assert!(
+                stderr.contains("sqlh mcp: request 2 cancelled\n"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("exit 6 (cancelled)"), "{stderr}");
+            // Logged once the call has put its connection back.
+            let idle = on_server(&p, &db, spid, session);
+            assert_eq!(idle["requests"], 0, "idle: {idle:?}");
+            assert_eq!(idle["transactions"], 0, "the wrapper rolled back: {idle:?}");
+            assert_eq!(idle["isolation"], 4, "the reset hasn't run yet: {idle:?}");
+            assert_eq!(idle["language_name"], running["language_name"], "{idle:?}");
+
+            let next_document =
+                ok_document(&mcp.call(3, "query", json!({"sql": state, "format": "json"})));
+            assert_eq!(
+                next_document["connect_ms"], 0,
+                "the connection the driver kept"
+            );
+            assert_eq!(
+                first_row(&next_document),
+                fresh,
+                "a fresh call's session, same SPID"
+            );
+
+            let (code, messages, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+            let ids: Vec<&Value> = messages.iter().map(|m| &m["id"]).collect();
+            assert_eq!(ids, [1, 3], "nothing for the cancelled call: {messages:?}");
+        }
+
+        /// The test profile's table in the machine's profiles file (`SQLH_CONFIG`, else the
+        /// default place), as the file has it: its spelling of the name and its key lines.
+        /// Read, never written.
+        fn test_profile_entry(profile: &str) -> (String, Vec<String>) {
+            let path = std::env::var_os("SQLH_CONFIG")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA is set"))
+                        .join("sqlh")
+                        .join("profiles.toml")
+                });
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("the profiles file {}: {e}", path.display()));
+            let mut entry: Option<(String, Vec<String>)> = None;
+            let mut inside = false;
+            for line in text.lines().map(str::trim) {
+                if let Some(header) = line.strip_prefix('[') {
+                    let header = header.split('#').next().unwrap_or("").trim();
+                    let name = header
+                        .trim_end_matches(']')
+                        .trim()
+                        .trim_start_matches("profiles.")
+                        .trim_matches('"');
+                    inside = name.eq_ignore_ascii_case(profile);
+                    if inside {
+                        entry = Some((name.to_owned(), Vec::new()));
+                    }
+                } else if inside
+                    && !line.is_empty()
+                    && !line.starts_with('#')
+                    && let Some((_, lines)) = entry.as_mut()
+                {
+                    lines.push(line.to_owned());
+                }
+            }
+            entry.unwrap_or_else(|| panic!("no [profiles.{profile}] in {}", path.display()))
+        }
+
+        /// A file for one test that holds a copy of the test profile's entry: removed when
+        /// dropped, whether the test passed or not.
+        struct ScratchProfiles(PathBuf);
+
+        impl Drop for ScratchProfiles {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+
+        // docs/mcp-mode.md §3 (decision 18): a server reaches the profiles listed at its
+        // launch, each by a call's `profile`, and no other. The machine's profiles file need
+        // hold only the test profile, so this server reads a scratch one (SQLH_CONFIG) with
+        // three: a copy of the test profile's entry, whose password Credential Manager still
+        // gives, since a credential is bound to the profile's name, its login and its
+        // connection identity (R20) and the copy keeps all three; a profile for a read-only
+        // login made for this test (Reader, decision 5) on the same server and the scratch
+        // database, whose password reaches sqlh through SQLCMDPASSWORD (Credential Manager
+        // holds none for it); and a third like it, in the file but not listed. Calls reach the
+        // test profile's login and the reader's (its login, its database and its read rights),
+        // info names each profile, and a call naming the unlisted profile, one in no file, or
+        // none (with two listed) is refused: isError, the usage error, exit 3. The scratch file
+        // is removed at the end.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_each_listed_profile_is_reached_and_no_other() {
+            let (p, db) = target();
+            let reader = Reader::create(&p, &db);
+            let (spelled, lines) = test_profile_entry(&p);
+            let pid = std::process::id();
+            let (reading, unlisted) =
+                (format!("live-reader-{pid}"), format!("live-unlisted-{pid}"));
+            let key = |line: &str| {
+                line.split_once('=')
+                    .map_or("", |(key, _)| key.trim())
+                    .to_owned()
+            };
+            let connection: Vec<&String> = lines
+                .iter()
+                .filter(|line| {
+                    [
+                        "server",
+                        "encrypt",
+                        "trust_server_certificate",
+                        "login_timeout",
+                    ]
+                    .contains(&key(line).as_str())
+                })
+                .collect();
+            assert!(
+                connection.iter().any(|line| key(line) == "server"),
+                "the test profile names its server"
+            );
+            let quoted = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+            let reader_entry = |name: &str| {
+                let mut entry = format!("[profiles.{name}]\n");
+                for line in &connection {
+                    entry.push_str(line);
+                    entry.push('\n');
+                }
+                entry.push_str(&format!(
+                    "auth = \"sql\"\nuser = \"{}\"\ndatabase = \"{}\"\n",
+                    reader.login,
+                    quoted(&db)
+                ));
+                entry
+            };
+            let dir = scratch("live_mcp_profiles");
+            let config = ScratchProfiles(dir.join("profiles.toml"));
+            fs::write(
+                &config.0,
+                format!(
+                    "[profiles.{spelled}]\n{}\n\n{}\n{}",
+                    lines.join("\n"),
+                    reader_entry(&reading),
+                    reader_entry(&unlisted)
+                ),
+            )
+            .expect("the scratch profiles file");
+
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command
+                .env("SQLH_CONFIG", &config.0)
+                .env("SQLCMDPASSWORD", &reader.password)
+                .args(["mcp", "--profile", &spelled, "--profile", &reading])
+                .args(MCP_FLAGS);
+            let mut mcp = Mcp::start(&mut command);
+
+            let tools = mcp.list(1);
+            let schema = &tools["result"]["tools"][0]["inputSchema"];
+            assert_eq!(
+                schema["properties"]["profile"]["enum"],
+                json!([spelled, reading])
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .is_some_and(|r| r.contains(&json!("profile"))),
+                "{schema}"
+            );
+
+            let who = "SELECT SUSER_NAME() AS login, DB_NAME() AS db";
+            let cli = live(&p, &db, &["--format", "json", "-Q", who]);
+            assert_eq!(cli.code, 0, "{}", cli.stdout);
+            let test_login = first_row(&serde_json::from_str(cli.stdout.trim_end()).expect("JSON"))
+                ["login"]
+                .clone();
+            assert_ne!(test_login, reader.login.as_str());
+
+            let as_test = first_row(&ok_document(&mcp.call(
+                2,
+                "query",
+                json!({"sql": who, "profile": spelled, "format": "json"}),
+            )));
+            assert_eq!(as_test["login"], test_login, "{as_test:?}");
+            let as_reader = first_row(&ok_document(&mcp.call(
+                3,
+                "query",
+                json!({"sql": who, "profile": reading, "format": "json"}),
+            )));
+            assert_eq!(as_reader["login"], reader.login.as_str(), "{as_reader:?}");
+            assert_eq!(
+                as_reader["db"],
+                db.as_str(),
+                "the reader profile's database"
+            );
+            let count = format!("SELECT COUNT(*) AS n FROM {}", reader.probe.name);
+            let read = first_row(&ok_document(&mcp.call(
+                4,
+                "query",
+                json!({"sql": count, "profile": reading, "format": "json"}),
+            )));
+            assert_eq!(read["n"], 0, "{read:?}");
+            for (id, profile) in [(5, &spelled), (6, &reading)] {
+                let info = mcp.call(id, "info", json!({"profile": profile}));
+                let (error, text) = tool_text(&info);
+                assert!(!error, "{text}");
+                assert!(
+                    text.contains(&format!("-- note: profile {profile}; connected in 0 ms")),
+                    "{text}"
+                );
+            }
+
+            let refusal = |mcp: &mut Mcp, id: u64, arguments: Value, error: String| {
+                let (failed, text) = tool_text(&mcp.call(id, "query", arguments));
+                assert!(failed, "{text}");
+                let (body, status) = split_status(&text);
+                assert_eq!(
+                    body,
+                    format!("-- error: invalid arguments for query: {error}\n")
+                );
+                assert!(
+                    status.starts_with("-- failed (exit 3): usage error, "),
+                    "{status}"
+                );
+            };
+            let listed = format!("{spelled}, {reading}");
+            refusal(
+                &mut mcp,
+                7,
+                json!({"sql": who}),
+                format!("missing required property profile: one of {listed}"),
+            );
+            for (id, profile) in [(8, unlisted.as_str()), (9, "nowhere")] {
+                refusal(
+                    &mut mcp,
+                    id,
+                    json!({"sql": who, "profile": profile}),
+                    format!("profile {profile} isn't one of {listed}"),
+                );
+            }
+
+            let (code, messages, stderr) = mcp.finish();
+            assert_eq!(code, 0, "{stderr}");
+            assert_eq!(messages.len(), 9, "{messages:?}");
+            assert!(
+                stderr.contains(&format!("sqlh mcp: serving {listed}\n")),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("query on {spelled}: exit 0 in ")),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("query on {reading}: exit 0 in ")),
+                "{stderr}"
+            );
+            assert!(!stderr.contains(&unlisted), "{stderr}");
+            let everything = format!("{messages:?}{stderr}");
+            assert!(
+                !everything.contains(&reader.password),
+                "the password never shows"
+            );
+        }
+    }
 }
