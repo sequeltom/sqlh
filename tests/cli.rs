@@ -6319,8 +6319,9 @@ mod live {
     // in tests/golden/: every data type's rendering, escapes, cut values, the row limit, temp
     // tables in read-only mode, `GO n`, messages, a result an error cut short, errors mapped to
     // their lines and the status line. Only what changes from run to run is normalized: the
-    // times, the server's name and version, and the database's name. After a deliberate change
-    // to the output, rerun with SQLH_BLESS=1 to rewrite the golden files, and review the diff.
+    // times, the server's name and version, the database's name, and in JSON the script's
+    // path, which is the checkout's. After a deliberate change to the output, rerun with
+    // SQLH_BLESS=1 to rewrite the golden files, and review the diff.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_smoke_script_matches_its_golden_output() {
@@ -6339,7 +6340,7 @@ mod live {
         );
         assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
         let mut doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
-        normalize_json(&mut doc, &db);
+        normalize_json(&mut doc, &db, smoke);
         let json = serde_json::to_string_pretty(&doc).unwrap() + "\n";
 
         for (name, actual) in [("smoke.txt", &text), ("smoke.json", &json)] {
@@ -6406,26 +6407,29 @@ mod live {
         out
     }
 
-    /// The JSON document with its volatile values replaced: times, and the connection's
-    /// server, version and database.
-    fn normalize_json(doc: &mut serde_json::Value, db: &str) {
+    /// The JSON document with its volatile values replaced: times, the script's path (`smoke`,
+    /// which is the checkout's, so a worktree's differs), and the connection's server, version
+    /// and database.
+    fn normalize_json(doc: &mut serde_json::Value, db: &str, smoke: &str) {
         use serde_json::Value;
-        fn walk(value: &mut Value) {
+        fn walk(value: &mut Value, smoke: &str) {
             match value {
                 Value::Object(map) => {
                     for (key, v) in map.iter_mut() {
                         if key.ends_with("_ms") && v.is_u64() {
                             *v = Value::from("N");
+                        } else if key == "source" && v.as_str() == Some(smoke) {
+                            *v = Value::from("<repo>/tests/smoke.sql");
                         } else {
-                            walk(v);
+                            walk(v, smoke);
                         }
                     }
                 }
-                Value::Array(items) => items.iter_mut().for_each(walk),
+                Value::Array(items) => items.iter_mut().for_each(|item| walk(item, smoke)),
                 _ => {}
             }
         }
-        walk(doc);
+        walk(doc, smoke);
         let connection = &mut doc["connection"];
         assert_eq!(connection["database"], db, "{connection}");
         connection["database"] = Value::from("<database>");

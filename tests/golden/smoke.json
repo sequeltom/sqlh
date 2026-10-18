@@ -574,7 +574,7 @@
         }
       ],
       "line": 1,
-      "source": "C:\\code\\sqlharness/tests/smoke.sql"
+      "source": "<repo>/tests/smoke.sql"
     },
     {
       "batch": 2,
@@ -623,7 +623,7 @@
       "line": 30,
       "run": 1,
       "runs": 2,
-      "source": "C:\\code\\sqlharness/tests/smoke.sql"
+      "source": "<repo>/tests/smoke.sql"
     },
     {
       "batch": 3,
@@ -672,7 +672,7 @@
       "line": 30,
       "run": 2,
       "runs": 2,
-      "source": "C:\\code\\sqlharness/tests/smoke.sql"
+      "source": "<repo>/tests/smoke.sql"
     },
     {
       "batch": 4,
@@ -755,7 +755,7 @@
         }
       ],
       "line": 37,
-      "source": "C:\\code\\sqlharness/tests/smoke.sql"
+      "source": "<repo>/tests/smoke.sql"
     }
   ],
   "connect_ms": "N",
