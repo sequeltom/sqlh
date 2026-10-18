@@ -94,8 +94,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30);
 const STALL_WHEN_NO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The longest each wait of the end may take, but the replay of the requests held back after
-/// stdin closes, which goes on as long as stdout keeps taking bytes (the stall rule bounds
-/// it): for the calls in flight to finish after stdin closes, once nothing is held back, for
+/// stdin closes, which goes on as long as stdout keeps taking bytes, with no limit of its own
+/// (the stall rule ends it only for a client that stops reading): for the calls in flight to finish after stdin closes, once nothing is held back, for
 /// what is then cancelled to settle (on top of the engine's own settle grace inside each
 /// call), for the idle connections to close, and for the writer's flush. A console event makes
 /// the whole end due sooner (`End`).
@@ -658,7 +658,10 @@ impl End<'_> {
 
 /// The end (docs/mcp-mode.md §2, The end), from where the serving stopped. Every step is
 /// bounded by `END_GRACE`, but the replay of the requests held back after stdin closed, which
-/// the stall rule bounds; a console event at any of them cuts what is left and bounds the rest
+/// has no limit of its own while stdout takes bytes (the stall rule ends a client that stops
+/// reading); the answers still queued then get the flush wait's `END_GRACE` at most, as
+/// before, so a reader too slow to take them in that time loses the rest, which `--verbose`
+/// counts. A console event at any of them cuts what is left and bounds the rest
 /// by its grace, the closing writes getting up to `FLUSH_WAIT` past it, so after a close,
 /// logoff or shutdown the whole end takes about 2 s at most, inside Windows' 5 s.
 async fn end(
@@ -680,7 +683,8 @@ async fn end(
         Why::StdoutClosed | Why::StdoutStalled => server.broken.store(true, Ordering::Relaxed),
         // At the end of the input, the requests held back run as stdout drains, and the calls
         // in flight may still finish and answer, so a client that pipes its requests, closes
-        // stdin and reads slowly gets its results; a stdout that breaks or stalls ends that.
+        // stdin and reads slowly gets its results, the last of them within the flush wait's
+        // END_GRACE; a stdout that breaks or stalls ends that.
         Why::StdinClosed => {
             let mut gone = || {
                 if server.broken.load(Ordering::Relaxed) {

@@ -61,7 +61,7 @@ The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mc
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 39 built, 2 planned.**
+**Tally: 40 built, 2 planned.**
 
 ### Built
 
@@ -99,6 +99,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **A blocked query fails fast, and production work comes first.** Every session gives up on a lock after 10 s (error 1222; `--lock-timeout` changes it) and is the one chosen when it deadlocks with ordinary work, so an agent gets a clear error instead of waiting out the query timeout, and a deadlock costs the agent's query, not the application's. *(Phase 2.8)*
 - **A reader that stops reading can't hang it.** Output is written from its own thread, so a harness that stalls gets exit 7 after `-t` seconds, and timers and Ctrl+C keep working. A slow reader isn't cut off as long as it takes each 4 KB within `-t`, and an unread stderr can't hold up the response or hang sqlh's own diagnostics. *(Phase 2.3)*
 - **Cancelling works, at any point.** Ctrl+C, Ctrl+Break or closing the console stops sqlh while it connects, runs a query, waits on a slow reader or delivers its last lines. It exits 6 and says what became of the statement. A harness that kills sqlh also stops the server's work: measured for waiting, CPU-bound and lock-blocked queries, the server ends the request within about 0.1 s. *(MVP; every console event in Phase 2.4)*
+- **The MCP server can't be hung by its client either.** A cancel reaches the query even while the harness has stopped reading answers; a harness that stops reading while its answers pile up is treated as gone after the query timeout (a minute when there is none), so the server never waits on it forever; and Ctrl+C or closing the console still ends the server within a few seconds while it is shutting down. *(Phase 5 review)*
 - **Connect failures come back fast, and the same way every time.** One attempt per address: a refused one fails in about 2 s, and one that doesn't answer after `-l` seconds. sqlh never makes the slow, uncancellable Named Pipes attempt to another machine: remote names go over TCP, and an explicit remote pipe is refused with the TCP spelling to use. *(Phase 2.4)*
 
 **Fits how models already work**

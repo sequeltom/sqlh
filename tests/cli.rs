@@ -5001,7 +5001,9 @@ mod live {
     //! `dbo.sqlh_scratch` marker; it writes only to a table of its own, which it drops. One
     //! test also changes `sqlh_test`'s compatibility level (owner decision 21), and runs alone
     //! while it does (`target_alone`); a level a killed run left changed is put back before
-    //! any live test of the next run starts (`hold_scratch`).
+    //! any live test of the next test process starts (`hold_scratch`). A run killed while
+    //! another process's live tests are already past their start is repaired only at the next
+    //! process's start, so those tests can meanwhile run at the changed level.
 
     use super::*;
     use std::cell::RefCell;
@@ -5060,7 +5062,8 @@ mod live {
     /// shares the database meanwhile), it puts back a compatibility level a killed run left
     /// changed (`put_back_left_level`, owner decision 21), then lets the lock go. If that
     /// step fails, no live test in the process takes the lock: each fails with its reason,
-    /// and it isn't tried again.
+    /// and it isn't tried again. It covers a run killed before this process's first hold; one
+    /// killed later, in another process, is repaired at the next process's start.
     fn hold_scratch(
         start: &OnceLock<Result<(), String>>,
         lock: &dyn ScratchLock,
