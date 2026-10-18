@@ -5360,6 +5360,25 @@ mod live {
         (profile, database)
     }
 
+    /// A fresh directory of this test process's own for one live test's files
+    /// (`{test}_{pid}` under target/tmp/cli), removed with them when dropped, whether the test
+    /// passed or not. The debug and release test binaries share target/tmp, and the scratch
+    /// lock is shared, so their live tests run at once: under a fixed name one process would
+    /// remove or rewrite the files the other's sqlh is about to read.
+    struct OwnScratch(PathBuf);
+
+    impl OwnScratch {
+        fn new(test: &str) -> Self {
+            Self(scratch(&format!("{test}_{}", std::process::id())))
+        }
+    }
+
+    impl Drop for OwnScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Like `sqlh()`, but with the real profiles file so the test profile resolves.
     fn live(profile: &str, database: &str, args: &[&str]) -> Run {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
@@ -6472,8 +6491,8 @@ mod live {
         );
 
         // In a file, the error is on the line of the statement, in the right batch.
-        let dir = scratch("lock_timeout_lines");
-        let input = dir.join("blocked.sql");
+        let dir = OwnScratch::new("lock_timeout_lines");
+        let input = dir.0.join("blocked.sql");
         fs::write(
             &input,
             format!("SELECT 1 AS a\nGO\n-- waits here\nSELECT COUNT(*) AS n\nFROM {t}\nGO\nSELECT 2 AS b\n"),
@@ -10159,15 +10178,26 @@ mod live {
             );
         }
 
-        // docs/mcp-mode.md §5 (Reset before every call), on one connection: a call that
+        // docs/mcp-mode.md §9 (what a call sets doesn't leak), on one connection: a call that
         // changes database with USE (to another the login can read), turns ANSI_NULLS off and
         // NOCOUNT on, sets its language and SERIALIZABLE (and IMPLICIT_TRANSACTIONS,
         // ARITHIGNORE, XACT_ABORT, a lock timeout and a deadlock priority of its own) and
         // creates a #temp table sees all of that in force. The next call on the session sees
-        // none of it: the profile's database, a fresh call's @@OPTIONS (sqlh's session setup
-        // again), language, lock timeout, deadlock priority and READ COMMITTED, no #temp table;
-        // and none of their effects (NULL = NULL is unknown again, an INSERT reports its row, a
-        // month is named in the login's language, and the #temp table can't be read).
+        // none of it, nor any of its effects, and three different steps undo it:
+        // - the reset before that call (§5, Reset before every call): the profile's database,
+        //   the login's language (a month is named in it again), and NOCOUNT,
+        //   IMPLICIT_TRANSACTIONS and ARITHIGNORE off (an INSERT reports its row again);
+        // - sqlh's session setup, which every call sends after the reset: ANSI_NULLS on (NULL =
+        //   NULL is unknown again), XACT_ABORT off, sqlh's lock timeout and deadlock priority,
+        //   and READ COMMITTED;
+        // - the setter call's own wrapper rollback, at its end: the #temp table was made inside
+        //   the wrapper transaction, so the rollback drops it before any reset, and the next
+        //   call can't read it (error 208).
+        // So the #temp table and NULL = NULL are outcomes, not evidence of the reset: without
+        // the reset they come out as here, and only the reset's items fail. The reset's own
+        // drop of a #temp table can't be reached through sqlh mcp (the guard refuses
+        // transaction control, so no call's #temp table outlives its wrapper);
+        // db::spike::spike_reset covers it at the driver level.
         #[test]
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn mcp_what_a_call_sets_is_gone_from_the_next_call() {
@@ -10182,10 +10212,11 @@ mod live {
                  OBJECT_ID(N'tempdb..#sqlh_left') AS temp_table \
                  FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID";
             let options = |row: &Row| row["options"].as_i64().expect("@@OPTIONS");
-            // @@OPTIONS bits: the two the setter's effects show, and three more it sets, which
-            // only the reset clears (IMPLICIT_TRANSACTIONS, ARITHIGNORE) or which sqlh's
-            // session setup sets again (XACT_ABORT, with the lock timeout and the deadlock
-            // priority).
+            // @@OPTIONS bits: the two whose effects the test shows (ANSI_NULLS, which sqlh's
+            // session setup turns on again, and NOCOUNT, which the reset turns off), and three
+            // more the setter sets, which the reset clears (IMPLICIT_TRANSACTIONS, ARITHIGNORE)
+            // or the session setup sets again (XACT_ABORT, with the lock timeout and the
+            // deadlock priority).
             let (ansi_nulls, nocount) = (32, 512);
             let others = 2 | 128 | 16384;
 
@@ -10411,11 +10442,13 @@ mod live {
         // creates a #temp table, turns ANSI_NULLS off and NOCOUNT on, sets its language and
         // SERIALIZABLE, and is cancelled by the client while it waits in a read (`Blocked`,
         // since the guard refuses WAITFOR). The driver keeps the connection: the server shows
-        // the session idle with no open transaction (put_back rolled the wrapper back) and
-        // still at the cancelled call's level and language, which only the next call's reset
-        // clears. That call, on the same SPID with no new login, sees a fresh call's
-        // @@TRANCOUNT (1, the wrapper's own), @@OPTIONS (sqlh's session setup), language and
-        // level, and no #temp table.
+        // the session idle with no open transaction, so put_back has rolled the wrapper back,
+        // and with it dropped the #temp table, which was made inside the wrapper; and still at
+        // the cancelled call's level and language, since no call has run since. The next call,
+        // on the same SPID with no new login, sees a fresh call's @@TRANCOUNT (1, the wrapper's
+        // own), @@OPTIONS (ANSI_NULLS on again by sqlh's session setup, NOCOUNT off again by
+        // the reset), language (the reset's) and level (READ COMMITTED, the session setup's:
+        // the reset leaves the level as it was), and no #temp table (put_back's rollback).
         #[test]
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn mcp_a_cancel_the_driver_kept_leaves_the_next_call_clean() {
@@ -10472,7 +10505,7 @@ mod live {
             let idle = on_server(&p, &db, spid, session);
             assert_eq!(idle["requests"], 0, "idle: {idle:?}");
             assert_eq!(idle["transactions"], 0, "the wrapper rolled back: {idle:?}");
-            assert_eq!(idle["isolation"], 4, "the reset hasn't run yet: {idle:?}");
+            assert_eq!(idle["isolation"], 4, "no call has run since: {idle:?}");
             assert_eq!(idle["language_name"], running["language_name"], "{idle:?}");
 
             let next_document =
@@ -10532,16 +10565,6 @@ mod live {
             entry.unwrap_or_else(|| panic!("no [profiles.{profile}] in {}", path.display()))
         }
 
-        /// A file for one test that holds a copy of the test profile's entry: removed when
-        /// dropped, whether the test passed or not.
-        struct ScratchProfiles(PathBuf);
-
-        impl Drop for ScratchProfiles {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(&self.0);
-            }
-        }
-
         // docs/mcp-mode.md §3 (decision 18): a server reaches the profiles listed at its
         // launch, each by a call's `profile`, and no other. The machine's profiles file need
         // hold only the test profile, so this server reads a scratch one (SQLH_CONFIG) with
@@ -10554,7 +10577,7 @@ mod live {
         // test profile's login and the reader's (its login, its database and its read rights),
         // info names each profile, and a call naming the unlisted profile, one in no file, or
         // none (with two listed) is refused: isError, the usage error, exit 3. The scratch file
-        // is removed at the end.
+        // is in a directory of this test process's own (`OwnScratch`), removed at the end.
         #[test]
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn mcp_each_listed_profile_is_reached_and_no_other() {
@@ -10599,10 +10622,10 @@ mod live {
                 ));
                 entry
             };
-            let dir = scratch("live_mcp_profiles");
-            let config = ScratchProfiles(dir.join("profiles.toml"));
+            let dir = OwnScratch::new("live_mcp_profiles");
+            let config = dir.0.join("profiles.toml");
             fs::write(
-                &config.0,
+                &config,
                 format!(
                     "[profiles.{spelled}]\n{}\n\n{}\n{}",
                     lines.join("\n"),
@@ -10614,7 +10637,7 @@ mod live {
 
             let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
             command
-                .env("SQLH_CONFIG", &config.0)
+                .env("SQLH_CONFIG", &config)
                 .env("SQLCMDPASSWORD", &reader.password)
                 .args(["mcp", "--profile", &spelled, "--profile", &reading])
                 .args(MCP_FLAGS);
