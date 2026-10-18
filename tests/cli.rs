@@ -3559,7 +3559,7 @@ mod mcp {
             &config,
             &["--profile", "win"],
             &[
-                request("subscriptions/listen", &with_meta("")),
+                request("subscriptions/listen", &with_meta(r#","notifications":{}"#)),
                 request("ping", &with_meta("")),
                 request("tools/list", &with_meta("")),
                 request("subscriptions/listen", &with_meta(r#","notifications":3"#)),
@@ -3875,6 +3875,829 @@ mod mcp {
             9
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
+    }
+
+    fn ping(id: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{{META}}}}}"#)
+    }
+
+    fn query(id: u32, sql: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"{sql}"}}}}}}"#
+        )
+    }
+
+    fn cancel(id: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#
+        )
+    }
+
+    /// A profiles file with one Windows-auth profile, `slow`, on a listener that accepts the
+    /// connection and never answers it, so a call stays connecting; and the listener.
+    fn silent(test: &str) -> (std::net::TcpListener, PathBuf) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = scratch(test).join("profiles.toml");
+        fs::write(
+            &config,
+            format!(
+                "[profiles.slow]\nserver = \"127.0.0.1,{port}\"\nauth = \"windows\"\n\
+                 login_timeout = 30\n"
+            ),
+        )
+        .unwrap();
+        (listener, config)
+    }
+
+    /// Writes `lines` to `stdin`, each with its line break.
+    fn send(stdin: &mut std::process::ChildStdin, lines: &[String]) {
+        use std::io::Write as _;
+        for line in lines {
+            writeln!(stdin, "{line}").expect("sqlh reads stdin");
+        }
+        stdin.flush().unwrap();
+    }
+
+    /// 120 pings: 64 answers fill what may wait for stdout, and the other 56 are held back.
+    fn pings() -> Vec<String> {
+        (1000..1120).map(|id| ping(&id.to_string())).collect()
+    }
+
+    /// Waits until the client side of `held` is closed (a read gives 0 bytes or fails), at
+    /// most `limit`; whether it was.
+    fn closed_within(held: &mut std::net::TcpStream, limit: Duration) -> bool {
+        held.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let started = Instant::now();
+        let mut buffer = [0u8; 4096];
+        while started.elapsed() < limit {
+            match held.read(&mut buffer) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// What `child` writes to stderr, read as it comes.
+    fn watch_stderr(child: &mut std::process::Child) -> std::sync::Arc<std::sync::Mutex<String>> {
+        let mut stderr = child.stderr.take().expect("a piped stderr");
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let shared = std::sync::Arc::clone(&text);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            while let Ok(n) = stderr.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                shared
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..n]));
+            }
+        });
+        text
+    }
+
+    /// Waits until `stderr` (`watch_stderr`) holds `wanted`, at most `limit`; what it holds.
+    fn stderr_with(stderr: &std::sync::Mutex<String>, wanted: &str, limit: Duration) -> String {
+        let started = Instant::now();
+        loop {
+            let text = stderr.lock().unwrap().clone();
+            if text.contains(wanted) || started.elapsed() > limit {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Ends `child`, which is no longer needed.
+    fn kill(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// R35: a cancel is taken while stdout is behind. The client never reads stdout (held open,
+    /// full), so the 120 pings' answers fill what may wait for it and the rest are held back;
+    /// the cancel that follows still reaches the call, which is connecting to a server that
+    /// never answers: its connection is closed at once. `-t 0`: no stall limit. Before the fix
+    /// the cancel waited, unread, behind the answers.
+    #[test]
+    fn a_cancel_reaches_a_connecting_call_while_stdout_is_unread() {
+        let (listener, config) = silent("mcp_cancel_behind");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "slow", "-t", "0", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let stderr = watch_stderr(&mut child);
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &[query(1, "SELECT 1")]);
+        let (mut held, _) = listener.accept().expect("the call connects");
+        send(&mut stdin, &pings());
+        send(&mut stdin, &[cancel("1")]);
+        let closed = closed_within(&mut held, Duration::from_secs(3));
+        let logged = stderr_with(
+            &stderr,
+            "query on slow: exit 6 (cancelled)",
+            Duration::from_secs(3),
+        );
+        kill(child);
+        drop(readers);
+        assert!(closed, "the cancel closed the call's connection: {logged}");
+        assert!(
+            logged.contains("sqlh mcp: request 1 cancelled")
+                && logged.contains("query on slow: exit 6 (cancelled)"),
+            "{logged}"
+        );
+    }
+
+    /// A fake SQL Server on loopback, for one connection: it answers the prelogin (no TLS) and
+    /// the login, and every SQL batch with a DONE (the session setup's `BEGIN TRANSACTION`
+    /// with the transaction's ENVCHANGE), but a batch whose text holds `hang`, which it never
+    /// answers: it says so on the channel, and then the attention that cancels it, which it
+    /// acknowledges. Its tokens are those of `db::fake_server` (MS-TDS 2.2.7).
+    fn hanging_sql_server() -> (u16, std::sync::mpsc::Receiver<&'static str>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (events, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            // One whole message: its type and payload (the 8-byte header of each packet is
+            // `type | status (0x01 the last) | length u16 BE | spid | id | window`).
+            let receive = |s: &mut std::net::TcpStream| -> Option<(u8, Vec<u8>)> {
+                let mut payload = Vec::new();
+                loop {
+                    let mut header = [0u8; 8];
+                    s.read_exact(&mut header).ok()?;
+                    let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+                    let mut part = vec![0; length.checked_sub(8)?];
+                    s.read_exact(&mut part).ok()?;
+                    payload.extend(part);
+                    if header[1] & 1 != 0 {
+                        return Some((header[0], payload));
+                    }
+                }
+            };
+            let reply = |s: &mut std::net::TcpStream, payload: &[u8]| {
+                let [high, low] = u16::try_from(payload.len() + 8).unwrap().to_be_bytes();
+                let _ = s.write_all(&[4, 1, high, low, 0, 0, 1, 0]);
+                let _ = s.write_all(payload);
+            };
+            let utf16 = |text: &str| -> Vec<u8> {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            };
+            // DONE: `FD | status u16 | curcmd u16 | row count u64`, all LE.
+            let done = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            // Prelogin: VERSION 17.0.0.0 and ENCRYPT_NOT_SUP.
+            if receive(&mut s).map(|m| m.0) != Some(0x12) {
+                return;
+            }
+            reply(
+                &mut s,
+                &[0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xff, 17, 0, 0, 0, 0, 0, 2],
+            );
+            if receive(&mut s).map(|m| m.0) != Some(0x10) {
+                return;
+            }
+            // LOGINACK, then the collation, the database and the packet size, then DONE.
+            let mut ack = vec![1, 0x74, 0, 0, 4, 4];
+            ack.extend(utf16("fake"));
+            ack.extend([17, 0, 0, 1]);
+            let mut login = vec![0xad];
+            login.extend(u16::try_from(ack.len()).unwrap().to_le_bytes());
+            login.extend(ack);
+            login.extend([0xe3, 8, 0, 7, 5, 9, 4, 0xd0, 0, 0x34, 0]);
+            login.extend([0xe3, 15, 0, 1, 6]);
+            login.extend(utf16("master"));
+            login.push(0);
+            login.extend([0xe3, 19, 0, 4, 4]);
+            login.extend(utf16("4096"));
+            login.push(4);
+            login.extend(utf16("4096"));
+            login.extend([0xfd, 0x10, 0, 0xc1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            reply(&mut s, &login);
+            let (hang, begin) = (utf16("hang"), utf16("BEGIN TRANSACTION"));
+            let holds =
+                |payload: &[u8], what: &[u8]| payload.windows(what.len()).any(|w| w == what);
+            while let Some((kind, payload)) = receive(&mut s) {
+                match kind {
+                    1 if holds(&payload, &hang) => {
+                        let _ = events.send("batch");
+                    }
+                    1 if holds(&payload, &begin) => {
+                        let mut tokens = vec![0xe3, 11, 0, 8, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+                        tokens.extend(done);
+                        reply(&mut s, &tokens);
+                    }
+                    1 => reply(&mut s, &done),
+                    6 => {
+                        let _ = events.send("attention");
+                        // DONE with ATTN: the attention acknowledged.
+                        reply(&mut s, &[0xfd, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// R35: the same for a call whose batch is running: with stdout unread and the answers
+    /// held back, the cancel still sends the batch's attention. The server is a fake on
+    /// loopback with a synthetic login, so the password (in SQLCMDPASSWORD, which a profile
+    /// with no stored one takes) is no real one.
+    #[test]
+    fn a_cancel_reaches_a_running_batch_while_stdout_is_unread() {
+        let (port, seen) = hanging_sql_server();
+        let config = scratch("mcp_cancel_batch").join("profiles.toml");
+        fs::write(
+            &config,
+            format!(
+                "[profiles.fake]\nserver = \"127.0.0.1,{port}\"\nuser = \"fake\"\n\
+                 encrypt = \"optional\"\nlogin_timeout = 5\n"
+            ),
+        )
+        .unwrap();
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "fake", "-t", "0", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .env("SQLCMDPASSWORD", "fake")
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let stderr = watch_stderr(&mut child);
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &[query(1, "SELECT 'hang'")]);
+        let running = seen.recv_timeout(Duration::from_secs(10));
+        if running != Ok("batch") {
+            kill(child);
+            panic!(
+                "the batch didn't reach the server: {}",
+                stderr.lock().unwrap()
+            );
+        }
+        send(&mut stdin, &pings());
+        send(&mut stdin, &[cancel("1")]);
+        let attention = seen.recv_timeout(Duration::from_secs(3));
+        let logged = stderr_with(
+            &stderr,
+            "query on fake: exit 6 (cancelled)",
+            Duration::from_secs(3),
+        );
+        kill(child);
+        drop(readers);
+        assert_eq!(attention, Ok("attention"), "{logged}");
+        assert!(
+            logged.contains("sqlh mcp: request 1 cancelled")
+                && logged.contains("query on fake: exit 6 (cancelled)"),
+            "{logged}"
+        );
+    }
+
+    /// R35: a request held back while stdout is behind keeps its id open (a request reusing it
+    /// is refused, `-32600`), a cancel for it drops it (it never runs, and nothing is sent for
+    /// it), and once the client reads, everything else held back is answered, in order.
+    #[test]
+    fn a_request_held_back_counts_as_open_and_a_cancel_drops_it() {
+        let config = profiles("mcp_held_back");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "win", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        // The stalled pipe's writer is the child's alone now, so its end is the child's exit.
+        drop(command);
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &pings());
+        send(
+            &mut stdin,
+            &[query(77, "SELECT 1"), ping("77"), cancel("77"), ping("78")],
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(child.try_wait().unwrap().is_none(), "behind, still serving");
+        drop(stdin);
+        let mut text = String::new();
+        readers
+            .into_iter()
+            .next()
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        let status = wait_within(&mut child, Duration::from_secs(15), "a reader at last");
+        let r = finished(&mut child, status);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let messages: Vec<serde_json::Value> = text
+            .trim_start_matches('.')
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line whole"))
+            .collect();
+        let ids: Vec<i64> = messages.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+        let mut wanted: Vec<i64> = (1000..1120).collect();
+        wanted.extend([77, 78]);
+        assert_eq!(ids, wanted, "everything answered once, in order");
+        assert_eq!(
+            by_id(&messages, 77)["error"]["message"],
+            "Invalid request: a request with this id is still waiting to run"
+        );
+        assert!(
+            !r.stderr.contains("query on win"),
+            "the call never ran: {}",
+            r.stderr
+        );
+    }
+
+    /// R35: the end of the input is taken while stdout is behind, and the end is bounded
+    /// without the client reading: the requests held back get END_GRACE (6 s) to run as
+    /// stdout drains, which it never does, then the flush wait gives up after FLUSH_WAIT (1 s)
+    /// with no byte taken. The answers and the requests that never ran are counted. Before the
+    /// fix the process ran until stdout was read.
+    #[test]
+    fn the_end_of_input_ends_the_server_with_stdout_unread() {
+        let config = profiles("mcp_eof_behind");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "win", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &pings());
+        drop(stdin);
+        let started = Instant::now();
+        let status = wait_within(&mut child, Duration::from_secs(15), "stdin closed");
+        let elapsed = started.elapsed();
+        let r = finished(&mut child, status);
+        drop(readers);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(
+            elapsed > Duration::from_secs(5) && elapsed < Duration::from_secs(10),
+            "{elapsed:?}"
+        );
+        assert!(
+            r.stderr.contains("sqlh mcp: ending (stdin closed)")
+                && r.stderr.contains(
+                    "sqlh mcp: 120 responses were never written (56 for requests that never ran)"
+                ),
+            "{}",
+            r.stderr
+        );
+    }
+
+    /// R35's stall rule: a client that stops reading stdout and keeps stdin open is taken for
+    /// gone once stdout has taken nothing for the stall limit (here `-t 1`) while the server
+    /// is behind, and the server ends as if stdout had closed. Before the fix it ran for good.
+    #[test]
+    fn a_client_that_stops_reading_is_taken_for_gone() {
+        let config = profiles("mcp_stalled");
+        let mut command = sqlh();
+        command
+            .args(["mcp", "--profile", "win", "-t", "1", "--verbose"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped());
+        let readers = stall(&mut command, true, false);
+        let mut child = command.spawn().expect("sqlh starts");
+        let mut stdin = child.stdin.take().unwrap();
+        let started = Instant::now();
+        send(&mut stdin, &pings());
+        let status = wait_within(&mut child, Duration::from_secs(15), "a stalled stdout");
+        let elapsed = started.elapsed();
+        let r = finished(&mut child, status);
+        drop((stdin, readers));
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert!(
+            r.stderr.contains("sqlh mcp: ending (stdout stalled)")
+                && r.stderr.contains(
+                    "sqlh mcp: 120 responses were never written (56 for requests that never ran)"
+                ),
+            "{}",
+            r.stderr
+        );
+    }
+
+    /// R36: a console event during the wait after stdin closed cancels the call at once and
+    /// ends the server within the event's grace (2 s), where it used to wait out END_GRACE.
+    /// The call is connecting to a server that never answers; it settles (its exit is logged)
+    /// before the process ends, and gets no answer.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_break_after_stdin_closed_ends_the_server_at_once() {
+        let (listener, config) = silent("mcp_break_eof");
+        let mut child = spawn_in_group(
+            sqlh()
+                .args(["mcp", "--profile", "slow", "--verbose"])
+                .env("SQLH_CONFIG", &config)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        let mut stdin = child.stdin.take().unwrap();
+        send(&mut stdin, &[query(1, "SELECT 1")]);
+        let (_held, _) = listener.accept().expect("the call connects");
+        drop(stdin);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "still waiting for the call"
+        );
+        let started = Instant::now();
+        ctrl_break(&child);
+        let status = wait_within(&mut child, Duration::from_secs(10), "Ctrl+Break");
+        let elapsed = started.elapsed();
+        let r = finished(&mut child, status);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(r.stdout, "", "nothing for the cancelled call");
+        assert!(
+            r.stderr.contains("sqlh mcp: ending (stdin closed)")
+                && r.stderr.contains("sqlh mcp: Ctrl+Break during the end")
+                && r.stderr.contains("query on slow: exit 6 (cancelled)"),
+            "{}",
+            r.stderr
+        );
+    }
+
+    /// R36: a console event during the last writes, which a slow reader would otherwise keep
+    /// going up to END_GRACE (6 s): a 2 MB answer read at 40 KB/s. The end is due within the
+    /// event's grace (2 s), and the answer is left unfinished.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_break_during_the_last_writes_ends_them_within_its_grace() {
+        let config = profiles("mcp_break_flush");
+        let mut child = spawn_in_group(
+            sqlh()
+                .args(["mcp", "--profile", "win", "--verbose"])
+                .env("SQLH_CONFIG", &config)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        let version = "v".repeat(2_000_000);
+        let mut stdin = child.stdin.take().unwrap();
+        send(
+            &mut stdin,
+            &[format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"_meta\":{{\
+                 \"io.modelcontextprotocol/protocolVersion\":\"{version}\",\
+                 \"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}"
+            )],
+        );
+        drop(stdin);
+        let closed = Instant::now();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut got, mut buffer) = (0usize, vec![0u8; 4096]);
+            while let Ok(n) = stdout.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                got += n;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            got
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_none(), "still writing");
+        let started = Instant::now();
+        ctrl_break(&child);
+        let status = wait_within(&mut child, Duration::from_secs(15), "Ctrl+Break");
+        let (elapsed, since_closed) = (started.elapsed(), closed.elapsed());
+        let got = reader.join().unwrap();
+        let r = finished(&mut child, status);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(
+            elapsed < Duration::from_secs(3) && since_closed < Duration::from_secs(5),
+            "{elapsed:?} after the event, {since_closed:?} after stdin closed"
+        );
+        assert!(got > 4096 && got < 1_000_000, "{got} bytes read");
+        assert!(
+            r.stderr.contains("sqlh mcp: Ctrl+Break during the end")
+                && r.stderr
+                    .contains("sqlh mcp: 1 responses were never written"),
+            "{}",
+            r.stderr
+        );
+    }
+
+    /// R38: an id is a string or an integer that serde_json reads exactly (i64 or u64); every
+    /// other number is refused without an id, so two ids never become one. Ids are compared as
+    /// they are written, for calls, subscriptions and cancels alike: `1` and `"1"` are two ids,
+    /// and a cancel whose `requestId` is a number past 64 bits matches nothing.
+    #[test]
+    fn ids_are_kept_exactly_and_compared_as_written() {
+        let config = profiles("mcp_ids");
+        let listen = |id: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"subscriptions/listen","params":{{{META},"notifications":{{}}}}}}"#
+            )
+        };
+        let (max_u64, past_u64) = ("18446744073709551615", "18446744073709551616");
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win"],
+            &[
+                ping("9223372036854775807"),
+                ping("-9223372036854775808"),
+                ping(max_u64),
+                ping(past_u64),
+                ping("18446744073709551617"),
+                ping("1.5"),
+                ping("1e2"),
+                ping("1.0"),
+                listen(r#""1""#),
+                ping("1"),
+                ping(r#""1""#),
+                listen(max_u64),
+                ping("18446744073709551614"),
+                ping(max_u64),
+                cancel("1"),
+                ping(r#""1""#),
+                cancel(r#""1""#),
+                ping(r#""1""#),
+                cancel(past_u64),
+                ping(max_u64),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let lines: Vec<&str> = r.stdout.lines().collect();
+        // Echoed exactly, as written.
+        for (at, id) in [
+            (0, "9223372036854775807"),
+            (1, "-9223372036854775808"),
+            (2, max_u64),
+        ] {
+            assert!(
+                lines[at].contains(&format!(r#""id":{id},"#))
+                    && messages[at].get("result").is_some(),
+                "{}",
+                lines[at]
+            );
+        }
+        for refused in &messages[3..8] {
+            assert!(refused.get("id").is_none(), "{refused}");
+            assert_eq!(refused["error"]["code"], -32600);
+            assert_eq!(
+                refused["error"]["message"],
+                "Invalid request: id must be a string or an integer within 64 bits"
+            );
+        }
+        let open = "Invalid request: a subscription with this id is still open";
+        let answered = |m: &serde_json::Value, id: serde_json::Value| {
+            m["id"] == id && m.get("result").is_some()
+        };
+        let refused = |m: &serde_json::Value, id: serde_json::Value| {
+            m["id"] == id && m["error"]["message"] == open
+        };
+        let one = serde_json::json!("1");
+        let max: serde_json::Value = serde_json::from_str(max_u64).unwrap();
+        assert_eq!(
+            messages[8]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            one
+        );
+        assert!(
+            answered(&messages[9], serde_json::json!(1)),
+            "1 isn't \"1\""
+        );
+        assert!(refused(&messages[10], one.clone()));
+        assert_eq!(
+            messages[11]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            max
+        );
+        assert!(answered(
+            &messages[12],
+            serde_json::json!(18446744073709551614u64)
+        ));
+        assert!(refused(&messages[13], max.clone()));
+        // The cancel of 1 leaves "1" open; the cancel of "1" ends it; one of a number past
+        // 64 bits (read as the nearest f64) ends nothing.
+        assert!(refused(&messages[14], one.clone()));
+        assert!(answered(&messages[15], one));
+        assert!(refused(&messages[16], max.clone()));
+        // At the end, the one still open is answered and torn down, its id as it came.
+        assert!(answered(&messages[17], max.clone()));
+        assert!(
+            lines[17].contains(&format!(r#""id":{max_u64},"#)),
+            "{}",
+            lines[17]
+        );
+        assert_eq!(messages[18]["params"]["requestId"], max);
+        assert_eq!(messages.len(), 19, "{messages:?}");
+    }
+
+    /// R39: the members a method's params declare are checked before anything runs, a
+    /// malformed one `-32602` with no call started (none logged) and no subscription opened
+    /// (only the well-formed one is answered at the end); members the schema doesn't declare
+    /// pass; and a wrong property inside a valid `arguments` object is still a tool error.
+    #[test]
+    fn method_envelopes_are_checked_before_anything_runs() {
+        let config = profiles("mcp_envelopes");
+        let call = |id: u32, rest: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query"{rest}}}}}"#
+            )
+        };
+        let listen = |id: u32, rest: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"subscriptions/listen","params":{{{META}{rest}}}}}"#
+            )
+        };
+        let list = |id: u32, rest: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list","params":{{{META}{rest}}}}}"#
+            )
+        };
+        let ping_with = |id: u32, meta: &str| {
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{"_meta":{meta}}}}}"#)
+        };
+        let modern_meta = |extra: &str| {
+            format!(
+                r#"{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}{extra}}}"#
+            )
+        };
+        let initialize = |id: u32, params: &str| {
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize","params":{params}}}"#)
+        };
+        let info = r#""clientInfo":{"name":"t","version":"1"}"#;
+        let (r, messages) = session(
+            &config,
+            &["--profile", "win", "--verbose"],
+            &[
+                call(1, ""),
+                call(2, r#","arguments":{"sql":"SELECT 1"}"#),
+                call(3, r#","arguments":null"#),
+                call(4, r#","arguments":[]"#),
+                call(5, r#","arguments":"SELECT 1""#),
+                call(6, r#","arguments":{"sql":1}"#),
+                call(7, r#","arguments":{"sql":"SELECT 1"},"requestState":5"#),
+                call(8, r#","arguments":{"sql":"SELECT 1"},"inputResponses":[]"#),
+                listen(10, ""),
+                listen(11, r#","notifications":3"#),
+                listen(12, r#","notifications":{"toolsListChanged":"yes"}"#),
+                listen(13, r#","notifications":{"resourceSubscriptions":[1]}"#),
+                listen(
+                    14,
+                    r#","notifications":{"promptsListChanged":false,"resourceSubscriptions":["a"],"com.example/x":1}"#,
+                ),
+                listen(15, r#","notifications":{"resourcesListChanged":null}"#),
+                list(20, r#","cursor":5"#),
+                list(21, r#","cursor":"x""#),
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":22,"method":"tools/list","params":{{"_meta":{},"com.example/x":1}}}}"#,
+                    modern_meta(r#","com.example/y":2"#)
+                ),
+                ping_with(23, "5"),
+                ping_with(24, &modern_meta(r#","progressToken":{}"#)),
+                ping_with(
+                    25,
+                    &modern_meta(r#","io.modelcontextprotocol/clientInfo":{"name":"x"}"#),
+                ),
+                ping_with(
+                    26,
+                    &modern_meta(
+                        r#","progressToken":"t","io.modelcontextprotocol/clientInfo":{"name":"x","version":"1"}"#,
+                    ),
+                ),
+                initialize(30, &format!(r#"{{"capabilities":{{}},{info}}}"#)),
+                initialize(
+                    31,
+                    &format!(r#"{{"protocolVersion":5,"capabilities":{{}},{info}}}"#),
+                ),
+                initialize(
+                    32,
+                    &format!(r#"{{"protocolVersion":"2025-11-25","capabilities":[],{info}}}"#),
+                ),
+                initialize(
+                    33,
+                    r#"{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t"}}"#,
+                ),
+                initialize(
+                    34,
+                    &format!(
+                        r#"{{"_meta":5,"protocolVersion":"2025-11-25","capabilities":{{}},{info}}}"#
+                    ),
+                ),
+                r#"{"jsonrpc":"2.0","id":35,"method":"tools/list"}"#.into(),
+                initialize(
+                    36,
+                    r#"{"protocolVersion":"2025-11-25","capabilities":{"x":1},"clientInfo":{"name":"t","version":"1","title":"T"},"com.example/x":1}"#,
+                ),
+                r#"{"jsonrpc":"2.0","id":37,"method":"tools/list"}"#.into(),
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let tool_error = |id: i64, wanted: &str| {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{id}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(wanted), "{id}: {text}");
+        };
+        let invalid = |id: i64, wanted: &str| {
+            let error = &by_id(&messages, id)["error"];
+            assert_eq!(error["code"], -32602, "{id}: {error}");
+            assert_eq!(error["message"], wanted, "{id}");
+        };
+        tool_error(1, "missing required property sql");
+        tool_error(2, "-- failed (exit 2): connection failed");
+        let not_object = "Invalid params: the arguments of tool query must be an object";
+        for id in [3, 4, 5] {
+            invalid(id, not_object);
+        }
+        tool_error(6, "sql must be a string");
+        invalid(7, "Invalid params: requestState must be a string");
+        invalid(8, "Invalid params: inputResponses must be an object");
+        invalid(10, "Invalid params: notifications must be an object");
+        invalid(11, "Invalid params: notifications must be an object");
+        invalid(
+            12,
+            "Invalid params: notifications.toolsListChanged must be true or false",
+        );
+        invalid(
+            13,
+            "Invalid params: notifications.resourceSubscriptions must be an array of strings",
+        );
+        invalid(
+            15,
+            "Invalid params: notifications.resourcesListChanged must be true or false",
+        );
+        invalid(20, "Invalid params: cursor must be a string");
+        invalid(21, "Invalid params: no such cursor");
+        assert_eq!(
+            by_id(&messages, 22)["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
+        invalid(23, "Invalid params: _meta must be an object");
+        invalid(
+            24,
+            "Invalid params: _meta progressToken must be a string or a number",
+        );
+        invalid(
+            25,
+            "Invalid params: _meta io.modelcontextprotocol/clientInfo must be an object with \
+             name and version strings",
+        );
+        assert_eq!(by_id(&messages, 26)["result"]["resultType"], "complete");
+        invalid(30, "Invalid params: protocolVersion must be a string");
+        invalid(31, "Invalid params: protocolVersion must be a string");
+        invalid(32, "Invalid params: capabilities must be an object");
+        invalid(
+            33,
+            "Invalid params: clientInfo must be an object with name and version strings",
+        );
+        invalid(34, "Invalid params: _meta must be an object");
+        // None of those initializes agreed a version.
+        assert_eq!(by_id(&messages, 35)["error"]["code"], -32602);
+        assert_eq!(
+            by_id(&messages, 36)["result"]["protocolVersion"],
+            "2025-11-25"
+        );
+        assert_eq!(
+            by_id(&messages, 37)["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
+        // Only 14 was acknowledged, and only 14 is answered and torn down at the end.
+        let acks: Vec<_> = messages
+            .iter()
+            .filter(|m| m["method"] == "notifications/subscriptions/acknowledged")
+            .collect();
+        assert_eq!(acks.len(), 1, "{messages:?}");
+        assert_eq!(
+            acks[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            14
+        );
+        assert_eq!(by_id(&messages, 14)["result"]["resultType"], "complete");
+        // Only call 2 started.
+        assert_eq!(
+            r.stderr.matches("query on win: exit").count(),
+            1,
+            "{}",
+            r.stderr
+        );
+        // 8 calls, 5 refused subscriptions and one acknowledged, 7 lists and pings, 8
+        // initializes and lists, and the open subscription's answer and teardown.
+        assert_eq!(messages.len(), 8 + 6 + 7 + 8 + 2, "{messages:?}");
     }
 }
 

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use serde_json::{Map, Value, json};
 
-use super::protocol::ProtocolError;
+use super::protocol::{Kind, ProtocolError, member};
 use crate::cli::SchemaCommand;
 use crate::db::Cancel;
 use crate::engine::{Call, Engine};
@@ -271,8 +271,9 @@ pub(crate) struct Planned {
 }
 
 /// Why a `tools/call` was refused before it ran (docs/mcp-mode.md §4, Errors). A request that
-/// doesn't fit `CallToolRequest` (no tool name, an unknown tool, `arguments` that isn't an
-/// object) is a protocol error, -32602. Arguments the tool can't take (an unknown one, a wrong
+/// doesn't fit `CallToolRequest` (no tool name, an unknown tool, `arguments` present but not
+/// an object, `null` included, an `inputResponses` that isn't an object or a `requestState`
+/// that isn't a string) is a protocol error, -32602. Arguments the tool can't take (an unknown one, a wrong
 /// type, a value out of range, a missing one, a profile the server doesn't serve) are a tool
 /// execution error, which the spec puts in the result (`isError`) so the model can correct
 /// the call; `format` is the call's own, where it named a valid one.
@@ -312,9 +313,12 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
             echo(name)
         ))));
     };
+    // The rest of `CallToolRequestParams` (R39): `arguments` left out is none, but present it is
+    // an object (`null` included, it isn't one); the multi-round-trip members, which sqlh never
+    // asks for, are typed all the same.
     let empty = Map::new();
     let args = match params.get("arguments") {
-        None | Some(Value::Null) => &empty,
+        None => &empty,
         Some(Value::Object(args)) => args,
         Some(_) => {
             return Err(Refused::Protocol(ProtocolError::invalid_params(format!(
@@ -323,6 +327,8 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
             ))));
         }
     };
+    member(params, "", "inputResponses", false, Kind::Object).map_err(Refused::Protocol)?;
+    member(params, "", "requestState", false, Kind::String).map_err(Refused::Protocol)?;
     // The format first, so a refusal of the other arguments comes in the format asked for.
     let format = match args.get("format") {
         None => Format::Text,
@@ -690,6 +696,19 @@ mod tests {
             (
                 json!({"name": "query", "arguments": []}),
                 "the arguments of tool query must be an object",
+            ),
+            // R39: `null` isn't an object either; only `arguments` left out is none.
+            (
+                json!({"name": "query", "arguments": null}),
+                "the arguments of tool query must be an object",
+            ),
+            (
+                json!({"name": "query", "arguments": {"sql": "x"}, "requestState": 1}),
+                "Invalid params: requestState must be a string",
+            ),
+            (
+                json!({"name": "query", "arguments": {"sql": "x"}, "inputResponses": []}),
+                "Invalid params: inputResponses must be an object",
             ),
         ] {
             match plan(&call(params.clone()), &one) {

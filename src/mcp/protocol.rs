@@ -17,6 +17,7 @@ pub(crate) const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub(crate) const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 pub(crate) const META_SERVER: &str = "io.modelcontextprotocol/serverInfo";
 pub(crate) const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
+pub(crate) const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
 
 pub(crate) const PARSE_ERROR: i64 = -32700;
 pub(crate) const INVALID_REQUEST: i64 = -32600;
@@ -78,6 +79,16 @@ pub(crate) enum Era {
 /// and echoed in every answer, so it is bounded on its own, far below the message size.
 pub(crate) const MAX_ID_BYTES: usize = 1024;
 
+/// What an id is known by, for every rule that compares ids (the calls in flight, the
+/// requests held back, the open subscriptions and the cancels that name them): its JSON text
+/// as serde_json writes it again. `parse` takes only ids it reads exactly (strings, and
+/// integers within 64 bits), so two ids share a key only when they are the same id, and `1`
+/// and `"1"` never do. A cancel's `requestId` that isn't such an id has a key no open request
+/// has.
+pub(crate) fn key(id: &Value) -> String {
+    id.to_string()
+}
+
 /// Parses one line. An error comes with the request's id when it could be read.
 ///
 /// What must not be answered isn't: a response (anything with `result` or `error` and no
@@ -99,21 +110,23 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
     {
         return Ok(Incoming::Response);
     }
-    // An id is a string or a number, of at most MAX_ID_BYTES. One that is there but is
+    // An id is a string or an integer, of at most MAX_ID_BYTES. One that is there but is
     // anything else (null included), or longer, can't be answered by, so the error leaves it
-    // out.
+    // out. An integer is taken only as serde_json reads it exactly, an i64 or a u64: past that
+    // range it reads a number as the nearest f64, so two ids could become one (R38), and a
+    // fraction or an exponent form (`1.5`, `1e2`) is no integer id at all.
     let id = match message.remove("id") {
         None => None,
-        Some(id) if !(id.is_string() || id.is_number()) => {
+        Some(id) if !(id.is_string() || id.is_i64() || id.is_u64()) => {
             return Err((
                 None,
                 ProtocolError::new(
                     INVALID_REQUEST,
-                    "Invalid request: id must be a string or a number",
+                    "Invalid request: id must be a string or an integer within 64 bits",
                 ),
             ));
         }
-        Some(id) if id.to_string().len() > MAX_ID_BYTES => {
+        Some(id) if key(&id).len() > MAX_ID_BYTES => {
             return Err((
                 None,
                 ProtocolError::new(
@@ -163,12 +176,13 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
 
 /// The era to serve a request in: modern when it carries the modern `_meta` (checked: the
 /// version must be ours, and the client's capabilities are required), else the legacy version
-/// `initialize` agreed, if any.
+/// `initialize` agreed, if any. A `_meta` that isn't an object, or whose declared members are
+/// mistyped, is `-32602` in either era (`check_meta`).
 pub(crate) fn era_of(
     params: &Map<String, Value>,
     agreed: Option<&'static str>,
 ) -> Result<Era, ProtocolError> {
-    let meta = params.get("_meta").and_then(Value::as_object);
+    let meta = check_meta(params)?;
     match meta.and_then(|meta| meta.get(META_VERSION)) {
         Some(Value::String(version)) if version == MODERN => {
             if meta
@@ -193,6 +207,96 @@ pub(crate) fn era_of(
             ))),
         },
     }
+}
+
+/// A request's `_meta`, when it has one, with the members both eras declare typed (R39): an
+/// object (2026-07-28's `RequestMetaObject`, the legacy revisions' optional `_meta`), whose
+/// `progressToken` is a string or a number and whose modern client info is an
+/// `Implementation`. The version and the capabilities are `era_of`'s; any other member, an
+/// extension's, is let be.
+pub(crate) fn check_meta(
+    params: &Map<String, Value>,
+) -> Result<Option<&Map<String, Value>>, ProtocolError> {
+    let meta = match params.get("_meta") {
+        None => return Ok(None),
+        Some(Value::Object(meta)) => meta,
+        Some(_) => return Err(must_be("", "_meta", "an object")),
+    };
+    member(meta, "_meta ", "progressToken", false, Kind::Token)?;
+    member(
+        meta,
+        "_meta ",
+        META_CLIENT_INFO,
+        false,
+        Kind::Implementation,
+    )?;
+    Ok(Some(meta))
+}
+
+/// What a declared member of a request's params must be (`member`).
+#[derive(Clone, Copy)]
+pub(crate) enum Kind {
+    Object,
+    String,
+    Bool,
+    /// `string[]`.
+    Strings,
+    /// The schema's `Implementation` (a client's info): an object whose `name` and `version`
+    /// are strings.
+    Implementation,
+    /// A `ProgressToken`: a string or a number.
+    Token,
+}
+
+impl Kind {
+    fn takes(self, value: &Value) -> bool {
+        match self {
+            Kind::Object => value.is_object(),
+            Kind::String => value.is_string(),
+            Kind::Bool => value.is_boolean(),
+            Kind::Strings => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            Kind::Implementation => {
+                value.get("name").is_some_and(Value::is_string)
+                    && value.get("version").is_some_and(Value::is_string)
+            }
+            Kind::Token => value.is_string() || value.is_number(),
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Kind::Object => "an object",
+            Kind::String => "a string",
+            Kind::Bool => "true or false",
+            Kind::Strings => "an array of strings",
+            Kind::Implementation => "an object with name and version strings",
+            Kind::Token => "a string or a number",
+        }
+    }
+}
+
+/// Checks one declared member of a request's params (`within` says where it is, for the
+/// message): left out, it is refused only when `required`; present, it must be of its `kind`,
+/// or the request is `-32602`, `Invalid params: <within><name> must be <what the kind is>`.
+/// Members the schema doesn't declare are never looked at, so an extension's pass.
+pub(crate) fn member(
+    params: &Map<String, Value>,
+    within: &str,
+    name: &str,
+    required: bool,
+    kind: Kind,
+) -> Result<(), ProtocolError> {
+    match params.get(name) {
+        None if !required => Ok(()),
+        Some(value) if kind.takes(value) => Ok(()),
+        _ => Err(must_be(within, name, kind.what())),
+    }
+}
+
+fn must_be(within: &str, name: &str, what: &str) -> ProtocolError {
+    ProtocolError::invalid_params(format!("Invalid params: {within}{name} must be {what}"))
 }
 
 /// `UnsupportedProtocolVersionError`: what sqlh supports, and what was asked for.
@@ -366,6 +470,40 @@ mod tests {
             "x".repeat(MAX_ID_BYTES - 2)
         );
         assert!(parse(&fits).is_ok());
+        // R38: an id is a string or an integer serde_json reads exactly, an i64 or a u64, and
+        // it is known by its text as written; any other number is refused without it, so two
+        // ids never become one.
+        let ping = |id: &str| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+        for id in [
+            "9223372036854775807",
+            "-9223372036854775808",
+            "18446744073709551615",
+            "0",
+            r#""1""#,
+        ] {
+            match parse(&ping(id)) {
+                Ok(Incoming::Request { id: read, .. }) => assert_eq!(key(&read), id),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+        for id in [
+            "18446744073709551616",
+            "18446744073709551617",
+            "-9223372036854775809",
+            "1.5",
+            "1e2",
+            "1.0",
+            "-0",
+        ] {
+            let refused = parse(&ping(id)).unwrap_err();
+            assert_eq!(refused.0, None, "{id}");
+            assert_eq!(
+                refused.1.message,
+                "Invalid request: id must be a string or an integer within 64 bits",
+                "{id}"
+            );
+        }
+        assert_ne!(key(&json!(1)), key(&json!("1")));
     }
 
     // docs/mcp-mode.md §2: modern requests carry the version and the client's capabilities;
@@ -399,6 +537,24 @@ mod tests {
                 "requested": "1900-01-01"
             }))
         );
+        // R39: a `_meta` that isn't an object, or whose declared members are mistyped, is
+        // -32602 in either era; an extension's members pass.
+        let legacy = Some("2025-11-25");
+        for meta in [
+            json!(5),
+            json!(null),
+            json!({"progressToken": {}}),
+            json!({META_CLIENT_INFO: {"name": "x"}}),
+        ] {
+            let error = era_of(&object(json!({"_meta": meta})), legacy).unwrap_err();
+            assert_eq!(error.code, INVALID_PARAMS, "{meta}");
+        }
+        let extended = object(json!({"_meta": {
+            "progressToken": 7,
+            META_CLIENT_INFO: {"name": "x", "version": "1", "title": "X"},
+            "com.example/x": [1],
+        }}));
+        assert_eq!(era_of(&extended, legacy), Ok(Era::Legacy("2025-11-25")));
         assert_eq!(negotiate(Some("2025-06-18")), "2025-06-18");
         assert_eq!(negotiate(Some("2025-03-26")), "2025-11-25");
         assert_eq!(negotiate(None), "2025-11-25");

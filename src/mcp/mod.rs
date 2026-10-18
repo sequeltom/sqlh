@@ -9,23 +9,33 @@
 //! - **Concurrency:** calls run concurrently on the current-thread runtime (`LocalSet`), each
 //!   with its own cancel; `notifications/cancelled` cancels one, and nothing more is sent for
 //!   it.
+//! - **Backpressure** (R35): stdin keeps being read while `MAX_UNWRITTEN` responses wait for
+//!   stdout. A notification (a cancel) is acted on at once; a request is held back
+//!   (`Deferred`) until stdout catches up, and only once those held back reach their bound does
+//!   the server stop reading stdin. While it is behind, a stdout that takes no byte for the
+//!   stall limit (the query timeout, as the CLI's delivery has it) means a client that stopped
+//!   reading: the server ends as if stdout had broken.
 //! - **Subscriptions:** `subscriptions/listen` is acknowledged with none of what it asks
 //!   for (the tool list never changes) and stays open until the client cancels it or the
 //!   server ends, which answers it and then tears it down with `notifications/cancelled`.
-//! - **The end:** when stdin closes, the calls in flight get `END_GRACE` to finish and answer;
-//!   when stdout breaks or a console event arrives, they get none. What is still running is
-//!   cancelled and given time to settle, open subscriptions are answered, the idle
-//!   connections are closed, the writer gets its flush wait, and the process exits 0, without
-//!   waiting for anything the runtime still runs. Each of those waits is `END_GRACE`, or a
-//!   console event's own grace (`Signal::grace`), since Windows ends the process about 5 s
-//!   after a close, logoff or shutdown.
+//! - **The end** (`end`): when stdin closes, the calls in flight and the requests held back
+//!   get `END_GRACE` to finish and answer; when stdout breaks or stalls, or a console event
+//!   arrives, they get none. What is still running is cancelled and given time to settle, open
+//!   subscriptions are answered, the idle connections are closed, and the writer gets its flush
+//!   wait; then the process exits 0, without waiting for anything the runtime still runs. Each
+//!   wait is at most `END_GRACE`, and console events are taken throughout (R36): one cancels
+//!   what is left at once and makes the end due within its grace (`Signal::grace`), which a
+//!   later one can only bring nearer, since Windows ends the process about 5 s after a close,
+//!   logoff or shutdown. The closing writes still get up to `FLUSH_WAIT` past it.
 
 mod protocol;
 mod tools;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, BufRead, Write};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -36,21 +46,29 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, mpsc};
 
-use protocol::{Era, Incoming, ProtocolError};
+use protocol::{Era, Incoming, Kind, ProtocolError, member};
 use tools::{Launch, Profile};
 
 use crate::cli::{McpOpts, Opts};
 use crate::db::Cancel;
 use crate::engine::{self, Engine};
 use crate::error::{Exit, Failure};
-use crate::signals::Signals;
+use crate::signals::{Signal, Signals};
 use crate::{app, config, console};
 
 /// The longest message sqlh reads: 4 MB. A longer line is answered with an error and skipped.
 const MAX_MESSAGE: usize = 4 << 20;
 
-/// How many responses may wait for stdout before the server stops reading stdin.
+/// How many responses may wait for stdout before the server is behind: a request that comes
+/// then is held back (`Deferred`) until stdout catches up, so a client that stops reading
+/// can't make the server's memory grow.
 const MAX_UNWRITTEN: usize = 64;
+
+/// How many requests may be held back while stdout is behind, and how many bytes of them:
+/// once either is reached the server stops reading stdin (one more message, up to
+/// `MAX_MESSAGE`, can take the bytes past the bound).
+const MAX_DEFERRED: usize = 64;
+const MAX_DEFERRED_BYTES: usize = 16 << 20;
 
 /// How many `subscriptions/listen` streams may be open at once. sqlh honors none of their
 /// notifications, so a few are plenty; each holds its id until it ends.
@@ -63,15 +81,21 @@ const MAX_IN_FLIGHT: usize = 64;
 /// How often idle connections are checked against `--idle`.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
-/// How long calls in flight get when the server ends: to finish after stdin closes, and then,
-/// once cancelled, to settle (on top of the engine's own settle grace inside each call); the
-/// closing of idle connections and the writer's flush are held to it too. A console event
-/// gives its own grace instead (`Signal::grace`).
+/// The longest each wait of the end may take: for the calls in flight and the requests held
+/// back to finish after stdin closes, for what is then cancelled to settle (on top of the
+/// engine's own settle grace inside each call), for the idle connections to close, and for the
+/// writer's flush. A console event makes the whole end due sooner (`End`).
 const END_GRACE: Duration = Duration::from_secs(6);
 
 /// How long the end's flush wait goes on with no byte reaching stdout before it stops; the
-/// whole wait is bounded by the grace (`END_GRACE`, or a console event's own).
+/// whole wait is bounded by `END_GRACE`. After a console event it gets up to this long past
+/// the end's deadline, for the closing writes (the answers and teardowns of open
+/// subscriptions).
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
+
+/// How often the serving loop looks at stdout again while it is behind, and the end at what
+/// it waits for.
+const POLL: Duration = Duration::from_millis(10);
 
 /// How much of a line the stdout thread writes at a time, so that the flush wait sees a long
 /// line the client is still reading make progress (`FLUSH_WAIT`). A write to a pipe returns
@@ -81,7 +105,7 @@ const FLUSH_WAIT: Duration = Duration::from_secs(1);
 /// goes straight to the pipe.
 const WRITE_CHUNK: usize = 4 * 1024;
 
-/// What the stdin thread (and the stdout thread, when it breaks) tell the server.
+/// What the stdin thread tells the server.
 enum Line {
     Text(Vec<u8>),
     TooLong,
@@ -130,7 +154,8 @@ pub(crate) fn run(opts: McpOpts) -> Exit {
     let local = tokio::task::LocalSet::new();
     let exit = local.block_on(&runtime, serve(engine, launch, opts.verbose));
     // `serve` has bounded the end; what the runtime still runs (a name lookup the driver left
-    // on a blocking thread) is abandoned, not waited for, as dropping the runtime would.
+    // on a blocking thread, a call still settling after a console event) is abandoned, not
+    // waited for, as dropping the runtime would.
     drop(local);
     runtime.shutdown_background();
     exit
@@ -184,23 +209,52 @@ struct Server {
     tools: Value,
     instructions: String,
     out: std_mpsc::Sender<String>,
-    /// Lines handed to the stdout thread and not yet written: past `MAX_UNWRITTEN`, stdin
-    /// waits, so a client that stops reading can't make the server's memory grow.
+    /// Lines handed to the stdout thread and not yet written: at `MAX_UNWRITTEN` the server is
+    /// behind, and requests are held back.
     unwritten: Arc<AtomicUsize>,
+    /// Bytes the stdout thread has handed to stdout: the measure of a client's reading, for
+    /// the stall rule and the flush wait.
+    progress: Arc<AtomicU64>,
     log: Option<std_mpsc::SyncSender<String>>,
-    /// The calls in flight, by request id (as JSON text), with the cancel that ends each:
-    /// taken out when the call is cancelled, so the id stays taken until the call has settled.
+    /// The calls in flight, by their id's key (`protocol::key`), with the cancel that ends
+    /// each: taken out when the call is cancelled, so the id stays taken until the call has
+    /// settled.
     calls: RefCell<HashMap<String, Option<Cancel>>>,
-    /// The open `subscriptions/listen` requests, by id: answered when the server ends, unless
-    /// the client cancelled them first.
-    subscriptions: RefCell<Vec<Value>>,
-    /// The stdout thread failed: the client is gone, and nothing more is sent.
+    /// The open `subscriptions/listen` requests, by key and id: answered when the server ends,
+    /// unless the client cancelled them first.
+    subscriptions: RefCell<Vec<(String, Value)>>,
+    /// The requests held back while stdout is behind.
+    deferred: RefCell<Deferred>,
+    /// stdout failed, or stalled: the client is gone, and nothing more is sent.
     broken: Arc<AtomicBool>,
     /// The legacy version `initialize` agreed, if a legacy client opened.
     agreed: RefCell<Option<&'static str>>,
 }
 
 impl Server {
+    fn new(
+        engine: Engine,
+        launch: Launch,
+        out: std_mpsc::Sender<String>,
+        log: Option<std_mpsc::SyncSender<String>>,
+    ) -> Server {
+        Server {
+            tools: tools::definitions(&launch),
+            instructions: tools::instructions(&launch),
+            engine,
+            launch,
+            out,
+            unwritten: Arc::default(),
+            progress: Arc::default(),
+            log,
+            calls: RefCell::default(),
+            subscriptions: RefCell::default(),
+            deferred: RefCell::default(),
+            broken: Arc::default(),
+            agreed: RefCell::new(None),
+        }
+    }
+
     fn send(&self, line: String) {
         // Once stdout has failed, the client is gone and the server is ending: nothing is
         // queued for it.
@@ -211,6 +265,11 @@ impl Server {
         if self.out.send(line).is_err() {
             self.unwritten.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether as many responses wait for stdout as may: requests are held back meanwhile.
+    fn behind(&self) -> bool {
+        self.unwritten.load(Ordering::Relaxed) >= MAX_UNWRITTEN
     }
 
     /// The launch's limits, for an answer given before a call has a profile (the
@@ -227,60 +286,208 @@ impl Server {
     }
 }
 
+/// What a request held back becomes when it is let through.
+enum Held {
+    /// A request, as it came: read again and dispatched then.
+    Request(Vec<u8>),
+    /// An answer settled when the line came (a malformed message, one too long, a request
+    /// reusing an open id), sent as it is.
+    Answer(String),
+}
+
+impl Held {
+    fn len(&self) -> usize {
+        match self {
+            Held::Request(bytes) => bytes.len(),
+            Held::Answer(line) => line.len(),
+        }
+    }
+}
+
+/// The requests held back while stdout is behind (R35), in arrival order, each request with
+/// its id's key: a cancel for one drops it, and its id counts as open meanwhile. At most
+/// `MAX_DEFERRED` of them, and `MAX_DEFERRED_BYTES`.
+#[derive(Default)]
+struct Deferred {
+    /// Oldest first; short enough that taking from the front costs nothing to speak of.
+    queue: Vec<(Option<String>, Held)>,
+    bytes: usize,
+}
+
+impl Deferred {
+    /// Whether it is full: the server then stops reading stdin.
+    fn full(&self) -> bool {
+        self.queue.len() >= MAX_DEFERRED || self.bytes >= MAX_DEFERRED_BYTES
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn holds(&self, key: &str) -> bool {
+        self.queue
+            .iter()
+            .any(|(held, _)| held.as_deref() == Some(key))
+    }
+
+    fn push(&mut self, key: Option<String>, held: Held) {
+        self.bytes += held.len();
+        self.queue.push((key, held));
+    }
+
+    /// The oldest, taken out.
+    fn pop(&mut self) -> Option<Held> {
+        self.take(0)
+    }
+
+    fn take(&mut self, at: usize) -> Option<Held> {
+        if at >= self.queue.len() {
+            return None;
+        }
+        let (_, held) = self.queue.remove(at);
+        self.bytes -= held.len();
+        Some(held)
+    }
+
+    /// Drops the request held back under `key`, if one is (only one can be: a request reusing
+    /// the id of one held back is refused, `in_use`): it never runs, and nothing is sent for
+    /// it.
+    fn cancel(&mut self, key: &str) {
+        if let Some(at) = self
+            .queue
+            .iter()
+            .position(|(held, _)| held.as_deref() == Some(key))
+        {
+            self.take(at);
+        }
+    }
+
+    /// Drops them all: the server is ending. How many there were.
+    fn clear(&mut self) -> usize {
+        self.bytes = 0;
+        let count = self.queue.len();
+        self.queue.clear();
+        count
+    }
+}
+
+/// Where the console events come from (`Signals`): an end can be played with a test's own.
+trait Events {
+    /// The next event; pending for good when there are none to watch.
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = Signal> + '_>>;
+}
+
+impl Events for Option<Signals> {
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = Signal> + '_>> {
+        Box::pin(async move {
+            match self {
+                Some(signals) => signals.recv().await,
+                None => std::future::pending().await,
+            }
+        })
+    }
+}
+
+/// Why the serving stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    StdinClosed,
+    /// A write or flush to stdout failed: the client is gone.
+    StdoutClosed,
+    /// stdout took no byte for the stall limit while the server was behind (R35).
+    StdoutStalled,
+    Event(Signal),
+}
+
+impl Why {
+    fn name(self) -> &'static str {
+        match self {
+            Why::StdinClosed => "stdin closed",
+            Why::StdoutClosed => "stdout closed",
+            Why::StdoutStalled => "stdout stalled",
+            Why::Event(signal) => signal.name(),
+        }
+    }
+}
+
+/// R35's rule for a client that stops reading without closing stdout: while the server is
+/// behind, a stdout that takes no byte for the limit (`stall_limit`; none, no limit) means the
+/// client is gone.
+struct Stall {
+    limit: Option<Duration>,
+    /// What stdout had taken when the server was last seen behind with no progress, and since
+    /// when.
+    seen: Option<(u64, Instant)>,
+}
+
+impl Stall {
+    fn new(limit: Option<Duration>) -> Stall {
+        Stall { limit, seen: None }
+    }
+
+    fn stalled(&mut self, server: &Server) -> bool {
+        let Some(limit) = self.limit else {
+            return false;
+        };
+        if !server.behind() {
+            self.seen = None;
+            return false;
+        }
+        let taken = server.progress.load(Ordering::Relaxed);
+        match self.seen {
+            Some((at, since)) if at == taken => since.elapsed() >= limit,
+            _ => {
+                self.seen = Some((taken, Instant::now()));
+                false
+            }
+        }
+    }
+}
+
+/// The stall limit: the query timeout, as the CLI's delivery has it (`Limits::stall_secs`,
+/// which follows `-t`): the launch's `-t` when it set one, else the longest of the listed
+/// profiles' timeouts, and none when it, or any of them, is 0.
+fn stall_limit(engine: &Engine) -> Option<Duration> {
+    let mut longest = 0;
+    for profile in 0..engine.profiles().count() {
+        match engine.settings(profile).limits.stall_secs {
+            0 => return None,
+            secs => longest = longest.max(secs),
+        }
+    }
+    (longest > 0).then(|| Duration::from_secs(longest.into()))
+}
+
 async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let (lines_tx, mut lines) = mpsc::channel::<Line>(64);
-    let reader_tx = lines_tx.clone();
     if thread::Builder::new()
         .name("sqlh-mcp-stdin".into())
-        .spawn(move || read_stdin(&reader_tx))
+        .spawn(move || read_stdin(&lines_tx))
         .is_err()
     {
         app::mcp_log("sqlh mcp: cannot start the stdin reader");
         return Exit::Internal;
     }
     let (out, out_rx) = std_mpsc::channel::<String>();
-    let unwritten = Arc::new(AtomicUsize::new(0));
-    let written = Arc::clone(&unwritten);
-    // Bytes the stdout thread has handed to stdout: the flush wait's measure of progress.
-    let progress = Arc::new(AtomicU64::new(0));
-    let writer_progress = Arc::clone(&progress);
+    let log = verbose.then(start_log).flatten();
+    let server = Rc::new(Server::new(engine, launch, out, log));
     // stdout's failure reaches the server outside the stdin channel, which may be full and
     // unread while stdout is behind (the review's orphan-process finding).
-    let broken = Arc::new(AtomicBool::new(false));
     let gone = Arc::new(Notify::new());
-    let (writer_broken, writer_gone) = (Arc::clone(&broken), Arc::clone(&gone));
-    drop(lines_tx);
-    let writer = match thread::Builder::new()
+    let (written, progress, broken, writer_gone) = (
+        Arc::clone(&server.unwritten),
+        Arc::clone(&server.progress),
+        Arc::clone(&server.broken),
+        Arc::clone(&gone),
+    );
+    if thread::Builder::new()
         .name("sqlh-mcp-stdout".into())
-        .spawn(move || {
-            write_stdout(
-                &out_rx,
-                &written,
-                &writer_progress,
-                &writer_broken,
-                &writer_gone,
-            )
-        }) {
-        Ok(writer) => writer,
-        Err(_) => {
-            app::mcp_log("sqlh mcp: cannot start the stdout writer");
-            return Exit::Internal;
-        }
-    };
-    let log = verbose.then(start_log).flatten();
-    let server = Rc::new(Server {
-        tools: tools::definitions(&launch),
-        instructions: tools::instructions(&launch),
-        engine,
-        launch,
-        out,
-        unwritten,
-        log,
-        calls: RefCell::new(HashMap::new()),
-        subscriptions: RefCell::new(Vec::new()),
-        broken,
-        agreed: RefCell::new(None),
-    });
+        .spawn(move || write_stdout(&out_rx, &written, &progress, &broken, &writer_gone))
+        .is_err()
+    {
+        app::mcp_log("sqlh mcp: cannot start the stdout writer");
+        return Exit::Internal;
+    }
     let names: Vec<&str> = server.engine.profiles().collect();
     server.log(format!("sqlh mcp: serving {}", names.join(", ")));
     let mut signals = match Signals::new() {
@@ -293,132 +500,307 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
             None
         }
     };
+    let running = Rc::new(Cell::new(0usize));
+    let mut stall = Stall::new(stall_limit(&server.engine));
+    let why = serving(
+        &server,
+        &running,
+        &mut lines,
+        &gone,
+        &mut signals,
+        &mut stall,
+    )
+    .await;
+    end(&server, &running, why, &mut signals, stall).await;
+    Exit::Ok
+}
+
+/// The serving loop, until stdin closes, stdout breaks or stalls, or a console event comes.
+async fn serving(
+    server: &Rc<Server>,
+    running: &Rc<Cell<usize>>,
+    lines: &mut mpsc::Receiver<Line>,
+    gone: &Notify,
+    events: &mut dyn Events,
+    stall: &mut Stall,
+) -> Why {
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
-    let running = Rc::new(std::cell::Cell::new(0usize));
-    // How long the end may take at each step. A console event's own grace (`Signal::grace`):
-    // Windows ends the process about 5 s after a close, logoff or shutdown event.
-    let mut grace = END_GRACE;
-    let ended_by = loop {
+    loop {
         if server.broken.load(Ordering::Relaxed) {
-            break "stdout closed";
+            return Why::StdoutClosed;
         }
-        let behind = server.unwritten.load(Ordering::Relaxed) >= MAX_UNWRITTEN;
+        replay(server, running);
+        if stall.stalled(server) {
+            return Why::StdoutStalled;
+        }
+        let behind = server.behind();
+        // Only a full queue of requests held back stops stdin: until then a cancel, or the
+        // end of the input, is taken whatever stdout does.
+        let full = server.deferred.borrow().full();
         tokio::select! {
-            line = lines.recv(), if !behind => match line {
-                Some(Line::Text(bytes)) => dispatch(&server, &running, &bytes),
-                Some(Line::TooLong) => server.send(protocol::error_line(
-                    None,
-                    &ProtocolError::new(
+            line = lines.recv(), if !full => match line {
+                Some(Line::Text(bytes)) => arrive(server, running, read(&bytes), Some(bytes)),
+                Some(Line::TooLong) => {
+                    let error = ProtocolError::new(
                         protocol::INVALID_REQUEST,
                         format!("Invalid request: a message is at most {MAX_MESSAGE} bytes"),
-                    ),
-                )),
-                Some(Line::End) | None => break "stdin closed",
-            },
-            () = gone.notified() => break "stdout closed",
-            // While stdout is behind, look again soon; stdin waits meanwhile.
-            () = tokio::time::sleep(Duration::from_millis(10)), if behind => {}
-            _ = sweep.tick() => server.engine.sweep(),
-            signal = async {
-                match signals.as_mut() {
-                    Some(signals) => signals.recv().await,
-                    None => std::future::pending().await,
+                    );
+                    arrive(server, running, Message::Refused(None, error), None);
                 }
-            } => {
-                grace = signal.grace();
-                break signal.name();
+                Some(Line::End) | None => return Why::StdinClosed,
+            },
+            () = gone.notified() => return Why::StdoutClosed,
+            // While stdout is behind, look again soon: for its progress, to let the requests
+            // held back through, and for the stall rule.
+            () = tokio::time::sleep(POLL), if behind => {}
+            _ = sweep.tick() => server.engine.sweep(),
+            signal = events.recv() => return Why::Event(signal),
+        }
+    }
+}
+
+/// The end: one deadline over all of its steps, which a console event sets and a later one
+/// can only bring nearer (R36).
+struct End<'e> {
+    events: &'e mut dyn Events,
+    deadline: Option<Instant>,
+    /// Requests held back that the end dropped, never run.
+    never_ran: usize,
+}
+
+impl End<'_> {
+    /// A console event, at any step: what is left is cancelled at once, and the end is due
+    /// within the event's grace, or sooner if an earlier event made it so.
+    fn event(&mut self, server: &Server, signal: Signal) {
+        self.cut(server);
+        let due = Instant::now() + signal.grace();
+        self.deadline = Some(self.deadline.map_or(due, |deadline| deadline.min(due)));
+    }
+
+    /// Cancels the calls still running (nothing more is sent for them) and drops the requests
+    /// held back.
+    fn cut(&mut self, server: &Server) {
+        let cancels: Vec<Cancel> = server
+            .calls
+            .borrow_mut()
+            .values_mut()
+            .filter_map(Option::take)
+            .collect();
+        for cancel in cancels {
+            cancel.cancel();
+        }
+        self.never_ran += server.deferred.borrow_mut().clear();
+    }
+
+    /// Waits until `done` (looked at every `POLL`), for at most `limit` and, once a console
+    /// event has set one, the end's deadline, which can't end the wait within `floor` of its
+    /// start (the closing writes' due); an event meanwhile is taken at once.
+    async fn wait(
+        &mut self,
+        server: &Server,
+        limit: Duration,
+        floor: Duration,
+        done: &mut dyn FnMut() -> bool,
+    ) {
+        let start = Instant::now();
+        let (until, floor) = (start + limit, start + floor);
+        while !done() {
+            let due = self
+                .deadline
+                .map_or(until, |deadline| until.min(deadline.max(floor)));
+            let now = Instant::now();
+            if now >= due {
+                return;
+            }
+            let tick = due.min(now + POLL).into();
+            if let Ok(signal) = tokio::time::timeout_at(tick, self.events.recv()).await {
+                server.log(format!("sqlh mcp: {} during the end", signal.name()));
+                self.event(server, signal);
             }
         }
+    }
+}
+
+/// The end (docs/mcp-mode.md §2, The end), from where the serving stopped. Every step is
+/// bounded by `END_GRACE`; a console event at any of them cuts what is left and bounds the
+/// rest by its grace, the closing writes getting up to `FLUSH_WAIT` past it, so after a close,
+/// logoff or shutdown the whole end takes about 2 s at most, inside Windows' 5 s.
+async fn end(
+    server: &Rc<Server>,
+    running: &Rc<Cell<usize>>,
+    why: Why,
+    events: &mut dyn Events,
+    mut stall: Stall,
+) {
+    server.log(format!("sqlh mcp: ending ({})", why.name()));
+    let mut end = End {
+        events,
+        deadline: None,
+        never_ran: 0,
     };
-    server.log(format!("sqlh mcp: ending ({ended_by})"));
-    // At the end of the input, the calls in flight may still finish and answer (a client that
-    // pipes its requests and closes stdin gets its results); a console event or a broken
-    // stdout ends them at once.
-    if ended_by == "stdin closed" {
-        wait_for_calls(&running, END_GRACE).await;
+    match why {
+        Why::Event(signal) => end.event(server, signal),
+        // The client is gone, or taken for gone: nothing more is queued for it.
+        Why::StdoutClosed | Why::StdoutStalled => server.broken.store(true, Ordering::Relaxed),
+        // At the end of the input, the calls in flight may still finish and answer, and the
+        // requests held back run as stdout drains, so a client that pipes its requests, closes
+        // stdin and reads slowly gets its results; a stdout that breaks or stalls ends that.
+        Why::StdinClosed => {
+            end.wait(server, END_GRACE, Duration::ZERO, &mut || {
+                replay(server, running);
+                if stall.stalled(server) {
+                    server.log("sqlh mcp: stdout stalled during the end".into());
+                    server.broken.store(true, Ordering::Relaxed);
+                }
+                server.broken.load(Ordering::Relaxed)
+                    || (running.get() == 0 && server.deferred.borrow().is_empty())
+            })
+            .await;
+        }
     }
-    // What is still running is cancelled; nothing more is sent for it.
-    let cancels: Vec<Cancel> = server
-        .calls
-        .borrow_mut()
-        .values_mut()
-        .filter_map(Option::take)
-        .collect();
-    for cancel in cancels {
-        cancel.cancel();
-    }
-    wait_for_calls(&running, grace).await;
+    // What is still running is cancelled, and nothing more is sent for it; what is still held
+    // back never runs.
+    end.cut(server);
+    end.wait(server, END_GRACE, Duration::ZERO, &mut || {
+        running.get() == 0
+    })
+    .await;
     // An open subscription ends gracefully: its request is answered (the subscriptions page's
     // Graceful Closure), so the client can tell this end from a dropped transport.
     // The stream is then torn down with `notifications/cancelled`, which the cancellation page
     // requires of a server ending a subscription (and allows for nothing else); the answer
     // comes first, as the subscriptions page has it sent before the stream closes.
-    let open: Vec<Value> = server.subscriptions.borrow_mut().drain(..).collect();
-    for id in open {
-        end_subscription(&server, &id, "the server is ending");
+    let open: Vec<(String, Value)> = server.subscriptions.borrow_mut().drain(..).collect();
+    for (_, id) in open {
+        end_subscription(server, &id, "the server is ending");
     }
-    let _ = tokio::time::timeout(grace, server.engine.close_all()).await;
-    // The writer ends once every sender is gone and the last lines are out. It gets as long
-    // as bytes keep reaching stdout (FLUSH_WAIT with none ends the wait), up to the grace:
-    // a long line the client is still reading counts as progress, a client that has stopped
-    // reading doesn't.
-    let unwritten = Arc::clone(&server.unwritten);
-    let log = server.log.clone();
-    drop(server);
-    let (deadline, mut stalled_at) = (Instant::now() + grace, Instant::now() + FLUSH_WAIT);
-    let mut sent = progress.load(Ordering::Relaxed);
-    while !writer.is_finished() && Instant::now() < deadline && Instant::now() < stalled_at {
-        thread::sleep(Duration::from_millis(10));
-        let now = progress.load(Ordering::Relaxed);
-        if now > sent {
-            sent = now;
+    // The idle connections are closed politely, while console events are taken as in every
+    // other wait; past it they are dropped where they stand.
+    let mut never = || false;
+    tokio::select! {
+        () = server.engine.close_all() => {}
+        () = end.wait(server, END_GRACE, Duration::ZERO, &mut never) => {}
+    }
+    // The last lines get as long as bytes keep reaching stdout (FLUSH_WAIT with none ends the
+    // wait), up to END_GRACE: a long line the client is still reading counts as progress, a
+    // client that has stopped reading doesn't. Done once every line queued is written.
+    let mut taken = server.progress.load(Ordering::Relaxed);
+    let mut stalled_at = Instant::now() + FLUSH_WAIT;
+    end.wait(server, END_GRACE, FLUSH_WAIT, &mut || {
+        let now = server.progress.load(Ordering::Relaxed);
+        if now > taken {
+            taken = now;
             stalled_at = Instant::now() + FLUSH_WAIT;
         }
-    }
-    let dropped = unwritten.load(Ordering::Relaxed);
-    if dropped > 0
-        && let Some(log) = log
+        server.broken.load(Ordering::Relaxed)
+            || server.unwritten.load(Ordering::Relaxed) == 0
+            || Instant::now() >= stalled_at
+    })
+    .await;
+    let unwritten = server.unwritten.load(Ordering::Relaxed);
+    if unwritten + end.never_ran > 0
+        && let Some(log) = &server.log
     {
-        let _ = log.try_send(format!("sqlh mcp: {dropped} responses were never written"));
-        thread::sleep(Duration::from_millis(50));
-    }
-    Exit::Ok
-}
-
-/// Waits until no call is running, at most `limit`.
-async fn wait_for_calls(running: &std::cell::Cell<usize>, limit: Duration) {
-    let deadline = Instant::now() + limit;
-    while running.get() > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// One message from the client.
-fn dispatch(server: &Rc<Server>, running: &Rc<std::cell::Cell<usize>>, bytes: &[u8]) {
-    let Ok(line) = std::str::from_utf8(bytes) else {
-        server.send(protocol::error_line(
-            None,
-            &ProtocolError::new(protocol::PARSE_ERROR, "Parse error: not UTF-8"),
+        let never_ran = match end.never_ran {
+            0 => String::new(),
+            n => format!(" ({n} for requests that never ran)"),
+        };
+        let _ = log.try_send(format!(
+            "sqlh mcp: {} responses were never written{never_ran}",
+            unwritten + end.never_ran
         ));
-        return;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// What a line from the client is, read once.
+enum Message {
+    /// Nothing to do: an empty line, or a response.
+    Nothing,
+    Notification(String, Map<String, Value>),
+    Request(Value, String, Map<String, Value>),
+    /// An error to answer with, with the request's id when it could be read.
+    Refused(Option<Value>, ProtocolError),
+}
+
+fn read(bytes: &[u8]) -> Message {
+    let Ok(line) = std::str::from_utf8(bytes) else {
+        return Message::Refused(
+            None,
+            ProtocolError::new(protocol::PARSE_ERROR, "Parse error: not UTF-8"),
+        );
     };
     let line = line.trim();
     if line.is_empty() {
-        return;
+        return Message::Nothing;
     }
     match protocol::parse(line) {
-        Err((id, error)) => {
-            // A malformed request reusing an open id gets the same refusal as a well-formed one.
-            let error = id
+        Err((id, error)) => Message::Refused(id, error),
+        Ok(Incoming::Response) => Message::Nothing,
+        Ok(Incoming::Notification { method, params }) => Message::Notification(method, params),
+        Ok(Incoming::Request { id, method, params }) => Message::Request(id, method, params),
+    }
+}
+
+/// One message from the client (`bytes`, the line it came in). A notification is acted on at
+/// once, even while stdout is behind, so a cancel is never held up behind answers the client
+/// hasn't read (R35). Anything to answer goes behind the requests held back already, and is
+/// held back while stdout is behind, its id checked as it comes, as it would have been at
+/// once.
+fn arrive(
+    server: &Rc<Server>,
+    running: &Rc<Cell<usize>>,
+    message: Message,
+    bytes: Option<Vec<u8>>,
+) {
+    let hold = server.behind() || !server.deferred.borrow().is_empty();
+    let (id, error) = match message {
+        Message::Nothing => return,
+        Message::Notification(method, params) => return notification(server, &method, &params),
+        Message::Request(id, method, params) => match bytes {
+            Some(bytes) if hold => {
+                let key = protocol::key(&id);
+                match in_use(server, &key) {
+                    Some(error) => (Some(id), error),
+                    None => {
+                        return server
+                            .deferred
+                            .borrow_mut()
+                            .push(Some(key), Held::Request(bytes));
+                    }
+                }
+            }
+            _ => return request(server, running, id, &method, &params),
+        },
+        // A malformed request reusing an open id gets the same refusal as a well-formed one.
+        Message::Refused(id, error) => {
+            let open = id
                 .as_ref()
-                .and_then(|id| in_use(server, id))
-                .unwrap_or(error);
-            server.send(protocol::error_line(id.as_ref(), &error));
+                .and_then(|id| in_use(server, &protocol::key(id)));
+            (id, open.unwrap_or(error))
         }
-        Ok(Incoming::Response) => {}
-        Ok(Incoming::Notification { method, params }) => notification(server, &method, &params),
-        Ok(Incoming::Request { id, method, params }) => {
-            request(server, running, id, &method, &params)
+    };
+    let line = protocol::error_line(id.as_ref(), &error);
+    if hold {
+        server.deferred.borrow_mut().push(None, Held::Answer(line));
+    } else {
+        server.send(line);
+    }
+}
+
+/// Lets the requests held back through, in the order they came, while stdout keeps up.
+fn replay(server: &Rc<Server>, running: &Rc<Cell<usize>>) {
+    while !server.behind() {
+        let held = server.deferred.borrow_mut().pop();
+        match held {
+            None => return,
+            Some(Held::Answer(line)) => server.send(line),
+            // Read again as it was read when it came: a request.
+            Some(Held::Request(bytes)) => {
+                if let Message::Request(id, method, params) = read(&bytes) {
+                    request(server, running, id, &method, &params);
+                }
+            }
         }
     }
 }
@@ -427,17 +809,23 @@ fn notification(server: &Server, method: &str, params: &Map<String, Value>) {
     if method == "notifications/cancelled"
         && let Some(id) = params.get("requestId")
     {
+        let key = protocol::key(id);
+        // A subscription the client cancels just ends, and a request still held back never
+        // runs: nothing more is sent for either.
+        server
+            .subscriptions
+            .borrow_mut()
+            .retain(|(open, _)| *open != key);
+        server.deferred.borrow_mut().cancel(&key);
         // Taken out, not removed: the id stays taken until the call has settled, so a call
         // reusing it is refused rather than left uncancellable.
-        // A subscription the client cancels just ends: nothing more is sent for it.
-        server.subscriptions.borrow_mut().retain(|open| open != id);
         let cancel = server
             .calls
             .borrow_mut()
-            .get_mut(&id.to_string())
+            .get_mut(&key)
             .and_then(Option::take);
         if let Some(cancel) = cancel {
-            server.log(format!("sqlh mcp: request {id} cancelled"));
+            server.log(format!("sqlh mcp: request {key} cancelled"));
             cancel.cancel();
         }
     }
@@ -446,18 +834,29 @@ fn notification(server: &Server, method: &str, params: &Map<String, Value>) {
 
 fn request(
     server: &Rc<Server>,
-    running: &Rc<std::cell::Cell<usize>>,
+    running: &Rc<Cell<usize>>,
     id: Value,
     method: &str,
     params: &Map<String, Value>,
 ) {
-    // An id still open (a call in flight or settling, a subscription) gets only this refusal,
-    // whatever the method, so no request is ever answered twice under one id.
-    if let Some(error) = in_use(server, &id) {
+    // An id still open (a call in flight or settling, a subscription, a request held back)
+    // gets only this refusal, whatever the method, so no request is ever answered twice under
+    // one id.
+    if let Some(error) = in_use(server, &protocol::key(&id)) {
         server.send(protocol::error_line(Some(&id), &error));
         return;
     }
     if method == "initialize" {
+        // The legacy `InitializeRequestParams`: all three members are required (R39).
+        let checked = protocol::check_meta(params).and_then(|_| {
+            member(params, "", "protocolVersion", true, Kind::String)?;
+            member(params, "", "capabilities", true, Kind::Object)?;
+            member(params, "", "clientInfo", true, Kind::Implementation)
+        });
+        if let Err(error) = checked {
+            server.send(protocol::error_line(Some(&id), &error));
+            return;
+        }
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let version = protocol::negotiate(requested);
         *server.agreed.borrow_mut() = Some(version);
@@ -510,10 +909,13 @@ fn request(
         "ping" => server.send(protocol::result_line(&id, era, Map::new())),
         "tools/list" => {
             if params.contains_key("cursor") {
-                server.send(protocol::error_line(
-                    Some(&id),
-                    &ProtocolError::invalid_params("Invalid params: no such cursor"),
-                ));
+                // A cursor is a string, and the one page has none to go on from.
+                let error = member(params, "", "cursor", false, Kind::String)
+                    .err()
+                    .unwrap_or_else(|| {
+                        ProtocolError::invalid_params("Invalid params: no such cursor")
+                    });
+                server.send(protocol::error_line(Some(&id), &error));
                 return;
             }
             let result = cacheable(protocol::object(json!({"tools": server.tools})));
@@ -531,13 +933,21 @@ fn request(
     }
 }
 
-/// Whether a request with `id` is still open: a call in flight (until it settles) or a
-/// subscription. A request reusing it is refused, with the error this returns.
-fn in_use(server: &Server, id: &Value) -> Option<ProtocolError> {
-    let why = if server.calls.borrow().contains_key(&id.to_string()) {
+/// Whether a request whose id has `key` is still open: a call in flight (until it settles), a
+/// subscription, or a request held back. A request reusing it is refused, with the error this
+/// returns.
+fn in_use(server: &Server, key: &str) -> Option<ProtocolError> {
+    let why = if server.calls.borrow().contains_key(key) {
         "Invalid request: a call with this id is still running"
-    } else if server.subscriptions.borrow().contains(id) {
+    } else if server
+        .subscriptions
+        .borrow()
+        .iter()
+        .any(|(open, _)| open == key)
+    {
         "Invalid request: a subscription with this id is still open"
+    } else if server.deferred.borrow().holds(key) {
+        "Invalid request: a request with this id is still waiting to run"
     } else {
         return None;
     };
@@ -548,11 +958,29 @@ fn in_use(server: &Server, id: &Value) -> Option<ProtocolError> {
 /// subset the server honors, which is none (the tool list never changes, and sqlh has no
 /// prompts or resources), then held open until the client cancels it or the server ends.
 fn listen(server: &Server, id: Value, params: &Map<String, Value>) {
-    if !matches!(params.get("notifications"), None | Some(Value::Object(_))) {
-        server.send(protocol::error_line(
-            Some(&id),
-            &ProtocolError::invalid_params("Invalid params: notifications must be an object"),
-        ));
+    // The `SubscriptionFilter` is required, and its members are typed; an extension's members
+    // pass (R39). A malformed one takes no place.
+    let checked = match params.get("notifications") {
+        Some(Value::Object(filter)) => [
+            "toolsListChanged",
+            "promptsListChanged",
+            "resourcesListChanged",
+        ]
+        .into_iter()
+        .try_for_each(|name| member(filter, "notifications.", name, false, Kind::Bool))
+        .and_then(|()| {
+            member(
+                filter,
+                "notifications.",
+                "resourceSubscriptions",
+                false,
+                Kind::Strings,
+            )
+        }),
+        _ => member(params, "", "notifications", true, Kind::Object),
+    };
+    if let Err(error) = checked {
+        server.send(protocol::error_line(Some(&id), &error));
         return;
     }
     if server.subscriptions.borrow().len() >= MAX_SUBSCRIPTIONS {
@@ -573,7 +1001,10 @@ fn listen(server: &Server, id: Value, params: &Map<String, Value>) {
         "notifications/subscriptions/acknowledged",
         protocol::object(ack),
     ));
-    server.subscriptions.borrow_mut().push(id);
+    server
+        .subscriptions
+        .borrow_mut()
+        .push((protocol::key(&id), id));
 }
 
 /// Ends an open subscription from the server's side: its answer, then the cancel that tears
@@ -596,7 +1027,7 @@ fn end_subscription(server: &Server, id: &Value, reason: &str) {
 /// cancelled.
 fn call(
     server: &Rc<Server>,
-    running: &Rc<std::cell::Cell<usize>>,
+    running: &Rc<Cell<usize>>,
     id: Value,
     era: Era,
     params: &Map<String, Value>,
@@ -629,7 +1060,7 @@ fn call(
         server.send(protocol::result_line(&id, era, result));
         return;
     }
-    let key = id.to_string();
+    let key = protocol::key(&id);
     let root = Cancel::new();
     let cancel = root.child();
     server.calls.borrow_mut().insert(key.clone(), Some(root));
@@ -765,6 +1196,7 @@ fn start_log() -> Option<std_mpsc::SyncSender<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     fn lines(input: &[u8], max: usize) -> Vec<Option<Vec<u8>>> {
         let mut reader = io::BufReader::with_capacity(4, input);
@@ -790,5 +1222,165 @@ mod tests {
         assert_eq!(lines(b"0123456789\nok\n", 5), [None, Some(b"ok".to_vec())]);
         assert_eq!(lines(b"", 5), Vec::<Option<Vec<u8>>>::new());
         assert_eq!(lines(b"\n", 5), [Some(Vec::new())]);
+    }
+
+    // R35: what is held back is counted in requests and bytes, kept in order, and a cancel
+    // drops the request it names (its key), and nothing else.
+    #[test]
+    fn requests_held_back_are_bounded_in_order_and_cancelled_by_key() {
+        let mut deferred = Deferred::default();
+        deferred.push(Some("1".into()), Held::Request(b"one".to_vec()));
+        deferred.push(None, Held::Answer("answer".into()));
+        deferred.push(Some("\"1\"".into()), Held::Request(b"quoted".to_vec()));
+        assert_eq!(deferred.bytes, 3 + 6 + 6);
+        assert!(deferred.holds("1") && deferred.holds("\"1\"") && !deferred.holds("2"));
+        deferred.cancel("1");
+        assert_eq!((deferred.queue.len(), deferred.bytes), (2, 12));
+        assert!(matches!(deferred.pop(), Some(Held::Answer(line)) if line == "answer"));
+        assert!(matches!(deferred.pop(), Some(Held::Request(bytes)) if bytes == b"quoted"));
+        assert_eq!((deferred.pop().is_none(), deferred.bytes), (true, 0));
+        for _ in 0..MAX_DEFERRED - 1 {
+            deferred.push(None, Held::Answer(String::new()));
+        }
+        assert!(!deferred.full());
+        deferred.push(None, Held::Answer(String::new()));
+        assert!(deferred.full(), "by count");
+        assert_eq!(deferred.clear(), MAX_DEFERRED);
+        deferred.push(None, Held::Request(vec![0; MAX_DEFERRED_BYTES]));
+        assert!(deferred.full(), "by bytes");
+    }
+
+    /// A test's console events: each at its time, once.
+    struct Script(VecDeque<(Instant, Signal)>);
+
+    impl Events for Script {
+        fn recv(&mut self) -> Pin<Box<dyn Future<Output = Signal> + '_>> {
+            Box::pin(async move {
+                match self.0.front().copied() {
+                    Some((at, signal)) => {
+                        tokio::time::sleep_until(at.into()).await;
+                        self.0.pop_front();
+                        signal
+                    }
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    /// Plays an end after stdin closed, with a call still running whose cancel can't settle
+    /// (the fake server never acknowledges its attention, and the driver waits 5 s for it):
+    /// `first` comes 300 ms into the end and Ctrl+Break 300 ms after it. What the end took,
+    /// whether the call was still running when it returned, whether its connection was closed
+    /// once the runtime let it go, and what was written.
+    fn end_with(first: Signal) -> (Duration, bool, bool, Vec<String>) {
+        use crate::db::fake_server::{self, Conn, End as Ended, Turn, serve_pool};
+        let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
+        let settings = config::Settings {
+            connect: fake_server::options(fake.server.clone()),
+            limits: crate::output::Limits {
+                advice: crate::output::Advice::Mcp,
+                ..crate::output::Limits::default()
+            },
+            query_timeout: 30,
+            allow_write: false,
+            writes_off: Some(crate::guard::WritesOff::Mcp),
+            lock_timeout: 10,
+            read_uncommitted: false,
+            exact_count: false,
+            profile: Some("fake".into()),
+        };
+        let engine = Engine::new(vec![("fake".into(), settings)], 2, None);
+        let launch = Launch {
+            profiles: vec![Profile {
+                name: "fake".into(),
+                description: None,
+            }],
+            rows_given: false,
+            cell_given: false,
+        };
+        let (out, written) = std_mpsc::channel::<String>();
+        let server = Rc::new(Server::new(engine, launch, out, None));
+        // The stdout thread's part: every line written at once.
+        let unwritten = Arc::clone(&server.unwritten);
+        let writer = thread::spawn(move || {
+            let mut lines = Vec::new();
+            for line in written {
+                lines.push(line);
+                unwritten.fetch_sub(1, Ordering::Relaxed);
+            }
+            lines
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let running = Rc::new(Cell::new(0));
+        let (took, still_running) = local.block_on(&runtime, async {
+            let params =
+                protocol::object(json!({"name": "query", "arguments": {"sql": "SELECT 1"}}));
+            call(&server, &running, json!(1), Era::Modern, &params);
+            let hung = fake
+                .wait_for(Duration::from_secs(10), |f| f.requests(0).len() >= 2)
+                .await;
+            assert!(hung, "the call's batch reached the server");
+            let started = Instant::now();
+            let mut events = Script(VecDeque::from([
+                (started + Duration::from_millis(300), first),
+                (started + Duration::from_millis(600), Signal::CtrlBreak),
+            ]));
+            end(
+                &server,
+                &running,
+                Why::StdinClosed,
+                &mut events,
+                Stall::new(None),
+            )
+            .await;
+            (started.elapsed(), running.get() == 1)
+        });
+        // As `run` does: the call still settling is dropped where it stands, and with it its
+        // connection.
+        drop(local);
+        drop(runtime);
+        let mut closed = false;
+        for _ in 0..200 {
+            if fake.ended(0) == Some(Ended::Client) {
+                closed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(server);
+        (took, still_running, closed, writer.join().unwrap())
+    }
+
+    // R36: a close, logoff or shutdown during the end, here the wait after stdin closed,
+    // cancels what is left at once and makes the whole end due within its grace (1 s), however
+    // long the waits would otherwise be (END_GRACE, 6 s, for the call to finish); a later
+    // Ctrl+Break (2 s) doesn't put it off. A call that can't settle in time is left to the
+    // runtime's end, which closes its connection; it gets no answer. With the events from a
+    // test's script in place of the console's.
+    #[test]
+    fn a_close_logoff_or_shutdown_during_the_end_bounds_it_by_its_grace() {
+        let ends: Vec<_> = [Signal::Close, Signal::Logoff, Signal::Shutdown]
+            .into_iter()
+            .map(|signal| thread::spawn(move || (signal, end_with(signal))))
+            .collect();
+        for end in ends {
+            let (signal, (took, still_running, closed, written)) = end.join().unwrap();
+            let due = Duration::from_millis(300) + signal.grace();
+            assert!(
+                took >= due - Duration::from_millis(50) && took < due + Duration::from_millis(500),
+                "{signal:?}: {took:?}"
+            );
+            assert!(
+                still_running,
+                "{signal:?}: the call couldn't settle in time"
+            );
+            assert!(closed, "{signal:?}: its connection was closed");
+            assert!(written.is_empty(), "{signal:?}: {written:?}");
+        }
     }
 }
