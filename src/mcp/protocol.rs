@@ -276,7 +276,7 @@ pub(crate) fn exact_id(number: &str) -> Option<Value> {
 /// The text of the value at `path` (member names, from the top object down), as the line
 /// writes it: the last member of that name, as serde_json keeps the last of a duplicate. For
 /// a line serde_json has already read whole, so it only needs to find its way, decoding the
-/// names it compares (`"id"` is `id`).
+/// names it compares (`"\u0069d"` is `id`).
 fn raw_member<'a>(line: &'a str, path: &[&str]) -> Option<&'a str> {
     let mut scan = Scan {
         bytes: line.as_bytes(),
