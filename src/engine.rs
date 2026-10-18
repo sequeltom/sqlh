@@ -502,6 +502,27 @@ mod tests {
         Engine::new(vec![("fake".into(), settings(fake))], max, idle_after)
     }
 
+    /// `settings` as `sqlh mcp` gives a listed profile (`mcp::resolve`): writes off, and the
+    /// advice and a failed connect's hints in the words of a call and of the server's owner
+    /// (docs/mcp-mode.md §4). `query_timeout` is the server's own limit (its `-t`; 0 is none).
+    fn mcp_settings(fake: &Fake, query_timeout: u32) -> Settings {
+        let mut settings = settings(fake);
+        settings.writes_off = Some(crate::guard::WritesOff::Mcp);
+        settings.limits.advice = Advice::Mcp;
+        settings.connect.hints = crate::db::Hints::Profile;
+        settings.query_timeout = query_timeout;
+        settings
+    }
+
+    /// An engine serving one profile on `fake`, as `sqlh mcp` does (`mcp_settings`).
+    fn serving_mcp(fake: &Fake, max: usize, query_timeout: u32) -> Engine {
+        Engine::new(
+            vec![("fake".into(), mcp_settings(fake, query_timeout))],
+            max,
+            None,
+        )
+    }
+
     /// One call as the MCP front end makes it: its exit code, and its text with the closing
     /// lines.
     struct Called {
@@ -530,13 +551,30 @@ mod tests {
 
     /// `call`, for any request (a `check`, a `database`).
     async fn call_with(engine: &Engine, request: Request, timeout: u32, cancel: &Cancel) -> Called {
+        call_as(engine, request, QueryOrigin::User, timeout, cancel).await
+    }
+
+    /// `call_with`, for SQL of either origin (a schema command's is sqlh's own).
+    async fn call_as(
+        engine: &Engine,
+        request: Request,
+        origin: QueryOrigin,
+        timeout: u32,
+        cancel: &Cancel,
+    ) -> Called {
         let started = Instant::now();
         let settings = engine.settings(0);
-        let prepared = match run::prepare(request, settings, QueryOrigin::User) {
+        let prepared = match run::prepare(request, settings, origin) {
             Ok(prepared) => prepared,
             Err(failure) => panic!("prepare: {}", failure.message),
         };
-        let mut out = TextSink::with_meta(Vec::new(), Box::new(io::sink()), settings.limits);
+        // As `mcp::tools::execute` sets it: a call at the server's own limit is offered no
+        // larger timeout (it matters only to `Advice::Mcp`).
+        let limits = Limits {
+            timeout_at_limit: settings.query_timeout > 0 && timeout >= settings.query_timeout,
+            ..settings.limits
+        };
+        let mut out = TextSink::with_meta(Vec::new(), Box::new(io::sink()), limits);
         let outcome = engine
             .run(Call {
                 profile: 0,
@@ -609,6 +647,24 @@ mod tests {
                 out.push('N');
             }
         }
+        out
+    }
+
+    /// The text with the number before each ` ms` as `N`: a call's text apart from its
+    /// timings, every other number kept, for exact-output tests.
+    fn untimed(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(" ms") {
+            let before = rest[..at].trim_end_matches(|c: char| c.is_ascii_digit());
+            out.push_str(before);
+            if before.len() < at {
+                out.push('N');
+            }
+            out.push_str(" ms");
+            rest = &rest[at + " ms".len()..];
+        }
+        out.push_str(rest);
         out
     }
 
@@ -1469,5 +1525,503 @@ mod tests {
         for conn in 0..2 {
             assert_eq!(fake.requests(conn).len(), 3, "connection {conn}");
         }
+    }
+
+    // Decision 19 as built: the regressions the external review of Phase 5.2 and 5.3 asked to
+    // keep (PLAN.md): the probe's two sides, the idle peers a retry drops, a replacement that
+    // can't log in, a cancel in the probe's attention wait, and a connection that dies at the
+    // call's USE.
+
+    /// A connection of the pooled fake that holds its first call's SELECT 50 ms, and answers the
+    /// next call's setup, a reused connection's probe, after `setup`.
+    fn answering_the_probe_after(setup: Duration) -> Conn {
+        Conn::new()
+            .at(2, Turn::Delay(Duration::from_millis(50)))
+            .at(4, Turn::Delay(setup))
+    }
+
+    /// Two calls at once, so the profile opens two connections, both idle once the calls end:
+    /// the next call reuses one, and the other is its idle peer.
+    async fn two_idle(engine: &Rc<Engine>) {
+        let a = tokio::task::spawn_local(later(Rc::clone(engine), Duration::ZERO, 30));
+        let b = tokio::task::spawn_local(later(Rc::clone(engine), Duration::ZERO, 30));
+        for called in [a.await.expect("a"), b.await.expect("b")] {
+            assert_ok(&called);
+        }
+        assert_eq!(engine.idle_count(0), 2);
+    }
+
+    /// Of `two_idle`'s connections, the one the next call reused (it got more than its first
+    /// call's three requests), and its peer.
+    fn reused_and_peer(fake: &Fake) -> (usize, usize) {
+        if fake.requests(0).len() > 3 {
+            (0, 1)
+        } else {
+            (1, 0)
+        }
+    }
+
+    // The probe's live side (docs/mcp-mode.md §5, The boundary). The probe cuts a reused setup
+    // at 5 s; a server that answers it at 9 s acknowledges the attention 4 s into the driver's
+    // 5 s wait for that, so the connection is alive: it is reset and set up again, and the call
+    // runs on it. No new login, and the profile's other idle connection is kept.
+    #[test]
+    fn a_setup_acknowledged_within_the_attention_wait_keeps_its_connection_and_its_peer() {
+        let late = || answering_the_probe_after(Duration::from_secs(9));
+        let fake = serve_pool(vec![late(), late()]);
+        let engine = Rc::new(serving(&fake, DEFAULT_POOL, None));
+        let called = block_on_local(async {
+            two_idle(&engine).await;
+            call(&engine, "SELECT 1", 60, &Cancel::new()).await
+        });
+        assert_ok(&called);
+        assert!(
+            called.elapsed >= Duration::from_secs(9) && called.elapsed < Duration::from_secs(12),
+            "{:?}",
+            called.elapsed
+        );
+        assert_eq!(fake.accepted(), 2, "no new login");
+        let (reused, peer) = reused_and_peer(&fake);
+        // The first call's three requests; the cut setup and the setup again, each with the
+        // reset; the call's SELECT and its rollback.
+        assert_eq!(
+            fake.resets(reused),
+            [false, false, false, true, true, false, false]
+        );
+        assert_eq!(fake.requests(peer).len(), 3, "the peer was left alone");
+        assert_eq!(engine.idle_count(0), 2, "both connections were kept");
+        assert_eq!((fake.ended(reused), fake.ended(peer)), (None, None));
+        // The probe and the wait for the attention are the call's connect time.
+        assert!(connect_ms(&called.text) >= 9_000, "{}", called.text);
+    }
+
+    // The probe's other side (docs/mcp-mode.md §5, The boundary). A server that answers a reused
+    // setup only at 11 s leaves the probe's attention unacknowledged past the driver's 5 s wait,
+    // so at about 10 s the driver marks the connection dead: it can't be told from a half-open
+    // one, and it is replaced like one. The profile's other idle connection goes too, healthy as
+    // it is (the documented policy, right for a firewall's idle cut), and the call runs on a new
+    // login.
+    #[test]
+    fn a_setup_silent_past_the_attention_wait_is_replaced_with_its_idle_peer() {
+        let late = || answering_the_probe_after(Duration::from_secs(11));
+        let fake = serve_pool(vec![late(), late()]);
+        let engine = Rc::new(serving(&fake, DEFAULT_POOL, None));
+        let (called, both_closed) = block_on_local(async {
+            two_idle(&engine).await;
+            let called = call(&engine, "SELECT 1", 60, &Cancel::new()).await;
+            let both_closed = fake
+                .wait_for(Duration::from_secs(5), |f| {
+                    f.ended(0) == Some(End::Client) && f.ended(1) == Some(End::Client)
+                })
+                .await;
+            (called, both_closed)
+        });
+        assert_ok(&called);
+        assert!(
+            called.elapsed >= Duration::from_secs(9) && called.elapsed < Duration::from_secs(15),
+            "{:?}",
+            called.elapsed
+        );
+        assert_eq!(fake.accepted(), 3, "a new login");
+        let (reused, peer) = reused_and_peer(&fake);
+        assert_eq!(fake.resets(reused), [false, false, false, true]);
+        assert_eq!(
+            fake.requests(peer).len(),
+            3,
+            "the healthy peer ran nothing more"
+        );
+        assert!(
+            both_closed,
+            "the dead connection and its healthy peer were closed"
+        );
+        assert_eq!(fake.resets(2), [false, false, false]);
+        assert_eq!(engine.idle_count(0), 1, "only the new connection is left");
+        assert!(connect_ms(&called.text) >= 9_000, "{}", called.text);
+    }
+
+    // Decision 19's one retry, when its new login fails: the call gets the connect error, as a
+    // call with nothing to reuse would (exit 2; in sqlh mcp its hint names the profile), and no
+    // third attempt. Its permit goes back: with a pool of one, the next call gets the slot at
+    // once, logs in on a new connection and succeeds.
+    #[test]
+    fn a_replacement_that_cannot_log_in_fails_the_call_and_frees_its_slot() {
+        let fake = serve_pool(vec![
+            Conn::new().close_after(3),
+            Conn::new().refusing_login(),
+        ]);
+        let engine = serving_mcp(&fake, 1, 30);
+        let (first, failed, accepted, next) = block_on(async {
+            let first = plain(&engine).await;
+            let closed = fake
+                .wait_for(Duration::from_secs(2), |f| f.ended(0) == Some(End::Server))
+                .await;
+            assert!(closed, "the server closed the idle connection");
+            let failed = plain(&engine).await;
+            let accepted = fake.accepted();
+            assert_eq!(
+                engine.pools[0].permits.available_permits(),
+                1,
+                "the failed call's permit was released"
+            );
+            assert_eq!(engine.idle_count(0), 0);
+            (first, failed, accepted, plain(&engine).await)
+        });
+        assert_ok(&first);
+        assert_eq!(failed.exit, Exit::Connect, "{}", failed.text);
+        assert_eq!(
+            untimed(&failed.text),
+            format!(
+                "-- error: cannot connect to {} (SQL login 'fake', encrypt optional): Login failed \
+                 for user 'fake'. (error 18456, severity 14); check the profile's login and its \
+                 saved password (sqlh profile add), and that the login may use this database\n\
+                 -- failed (exit 2): connection failed, N ms\n",
+                fake.server
+            )
+        );
+        assert_eq!(accepted, 2, "no third attempt");
+        assert_ok(&next);
+        assert_eq!(fake.accepted(), 3);
+        assert_eq!(fake.resets(2), [false, false, false]);
+        assert_eq!(engine.idle_count(0), 1);
+    }
+
+    /// A call on a reused connection cancelled 6 s in, while the probe (cut at 5 s) waits for
+    /// its attention's acknowledgement; then the next call. The cancelled call, how many
+    /// connections had been accepted and were idle after it, whether the server saw a
+    /// transaction still open on the first, and the next call.
+    async fn cancelled_in_the_attention_wait(
+        fake: &Fake,
+        engine: &Engine,
+    ) -> (Called, usize, usize, bool, Called) {
+        assert_ok(&plain(engine).await);
+        let cut = cancelled(engine, Duration::from_secs(6)).await;
+        let after = (
+            fake.accepted(),
+            engine.idle_count(0),
+            fake.in_transaction(0),
+        );
+        (cut, after.0, after.1, after.2, plain(engine).await)
+    }
+
+    // A cancel during the probe's wait for its attention (`!cancel.is_cancelled()` in both of
+    // `run_pooled`'s conditions): the setup isn't run again and the call isn't retried, and no
+    // transaction is left open. A server that acknowledges the attention after the cancel (at
+    // 7 s) kept the connection in step, so it goes back to the pool and the next call reuses
+    // it; one that never does left it dead, so it is dropped, and the next call logs in anew.
+    #[test]
+    fn a_cancel_during_the_probes_attention_wait_is_neither_set_up_again_nor_retried() {
+        let answering = serve_pool(vec![Conn::new().at(4, Turn::Delay(Duration::from_secs(7)))]);
+        let silent = serve_pool(vec![Conn::new().at(4, Turn::Silent)]);
+        let (kept, dropped) = (
+            serving(&answering, DEFAULT_POOL, None),
+            serving(&silent, DEFAULT_POOL, None),
+        );
+        let (on_answering, on_silent) = block_on(async {
+            tokio::join!(
+                cancelled_in_the_attention_wait(&answering, &kept),
+                cancelled_in_the_attention_wait(&silent, &dropped)
+            )
+        });
+
+        // The cancelled call ends with the probe's timeout, which sqlh mcp never sends: a
+        // cancelled call gets no response (docs/mcp-mode.md §2, §5).
+        let probe_cut = "-- error: query timeout after 5 s in the session setup\n\
+                         -- failed (exit 4): timeout, N ms\n";
+        let (cut, accepted, idle, open, next) = on_answering;
+        assert_eq!(untimed(&cut.text), probe_cut);
+        assert!(
+            cut.elapsed >= Duration::from_millis(6_500) && cut.elapsed < Duration::from_secs(9),
+            "{:?}",
+            cut.elapsed
+        );
+        assert_eq!(accepted, 1, "not retried");
+        assert_eq!(idle, 1, "the connection the driver kept was pooled");
+        assert!(!open, "no transaction was left open");
+        assert_ok(&next);
+        assert_eq!(answering.accepted(), 1);
+        // The first call; the cut setup (its BEGIN TRANSACTION ran), never set up again, and
+        // `put_back`'s NOEXEC OFF and rollback; then the next call, reset first.
+        let sql = answering.sql(0);
+        assert!([0, 3, 6].iter().all(|&at| is_setup(&sql[at])), "{sql:?}");
+        assert_eq!(sql[1..3], ["SELECT 1", ROLLBACK], "{sql:?}");
+        assert_eq!(sql[4..6], [NOEXEC_OFF, ROLLBACK], "{sql:?}");
+        assert_eq!(sql[7..], ["SELECT 1", ROLLBACK], "{sql:?}");
+        assert_eq!(
+            answering.resets(0),
+            [false, false, false, true, false, false, true, false, false]
+        );
+
+        // A connection closed holds no transaction (the server rolls it back), whatever the
+        // fake last saw on it.
+        let (cut, accepted, idle, _, next) = on_silent;
+        assert_eq!(untimed(&cut.text), probe_cut);
+        assert!(
+            cut.elapsed >= Duration::from_secs(9) && cut.elapsed < Duration::from_secs(12),
+            "{:?}",
+            cut.elapsed
+        );
+        assert_eq!(accepted, 1, "not retried");
+        assert_eq!(idle, 0, "the dead connection was dropped");
+        assert_ok(&next);
+        assert_eq!(silent.accepted(), 2);
+        assert_eq!(silent.ended(0), Some(End::Client), "and closed");
+        assert_eq!(silent.requests(0).len(), 4, "the setup wasn't sent again");
+    }
+
+    /// A call naming the database `d`, with `-t timeout`, on the connection the call before it
+    /// left idle.
+    async fn use_on_reused(engine: &Engine, timeout: u32) -> Called {
+        assert_ok(&plain(engine).await);
+        let use_db = Request {
+            database: Some("d".into()),
+            ..request("SELECT 1")
+        };
+        call_with(engine, use_db, timeout, &Cancel::new()).await
+    }
+
+    // Decision 19's retry at the call's USE: a reused connection whose setup, with its reset,
+    // was acknowledged, and that then dies at the USE, ran nothing of the call, so the call
+    // runs again, once, on a new connection, which gets the setup and the USE again. Two ways
+    // to die there: the server closes the connection once it has answered the setup, or the
+    // USE goes unanswered past the call's timeout and the driver's 5 s wait for the attention,
+    // which the retried call reports as connect time.
+    #[test]
+    fn a_connection_that_dies_at_the_calls_use_is_retried_with_its_use() {
+        let closed = serve_pool(vec![Conn::new().close_after(4)]);
+        let silent = serve_pool(vec![Conn::new().at(5, Turn::Silent)]);
+        let (on_closed, on_silent) = (
+            serving(&closed, DEFAULT_POOL, None),
+            serving(&silent, DEFAULT_POOL, None),
+        );
+        let (after_close, after_silence) = block_on(async {
+            tokio::join!(use_on_reused(&on_closed, 30), use_on_reused(&on_silent, 6))
+        });
+        for (called, fake, engine) in [
+            (&after_close, &closed, &on_closed),
+            (&after_silence, &silent, &on_silent),
+        ] {
+            assert_ok(called);
+            assert_eq!(fake.accepted(), 2, "retried once");
+            assert!(
+                fake.resets(0)[3],
+                "the reused connection's setup carried the reset"
+            );
+            let sql = fake.sql(1);
+            assert!(is_setup(&sql[0]), "{sql:?}");
+            assert_eq!(sql[1..], ["USE [d];", "SELECT 1", ROLLBACK], "{sql:?}");
+            assert_eq!(fake.resets(1), [false, false, false, false]);
+            assert_eq!(engine.idle_count(0), 1);
+        }
+        assert_eq!(
+            closed.requests(0).len(),
+            4,
+            "the closed connection read no USE"
+        );
+        assert_eq!(silent.sql(0)[4..], ["USE [d];"]);
+        // The call's 6 s and the driver's 5 s for the attention, then a new login: about 11 s.
+        assert!(
+            after_silence.elapsed >= Duration::from_secs(10)
+                && after_silence.elapsed < Duration::from_secs(16),
+            "{:?}",
+            after_silence.elapsed
+        );
+        assert!(
+            connect_ms(&after_silence.text) >= 10_000,
+            "{}",
+            after_silence.text
+        );
+    }
+
+    // What MCP results advise (docs/mcp-mode.md §4's tables), exactly, as the engine's calls
+    // end: what a call can change, and the server's own launch flags once a call can't.
+
+    /// One call's exit and text apart from its timings (`untimed`), on a fake server playing
+    /// `conns`, its profile served as `sqlh mcp` serves it with the server's `-t limit`, and the
+    /// call's own `timeout`. The fake reports no server name, so the status line's tail reads
+    /// `?/master`.
+    fn mcp_text(
+        conns: Vec<Conn>,
+        limit: u32,
+        request: Request,
+        origin: QueryOrigin,
+        timeout: u32,
+    ) -> (Exit, String) {
+        let fake = serve_pool(conns);
+        let engine = serving_mcp(&fake, DEFAULT_POOL, limit);
+        let called = block_on(call_as(&engine, request, origin, timeout, &Cancel::new()));
+        (called.exit, untimed(&called.text))
+    }
+
+    // A batch timeout: a larger `timeout`, up to the server's limit (any, when the server has
+    // none), or narrower SQL, and once the call has the server's limit, only narrower SQL.
+    #[test]
+    fn in_mcp_a_batch_timeout_offers_what_the_call_can_raise() {
+        for (limit, advice) in [
+            (
+                30,
+                "raise timeout (the server allows up to 30 s) or narrow the query",
+            ),
+            (0, "raise timeout or narrow the query"),
+            (1, "narrow the query (1 s is the server's limit)"),
+        ] {
+            let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+            let (exit, text) = mcp_text(hangs, limit, request("SELECT 1"), QueryOrigin::User, 1);
+            assert_eq!(exit, Exit::Timeout, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    "-- result 1\nx:int\n1\n1\n1\n\
+                     -- error: query timeout after 1 s in batch 1; {advice}\n\
+                     -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+                ),
+                "the server's -t {limit}"
+            );
+        }
+    }
+
+    // A schema tool's name lookup that times out (`describe`, `definition` and `deps` look the
+    // name up first): a larger `timeout`, or that the call has the server's limit.
+    #[test]
+    fn in_mcp_a_lookup_timeout_offers_what_the_call_can_raise() {
+        for (limit, advice) in [
+            (30, "raise timeout (the server allows up to 30 s)"),
+            (0, "raise timeout"),
+            (1, "1 s is the server's limit"),
+        ] {
+            let describe = Request {
+                input: crate::schema::Command::Describe("dbo.T".into())
+                    .input(Advice::Mcp)
+                    .expect("a lookup"),
+                ..request("")
+            };
+            let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+            let (exit, text) = mcp_text(hangs, limit, describe, QueryOrigin::Generated, 1);
+            assert_eq!(exit, Exit::Timeout, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    "-- error: query timeout after 1 s while looking the name up; {advice}\n\
+                     -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+                ),
+                "the server's -t {limit}"
+            );
+        }
+    }
+
+    // The wait for a free connection, whole: what was busy (the profile's only connection, or
+    // all of them), then a larger `timeout` and the server's --pool, or, once the call has the
+    // server's limit, the server's --pool and -t.
+    #[test]
+    fn in_mcp_the_wait_for_a_free_connection_says_what_was_busy_and_what_can_change() {
+        for (pool, limit, after) in [
+            (
+                1,
+                30,
+                "(the profile's only connection was busy); raise timeout (the server allows up \
+                 to 30 s), or start sqlh mcp with a larger --pool",
+            ),
+            (
+                1,
+                0,
+                "(the profile's only connection was busy); raise timeout, or start sqlh mcp \
+                 with a larger --pool",
+            ),
+            (
+                2,
+                1,
+                "(all 2 of the profile's connections were busy); start sqlh mcp with a larger \
+                 --pool or -t",
+            ),
+        ] {
+            let busy = || Conn::new().at(2, Turn::Delay(Duration::from_millis(1500)));
+            let fake = serve_pool(vec![busy(), busy()]);
+            let engine = Rc::new(serving_mcp(&fake, pool, limit));
+            let waiting = block_on_local(async {
+                let holders: Vec<_> = (0..pool)
+                    .map(|_| {
+                        tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30))
+                    })
+                    .collect();
+                let waiting = tokio::task::spawn_local(later(
+                    Rc::clone(&engine),
+                    Duration::from_millis(50),
+                    1,
+                ));
+                let waiting = waiting.await.expect("waiting");
+                for holder in holders {
+                    assert_ok(&holder.await.expect("holder"));
+                }
+                waiting
+            });
+            assert_eq!(waiting.exit, Exit::Timeout, "{}", waiting.text);
+            assert_eq!(
+                untimed(&waiting.text),
+                format!(
+                    "-- error: query timeout after 1 s waiting for a free connection {after}\n\
+                     -- failed (exit 4): timeout, N ms\n"
+                ),
+                "a pool of {pool}, the server's -t {limit}"
+            );
+        }
+    }
+
+    // `check`'s closing note names the tool, not --check.
+    #[test]
+    fn in_mcp_the_check_note_names_the_tool() {
+        let check = Request {
+            check: true,
+            ..request("SELECT 1")
+        };
+        let (exit, text) = mcp_text(Vec::new(), 30, check, QueryOrigin::User, 30);
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            "-- note: check compiled each batch without running it. Missing tables are only \
+             reported when a query runs (SQL Server defers their name resolution)\n\
+             -- ok: 1 batch, N ms; ?/master, connect N ms\n"
+        );
+    }
+
+    // The dirty-read note names the profile's setting, not --read-uncommitted.
+    #[test]
+    fn in_mcp_the_dirty_read_note_names_the_profiles_setting() {
+        let fake = serve_pool(Vec::new());
+        let profile = Settings {
+            read_uncommitted: true,
+            ..mcp_settings(&fake, 30)
+        };
+        let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+        let called = block_on(plain(&engine));
+        assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+        assert_eq!(
+            untimed(&called.text),
+            "-- note: reads were uncommitted (the profile's read_uncommitted = true): rows may \
+             include uncommitted, duplicated or missing data\n\
+             -- result 1\nx:int\n1\n-- 1 row\n\
+             -- ok: 1 batch, N ms; ?/master, connect N ms\n"
+        );
+    }
+
+    // A count of hidden rows that sqlh stopped (`max_rows 1`, then two hidden rows and the
+    // count's 250 ms) and the server never confirmed (exit 6, after the driver's 5 s): the way
+    // to read every row is the profile's exact_count. The result it was cut in gets no footer,
+    // as when a lost connection ends a run inside a result
+    // (`a_connection_lost_mid_run_is_not_retried`); the error says the rows shown are complete.
+    #[test]
+    fn in_mcp_an_unconfirmed_count_stop_names_the_profiles_exact_count() {
+        let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
+        let mut profile = mcp_settings(&fake, 30);
+        profile.limits.max_rows = 1;
+        let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+        let called = block_on(plain(&engine));
+        assert_eq!(called.exit, Exit::Cancelled, "{}", called.text);
+        assert_eq!(
+            untimed(&called.text),
+            "-- result 1\nx:int\n1\n\
+             -- error: stopped counting the rows that are not shown, but the server didn't \
+             confirm the cancel, so the connection was closed; the rows shown are complete (the \
+             profile's exact_count = true reads every row instead)\n\
+             -- failed (exit 6): cancelled, N ms; ?/master, connect N ms\n"
+        );
     }
 }

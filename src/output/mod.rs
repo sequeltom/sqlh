@@ -1602,6 +1602,109 @@ mod tests {
         assert_eq!(t.stopped_batches(), 2);
     }
 
+    // docs/mcp-mode.md §4, What a result advises, exactly and beside the CLI's: in sqlh mcp a
+    // footer names the limit that hid rows or cut values as the call's argument (`max_rows N`,
+    // `max_cell N`) and the output limit as the server's launch flag, which no call changes,
+    // with `counting stopped` and `interrupted` as in the CLI; the result sets past the limit
+    // are a fixed number per call.
+    #[test]
+    fn in_mcp_footers_and_the_result_set_note_name_the_calls_limits() {
+        // 2775 rows, 5 shown (the row limit 5), two of their values cut (the value limit 40).
+        let by_rows = |advice| {
+            let mut t = Tally::new(Limits {
+                max_rows: 5,
+                max_cell: 40,
+                advice,
+                ..Limits::default()
+            });
+            t.start_result();
+            for _ in 0..5 {
+                t.row_shown();
+            }
+            t.cell_cut();
+            t.cell_cut();
+            for _ in 0..2770 {
+                t.row_skipped();
+            }
+            t
+        };
+        // 50 rows, 3 shown before the output budget ran out.
+        let by_output = |advice| {
+            let mut t = Tally::new(Limits {
+                advice,
+                ..Limits::default()
+            });
+            t.start_result();
+            for _ in 0..3 {
+                t.row_shown();
+            }
+            t.row_withheld();
+            for _ in 0..46 {
+                t.row_skipped();
+            }
+            t
+        };
+        let stopped = |mut t: Tally| {
+            t.stop_counting(Stop::Budget);
+            t
+        };
+        for (advice, rows, cell, output, results) in [
+            (
+                Advice::Cli,
+                "--max-rows 5",
+                "--max-cell 40",
+                "--max-output",
+                "--max-results 1",
+            ),
+            (
+                Advice::Mcp,
+                "max_rows 5",
+                "max_cell 40",
+                "the server's --max-output",
+                "at most 1 per call",
+            ),
+        ] {
+            let values = format!("; 2 values cut ({cell})");
+            assert_eq!(
+                by_rows(advice).footer(),
+                format!("5 of 2775 rows shown ({rows}){values}")
+            );
+            assert_eq!(
+                by_rows(advice).footer_incomplete(),
+                format!("5 of ≥2775 rows shown ({rows}; interrupted){values}")
+            );
+            assert_eq!(
+                stopped(by_rows(advice)).footer(),
+                format!("5 of ≥2000 rows shown ({rows}; counting stopped){values}")
+            );
+            assert_eq!(
+                stopped(by_rows(advice)).footer_incomplete(),
+                format!("5 of ≥2000 rows shown ({rows}; counting stopped; interrupted){values}")
+            );
+            assert_eq!(
+                by_output(advice).footer(),
+                format!("3 of 50 rows shown ({output})")
+            );
+            assert_eq!(
+                stopped(by_output(advice)).footer(),
+                format!("3 of ≥50 rows shown ({output}; counting stopped)")
+            );
+            let mut t = Tally::new(Limits {
+                max_results: 1,
+                advice,
+                ..Limits::default()
+            });
+            for _ in 0..3 {
+                t.start_result();
+                t.end_rows();
+            }
+            assert_eq!(
+                t.limit_notes(),
+                [format!("2 more result sets not shown ({results})")]
+            );
+        }
+    }
+
     // F06: a refusal is final, and the closing note doesn't list counts that are all zero.
     #[test]
     fn the_output_budget_is_sticky() {

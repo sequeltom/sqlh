@@ -2426,6 +2426,7 @@ pub(crate) mod fake_server {
         turns: Vec<(usize, Turn)>,
         close_after: Option<usize>,
         no_reset_ack: bool,
+        refuse_login: bool,
     }
 
     impl Conn {
@@ -2453,6 +2454,14 @@ pub(crate) mod fake_server {
         /// as a server that didn't reset the session would.
         pub(crate) fn without_reset_ack(mut self) -> Conn {
             self.no_reset_ack = true;
+            self
+        }
+
+        /// Refuses the login as SQL Server refuses a wrong password (`login_refused`: error
+        /// 18456), then closes the connection: a login that fails, such as a pool's replacement
+        /// connection can meet.
+        pub(crate) fn refusing_login(mut self) -> Conn {
+            self.refuse_login = true;
             self
         }
 
@@ -2602,8 +2611,45 @@ pub(crate) mod fake_server {
         }
     }
 
+    /// The answer to a login SQL Server refuses: ERROR (`AA | length u16 LE | number i32 LE |
+    /// state | class | message US_VARCHAR | server B_VARCHAR | procedure B_VARCHAR | line i32
+    /// LE`, the lengths in characters), error 18456 of class 14, and a final DONE with the error
+    /// bit (0x02).
+    fn login_refused() -> Vec<u8> {
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let message = "Login failed for user 'fake'.";
+        let mut body = Vec::new();
+        body.extend(18456i32.to_le_bytes());
+        body.extend([1, 14]);
+        body.extend(
+            u16::try_from(message.encode_utf16().count())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        body.extend(utf16(message));
+        body.push(4);
+        body.extend(utf16("fake"));
+        body.push(0);
+        body.extend(1i32.to_le_bytes());
+        let mut reply = vec![0xaa];
+        reply.extend(u16::try_from(body.len()).unwrap().to_le_bytes());
+        reply.extend(body);
+        reply.extend(done_token(0x02, 0, 0));
+        reply
+    }
+
     /// One connection of `serve_pool`, from the handshake to its end.
     fn play(mut s: TcpStream, conn: usize, script: &Conn, log: &Mutex<Log>) -> End {
+        if script.refuse_login {
+            if receive(&mut s) == Some(0x12)
+                && write_packet(&mut s, &PRELOGIN_REPLY, true).is_ok()
+                && receive(&mut s) == Some(0x10)
+            {
+                let _ = write_packet(&mut s, &login_refused(), true);
+            }
+            let _ = s.shutdown(Shutdown::Both);
+            return End::Server;
+        }
         if !handshake(&mut s) {
             return End::Client;
         }
