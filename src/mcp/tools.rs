@@ -376,13 +376,10 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
     let number = |key: &str, min: u64, max: u64| -> Result<Option<u64>, Refused> {
         match args.get(key) {
             None => Ok(None),
-            // A whole number, whichever way JSON wrote it (`30` or `30.0`).
-            Some(value) => match value.as_u64().or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= max as f64)
-                    .map(|f| f as u64)
-            }) {
+            // A whole number: an integer as `protocol::parse` leaves it, which reads `30.0`
+            // and `3e1` from their text as 30 (R41). A float that reaches here is none, never
+            // rounded: `10.0000000000000001` and `-1e-9999` are refused, not 10 and 0.
+            Some(value) => match value.as_u64() {
                 Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
                 _ => Err(invalid(&format!(
                     "{key} must be a whole number from {min} to {max}"
@@ -683,13 +680,62 @@ mod tests {
         assert_eq!(any_case.profile, 1, "a profile's name in any ASCII case");
         assert_eq!(planned.max_rows, Some(5));
         assert_eq!(planned.format, Format::Json);
-        // A whole number written as 30.0 is a whole number.
-        let planned = plan(
-            &call(json!({"name": "query", "arguments": {"sql": "x", "timeout": 30.0}})),
-            &one,
-        )
-        .unwrap();
-        assert_eq!(planned.timeout, Some(30));
+        // A whole number written as 30.0 or 3e1 is that number, as `protocol::parse` reads it
+        // from its text (R41); a float that reaches the plan is none, never rounded.
+        let parsed = |arguments: &str| {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query","arguments":{arguments}}}}}"#
+            );
+            match super::super::protocol::parse(&line) {
+                Ok(super::super::protocol::Incoming::Request { params, .. }) => params,
+                other => panic!("{arguments}: {other:?}"),
+            }
+        };
+        for raw in ["30", "30.0", "3e1", "300e-1"] {
+            let planned =
+                plan(&parsed(&format!(r#"{{"sql":"x","timeout":{raw}}}"#)), &one).unwrap();
+            assert_eq!(planned.timeout, Some(30), "{raw}");
+        }
+        for raw in [
+            "30.0000000000000001",
+            "-1e-9999",
+            "1e30",
+            "30.5",
+            "0",
+            "-5.0",
+        ] {
+            match plan(&parsed(&format!(r#"{{"sql":"x","timeout":{raw}}}"#)), &one) {
+                Err(Refused::Arguments { message, .. }) => assert!(
+                    message.contains("timeout must be a whole number from 1 to"),
+                    "{raw}: {message}"
+                ),
+                _ => panic!("{raw}: not refused"),
+            }
+        }
+        for raw in ["10.0000000000000001", "-1e-9999", "10001", "1e30"] {
+            match plan(&parsed(&format!(r#"{{"sql":"x","max_rows":{raw}}}"#)), &one) {
+                Err(Refused::Arguments { message, .. }) => assert!(
+                    message.contains("max_rows must be a whole number from 0 to 10000"),
+                    "{raw}: {message}"
+                ),
+                _ => panic!("{raw}: not refused"),
+            }
+        }
+        // Zero stays valid where it is (all rows, a whole value), however it is written.
+        for raw in ["0", "0.0", "-0"] {
+            let planned = plan(
+                &parsed(&format!(
+                    r#"{{"sql":"x","max_rows":{raw},"max_cell":{raw}}}"#
+                )),
+                &one,
+            )
+            .unwrap();
+            assert_eq!(
+                (planned.max_rows, planned.max_cell),
+                (Some(0), Some(0)),
+                "{raw}"
+            );
+        }
         for (params, wanted) in [
             (json!({}), "needs a tool name"),
             (json!({"name": "drop"}), "Unknown tool: drop"),

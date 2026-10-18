@@ -97,7 +97,7 @@ pub(crate) const MAX_ID_BYTES: usize = 1024;
 /// What an id is known by, for every rule that compares ids (the calls in flight, the
 /// requests held back, the open subscriptions and the cancels that name them): its JSON text
 /// as serde_json writes it again. `parse` takes only strings and integers within 64 bits, a
-/// number written another way (`1.0`, `1e2`, `-0`) as the integer it is (`exact_id`), so two
+/// number written another way (`1.0`, `1e2`, `-0`) as the integer it is (`exact_integer`), so two
 /// ids share a key only when they are the same id: `1`, `1.0` and `1e0` one, `"1"` another.
 /// A cancel's `requestId` is taken the same way; one that isn't such an id has a key no open
 /// request has.
@@ -131,12 +131,12 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
     // anything else (null included), or longer, can't be answered by, so the error leaves it
     // out. An integer is what it is however it is written: serde_json reads `1` as an i64 but
     // `1.0`, `1e2` and `-0` as floats, and past 64 bits a whole number too, so those are
-    // decided from the number as the line writes it (`exact_id`, R40), never from the float,
+    // decided from the number as the line writes it (`exact_integer`, R40), never from the float,
     // which would round a fraction or a larger number onto an id (R38).
     let id = match message.remove("id") {
         None => None,
         Some(id) if id.is_string() || id.is_i64() || id.is_u64() => Some(id),
-        Some(other) => match (&other, raw_member(line, &["id"]).and_then(exact_id)) {
+        Some(other) => match (&other, raw_member(line, &["id"]).and_then(exact_integer)) {
             (Value::Number(_), Some(exact)) => Some(exact),
             _ => {
                 return Err((
@@ -204,10 +204,31 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
         && let Some(Value::Number(n)) = params.get("requestId")
         && !(n.is_i64() || n.is_u64())
     {
-        match raw_member(line, &["params", "requestId"]).and_then(exact_id) {
+        match raw_member(line, &["params", "requestId"]).and_then(exact_integer) {
             Some(exact) => params.insert("requestId".into(), exact),
             None => params.remove("requestId"),
         };
+    }
+    // A tool's numeric arguments (`max_rows`, `max_cell`, `timeout`) are integers, decided by
+    // the same rule (R41): one serde_json read as a float becomes the integer its text is
+    // (`30.0`, `3e1`), or stays a float, which the tool refuses as no whole number
+    // (`10.0000000000000001`, which the float would make 10; `-1e-9999`, which it would make
+    // 0; `1e30`).
+    if method == "tools/call"
+        && let Some(Value::Object(arguments)) = params.get_mut("arguments")
+    {
+        let floats: Vec<String> = arguments
+            .iter()
+            .filter(|(_, value)| matches!(value, Value::Number(n) if !(n.is_i64() || n.is_u64())))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in floats {
+            if let Some(exact) =
+                raw_member(line, &["params", "arguments", &name]).and_then(exact_integer)
+            {
+                arguments.insert(name, exact);
+            }
+        }
     }
     Ok(match id {
         Some(id) => Incoming::Request { id, method, params },
@@ -216,11 +237,11 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
 }
 
 /// The integer a JSON number is, from its text (`number`, as the line writes it), when it is
-/// one within i64 or u64: `1.0` and `1e0` are 1, `1e2` is 100, `-0` is 0. Not a fraction
+/// one within i64 or u64, for an id (R40) and a tool's numeric argument (R41): `1.0` and `1e0` are 1, `1e2` is 100, `-0` is 0. Not a fraction
 /// (`1.5`, `1.0000000000000001`, `5e-3`), nor a larger magnitude (`1e20`, `18446744073709551616`),
 /// which sqlh refuses as an implementation limit (MCP asks only for an integer). Exact: the
 /// digits are shifted by the exponent as text, never through a float, so nothing rounds.
-pub(crate) fn exact_id(number: &str) -> Option<Value> {
+pub(crate) fn exact_integer(number: &str) -> Option<Value> {
     let (negative, unsigned) = match number.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, number),
@@ -683,12 +704,43 @@ mod tests {
             ("1e999999999999999999999", None),
             ("1e-999999999999999999999", None),
         ] {
-            assert_eq!(exact_id(text), wanted, "{text}");
+            assert_eq!(exact_integer(text), wanted, "{text}");
         }
     }
 
     // R40: the text of a member, found as serde_json would: names decoded, the last of a
     // duplicate, strings and nesting stepped over.
+    // R41: a tool call's numeric arguments are read as R40 reads ids: an integer written
+    // another way is that integer, and anything else stays a float the tool refuses.
+    #[test]
+    fn a_tool_calls_numeric_arguments_are_integers_from_their_text() {
+        let arguments = |raw: &str| {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query","arguments":{raw}}}}}"#
+            );
+            match parse(&line) {
+                Ok(Incoming::Request { params, .. }) => params["arguments"].clone(),
+                other => panic!("{raw}: {other:?}"),
+            }
+        };
+        let read = arguments(r#"{"sql":"x","max_rows":30.0,"max_cell":3e1,"timeout":-0}"#);
+        assert_eq!(read["max_rows"], json!(30));
+        assert_eq!(read["max_cell"], json!(30));
+        assert_eq!(read["timeout"], json!(0));
+        assert!(read["max_rows"].is_u64() && read["max_cell"].is_u64());
+        let read =
+            arguments(r#"{"max_rows":10.0000000000000001,"max_cell":-1e-9999,"timeout":1e30}"#);
+        for name in ["max_rows", "max_cell", "timeout"] {
+            assert!(read[name].is_f64(), "{name}: {}", read[name]);
+        }
+        // Only a tool call's arguments are read so; a ping's params are left as they are.
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":1.0}}"#;
+        match parse(line) {
+            Ok(Incoming::Request { params, .. }) => assert!(params["x"].is_f64()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_members_text_is_found_as_the_line_writes_it() {
         let line =

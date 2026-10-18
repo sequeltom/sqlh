@@ -4768,6 +4768,92 @@ mod mcp {
         assert_eq!(messages.len(), 19, "{messages:?}");
     }
 
+    /// R41: a tool's numeric limits are whole numbers decided from their text, as ids are
+    /// (R40): a near-integer, a negative that a float would make 0, a value past a bound or an
+    /// unsupported magnitude is the run's usage error before anything connects; `30.0`, `3e1`
+    /// and a zero however written are taken and reach the connect.
+    #[test]
+    fn a_tool_calls_numeric_limits_are_exact() {
+        let config = profiles("mcp_limits");
+        let call = |id: u32, extra: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1"{extra}}}}}}}"#
+            )
+        };
+        let refused = [
+            (
+                r#","max_rows":10.0000000000000001"#,
+                "max_rows must be a whole number from 0 to 10000",
+            ),
+            (
+                r#","max_rows":-1e-9999"#,
+                "max_rows must be a whole number from 0 to 10000",
+            ),
+            (
+                r#","max_rows":10001"#,
+                "max_rows must be a whole number from 0 to 10000",
+            ),
+            (
+                r#","max_cell":10.0000000000000001"#,
+                "max_cell must be a whole number from 0 to",
+            ),
+            (
+                r#","max_cell":1e30"#,
+                "max_cell must be a whole number from 0 to",
+            ),
+            (
+                r#","timeout":10.0000000000000001"#,
+                "timeout must be a whole number from 1 to",
+            ),
+            (
+                r#","timeout":-1e-9999"#,
+                "timeout must be a whole number from 1 to",
+            ),
+            (
+                r#","timeout":0"#,
+                "timeout must be a whole number from 1 to",
+            ),
+        ];
+        let taken = [
+            r#","max_rows":30.0"#,
+            r#","max_cell":3e1"#,
+            r#","timeout":1e1"#,
+            r#","max_rows":-0,"max_cell":0.0"#,
+        ];
+        let mut lines: Vec<String> = Vec::new();
+        for (at, (extra, _)) in refused.iter().enumerate() {
+            lines.push(call(at as u32 + 1, extra));
+        }
+        for (at, extra) in taken.iter().enumerate() {
+            lines.push(call(at as u32 + 101, extra));
+        }
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let text = |id: i64| {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{result}");
+            result["content"][0]["text"].as_str().unwrap().to_owned()
+        };
+        for (at, (extra, wanted)) in refused.iter().enumerate() {
+            let text = text(at as i64 + 1);
+            assert!(
+                text.contains(wanted)
+                    && text.contains("-- failed (exit 3): usage error, ")
+                    && !text.contains("cannot connect"),
+                "{extra}: {text}"
+            );
+        }
+        // Taken: each reaches the connect, which the closed port refuses.
+        for (at, extra) in taken.iter().enumerate() {
+            let text = text(at as i64 + 101);
+            assert!(
+                text.contains("-- error: cannot connect to 127.0.0.1,1"),
+                "{extra}: {text}"
+            );
+        }
+        assert_eq!(messages.len(), refused.len() + taken.len(), "{messages:?}");
+    }
+
     /// R40: an integral number is one id however it is written, decided from its text so that
     /// nothing rounds: `1`, `1.0` and `1e0` are one request, `-0` and `0` another, a cancel's
     /// `1e2` names the request 100, `"1"` stays a request of its own, and a fraction or a
