@@ -40,6 +40,11 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+# serde_json is built for size (owner, 2026-10-18, decision 20 amended, PLAN.md §6): it saves
+# about 9.5 KiB of the exe, and its speed doesn't matter at MCP's message sizes.
+[profile.release.package.serde_json]
+opt-level = "z"
+
 [dev-dependencies]
 # The tests parse --format json output with it to check it is well-formed. It is also a normal
 # dependency since sqlh mcp (above), so this entry is redundant; a dev-dependency never reaches
