@@ -797,7 +797,7 @@ async fn run_session(
     // nothing connected, which is every path that returns before this point.
     out.connected(&session.connection(), connect_ms)
         .map_err(output_failure)?;
-    let setup_ms = open(&mut session, settings, prepared, timeout, None, cancel)
+    let setup_ms = open(&mut session, settings, prepared, timeout, cancel)
         .await
         .map_err(|e| db_failure(e, advice))?;
     let opened = Opened {
@@ -837,15 +837,35 @@ pub(crate) struct Opened {
 /// reset the server didn't acknowledge, shows up: before any of the run's own work, which the
 /// engine relies on to retry (owner decision 19). Returns the setup's milliseconds.
 ///
-/// `probe`, on a reused connection only (the engine's `REUSE_PROBE`), bounds the setup, which
-/// carries the reset and answers at once on a live connection; the `USE` gets the run's
-/// `timeout` whatever, since by then the connection has shown it is alive.
+/// It is `setup` then `use_database`; the engine runs the two apart, so that its probe of a
+/// reused connection (`REUSE_PROBE`) bounds the setup alone.
 pub(crate) async fn open(
     session: &mut Session,
     settings: &Settings,
     prepared: &Prepared,
     timeout: u32,
-    probe: Option<u32>,
+    cancel: &Cancel,
+) -> Result<u128, DbError> {
+    let setup_ms = setup(session, settings, prepared, timeout, cancel).await?;
+    use_database(session, prepared, timeout, cancel).await?;
+    Ok(setup_ms)
+}
+
+/// A timeout in `open` says where it struck: no query of the run's own was running.
+fn timed_out(error: DbError, after: u32, at: &str) -> DbError {
+    match error {
+        DbError::Timeout(_) => DbError::Timeout(format!("query timeout after {after} s {at}")),
+        error => error,
+    }
+}
+
+/// `open`'s first request, the session setup (`session_setup`), within `timeout`; it carries
+/// the reset of a reused connection. Returns its milliseconds.
+pub(crate) async fn setup(
+    session: &mut Session,
+    settings: &Settings,
+    prepared: &Prepared,
+    timeout: u32,
     cancel: &Cancel,
 ) -> Result<u128, DbError> {
     let policy = prepared.policy;
@@ -860,18 +880,22 @@ pub(crate) async fn open(
         Ok(prefix) => format!("{prefix} {setup}"),
         Err(_) => setup,
     };
-    // A timeout here says where it struck: no query of the run's own was running.
-    let timed_out = |error: DbError, after: u32, at: &str| match error {
-        DbError::Timeout(_) => DbError::Timeout(format!("query timeout after {after} s {at}")),
-        error => error,
-    };
-    let setup_timeout = probe.unwrap_or(timeout);
     let setup_started = Instant::now();
     session
-        .exec_internal(&setup, setup_timeout, cancel)
+        .exec_internal(&setup, timeout, cancel)
         .await
-        .map_err(|e| timed_out(e, setup_timeout, "in the session setup"))?;
-    let setup_ms = setup_started.elapsed().as_millis();
+        .map_err(|e| timed_out(e, timeout, "in the session setup"))?;
+    Ok(setup_started.elapsed().as_millis())
+}
+
+/// `open`'s second request, the call's `USE` when it names a database
+/// (`Prepared::database`), with `]` doubled; none otherwise.
+pub(crate) async fn use_database(
+    session: &mut Session,
+    prepared: &Prepared,
+    timeout: u32,
+    cancel: &Cancel,
+) -> Result<(), DbError> {
     if let Some(database) = &prepared.database {
         let sql = format!("USE [{}];", database.replace(']', "]]"));
         session
@@ -879,7 +903,7 @@ pub(crate) async fn open(
             .await
             .map_err(|e| timed_out(e, timeout, "changing to the call's database"))?;
     }
-    Ok(setup_ms)
+    Ok(())
 }
 
 /// Everything a run does on a session that is `open`: its notes, its lookup and batches, the

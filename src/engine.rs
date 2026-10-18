@@ -233,18 +233,11 @@ impl Engine {
             let mut probe = reused && (timeout == 0 || timeout > REUSE_PROBE);
             let mut probed = false;
             let mut open_started = Instant::now();
-            let opened = loop {
-                let limit = probe.then_some(REUSE_PROBE);
-                match run::open(
-                    &mut session,
-                    &pool.settings,
-                    prepared,
-                    timeout,
-                    limit,
-                    cancel,
-                )
-                .await
-                {
+            // The probe bounds the setup alone: the call's `USE` comes after the connection
+            // has shown it is alive, and gets the call's timeout, once.
+            let set_up = loop {
+                let limit = if probe { REUSE_PROBE } else { timeout };
+                match run::setup(&mut session, &pool.settings, prepared, limit, cancel).await {
                     Err(DbError::Timeout(_))
                         if probe && !session.connection_dead() && !cancel.is_cancelled() =>
                     {
@@ -253,8 +246,14 @@ impl Engine {
                         session.reset_before_next();
                         open_started = Instant::now();
                     }
-                    opened => break opened,
+                    set_up => break set_up,
                 }
+            };
+            let opened = match set_up {
+                Ok(setup_ms) => run::use_database(&mut session, prepared, timeout, cancel)
+                    .await
+                    .map(|()| setup_ms),
+                Err(error) => Err(error),
             };
             let setup_ms = match opened {
                 Ok(setup_ms) => setup_ms,
@@ -781,6 +780,38 @@ mod tests {
         assert_eq!(resets[3..6], [true, true, false], "{resets:?}");
         assert!(connect_ms(&second.text) >= 5_000, "{}", second.text);
         assert_eq!(engine.idle_count(0), 1);
+    }
+
+    // A reused connection's USE that runs past the call's own timeout, on a live connection:
+    // the call's own timeout, once, at about that timeout, with the USE sent once and no
+    // connect time; never a second setup and USE.
+    #[test]
+    fn a_use_past_the_calls_timeout_fails_once() {
+        let fake = serve_pool(vec![Conn::new().at(5, Turn::Hang { ack: true })]);
+        let engine = serving(&fake, DEFAULT_POOL, None);
+        let (first, second) = block_on(async {
+            let first = plain(&engine).await;
+            let mut use_db = request("SELECT 1");
+            use_db.database = Some("d".into());
+            (first, call_with(&engine, use_db, 6, &Cancel::new()).await)
+        });
+        assert_ok(&first);
+        assert_eq!(second.exit, Exit::Timeout, "{}", second.text);
+        assert!(
+            second
+                .text
+                .starts_with("-- error: query timeout after 6 s changing to the call's database\n"),
+            "{}",
+            second.text
+        );
+        assert!(
+            second.elapsed >= Duration::from_secs(6) && second.elapsed < Duration::from_secs(10),
+            "{:?}",
+            second.elapsed
+        );
+        let uses = fake.sql(0).iter().filter(|sql| *sql == "USE [d];").count();
+        assert_eq!(uses, 1, "{:?}", fake.sql(0));
+        assert_eq!(fake.accepted(), 1);
     }
 
     // The probe bounds only the setup, which carries the reset; a call's `USE` comes after the
