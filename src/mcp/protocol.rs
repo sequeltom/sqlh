@@ -6,6 +6,8 @@
 
 use serde_json::{Map, Value, json};
 
+use super::tools::NUMERIC_ARGS;
+
 /// The modern revision sqlh serves.
 pub(crate) const MODERN: &str = "2026-07-28";
 
@@ -209,24 +211,26 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
             None => params.remove("requestId"),
         };
     }
-    // A tool's numeric arguments (`max_rows`, `max_cell`, `timeout`) are integers, decided by
-    // the same rule (R41): one serde_json read as a float becomes the integer its text is
-    // (`30.0`, `3e1`), or stays a float, which the tool refuses as no whole number
-    // (`10.0000000000000001`, which the float would make 10; `-1e-9999`, which it would make
-    // 0; `1e30`).
+    // A tool's numeric arguments (`tools::NUMERIC_ARGS`: `max_rows`, `max_cell`, `timeout`) are
+    // integers, decided by the same rule (R41): one serde_json read as a float becomes the
+    // integer its text is (`30.0`, `3e1`), or stays a float, which the tool refuses as no whole
+    // number (`10.0000000000000001`, which the float would make 10; `-1e-9999`, which it would
+    // make 0; `1e30`). Only those three are reread, each with one scan of the line, so a call
+    // costs at most three scans however many other arguments it holds (R42); any other
+    // argument is refused by name, and no value of it needs reading.
     if method == "tools/call"
         && let Some(Value::Object(arguments)) = params.get_mut("arguments")
     {
-        let floats: Vec<String> = arguments
-            .iter()
-            .filter(|(_, value)| matches!(value, Value::Number(n) if !(n.is_i64() || n.is_u64())))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in floats {
-            if let Some(exact) =
-                raw_member(line, &["params", "arguments", &name]).and_then(exact_integer)
+        for name in NUMERIC_ARGS {
+            let float = matches!(
+                arguments.get(name),
+                Some(Value::Number(n)) if !(n.is_i64() || n.is_u64())
+            );
+            if float
+                && let Some(exact) =
+                    raw_member(line, &["params", "arguments", name]).and_then(exact_integer)
             {
-                arguments.insert(name, exact);
+                arguments.insert(name.into(), exact);
             }
         }
     }
@@ -299,12 +303,21 @@ pub(crate) fn exact_integer(number: &str) -> Option<Value> {
 /// a line serde_json has already read whole, so it only needs to find its way, decoding the
 /// names it compares (`"\u0069d"` is `id`).
 fn raw_member<'a>(line: &'a str, path: &[&str]) -> Option<&'a str> {
+    #[cfg(test)]
+    SCANS.with(|scans| scans.set(scans.get() + 1));
     let mut scan = Scan {
         bytes: line.as_bytes(),
         at: 0,
     };
     let (start, end) = scan.find(path)?;
     line.get(start..end)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times `raw_member` has scanned a line on this thread: the work a message costs
+    /// beyond `serde_json`'s own parse (R42).
+    static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A reader of a JSON text already known to be valid (`raw_member`).
@@ -739,6 +752,34 @@ mod tests {
             Ok(Incoming::Request { params, .. }) => assert!(params["x"].is_f64()),
             other => panic!("{other:?}"),
         }
+    }
+
+    // R42: a call's line is scanned once per declared numeric argument at most, however many
+    // other arguments it holds, float-valued or not; before, once per float argument, so a
+    // call with thousands of unknown ones held the serving loop for seconds.
+    #[test]
+    fn a_calls_line_is_scanned_at_most_once_per_numeric_argument() {
+        let scans = |raw: &str| {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"query","arguments":{raw}}}}}"#
+            );
+            let before = SCANS.with(std::cell::Cell::get);
+            let parsed = parse(&line);
+            assert!(parsed.is_ok(), "{parsed:?}");
+            SCANS.with(std::cell::Cell::get) - before
+        };
+        let unknown: Vec<String> = (0..4000).map(|n| format!(r#""x{n}":1.0"#)).collect();
+        let unknown = unknown.join(",");
+        assert_eq!(scans(&format!("{{{unknown}}}")), 0);
+        assert_eq!(scans(&format!(r#"{{{unknown},"max_rows":30.0}}"#)), 1);
+        assert_eq!(
+            scans(&format!(
+                r#"{{{unknown},"max_rows":30.0,"max_cell":3e1,"timeout":1e1}}"#
+            )),
+            3
+        );
+        // Integers, as serde_json reads them exactly, need no scan at all.
+        assert_eq!(scans(r#"{"max_rows":30,"max_cell":0,"timeout":10}"#), 0);
     }
 
     #[test]

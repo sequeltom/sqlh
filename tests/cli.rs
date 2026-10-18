@@ -4022,6 +4022,50 @@ mod mcp {
         );
     }
 
+    /// R42: a call's unknown float-valued arguments cost no rereading of its line, so a call
+    /// holding 4,000 of them, sent between a pending connect and its cancel, leaves the serving
+    /// loop free: the cancel closes the connect within a second or two, as it does when the
+    /// same arguments are integers. stdout is read throughout (`Stdio::null`), so nothing is
+    /// held back. Before the fix the float form held the loop for minutes.
+    #[test]
+    fn a_call_with_many_float_arguments_doesnt_hold_up_a_cancel() {
+        for (form, value) in [("integers", "1"), ("floats", "1.0")] {
+            let (listener, config) = silent(&format!("mcp_r42_{form}"));
+            let mut child = sqlh()
+                .args(["mcp", "--profile", "slow", "--verbose"])
+                .env("SQLH_CONFIG", &config)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("sqlh starts");
+            let stderr = watch_stderr(&mut child);
+            let mut stdin = child.stdin.take().unwrap();
+            send(&mut stdin, &[query(1, "SELECT 1")]);
+            let (mut held, _) = listener.accept().expect("the call connects");
+            let unknown: Vec<String> = (0..4000).map(|n| format!(r#""x{n}":{value}"#)).collect();
+            let junk = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":"SELECT 1",{}}}}}}}"#,
+                unknown.join(",")
+            );
+            let sent = Instant::now();
+            send(&mut stdin, &[junk, cancel("1")]);
+            let closed = closed_within(&mut held, Duration::from_secs(5));
+            let elapsed = sent.elapsed();
+            let logged = stderr_with(&stderr, "request 1 cancelled", Duration::from_secs(2));
+            kill(child);
+            assert!(closed, "{form}: the cancel closed the connect: {logged}");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "{form}: closed {elapsed:?} after the cancel was sent"
+            );
+            assert!(
+                logged.contains("sqlh mcp: request 1 cancelled"),
+                "{form}: {logged}"
+            );
+        }
+    }
+
     /// A fake SQL Server on loopback, for one connection: it answers the prelogin (no TLS) and
     /// the login, and every SQL batch with a DONE (the session setup's `BEGIN TRANSACTION`
     /// with the transaction's ENVCHANGE), but a batch whose text holds `hang`, which it never

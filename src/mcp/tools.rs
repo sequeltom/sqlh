@@ -293,6 +293,12 @@ pub(crate) fn echo(name: &str) -> String {
     }
 }
 
+/// The arguments that are whole numbers, which `protocol::parse` reads from their text so that
+/// none is rounded (R41), and only these, so a call costs at most this many rereadings of its
+/// line however many other arguments it holds (R42). Every tool's schema declares exactly these
+/// as `integer` (`the_numeric_arguments_are_the_schemas_integers`).
+pub(crate) const NUMERIC_ARGS: [&str; 3] = ["max_rows", "max_cell", "timeout"];
+
 /// The arguments every tool takes, after its own.
 const COMMON_ARGS: [&str; 6] = [
     "profile", "database", "max_rows", "max_cell", "timeout", "format",
@@ -598,6 +604,24 @@ mod tests {
 
     // docs/mcp-mode.md §4: the tools, in order, read-only, each with a closed schema whose
     // profile is the launch's list.
+    #[test]
+    fn the_numeric_arguments_are_the_schemas_integers() {
+        let tools = definitions(&launch(&["test"]));
+        for tool in tools.as_array().unwrap() {
+            let mut integers: Vec<&str> = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, schema)| schema["type"] == "integer")
+                .map(|(name, _)| name.as_str())
+                .collect();
+            integers.sort_unstable();
+            let mut wanted = NUMERIC_ARGS.to_vec();
+            wanted.sort_unstable();
+            assert_eq!(integers, wanted, "{}", tool["name"]);
+        }
+    }
+
     #[test]
     fn the_tools_are_listed_with_closed_schemas() {
         let tools = definitions(&launch(&["test", "reporting"]));
