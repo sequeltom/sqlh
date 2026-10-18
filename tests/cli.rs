@@ -3887,14 +3887,63 @@ mod live {
     //!
     //! They use the scratch database SQLH_TEST_DATABASE (default `sqlh_test`), created by
     //! `tests/fixtures/sqlh_test.sql`. Before writing, a test checks the database's
-    //! `dbo.sqlh_scratch` marker; it writes only to a table of its own, which it drops.
+    //! `dbo.sqlh_scratch` marker; it writes only to a table of its own, which it drops. One
+    //! test also changes `sqlh_test`'s compatibility level (owner decision 21), and runs alone
+    //! while it does (`target_alone`).
 
     use super::*;
     use std::cell::RefCell;
     use std::io::Write as _;
     use std::rc::Rc;
 
+    /// The live tests' hold on the scratch database: a lock on a file in the temp directory,
+    /// so it holds across processes too (the debug and release runs, another worktree's).
+    /// Every live test shares it, from its first `target()` until its thread ends; the one that
+    /// changes the database's compatibility level, which changes how every other test's SQL
+    /// compiles there, holds it alone (`target_alone`).
+    fn scratch_lock() -> fs::File {
+        let path = std::env::temp_dir().join("sqlh-live-scratch.lock");
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("the live tests' lock file {}: {e}", path.display()))
+    }
+
+    thread_local! {
+        /// This test's share of the scratch lock. libtest runs each test on a thread of its
+        /// own, so the share ends with the test, failed or not.
+        static SHARE: RefCell<Option<fs::File>> = const { RefCell::new(None) };
+    }
+
     fn target() -> (String, String) {
+        SHARE.with(|share| {
+            let mut share = share.borrow_mut();
+            if share.is_none() {
+                let lock = scratch_lock();
+                lock.lock_shared()
+                    .unwrap_or_else(|e| panic!("the live tests' shared lock: {e}"));
+                *share = Some(lock);
+            }
+        });
+        settings()
+    }
+
+    /// `target()` for the test that changes the scratch database's compatibility level: it
+    /// waits until no other live test holds the scratch lock, here or in another process, and
+    /// none starts until the lock it returns is dropped.
+    fn target_alone() -> (fs::File, String, String) {
+        // Never wait for this thread's own share.
+        SHARE.with(|share| share.borrow_mut().take());
+        let lock = scratch_lock();
+        lock.lock()
+            .unwrap_or_else(|e| panic!("the live tests' exclusive lock: {e}"));
+        let (profile, database) = settings();
+        (lock, profile, database)
+    }
+
+    fn settings() -> (String, String) {
         let profile = std::env::var("SQLH_TEST_PROFILE")
             .ok()
             .filter(|p| !p.is_empty())
@@ -7145,6 +7194,202 @@ mod live {
         );
     }
 
+    /// Where `save_level` keeps the scratch database's compatibility level while a test has
+    /// changed it: a table of the tests' own, with one fixed name, so a run killed before its
+    /// cleanup leaves the level for the next run's cleanup to put back.
+    const SAVED_LEVEL: &str = "dbo.probe_compatibility_level";
+
+    /// The current database's compatibility level.
+    const LEVEL: &str =
+        "SELECT compatibility_level AS level FROM sys.databases WHERE database_id = DB_ID()";
+
+    /// The first statement of every batch that saves, changes or restores the level: unless
+    /// the current database is `sqlh_test` with its scratch marker, the only database whose
+    /// level a test may change (owner decision 21), THROW ends the batch.
+    const ONLY_SQLH_TEST: &str = "IF DB_NAME() <> N'sqlh_test' \
+        OR OBJECT_ID(N'dbo.sqlh_scratch', N'U') IS NULL \
+        THROW 50000, N'only sqlh_test, marked as scratch, may have its compatibility level \
+        changed (owner decision 21)', 1;";
+
+    /// The one value a query returns: its first row's first column, as text shows it.
+    fn value(server: &dyn Server, sql: &str) -> String {
+        let r = server.query(sql);
+        assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        r.stdout
+            .lines()
+            .filter(|l| !l.starts_with("-- "))
+            .nth(1)
+            .and_then(|row| row.split('\t').next())
+            .unwrap_or_else(|| panic!("no value from {sql}:\n{}", r.stdout))
+            .to_owned()
+    }
+
+    /// Saves the scratch database's compatibility level in `SAVED_LEVEL` (owner decision 21)
+    /// and returns it; a table a killed run left is kept, since its level is the one to put
+    /// back. The restore is armed on `objects`' cleanup first (R24), so it runs when the test
+    /// ends, failed or not: it sets the saved level, then drops the table, which it keeps if
+    /// the level can't be set, for the next run's cleanup to try again.
+    fn save_level(objects: &mut Objects) -> String {
+        objects.probe.cleanup.arm(format!(
+            "{ONLY_SQLH_TEST}\n\
+             IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NOT NULL\n\
+             BEGIN\n\
+             DECLARE @set nvarchar(100) = (SELECT N'ALTER DATABASE CURRENT SET \
+             COMPATIBILITY_LEVEL = ' + CAST(level AS nvarchar(3)) FROM {SAVED_LEVEL});\n\
+             BEGIN TRY\n\
+             EXEC (@set);\n\
+             DROP TABLE {SAVED_LEVEL};\n\
+             END TRY\n\
+             BEGIN CATCH\n\
+             THROW;\n\
+             END CATCH;\n\
+             END"
+        ));
+        let r = objects.probe.server.write(&format!(
+            "{ONLY_SQLH_TEST}\n\
+             IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL\n\
+             SELECT compatibility_level AS level INTO {SAVED_LEVEL} \
+             FROM sys.databases WHERE database_id = DB_ID();"
+        ));
+        assert_eq!(
+            r.code, 0,
+            "saving the compatibility level failed:\n{}",
+            r.stdout
+        );
+        value(
+            &*objects.probe.server,
+            &format!("SELECT level FROM {SAVED_LEVEL}"),
+        )
+    }
+
+    /// Sets the scratch database's compatibility level; refused by the server unless
+    /// `save_level` has saved the level to put back.
+    fn set_level(objects: &Objects, level: u8) {
+        let sql = format!(
+            "{ONLY_SQLH_TEST}\n\
+             IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL \
+             THROW 50000, N'the compatibility level to put back is not saved', 1;\n\
+             ALTER DATABASE CURRENT SET COMPATIBILITY_LEVEL = {level};"
+        );
+        let r = objects.probe.server.write(&sql);
+        assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+    }
+
+    // R37 (owner decision 21): from compatibility level 110, describe aggregates its lists
+    // with STRING_AGG, which takes any character, so an index on a column whose name XML can't
+    // carry (U+001B) is described at 110 and at 120, where the FOR XML PATH form sqlh used
+    // there before failed (error 6841). At 100, which refuses WITHIN GROUP, the FOR XML form
+    // still gives every list of an ordinary table (index keys and includes, foreign key columns
+    // both ways, trigger events), in order. The level is saved, and its restore armed, before
+    // it is changed; the test runs alone while it is, and checks that it was put back.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn describe_shows_any_name_from_compatibility_level_110() {
+        let (_alone, p, db) = target_alone();
+        // The check every level batch starts with refuses another database (here alone, and
+        // read-only: there is nothing in it to refuse but itself).
+        let refused = live(&p, "master", &["-Q", ONLY_SQLH_TEST]);
+        assert_eq!(refused.code, 1, "{}", refused.stdout);
+        assert!(
+            refused.stdout.contains(
+                "only sqlh_test, marked as scratch, may have its compatibility level changed"
+            ),
+            "{}",
+            refused.stdout
+        );
+        let mut objects = Objects::new(&p, &db);
+        let original = save_level(&mut objects);
+        let server = objects.probe.server.clone();
+        let bare = |name: &str| name.trim_start_matches("dbo.").to_owned();
+        let (odd, odd_ix) = (objects.name("odd"), bare(&objects.name("odd_ix")));
+        let (plain, trg) = (objects.name("plain"), objects.name("plain_trg"));
+        let (pk, fk, ix) = (
+            bare(&objects.name("plain_pk")),
+            bare(&objects.name("plain_fk")),
+            bare(&objects.name("plain_ix")),
+        );
+        // A valid delimited name holding U+001B, made with NCHAR so no command holds the
+        // character itself.
+        objects.make(
+            &format!(
+                "DECLARE @c sysname = QUOTENAME(N'a' + NCHAR(27) + N'b');\n\
+                 DECLARE @sql nvarchar(max) = N'CREATE TABLE {odd} (id int NOT NULL, ' + @c \
+                 + N' int NOT NULL, note int NULL); \
+                 CREATE INDEX {odd_ix} ON {odd} (id, ' + @c + N' DESC) INCLUDE (note);';\n\
+                 EXEC (@sql);"
+            ),
+            format!("DROP TABLE IF EXISTS {odd}"),
+        );
+        objects.make(
+            &format!(
+                "CREATE TABLE {plain} (id int NOT NULL, code int NOT NULL, note int NULL, \
+                 parent_id int NULL, parent_code int NULL, \
+                 CONSTRAINT {pk} PRIMARY KEY (id, code), \
+                 CONSTRAINT {fk} FOREIGN KEY (parent_id, parent_code) \
+                 REFERENCES {plain} (id, code));\n\
+                 CREATE INDEX {ix} ON {plain} (code, note DESC) INCLUDE (parent_id);"
+            ),
+            format!("DROP TABLE IF EXISTS {plain}"),
+        );
+        objects.make(
+            &format!("CREATE TRIGGER {trg} ON {plain} AFTER INSERT, DELETE AS SET NOCOUNT ON"),
+            format!("DROP TRIGGER IF EXISTS {trg}"),
+        );
+        let described = |name: &str, level: u8| {
+            set_level(&objects, level);
+            assert_eq!(value(&*server, LEVEL), level.to_string());
+            let r = live(&p, &db, &["describe", name]);
+            assert_eq!(r.code, 0, "describe {name} at level {level}:\n{}", r.stdout);
+            r.stdout
+        };
+        let has = |out: &str, line: &str| {
+            assert!(
+                out.lines().any(|l| l == line),
+                "no line {line:?} in:\n{out}"
+            );
+        };
+
+        for level in [110, 120] {
+            let out = described(&odd, level);
+            has(&out, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
+            has(
+                &out,
+                &format!("{odd_ix}\tNONCLUSTERED\t0\t0\tid, [a\\x1Bb] DESC\tnote\tNULL\t0"),
+            );
+        }
+
+        let out = described(&plain, 100);
+        has(
+            &out,
+            &format!("{pk}\tCLUSTERED\t1\t1\tid, code\tNULL\tNULL\t0"),
+        );
+        has(
+            &out,
+            &format!("{ix}\tNONCLUSTERED\t0\t0\tcode, note DESC\tparent_id\tNULL\t0"),
+        );
+        has(
+            &out,
+            &format!("{fk}\tparent_id, parent_code\t{plain}\tid, code\tNO_ACTION\tNO_ACTION\t1"),
+        );
+        has(
+            &out,
+            &format!("{fk}\t{plain}\tparent_id, parent_code\tid, code\tNO_ACTION\tNO_ACTION\t1"),
+        );
+        has(&out, &format!("{}\tINSERT, DELETE\t0\t0", bare(&trg)));
+
+        // The cleanup puts the saved level back and drops the table that held it.
+        drop(objects);
+        assert_eq!(value(&*server, LEVEL), original, "the level is put back");
+        assert_eq!(
+            value(
+                &*server,
+                &format!("SELECT OBJECT_ID(N'{SAVED_LEVEL}', N'U') AS saved")
+            ),
+            "NULL",
+            "the saved level's table is dropped"
+        );
+    }
+
     // F03 (PLAN.md 1.5), end to end: every shape the review got past the guard is refused by
     // the real binary before anything runs, and a sequence it would have advanced is where it
     // was. (Unit tests in src/guard.rs cover the classifier; this is the regression against a
@@ -7537,6 +7782,67 @@ mod live {
             "{}",
             reports[0]
         );
+    }
+
+    // Owner decision 21 (R24): the level's restore is armed before the level is saved, so a
+    // save or a change that fails still puts the level back, before the probe's table goes.
+    // Each of these batches starts with the check that makes the server refuse it outside
+    // sqlh_test, and a change also checks that the level to put back is saved.
+    #[test]
+    fn a_changed_compatibility_level_is_put_back_even_when_a_step_fails() {
+        for fail_on in [
+            format!("INTO {SAVED_LEVEL}"),
+            "COMPATIBILITY_LEVEL = 110".to_owned(),
+        ] {
+            let fake = Fake::new(&[fail_on.as_str()]);
+            let server: Rc<dyn Server> = fake.clone();
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut objects = Objects {
+                    probe: Probe::on(server),
+                };
+                save_level(&mut objects);
+                set_level(&objects, 110);
+            }));
+            assert!(failed.is_err(), "{fail_on}");
+            let log = fake.log.borrow();
+            let at_save = fail_on.starts_with("INTO");
+            assert_eq!(log.len(), if at_save { 5 } else { 7 }, "{fail_on}: {log:?}");
+            assert!(log[0].starts_with("query: SELECT CASE WHEN OBJECT_ID(N'dbo.sqlh_scratch'"));
+            assert!(log[1].starts_with("CREATE TABLE dbo.probe_"), "{log:?}");
+            // The level's batches: the save, then (when it worked) the read and the change.
+            let mut level = vec![&log[2]];
+            if !at_save {
+                assert_eq!(log[3], format!("query: SELECT level FROM {SAVED_LEVEL}"));
+                assert!(
+                    log[4].contains(&format!(
+                        "IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL THROW 50000"
+                    )) && log[4].ends_with("SET COMPATIBILITY_LEVEL = 110;"),
+                    "{}",
+                    log[4]
+                );
+                level.push(&log[4]);
+            }
+            assert!(
+                log[2].contains(&format!("INTO {SAVED_LEVEL} ")),
+                "{}",
+                log[2]
+            );
+            // Then the cleanup: the restore, and last the probe's table.
+            let restore = &log[log.len() - 2];
+            assert!(
+                restore.contains(&format!("EXEC (@set);\nDROP TABLE {SAVED_LEVEL};")),
+                "{restore}"
+            );
+            level.push(restore);
+            for sql in level {
+                assert!(sql.starts_with(ONLY_SQLH_TEST), "{sql}");
+            }
+            assert!(
+                log[log.len() - 1].starts_with("DROP TABLE IF EXISTS dbo.probe_"),
+                "{log:?}"
+            );
+            assert!(fake.reports.borrow().is_empty());
+        }
     }
 
     // R24: a failed scratch check writes nothing, and so arms nothing to undo.
