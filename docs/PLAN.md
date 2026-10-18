@@ -741,10 +741,54 @@ The live tool tests of mcp-mode.md §9's list: six tests in `tests/cli.rs`, `liv
 - **Verification** (the builder's, at `a33d2ea` and again at `814ee12`): `scripts/check.ps1`'s steps 1–9 pass: fmt, clippy with both feature sets, 373 library unit tests, 91 debug and 85 release process tests, the release build at 2,804,224 bytes of the 3,145,728 budget, ten in-box imports. The live tests are 57 in the debug build (6 debug-only) and 51 in the release build; the six new ones pass in both, the 51 release live tests pass run directly, and the 57 debug ones with `--test-threads 4`. **`scripts/check.ps1 -Live` is not green:** its debug live step failed in every full run, each time on one or two timing tests that predate 5.4, fail with `fbbe1a8`'s test file too (all four full runs without the 5.4 tests failed) and pass alone: `the_chunk_loop_keeps_the_deadline_when_the_work_is_sqlhs_own` (6.6–6.8 s against its 6 s bound, in every full run), and now and then `a_fast_narrow_result_is_bounded_by_t_in_every_mode`, `many_small_results_are_bounded_by_t`, `the_read_uncommitted_note_counts_against_the_output_cap` and `a_timeout_during_the_count_reports_a_bound_not_exit_4`. In those failures, runs under `-t 1` ended about 5 s late (about 6.5 s in all), and the 250 ms count budget counted fewer rows than the tests expect. The likely cause, not confirmed, is the test server's load in a fully parallel run (a small server, and about 150 ms of its CPU for each SQL login, docs/notes/connect-latency.md). The script stops at the first failure, so its release live step didn't run; the release live tests were run directly. `spike_reset` wasn't rerun (it calls `run::session_setup` directly, unchanged). No timing test was changed.
 - **Still open, for the owner:**
   - **The timing tests in a full parallel debug live run** (above): the release check's live gate (§7, "live tests are green") fails today on tests older than 5.4. The R42 verification asked that repeated timing failures be investigated with their elapsed times and controls before a bound is loosened; the names and the figures are recorded above. Not decided.
+    - **Investigated for `the_chunk_loop_keeps_the_deadline_when_the_work_is_sqlhs_own`** (2026-10-18, at `32c82d5`, with nothing else running on the client). It failed again in the full debug live run, 56 of 57 passing: its `--allow-write` run took 6.58 s by the test's clock against its 6 s bound. sqlh's own status line gave 6,563 ms, of it a 454 ms connect.
+      - **Alone,** the same command (`SQLH_DEBUG_ROW_WORK_US=5000`, `--max-cell 10`, with and without `--allow-write`, `-t 1`) ended with exit 4 in 2.0 to 2.1 s, four times in each mode, the connect 160 to 230 ms.
+      - **Eight copies run at once,** each building its 16 MB value on the server, reproduced it: seven ended in 6.3 to 6.5 s, each about 6.0 s after its connect (`-t` plus sqlh's own 5 s cap), the eighth in 4.0 s. Under that load the server acknowledges the cancel late; a value still being built isn't interrupted (DESIGN.md §4.4, The grace).
+      - **So sqlh kept its documented bound.** The batch was over within `-t` plus 5 s. The test's bound is the problem: `timed` and `timed_with_work` measure the process from outside, so the connect and the session setup count against `-t` plus `GRACE`, and a run that needs the whole 5 s cap fails by its connect time. DESIGN.md §4.4's "the tests allow `-t` plus those 5 s" doesn't say from when. The other tests that use `timed` are exposed the same way; the two count-budget failures (fewer rows counted in 250 ms than a test expects) are a different symptom, not looked at here.
   - **`WAITFOR`, app locks and session context** stay out of reach of every MCP call; the session layer is to check them if the guard or its `EXEC` allowlist changes (Phase 6).
   - **The connection drop after `FMTONLY`, `PARSEONLY` or `SHOWPLAN_XML`:** kept as built (a login's cost, no leak).
   - **What isn't covered live yet** (mcp-mode.md §9, Not covered): the other tools through `sqlh mcp` (`check` and the schema tools), and the probe, the retry and a dead connection after a cancel, which only the fake TDS server plays.
 - **Docs:** mcp-mode.md's status, §1, §4 (R42's wording, below), §5, §7, §9 and §10; this plan; DESIGN.md §10 and §12 (their status and the live tests; no behavior changed); AGENTS.md's Status and live-test notes. The README is unchanged: no agent-facing behavior changed, and its "Every call starts clean" entry is what 5.4 checks. **R42's wording,** corrected in the same pass as the R42 verification asked: the rereading of a call's numeric arguments is at most three linear scans of its line, and the front parse is `serde_json`'s own `Value` parse, bounded by the 4 MB message limit but not linear in the message (its object maps cost more per member as members grow; mcp-mode.md §4, Parser work; R42 fixed, above). The code comment in `src/mcp/protocol.rs` (`a call costs at most three scans`) is left for the next code change.
+
+### CI failure after the push of `ef321ab` (October 18, 2026)
+
+CI run 39171456990, for the push of `ef321ab`, failed at `check.ps1` step 7, the release process tests. `mcp::a_gone_client_ends_the_server_with_stdin_still_open` exited 0 as it should, but its `--verbose` stderr held only `sqlh mcp: serving win`, with no `sqlh mcp: ending (stdout closed)`. The same test passed in that run's debug process tests, and 200 times out of 200 here.
+
+**The cause was a race in the product, not in the test.** `--verbose` lines go to a stderr thread through a bounded channel (`try_send`, so logging never holds the server up). Nothing at the end waited for that thread, but for a 50 ms sleep after the `never written` line. With stdout closed at once, the end has nothing to wait for, so the process could exit, and take the thread with it, before the line was written. The slower runner lost that race.
+
+**Reproduced here under load.** The test was run alone, with 16 busy loops on this machine's 12 logical processors. At `ef321ab` it failed 11 times in 400, every time on that stderr assertion (`tests/cli.rs:3745`); with the fix it passed all 400. Running copies of the test in parallel doesn't work as a load: `scratch()` keys its directory by the test's name, so the copies replace each other's profiles file and exit 3.
+
+**The fix** (`32c82d5`): the end's last step, `flush_log`, hands the thread a flush: an empty line, which no log line is (`Server::log` drops one). The thread answers it through a `Notify` once every line handed over before it is written. The end waits up to `delivery::SIDE_WAIT` (0.5 s) for the answer, the CLI's bound for its own `--verbose` lines (DESIGN.md §4.3). A stderr behind by more than the channel's 256 lines has its lines dropped, as before, and isn't waited for. The 50 ms sleep is gone.
+
+This last wait takes no console events, the one wait in the end that doesn't: by then nothing is left to cut, and every event's grace is longer. A console event's end bound grows by that 0.5 s at most, and only with `--verbose` and a stderr that isn't taking lines: about 2.5 s after a close, logoff or shutdown, still inside Windows' 5 s, and 3.5 s after Ctrl+C or Ctrl+Break (docs/mcp-mode.md §2, The end; DESIGN.md §4.3, §10).
+
+**Tests:**
+- **Unit `the_last_log_lines_reach_stderr_within_a_bound`:**
+  - a stderr that takes 5 ms a write has all five lines when `flush_log` returns, in under half of `SIDE_WAIT`, so the thread's answer ended the wait, not its bound;
+  - a stalled stderr holds the flush for `SIDE_WAIT` and less than three times that, writing nothing;
+  - with the thread stuck in a write and the 256-line channel full behind it, the flush isn't waited for (under a fifth of `SIDE_WAIT`), and neither is anything without `--verbose`.
+- **Unit `the_end_waits_for_its_last_log_lines`:** drives `mcp::end` itself, after stdout closed and after stdin closed, with nothing in flight and a stderr taking 100 ms a write. `sqlh mcp: ending (REASON)` is written when the end returns, and nothing goes to stdout.
+- **The process test** `a_gone_client_ends_the_server_with_stdin_still_open` is unchanged; a stderr pipe with room takes the lines at once.
+- **Checked to fail:**
+  - the flush skipped;
+  - the thread's answer dropped;
+  - the flush sent with a blocking `send`, which hangs the full-channel case;
+  - the flush moved back to where the 50 ms sleep was, for an end with something never written, which fails the second test.
+- **Not tested:** that the answer can come before the wait begins. That is `Notify::notify_one`'s stored permit, as documented by tokio, which the stdout thread's `gone` already relies on. A case with nothing queued didn't catch `notify_waiters` in its place in five runs, since the wait always began first, so it was dropped rather than kept as a claim it can't check.
+
+**Verification** (`32c82d5`, on top of 5.4's `4418c14`):
+- **`scripts/check.ps1 -Live`:** steps 1–9 pass: 375 library unit tests, 91 debug and 85 release process tests, the exe at 2,804,224 bytes, ten in-box imports. The debug live step failed only on `the_chunk_loop_keeps_the_deadline_when_the_work_is_sqlhs_own`, 56 of 57 passing: Phase 5.4's open timing failure, investigated there, which this fix doesn't touch.
+- **The 51 release live tests,** run directly since the script stops at the first failure, pass.
+- **The worktree check** (`pwsh scripts/check.ps1`, before the cherry-pick) passed the same, in 164 s.
+
+**The fix's review.** An internal review workflow (three lenses: concurrency, docs, tests; a skeptic for each finding) found no defect in the code, and nothing it reported was refuted. It found:
+- `app::DIAG_WAIT`, R09's bound for last-resort messages, borrowed where the CLI's `--verbose` bound is `delivery::SIDE_WAIT`; both are 0.5 s;
+- statements left saying that the end takes console events in every wait, and DESIGN.md §10's bound without the 0.5 s;
+- the test gaps closed above.
+
+All are fixed here. It also noticed two stale status lines in DESIGN.md §10 (R35–R39 "awaiting" verification, and decision 20 "pending"), which the 5.4 docs pass (`4418c14`) had already corrected.
+
+**Size: none.** The exe stays at 2,804,224 bytes. A first version gave the channel a message type of its own, an enum of a line or a flush. It made the exe 9,728 bytes larger with a oneshot to answer the flush, and 8,192 with a `Notify`: linker maps of the two builds put the growth in a second copy of std's channel code (`try_send`, `recv`, drop glue) for the new type, where the `String` channel's copy had been shared with stdout's. So the channel stays `String`.
 
 ### Phase 6: command categorization (VISION priority 4)
 
