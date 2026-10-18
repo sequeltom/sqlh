@@ -9,7 +9,7 @@ repository = "https://github.com/tkwj/sqlh"
 publish = false
 
 [dependencies]
-# JSON-RPC for sqlh mcp (docs/mcp-mode.md §8): Value only, no derive; 65 KB of the exe (spike 5.1).
+# JSON-RPC for sqlh mcp (docs/mcp-mode.md §8): Value and json! only, no derive; 65 KB of the exe (spike 5.1).
 serde_json = "1"
 # Preview driver: pin exactly and read the changelog before bumping. Only src/db/ may use it.
 mssql-tds = "=0.2.0"
@@ -41,5 +41,7 @@ panic = "abort"
 strip = "symbols"
 
 [dev-dependencies]
-# Tests only (not in the exe): parses --format json output to check it is well-formed.
+# The tests parse --format json output with it to check it is well-formed. It is also a normal
+# dependency since sqlh mcp (above), so this entry is redundant; a dev-dependency never reaches
+# the exe.
 serde_json = "1"

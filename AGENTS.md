@@ -28,6 +28,9 @@ Don't trade these away.
   - Tokio with the `current_thread` runtime.
   - `lexopt` for arguments. It's tiny, and sqlcmd-style flags (`-v a=1 b=2`, `-Ns`) are awkward in clap.
   - `windows-sys` for Win32 calls. It's already a transitive dependency.
+  - `serde_json` for `sqlh mcp`'s JSON-RPC: `Value` and `json!` only, no serde derive, to keep it small. It costs the exe 65 KB (spike 5.1), within decision 20's 300 KB gate for all of MCP (PLAN.md §6).
+  - `zeroize` wipes sqlh's own copies of a password on drop (`src/secret.rs`, F14). It's already a transitive dependency.
+  - `log`, only with `--features timing` (dev builds): it reads the driver's log events to time each connect step, and prints none of them (see Driver logging below).
 
 ## Layout
 
@@ -40,14 +43,19 @@ src/run.rs       the execution core, free of the CLI and of delivery: Request (w
                  sqlh's own, which is always read-only), prepare (sources → batches → guard), the
                  session and batch loop into any Output, cancellation, Accounting (the run's own
                  count of errors and stopped counts) and RunOutcome (exit code and counts); the run
-                 is split so a lent session can run it: preflight, open (the setup: a reused
-                 connection's reset rides on it), run_opened; Closing and close() end any output
-src/engine.rs    the connection-reuse engine (PLAN.md 5.2, decisions 14-19): a pool per profile,
-                 the reset on reuse, one silent retry on a connection dead before the call ran,
-                 the cancel rule (17, amended), idle close; no MCP in it
+                 is split so a lent session can run it: preflight, open (setup, which a reused
+                 connection's reset rides on, then use_database, a call's USE; the CLI calls open,
+                 the engine the two apart), run_opened; Closing and close() end any output
+src/engine.rs    the connection-reuse engine (PLAN.md 5.2, decisions 14, 15, 17, 19): a pool per profile,
+                 the reset on reuse, a 5 s probe on a reused connection's setup alone (one it cuts on a
+                 live connection, its attention acknowledged within the driver's 5 s, is set up again
+                 there; the call's USE then runs once, with the call's timeout), one silent retry on a
+                 new connection when the setup or the USE finds it dead (nothing of the call ran yet),
+                 the cancel rule (17, amended), put_back's rollback, idle close; no MCP in it
 src/mcp/         sqlh mcp (PLAN.md 5.3, docs/mcp-mode.md): protocol.rs (JSON-RPC, the two eras),
-                 tools.rs (the read-only tools, their schemas, a call into the engine), mod.rs
-                 (the stdin, stdout and stderr threads, dispatch, cancellation, shutdown)
+                 tools.rs (the read-only tools, their schemas, argument refusals as tool errors, a
+                 call into the engine), mod.rs (the stdin, stdout and stderr threads, dispatch,
+                 cancellation, subscriptions, shutdown)
 src/cli.rs       sqlcmd-compatible flags plus our long flags (lexopt); `profile` subcommands
 src/config.rs    profiles.toml (own strict parser) and settings resolution/precedence
 src/credman.rs   Windows Credential Manager (CredReadW/CredWriteW/CredDeleteW); each password is bound
@@ -64,11 +72,13 @@ src/signals.rs   the console events that cancel a run: Ctrl+C, Ctrl+Break, close
 src/files.rs     -o files: identity (refusing an input file) and the run's own .partial file
 src/script.rs    input decoding, GO splitting, $(var) substitution, line mapping
 src/guard.rs     read-only classifier (own T-SQL lexer, streamed, linear lookahead, work budget); XACT_ABORT detection
-src/db/          the only mssql-tds user: connect, run a batch into a BatchSink, the bounded count of
+src/db/          the only mssql-tds user: connect (a failed connect's hints name flags, or in sqlh mcp
+                 the profile's keys: Hints), run a batch into a BatchSink, the bounded count of
                  hidden rows (Counting), value/type rendering;
                  stream.rs reads large (PLP) values in chunks and cuts them as they arrive
-src/output/      Output trait + Tally (shared limits/counts); text.rs (default), json.rs, csv.rs;
-                 delivery.rs (the writer thread and its bounded queue)
+src/output/      Output trait + Tally (shared limits/counts), Advice (CLI or sqlh mcp wording of
+                 what a result advises and of the limits it names); text.rs (default), json.rs,
+                 csv.rs; delivery.rs (the writer thread and its bounded queue)
 tests/cli.rs     process-level tests of the real binary; `live` ones are ignored unless asked for
 tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use; shrinks it
 tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
@@ -87,7 +97,7 @@ docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect late
                  upstream-issues.md, the driver problems for the owner to raise upstream))
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   sqlh mcp's spec (built 2026-10-17)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
-                 (findings F.., R01–R19; PLAN.md records each one and its fix)
+                 (findings F.., R01–R34; PLAN.md records each one and its fix)
 ```
 
 Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (PLAN.md 3.5, 3.6).
@@ -103,7 +113,7 @@ The exe's version is `SQLH_VERSION` at build time if set (the release workflow s
 **Day to day:** `pwsh scripts/check.ps1` runs every check below that needs no server and stops at the first failure; `pwsh scripts/check.ps1 -Live` adds the live tests. Run it before every commit that touches code. The individual commands:
 
 ```powershell
-cargo build --release                               # ~2 MB exe; full LTO takes ~1–2 min
+cargo build --release                               # ~2.7 MB exe (budget 3 MB); full LTO takes ~1–2 min
 cargo test                                          # unit + process-level tests; no server needed
 cargo test --release --test cli                     # process-level tests against the release exe
 cargo build --release --features timing             # --verbose also times each connect step (dev builds; +270 KB)
@@ -167,4 +177,4 @@ The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md
 1. Phase 1, correctness and trustworthy outcomes: built and tested, including the manual Git Bash password check (PLAN.md 1.9) and the fixes from the follow-up review (PLAN.md, Phase 1 follow-up).
 2. Phase 2, fast, bounded, cancellable turns. 2.1, the connect-latency investigation, is done: most of each connect is the login step, which the measurements attribute to SQL Server 2025's password hashing for SQL logins ([docs/notes/connect-latency.md](docs/notes/connect-latency.md)). 2.2 (the response budget), 2.3 (a writer thread, so a stalled reader can't block the run) and 2.4 (cancellation everywhere, and connect failures that end the same way every time: [docs/notes/connect-failures.md](docs/notes/connect-failures.md)) are done, and so are the fixes the Phase 2 review asked for (PLAN.md, Phase 2 follow-up). 2.5 (harness kill), 2.6 (the drain experiment; the default is owner decision 6), 2.7 (memory), 2.12 (where messages land), 2.13 (Windows shells and paths) and 2.11 (provenance in every format) are done too. Owner decisions 6, 7, 10 and 11 (2026-10-11, PLAN.md §6) are built: 2.8 (agent session defaults: lock timeout, deadlock priority, opt-in READ UNCOMMITTED), 2.15 (the bounded count of hidden rows; its `-t` rule under `--allow-write` and `XACT_ABORT` is confirmed, §6.6), the text part of 2.11 and 2.13's follow-up; so is 2.14 (the guard's memory). The completion review of Phase 2 (R14–R18: `XACT_ABORT OFF` in the session setup, sqlh's own elapsed `-t`, JSON contract 2.0, incomplete closure after a SQL error, the guard's work bound) is fixed; the verification closed all but R15, whose follow-ups were fixed (the settlement bound was accepted, and the late-finish rule now goes by the phase the deadline passed in: the row that fills `--max-rows` is a row to show) and found closed by the Phase 3 review (PLAN.md, Phase 2 follow-up and Phase 3 initial review). Agent trial 2 (2.10) ran on 2026-10-12 ([docs/notes/agent-trial-2.md](docs/notes/agent-trial-2.md)); task 2.16 and owner decision 12 (new profiles refuse writes) followed from it. Phase 2 is done; decision 12's last question was settled on 2026-10-12 (`profile list` keeps showing the server and login).
 3. Phase 3, execution core, release checks, live fixtures, and GitHub Actions CI plus a signed release workflow: 3.1–3.4 are done, and the code review accepted Phase 3 after the R20–R24 fixes (PLAN.md, Phase 3 fix verification). 3.5 and 3.6 ran on GitHub on 2026-10-15: CI is green, and the release workflow signed a draft pre-release, `v0.1.0-dev.1`, after the federated credential took GitHub's immutable subject (PLAN.md 3.5, 3.6). Phase 3 is done; SmartScreen and antivirus on a locked-down workstation remain on the first-release checklist (PLAN.md §7).
-4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin). Phase 4 began with profile descriptions and `profile list --search` (4.1–4.3, accepted after the R25–R26 fix verification on 2026-10-13; PLAN.md, Phase 4.1–4.3 fix verification). Owner decision 13 keeps `profile list` text only. The schema commands (`info`, `dbs`, `tables`, `describe`, `find`, `def`) were accepted after R27–R33 closed on October 14, 2026 (PLAN.md, Schema commands fix verification). The preview boundary fix and `deps` implementation were accepted on October 14, 2026, with R34, a nonblocking permission-documentation correction, now fixed and awaiting verification (PLAN.md, Preview boundary and `deps` review). JSON contract 2.1 adds their `label`. Phase 5 (connection reuse) has its shape: owner decisions 14–19 (2026-10-15 to 2026-10-17, PLAN.md §6), with docs/mcp-mode.md rewritten to match; MCP first, stateless, read-only, a launch allowlist of profiles. Its build starts with the 5.1 spike (PLAN.md Phase 5).
+4. Phases 4–8: schema discovery, connection reuse, command categorization, evidence-based evaluations, delivery to agents (skill, MCP connector, plugin). Phase 4 began with profile descriptions and `profile list --search` (4.1–4.3, accepted after the R25–R26 fix verification on 2026-10-13; PLAN.md, Phase 4.1–4.3 fix verification). Owner decision 13 keeps `profile list` text only. The schema commands (`info`, `dbs`, `tables`, `describe`, `find`, `def`) were accepted after R27–R33 closed on October 14, 2026 (PLAN.md, Schema commands fix verification). The preview boundary fix and `deps` implementation were accepted on October 14, 2026, with R34, a nonblocking permission-documentation correction, now fixed and awaiting verification (PLAN.md, Preview boundary and `deps` review). JSON contract 2.1 adds their `label`. Phase 5 (connection reuse) follows owner decisions 14–20 (2026-10-15 to 2026-10-17, PLAN.md §6): MCP first, stateless, read-only, a launch allowlist of profiles, one exe behind a size gate. 5.1, the spike, is done ([docs/notes/mcp-reuse-spike.md](docs/notes/mcp-reuse-spike.md)). 5.2 (the engine) and 5.3 (`sqlh mcp`) are built, self-reviewed in five rounds and fixed (among the fixes, the isolation level the connection reset doesn't restore; the second round's in `05032c0`, the third's in `becb56f`, the fourth's in `6e7a0d8`, the fifth's in `4519341` and, for its second half, `dc24d4b`; the final pass's one finding in `9b5318d`, the last code commit), and await the owner's code review, with decision 19's as-built note (the reuse probe; only a dead connection is replaced, and a live server silent past about 10 s is taken for dead) and the items still open (PLAN.md, Phase 5.2 and 5.3, and §6); docs/mcp-mode.md is the spec as built. Next: 5.4–5.6 (live tool tests, interop, agent trial 3).
