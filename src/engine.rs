@@ -7,13 +7,17 @@
 //! - **Pool:** at most `max` connections per profile, opened only when a call needs one. A call
 //!   beyond them waits for one, at most its timeout. A connection idle longer than `idle_after`
 //!   is closed (`sweep`, and when a call would take it).
-//! - **Reset:** a reused connection's first request carries the reset
-//!   (`Session::reset_before_next`), whose acknowledgement the driver verifies; then the session
-//!   setup runs, as after a connect (`run::open`).
-//! - **Retry:** a reused connection that turns out dead at that first request (a network drop,
-//!   a session a DBA killed, a reset the server didn't acknowledge) is replaced and the call run
-//!   again, once, silently: nothing of the call has run, and every call is a read in a
-//!   rolled-back wrapper. A failure after that point is the call's own.
+//! - **Reset:** a reused connection's first request, the session setup (`run::setup`), carries
+//!   the reset (`Session::reset_before_next`), whose acknowledgement the driver verifies; the
+//!   call's `USE` follows (`run::use_database`), as after a connect.
+//! - **Probe:** that setup gets `REUSE_PROBE` (5 s), not the call's timeout. One it cuts while
+//!   the server still answers (the attention acknowledged within the driver's 5 s) is reset and
+//!   run again on the same connection with the call's timeout.
+//! - **Retry:** a reused connection that turns out dead at the setup or the `USE` (a network
+//!   drop, a session a DBA killed, a reset the server didn't acknowledge, a connection gone
+//!   silent) is replaced and the call run again, once, silently: nothing of the call has run,
+//!   and every call is a read in a rolled-back wrapper. A failure after that point is the
+//!   call's own.
 //! - **After the call:** a connection the driver kept is put back, with its wrapper rolled back
 //!   if a cancel left it open; one the driver marked dead, or one past its settle bound, is
 //!   dropped (decision 17, amended). A cancelled call gets `SETTLE_GRACE` to settle; past it,
@@ -442,20 +446,24 @@ fn more_connections(settings: &Settings, timeout: u32) -> String {
     }
 }
 
-/// How long a reused connection's setup (the first request of `run::open`, which carries the
-/// reset) may take before the call stops waiting on it, in seconds. It answers in
-/// milliseconds on a live connection; one that went silent while idle (a firewall's idle cut,
-/// a half-open socket) would otherwise hold the call for its whole timeout and then the
-/// driver's 5 s wait for the attention. A setup the probe cuts on a live connection runs again
-/// on that connection (`run_pooled`): a slow server keeps its connection.
+/// How long a reused connection's setup (`run::setup`, which carries the reset) may take
+/// before the call stops waiting on it, in seconds. It answers in milliseconds on a live
+/// connection; one that went silent while idle (a firewall's idle cut, a half-open socket)
+/// would otherwise hold the call for its whole timeout and then the driver's 5 s wait for the
+/// attention. A setup the probe cuts runs again on the same connection (`run_pooled`) when
+/// the server acknowledges the attention within the driver's 5 s, so about 10 s after the
+/// setup was sent. A live server stalled longer than that can't be told from a half-open
+/// connection: the driver marks the connection dead, and it is replaced like one, the
+/// profile's other idle connections with it (`dead_before_work`).
 const REUSE_PROBE: u32 = 5;
 
-/// Whether a reused connection's failed first request (`run::open`: sqlh's own setup and
-/// `USE`, so nothing of the call ran) means the connection was gone, so the call runs again
-/// on a new one, once (decision 19): the driver marked it dead (it broke while idle, `Lost`;
-/// the server didn't acknowledge the reset, `Protocol`; it went silent, a `Timeout` whose
-/// attention went unanswered) or it was retired. A SQL error or a cancel is the call's own,
-/// and so is a timeout on a live connection.
+/// Whether a reused connection's failed setup or `USE` (`run::setup`, `run::use_database`:
+/// sqlh's own requests, so nothing of the call ran) means the connection was gone, so the call
+/// runs again on a new one, once (decision 19): the driver marked it dead (it broke while
+/// idle, `Lost`; the server didn't acknowledge the reset, `Protocol`; it went silent, a
+/// `Timeout` whose attention went unanswered within the driver's 5 s) or it was retired. A
+/// SQL error or a cancel is the call's own, and so is a timeout on a connection the driver
+/// kept.
 fn dead_before_work(error: &DbError, session: &Session) -> bool {
     (session.connection_dead() || session.is_retired())
         && !matches!(error, DbError::Cancelled(_) | DbError::Sql(_))
@@ -757,7 +765,8 @@ mod tests {
 
     // A reused connection whose setup is slow but alive: the probe cuts it, the server
     // acknowledges the attention, so the connection is kept, reset again and set up with the
-    // call's own timeout. A slow server keeps its connection: no new login, which under load
+    // call's own timeout. A server that acknowledges the attention within the driver's 5 s
+    // keeps its connection: no new login, which under load
     // is the step most likely to fail.
     #[test]
     fn a_setup_the_probe_cuts_short_keeps_its_live_connection() {

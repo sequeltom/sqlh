@@ -3602,6 +3602,65 @@ mod mcp {
         assert_eq!(messages.len(), 1 + 6 + 1 + 1 + 2, "{messages:?}");
     }
 
+    /// docs/mcp-mode.md §2, the end: the flush wait counts bytes, not lines, so a long response
+    /// a slow reader is still taking in is written whole, though it takes longer than
+    /// FLUSH_WAIT (1 s) to drain. The long line is a -32022 that echoes a 2 MB version.
+    #[test]
+    fn a_slow_reader_gets_a_long_last_response_whole() {
+        let config = profiles("mcp_slow_reader");
+        let mut child = sqlh()
+            .args(["mcp", "--profile", "win"])
+            .env("SQLH_CONFIG", &config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sqlh starts");
+        let version = "v".repeat(2_000_000);
+        let lines = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"_meta\":{{\
+             \"io.modelcontextprotocol/protocolVersion\":\"{version}\",\
+             \"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}\n\
+             {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{{{META}}}}}\n"
+        );
+        let mut stdin = child.stdin.take().expect("stdin");
+        std::io::Write::write_all(&mut stdin, lines.as_bytes()).unwrap();
+        drop(stdin);
+        // 64 KB every 50 ms: about 1.6 s for the long line.
+        let mut stdout = child.stdout.take().expect("stdout");
+        let (mut got, mut buffer) = (Vec::new(), vec![0u8; 64 * 1024]);
+        let started = Instant::now();
+        loop {
+            let n = stdout.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buffer[..n]);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = wait_within(&mut child, Duration::from_secs(15), "a slow reader");
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            started.elapsed() > Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = String::from_utf8(got).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line whole"))
+            .collect();
+        assert_eq!(messages.len(), 2, "both answers, whole");
+        assert_eq!(by_id(&messages, 1)["error"]["code"], -32022);
+        assert_eq!(
+            by_id(&messages, 1)["error"]["data"]["requested"]
+                .as_str()
+                .map(str::len),
+            Some(2_000_000)
+        );
+        assert_eq!(by_id(&messages, 2)["result"]["resultType"], "complete");
+    }
+
     /// docs/mcp-mode.md §2: a client that goes away (its end of stdout closed) ends the server,
     /// though stdin stays open and requests keep coming, with more of them than may wait
     /// unwritten. Before the fix a full queue left the process running for good.

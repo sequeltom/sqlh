@@ -57,7 +57,7 @@ pub(crate) fn main() -> ExitCode {
         Ok(Command::Help) => print_plain(HELP),
         Ok(Command::Version) => print_plain(&version_line()),
         Err(message) if mcp => {
-            diag(format_args!("sqlh mcp: usage error: {message}"));
+            mcp_log(&format!("sqlh mcp: usage error: {message}"));
             Exit::Usage
         }
         Err(message) => fail(Failure::usage(message), Format::Text, started),
@@ -65,10 +65,11 @@ pub(crate) fn main() -> ExitCode {
     exit.into()
 }
 
-/// A line on stderr for `sqlh mcp`, which has no output of its own there: `--verbose`
-/// logging and launch errors (docs/mcp-mode.md §2). Bounded, like every last-resort line.
+/// A line on stderr for `sqlh mcp`, which has no output of its own there: its launch errors
+/// (docs/mcp-mode.md §3). Bounded, like every last-resort line, and escaped as any field is
+/// (DESIGN.md §5.1), since an argument it names can hold a line break: one error, one line.
 pub(crate) fn mcp_log(line: &str) {
-    diag(format_args!("{line}"));
+    diag(format_args!("{}", output::escaped(line)));
 }
 
 /// What `--version` prints: the program's version, and the version of the JSON document it
@@ -196,14 +197,19 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
             return destination.commit(exit);
         }
     };
-    runtime.block_on(run_and_deliver(
+    let exit = runtime.block_on(run_and_deliver(
         &opts,
         &settings,
         &prepared,
         out,
         destination,
         started,
-    ))
+    ));
+    // The run, its delivery and its publication are over; what the runtime still runs (a
+    // name lookup the driver left on a blocking thread after a cancel) is abandoned, not
+    // waited for, so a signal's grace bounds the exit (DESIGN.md §4.3).
+    runtime.shutdown_background();
+    exit
 }
 
 /// What the run core is asked to do (`run::Request`), from the command line.

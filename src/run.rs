@@ -823,16 +823,17 @@ async fn run_session(
 }
 
 /// How a session came to be ready for a run, for the `--verbose` line: the connect (0 ms for
-/// a pooled connection that was reused) with its steps, and the session setup.
+/// a pooled connection that was reused at once; after the engine's probe or a replacement,
+/// the time from its first attempt) with its steps, and the session setup.
 pub(crate) struct Opened {
     pub(crate) connect_ms: u128,
     pub(crate) steps: Vec<(&'static str, std::time::Duration)>,
     pub(crate) setup_ms: u128,
 }
 
-/// The first request of a run on a connection, and the only one before anything is shown:
-/// the session setup (`session_setup`), and the call's `USE` when it names a database
-/// (`Prepared::database`). On a reused connection it carries the reset
+/// A run's first requests on a connection, and the only ones before anything is shown: the
+/// session setup (`session_setup`), then the call's `USE` when it names a database
+/// (`Prepared::database`). On a reused connection the setup carries the reset
 /// (`Session::reset_before_next`), so this is where a connection that died while idle, or a
 /// reset the server didn't acknowledge, shows up: before any of the run's own work, which the
 /// engine relies on to retry (owner decision 19). Returns the setup's milliseconds.

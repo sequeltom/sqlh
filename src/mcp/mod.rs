@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,8 +69,13 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// gives its own grace instead (`Signal::grace`).
 const END_GRACE: Duration = Duration::from_secs(6);
 
-/// How long the last responses get to reach stdout before the process exits.
+/// How long the end's flush wait goes on with no byte reaching stdout before it stops; the
+/// whole wait is bounded by the grace (`END_GRACE`, or a console event's own).
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
+
+/// How much of a line the stdout thread writes at a time, so that the flush wait sees a long
+/// line the client is still reading make progress (`FLUSH_WAIT`).
+const WRITE_CHUNK: usize = 64 * 1024;
 
 /// What the stdin thread (and the stdout thread, when it breaks) tell the server.
 enum Line {
@@ -232,6 +237,9 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     let (out, out_rx) = std_mpsc::channel::<String>();
     let unwritten = Arc::new(AtomicUsize::new(0));
     let written = Arc::clone(&unwritten);
+    // Bytes the stdout thread has handed to stdout: the flush wait's measure of progress.
+    let progress = Arc::new(AtomicU64::new(0));
+    let writer_progress = Arc::clone(&progress);
     // stdout's failure reaches the server outside the stdin channel, which may be full and
     // unread while stdout is behind (the review's orphan-process finding).
     let broken = Arc::new(AtomicBool::new(false));
@@ -240,8 +248,15 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     drop(lines_tx);
     let writer = match thread::Builder::new()
         .name("sqlh-mcp-stdout".into())
-        .spawn(move || write_stdout(&out_rx, &written, &writer_broken, &writer_gone))
-    {
+        .spawn(move || {
+            write_stdout(
+                &out_rx,
+                &written,
+                &writer_progress,
+                &writer_broken,
+                &writer_gone,
+            )
+        }) {
         Ok(writer) => writer,
         Err(_) => {
             app::mcp_log("sqlh mcp: cannot start the stdout writer");
@@ -264,7 +279,16 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     });
     let names: Vec<&str> = server.engine.profiles().collect();
     server.log(format!("sqlh mcp: serving {}", names.join(", ")));
-    let mut signals = Signals::new().ok();
+    let mut signals = match Signals::new() {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            // Windows' own handling stays: a console event ends the process at once.
+            server.log(format!(
+                "sqlh mcp: console events can't be watched ({e}); Ctrl+C ends the process at once"
+            ));
+            None
+        }
+    };
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     let running = Rc::new(std::cell::Cell::new(0usize));
     // How long the end may take at each step. A console event's own grace (`Signal::grace`):
@@ -331,17 +355,19 @@ async fn serve(engine: Engine, launch: Launch, verbose: bool) -> Exit {
     }
     let _ = tokio::time::timeout(grace, server.engine.close_all()).await;
     // The writer ends once every sender is gone and the last lines are out. It gets as long
-    // as it keeps writing (FLUSH_WAIT with no progress ends the wait), up to the grace.
+    // as bytes keep reaching stdout (FLUSH_WAIT with none ends the wait), up to the grace:
+    // a long line the client is still reading counts as progress, a client that has stopped
+    // reading doesn't.
     let unwritten = Arc::clone(&server.unwritten);
     let log = server.log.clone();
     drop(server);
     let (deadline, mut stalled_at) = (Instant::now() + grace, Instant::now() + FLUSH_WAIT);
-    let mut left = unwritten.load(Ordering::Relaxed);
+    let mut sent = progress.load(Ordering::Relaxed);
     while !writer.is_finished() && Instant::now() < deadline && Instant::now() < stalled_at {
         thread::sleep(Duration::from_millis(10));
-        let now = unwritten.load(Ordering::Relaxed);
-        if now < left {
-            left = now;
+        let now = progress.load(Ordering::Relaxed);
+        if now > sent {
+            sent = now;
             stalled_at = Instant::now() + FLUSH_WAIT;
         }
     }
@@ -689,14 +715,21 @@ fn read_line(reader: &mut impl BufRead, max: usize) -> io::Result<Option<Option<
 fn write_stdout(
     lines: &std_mpsc::Receiver<String>,
     unwritten: &AtomicUsize,
+    progress: &AtomicU64,
     broken: &AtomicBool,
     gone: &Notify,
 ) {
     let stdout = io::stdout();
     for line in lines {
         let mut out = stdout.lock();
-        let written = out
-            .write_all(line.as_bytes())
+        let written = line
+            .as_bytes()
+            .chunks(WRITE_CHUNK)
+            .try_for_each(|chunk| {
+                out.write_all(chunk)?;
+                progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                Ok(())
+            })
             .and_then(|()| out.write_all(b"\n"))
             .and_then(|()| out.flush());
         unwritten.fetch_sub(1, Ordering::Relaxed);
