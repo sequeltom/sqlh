@@ -5000,12 +5000,14 @@ mod live {
     //! `tests/fixtures/sqlh_test.sql`. Before writing, a test checks the database's
     //! `dbo.sqlh_scratch` marker; it writes only to a table of its own, which it drops. One
     //! test also changes `sqlh_test`'s compatibility level (owner decision 21), and runs alone
-    //! while it does (`target_alone`).
+    //! while it does (`target_alone`); a level a killed run left changed is put back before
+    //! any live test of the next run starts (`hold_scratch`).
 
     use super::*;
     use std::cell::RefCell;
     use std::io::Write as _;
     use std::rc::Rc;
+    use std::sync::OnceLock;
 
     /// The live tests' hold on the scratch database: a lock on a file in the temp directory,
     /// so it holds across processes too (the debug and release runs, another worktree's).
@@ -5022,6 +5024,70 @@ mod live {
             .unwrap_or_else(|e| panic!("the live tests' lock file {}: {e}", path.display()))
     }
 
+    /// The moves on the scratch lock, so the fixtures' own tests can watch their order.
+    trait ScratchLock {
+        fn exclusive(&self) -> std::io::Result<()>;
+        fn shared(&self) -> std::io::Result<()>;
+        fn release(&self) -> std::io::Result<()>;
+    }
+
+    impl ScratchLock for fs::File {
+        fn exclusive(&self) -> std::io::Result<()> {
+            self.lock()
+        }
+        fn shared(&self) -> std::io::Result<()> {
+            self.lock_shared()
+        }
+        fn release(&self) -> std::io::Result<()> {
+            self.unlock()
+        }
+    }
+
+    /// How a live test holds the scratch lock: with the others (`target`), or alone
+    /// (`target_alone`).
+    #[derive(Clone, Copy)]
+    enum Hold {
+        Shared,
+        Alone,
+    }
+
+    /// How this process's start-of-run step ended (`hold_scratch`): once for all its live
+    /// tests.
+    static START: OnceLock<Result<(), String>> = OnceLock::new();
+
+    /// Takes `lock` as `hold` asks. First, once per test process (`start`), before any of its
+    /// live tests holds the lock: alone (exclusive, so no test here or in another process
+    /// shares the database meanwhile), it puts back a compatibility level a killed run left
+    /// changed (`put_back_left_level`, owner decision 21), then lets the lock go. If that
+    /// step fails, no live test in the process takes the lock: each fails with its reason,
+    /// and it isn't tried again.
+    fn hold_scratch(
+        start: &OnceLock<Result<(), String>>,
+        lock: &dyn ScratchLock,
+        server: &dyn Server,
+        hold: Hold,
+    ) -> Result<(), String> {
+        start
+            .get_or_init(|| {
+                lock.exclusive()
+                    .map_err(|e| format!("the live tests' exclusive lock: {e}"))?;
+                let put_back = put_back_left_level(server);
+                let released = lock
+                    .release()
+                    .map_err(|e| format!("releasing the live tests' exclusive lock: {e}"));
+                put_back.and(released)
+            })
+            .clone()?;
+        match hold {
+            Hold::Shared => lock
+                .shared()
+                .map_err(|e| format!("the live tests' shared lock: {e}")),
+            Hold::Alone => lock
+                .exclusive()
+                .map_err(|e| format!("the live tests' exclusive lock: {e}")),
+        }
+    }
+
     thread_local! {
         /// This test's share of the scratch lock. libtest runs each test on a thread of its
         /// own, so the share ends with the test, failed or not.
@@ -5029,28 +5095,30 @@ mod live {
     }
 
     fn target() -> (String, String) {
+        let (profile, database) = settings();
         SHARE.with(|share| {
             let mut share = share.borrow_mut();
             if share.is_none() {
                 let lock = scratch_lock();
-                lock.lock_shared()
-                    .unwrap_or_else(|e| panic!("the live tests' shared lock: {e}"));
+                let server = Live::server(&profile, &database);
+                hold_scratch(&START, &lock, &*server, Hold::Shared)
+                    .unwrap_or_else(|e| panic!("{e}"));
                 *share = Some(lock);
             }
         });
-        settings()
+        (profile, database)
     }
 
     /// `target()` for the test that changes the scratch database's compatibility level: it
     /// waits until no other live test holds the scratch lock, here or in another process, and
     /// none starts until the lock it returns is dropped.
     fn target_alone() -> (fs::File, String, String) {
+        let (profile, database) = settings();
         // Never wait for this thread's own share.
         SHARE.with(|share| share.borrow_mut().take());
         let lock = scratch_lock();
-        lock.lock()
-            .unwrap_or_else(|e| panic!("the live tests' exclusive lock: {e}"));
-        let (profile, database) = settings();
+        let server = Live::server(&profile, &database);
+        hold_scratch(&START, &lock, &*server, Hold::Alone).unwrap_or_else(|e| panic!("{e}"));
         (lock, profile, database)
     }
 
@@ -8307,7 +8375,8 @@ mod live {
 
     /// Where `save_level` keeps the scratch database's compatibility level while a test has
     /// changed it: a table of the tests' own, with one fixed name, so a run killed before its
-    /// cleanup leaves the level for the next run's cleanup to put back.
+    /// cleanup leaves the level for the next run to put back before its first live test
+    /// (`put_back_left_level`).
     const SAVED_LEVEL: &str = "dbo.probe_compatibility_level";
 
     /// The current database's compatibility level.
@@ -8322,26 +8391,28 @@ mod live {
         THROW 50000, N'only sqlh_test, marked as scratch, may have its compatibility level \
         changed (owner decision 21)', 1;";
 
+    /// The one value a query's text output holds: its first row's first column.
+    fn first_value(out: &str) -> Option<&str> {
+        out.lines()
+            .filter(|l| !l.starts_with("-- "))
+            .nth(1)
+            .and_then(|row| row.split('\t').next())
+    }
+
     /// The one value a query returns: its first row's first column, as text shows it.
     fn value(server: &dyn Server, sql: &str) -> String {
         let r = server.query(sql);
         assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
-        r.stdout
-            .lines()
-            .filter(|l| !l.starts_with("-- "))
-            .nth(1)
-            .and_then(|row| row.split('\t').next())
+        first_value(&r.stdout)
             .unwrap_or_else(|| panic!("no value from {sql}:\n{}", r.stdout))
             .to_owned()
     }
 
-    /// Saves the scratch database's compatibility level in `SAVED_LEVEL` (owner decision 21)
-    /// and returns it; a table a killed run left is kept, since its level is the one to put
-    /// back. The restore is armed on `objects`' cleanup first (R24), so it runs when the test
-    /// ends, failed or not: it sets the saved level, then drops the table, which it keeps if
-    /// the level can't be set, for the next run's cleanup to try again.
-    fn save_level(objects: &mut Objects) -> String {
-        objects.probe.cleanup.arm(format!(
+    /// Puts back the level `SAVED_LEVEL` holds, then drops the table, which it keeps if the
+    /// level can't be set, so the level is tried again later; nothing without the table. The
+    /// level test's cleanup (`save_level`) and the start-of-run step (`put_back_left_level`).
+    fn restore_level() -> String {
+        format!(
             "{ONLY_SQLH_TEST}\n\
              IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NOT NULL\n\
              BEGIN\n\
@@ -8355,7 +8426,61 @@ mod live {
              THROW;\n\
              END CATCH;\n\
              END"
-        ));
+        )
+    }
+
+    /// The start-of-run step (`hold_scratch`, owner decision 21): a run killed while the level
+    /// test had changed the scratch database's compatibility level (or whose restore failed)
+    /// left `SAVED_LEVEL`, and the level test's own restore (`restore_level`) puts that level
+    /// back before any other test runs at the changed one. Without the table nothing is
+    /// written, so a database where the level test never ran (it refuses all but
+    /// `sqlh_test`) is only read. An error says why and, for the restore, gives the SQL that
+    /// finishes it.
+    fn put_back_left_level(server: &dyn Server) -> Result<(), String> {
+        let check = format!(
+            "SELECT CASE WHEN OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL THEN 0 ELSE 1 END \
+             AS saved"
+        );
+        let r = server.query(&check);
+        match (r.code, first_value(&r.stdout)) {
+            (0, Some("0")) => Ok(()),
+            (0, Some("1")) => {
+                let restore = restore_level();
+                let r = server.write(&restore);
+                if r.code == 0 {
+                    return Ok(());
+                }
+                Err(format!(
+                    "a live run changed {db}'s compatibility level and did not put it back \
+                     (it was killed, or its restore failed; {SAVED_LEVEL} holds the level), \
+                     and putting it back failed (exit {code}), so no live test runs; to \
+                     finish it, run: {restore}\n\
+                     {out}{err}",
+                    db = server.database(),
+                    code = r.code,
+                    out = r.stdout,
+                    err = r.stderr
+                ))
+            }
+            _ => Err(format!(
+                "the live tests' check for a compatibility level a live run did not put back \
+                 ({SAVED_LEVEL} in {db}) failed (exit {code}), so no live test runs:\n\
+                 {out}{err}",
+                db = server.database(),
+                code = r.code,
+                out = r.stdout,
+                err = r.stderr
+            )),
+        }
+    }
+
+    /// Saves the scratch database's compatibility level in `SAVED_LEVEL` (owner decision 21)
+    /// and returns it; a table a killed run left is kept, since its level is the one to put
+    /// back. The restore (`restore_level`) is armed on `objects`' cleanup first (R24), so it
+    /// runs when the test ends, failed or not; a run killed first leaves the table for the
+    /// next run's start (`put_back_left_level`).
+    fn save_level(objects: &mut Objects) -> String {
+        objects.probe.cleanup.arm(restore_level());
         let r = objects.probe.server.write(&format!(
             "{ONLY_SQLH_TEST}\n\
              IF OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL\n\
@@ -8763,12 +8888,14 @@ mod live {
         }
     }
 
-    /// A server for the fixtures' own tests (R24): records every query and write, and fails a
-    /// write that contains `fail_on` (exit 1, as a SQL error would end it).
+    /// A server for the fixtures' own tests (R24): records every query and write, fails one
+    /// that contains `fail_on` (exit 1, as a SQL error would end it), and answers every query
+    /// with `answer` (1 at first: the scratch marker is there).
     struct Fake {
         log: RefCell<Vec<String>>,
         reports: RefCell<Vec<String>>,
         fail_on: RefCell<Vec<String>>,
+        answer: RefCell<String>,
     }
 
     impl Fake {
@@ -8777,7 +8904,16 @@ mod live {
                 log: RefCell::new(Vec::new()),
                 reports: RefCell::new(Vec::new()),
                 fail_on: RefCell::new(fail_on.iter().map(|s| s.to_string()).collect()),
+                answer: RefCell::new("scratch:int\n1\n".into()),
             })
+        }
+
+        /// Whether `sql` is one to fail.
+        fn fails(&self, sql: &str) -> bool {
+            self.fail_on
+                .borrow()
+                .iter()
+                .any(|f| sql.contains(f.as_str()))
         }
 
         /// The log, each entry cut to its first line.
@@ -8800,26 +8936,43 @@ mod live {
         fn query(&self, sql: &str) -> Run {
             self.log.borrow_mut().push(format!("query: {sql}"));
             Run {
-                code: 0,
-                stdout: "scratch:int\n1\n".into(),
+                code: if self.fails(sql) { 1 } else { 0 },
+                stdout: self.answer.borrow().clone(),
                 stderr: String::new(),
             }
         }
         fn write(&self, sql: &str) -> Run {
             self.log.borrow_mut().push(sql.to_owned());
-            let fails = self
-                .fail_on
-                .borrow()
-                .iter()
-                .any(|f| sql.contains(f.as_str()));
             Run {
-                code: if fails { 1 } else { 0 },
+                code: if self.fails(sql) { 1 } else { 0 },
                 stdout: String::new(),
                 stderr: String::new(),
             }
         }
         fn report(&self, line: &str) {
             self.reports.borrow_mut().push(line.to_owned());
+        }
+    }
+
+    /// The scratch lock for the fixtures' own tests: each move goes in the fake's log.
+    struct FakeLock(Rc<Fake>);
+
+    impl FakeLock {
+        fn note(&self, step: &str) -> std::io::Result<()> {
+            self.0.log.borrow_mut().push(format!("lock: {step}"));
+            Ok(())
+        }
+    }
+
+    impl ScratchLock for FakeLock {
+        fn exclusive(&self) -> std::io::Result<()> {
+            self.note("exclusive")
+        }
+        fn shared(&self) -> std::io::Result<()> {
+            self.note("shared")
+        }
+        fn release(&self) -> std::io::Result<()> {
+            self.note("release")
         }
     }
 
@@ -8944,6 +9097,11 @@ mod live {
                 restore.contains(&format!("EXEC (@set);\nDROP TABLE {SAVED_LEVEL};")),
                 "{restore}"
             );
+            assert_eq!(
+                *restore,
+                restore_level(),
+                "the start-of-run step's restore too"
+            );
             level.push(restore);
             for sql in level {
                 assert!(sql.starts_with(ONLY_SQLH_TEST), "{sql}");
@@ -8953,6 +9111,100 @@ mod live {
                 "{log:?}"
             );
             assert!(fake.reports.borrow().is_empty());
+        }
+    }
+
+    // Owner decision 21: a level a killed run left changed is put back once per test process,
+    // before any live test holds the scratch lock: alone (exclusive), with the level test's
+    // own guarded restore; then the lock is let go, and the test takes the hold it asked for.
+    // Without a saved level nothing is written. If the restore or the check fails, the lock
+    // is let go and never taken, and every live test in the process fails with that reason
+    // without trying again.
+    #[test]
+    fn a_level_a_killed_run_left_is_put_back_before_any_live_test_runs() {
+        let check = format!(
+            "query: SELECT CASE WHEN OBJECT_ID(N'{SAVED_LEVEL}', N'U') IS NULL THEN 0 ELSE 1 \
+             END AS saved"
+        );
+        let restore = restore_level();
+        assert!(restore.starts_with(ONLY_SQLH_TEST), "{restore}");
+        let holds = |fake: &Rc<Fake>, holds: &[Hold]| {
+            let (lock, start) = (FakeLock(fake.clone()), OnceLock::new());
+            holds
+                .iter()
+                .map(|&hold| hold_scratch(&start, &lock, &**fake, hold))
+                .collect::<Vec<_>>()
+        };
+
+        // A saved level, and the first test shares, or is the level test: the level is put
+        // back alone; later tests only take their holds.
+        for (order, taken) in [
+            (
+                [Hold::Shared, Hold::Alone, Hold::Shared],
+                ["lock: shared", "lock: exclusive", "lock: shared"],
+            ),
+            (
+                [Hold::Alone, Hold::Shared, Hold::Shared],
+                ["lock: exclusive", "lock: shared", "lock: shared"],
+            ),
+        ] {
+            let fake = Fake::new(&[]);
+            assert!(holds(&fake, &order).iter().all(|r| r.is_ok()));
+            let mut steps = vec![
+                "lock: exclusive",
+                check.as_str(),
+                restore.as_str(),
+                "lock: release",
+            ];
+            steps.extend(taken);
+            assert_eq!(*fake.log.borrow(), steps);
+        }
+
+        // Nothing saved: nothing written.
+        let fake = Fake::new(&[]);
+        *fake.answer.borrow_mut() = "saved:int\n0\n".into();
+        assert!(holds(&fake, &[Hold::Shared]).iter().all(|r| r.is_ok()));
+        assert_eq!(
+            *fake.log.borrow(),
+            [
+                "lock: exclusive",
+                check.as_str(),
+                "lock: release",
+                "lock: shared"
+            ]
+        );
+
+        // The restore fails, or the check: no test takes the lock, each fails the same way,
+        // and nothing is tried again.
+        for fail_on in ["EXEC (@set)", "AS saved"] {
+            let fake = Fake::new(&[fail_on]);
+            let ends = holds(&fake, &[Hold::Shared, Hold::Shared, Hold::Alone]);
+            let why = ends[0].clone().expect_err(fail_on);
+            assert!(ends.iter().all(|r| *r == Err(why.clone())), "{ends:?}");
+            let mut steps = vec!["lock: exclusive", check.as_str()];
+            if fail_on == "EXEC (@set)" {
+                steps.push(restore.as_str());
+                assert!(
+                    why.starts_with(&format!(
+                        "a live run changed scratch's compatibility level and did not put it \
+                         back (it was killed, or its restore failed; {SAVED_LEVEL} holds the \
+                         level), and putting it back failed (exit 1), so no live test runs; \
+                         to finish it, run: {restore}\n"
+                    )),
+                    "{why}"
+                );
+            } else {
+                assert!(
+                    why.starts_with(&format!(
+                        "the live tests' check for a compatibility level a live run did not \
+                         put back ({SAVED_LEVEL} in scratch) failed (exit 1), so no live test \
+                         runs:\n"
+                    )),
+                    "{why}"
+                );
+            }
+            steps.push("lock: release");
+            assert_eq!(*fake.log.borrow(), steps, "{fail_on}");
         }
     }
 
