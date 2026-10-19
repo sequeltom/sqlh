@@ -7556,20 +7556,65 @@ mod live {
     // stream. The driver waits for it 5 s at most (DESIGN.md §4.4). These tests allow `-t`
     // plus those 5 s, which a run that reads to the end (7.4 s and up) does not meet; 4 s was
     // exceeded by a debug build with the whole live suite running in parallel.
+    //
+    // The bound is on sqlh's own clock, the run's time less its connect (`sqlh_time`), with
+    // `SETUP` for the session setup before the batch and the close after it: it is the batch
+    // that `-t` and the grace bound, not the login. Measured from outside, as it was until
+    // 2026-10-19, the connect counted against it: a server busy enough to take the whole 5 s
+    // to acknowledge the cancel (eight runs at once, each building a 16 MB value) ended the
+    // batch at `-t` plus 5 s, as designed, and the run still failed the bound by its connect,
+    // 200 to 450 ms under that load (PLAN.md, Phase 5.4, Still open). The outside clock keeps a
+    // looser bound, `OUTSIDE`, so a run that hangs before or after its batch still fails.
     const GRACE: Duration = Duration::from_secs(5);
+    const SETUP: Duration = Duration::from_millis(500);
+    const OUTSIDE: Duration = Duration::from_secs(5);
 
-    /// A run with `-t 1` that has to be over within `-t` plus the grace.
-    fn timed(p: &str, db: &str, flags: &[&str], sql: &str) -> (Run, Duration) {
-        let started = Instant::now();
-        let r = live(p, db, &[flags, &["-t", "1", "-Q", sql]].concat());
-        let elapsed = started.elapsed();
+    /// sqlh's own time for a run, less its connect: the session setup, the batches and the
+    /// close. From the status line in text (`..., N ms; server/db, connect N ms`, DESIGN.md
+    /// §5.1) or from `elapsed_ms` and `connect_ms` in JSON.
+    fn sqlh_time(r: &Run) -> Duration {
+        let ms = |text: &str| text.strip_suffix(" ms").and_then(|n| n.parse::<u64>().ok());
+        let (run, connect) = match serde_json::from_str::<serde_json::Value>(&r.stdout) {
+            Ok(doc) => (doc["elapsed_ms"].as_u64(), doc["connect_ms"].as_u64()),
+            Err(_) => {
+                let line = last_line(&r.stdout);
+                // The names come between the two, so neither can be mistaken for a time.
+                let run = line.find(" ms; ").and_then(|end| {
+                    let head = &line[..end];
+                    head.rsplit(", ").next()?.parse::<u64>().ok()
+                });
+                let connect = line
+                    .rsplit_once(", connect ")
+                    .and_then(|(_, tail)| ms(tail));
+                (run, connect)
+            }
+        };
+        match (run, connect) {
+            (Some(run), Some(connect)) => Duration::from_millis(run.saturating_sub(connect)),
+            _ => panic!("no run and connect time:\n{}{}", r.stdout, r.stderr),
+        }
+    }
+
+    /// Asserts a `-t 1` run kept its bound: sqlh's own time within `-t` plus the grace (and
+    /// `SETUP`), and the whole process within that plus `OUTSIDE`. Returns sqlh's own time.
+    fn within_t(r: &Run, outside: Duration, flags: &[&str]) -> Duration {
+        let own = sqlh_time(r);
+        let bound = Duration::from_secs(1) + GRACE + SETUP;
         assert!(
-            elapsed < Duration::from_secs(1) + GRACE,
-            "{flags:?}: {elapsed:?}\n{}{}",
+            own < bound && outside < bound + OUTSIDE,
+            "{flags:?}: sqlh {own:?}, process {outside:?}\n{}{}",
             r.stdout,
             r.stderr
         );
-        (r, elapsed)
+        own
+    }
+
+    /// A run with `-t 1` that has to be over within `-t` plus the grace; sqlh's own time.
+    fn timed(p: &str, db: &str, flags: &[&str], sql: &str) -> (Run, Duration) {
+        let started = Instant::now();
+        let r = live(p, db, &[flags, &["-t", "1", "-Q", sql]].concat());
+        let own = within_t(&r, started.elapsed(), flags);
+        (r, own)
     }
 
     const TIMEOUT_1: &str =
@@ -7733,13 +7778,7 @@ mod live {
             &[("SQLH_DEBUG_ROW_WORK_US", work_us)],
             &[flags, &["-t", "1", "-Q", sql]].concat(),
         );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(1) + GRACE,
-            "{flags:?}: {elapsed:?}\n{}{}",
-            r.stdout,
-            r.stderr
-        );
+        within_t(&r, started.elapsed(), flags);
         r
     }
 
