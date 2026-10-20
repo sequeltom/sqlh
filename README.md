@@ -49,10 +49,16 @@ Orders	2026-09-30T14:02:11.483
 
 `--format json` and `--format csv` are also available. `sqlh --help` is the full reference; it's written to be read by models.
 
-To give Claude Code sqlh's commands as tools, with connections kept open between calls, add it as an MCP server (list each profile it may use):
+To give a harness such as Claude Code or OpenCode sqlh's commands as tools, with connections kept open between calls, add it as an MCP server (list each profile it may use):
 
 ```powershell
 claude mcp add sqlh -- sqlh mcp --profile dev
+```
+
+In OpenCode, add it to `opencode.json`:
+
+```json
+{ "mcp": { "sqlh": { "type": "local", "command": ["sqlh", "mcp", "--profile", "dev"] } } }
 ```
 
 The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mcp-mode.md) has the details.
