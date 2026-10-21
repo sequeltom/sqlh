@@ -432,8 +432,14 @@ Prerequisites, done: the execution correctness findings (Phase 1), dependable ou
 - **`--strict`** (the Inspector's tool-schema portability check, on `tools/list`): no problem reported, exit 0.
 - **How the Inspector ends a server:** it closes stdin; each run's `--verbose` log ends `sqlh mcp: ending (stdin closed)`. Its CLI makes one request per process, so every call connected afresh (142 to 380 ms); reuse across calls, which doesn't depend on the era, was seen with OpenCode (above).
 
+**Claude Code** (5.5, 2026-10-21, the same build; `claude` 2.1.288, the standalone CLI), run from a folder outside the repository with `-s local`, so the entry was tied to that folder, and removed after it (below):
+- **The README's form:** `claude mcp add -s local sqlh -- <path to sqlh.exe> mcp --profile test`, then `claude mcp get sqlh`: `Status: ✔ Connected`.
+- **The era: modern.** With the entry pointed at the `tee` wrapper, Claude Code opened with `server/discover` and then `tools/list`, each with `_meta` (`io.modelcontextprotocol/protocolVersion` `2026-07-28`, client info `claude-code` 2.1.288), no `initialize`; sqlh answered both in the modern form, and the server's log ended `sqlh mcp: ending (stdin closed)`: Claude Code ends a server by closing its stdin.
+- **No tool call was made:** the session (`claude -p --no-session-persistence`, only the `mcp__sqlh` tools allowed) stopped before its first turn, `Failed to authenticate: OAuth session expired and could not be refreshed`: the standalone CLI's sign-in had lapsed, which only the owner can renew. The tool calls themselves were seen in the modern era from the MCP Inspector (above).
+- **Clean-up:** `claude mcp remove sqlh -s local`, then the empty project entry Claude Code had added for the folder, removed from `~/.claude.json` (that one key); compared with a fingerprint taken before (the file's keys, its projects and their MCP server names, and the files under `~/.claude`, never a value), nothing of the test was left: no MCP server, no project entry, no session transcript. One of Claude Code's own rotating backups of `~/.claude.json` turned over meanwhile, holding nothing of the test.
+
 **Still to do:**
-- **Client interop, the rest of 5.5:** Claude Code (`claude mcp add`, the README's other form), not run.
+- **Client interop, the rest of 5.5:** a Claude Code session that calls the tools, once its CLI's sign-in is renewed.
 - **Agent trial 3** (5.6), with MCP: evidence for the deferred daemon and sessions (decisions 14, 15) and for the limits.
 
 The tool tests against the test server (5.4) are built (Live tool tests, above): the `query` happy path, a SQL error and a blocked write (test 1); a timeout and a cancel mid-query (2); reset hygiene, a `USE`, `SET`s, an isolation level and a temp table (3), and the review's comparison (4); a cancel the driver kept (5, where decision 17's "`@@TRANCOUNT` 0" is, inside the next call, its own wrapper's 1, and 0 on the idle session); and two listed profiles and one not listed (6).
