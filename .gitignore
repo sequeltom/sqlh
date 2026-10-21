@@ -72,6 +72,25 @@ profiles.toml.*.partial
 .claude/settings.local.json
 CLAUDE.local.md
 
+# MCP client configuration and state, if a client is pointed at the checkout (the interop
+# runs of PLAN.md 5.5 kept theirs in scratch/ and outside the repository). Each names a
+# profile and a server command, or holds a client's own state, so none belongs here:
+# Claude Code's project scope (`claude mcp add -s project` writes .mcp.json), OpenCode's
+# project config and folder, and the MCP Inspector's catalog and storage.
+/.mcp.json
+/opencode.json
+/opencode.jsonc
+.opencode/
+.mcp-inspector/
+
+# Node tooling for those clients: sqlh has no Node code, so an npm install for a test tool
+# (the MCP Inspector, 5.5) belongs in scratch/, and what one leaves here is never source.
+node_modules/
+.npm/
+.npm-cache/
+/package.json
+/package-lock.json
+
 # Codex runtime state if CODEX_HOME is placed inside the checkout.
 # Keep AGENTS.md, .agents/skills/, and shared .codex/config.toml, rules and hooks trackable.
 .codex/auth.json
