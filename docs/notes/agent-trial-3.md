@@ -39,7 +39,7 @@ Every call ended with `-- ok` or with an `isError` result the model read correct
   - task 4's second run: a ranking that drops a row its query returned;
   - task 5: an invented cause for error 207.
 
-  Every figure the tools returned was carried over correctly; what went wrong was what the model said around them, as in trial 2's arithmetic.
+  sqlh's output was right in each case; the errors were the model's, in what it claimed and in how it passed the results on, as in trial 2's arithmetic. The dropped ranking row is itself an error of fidelity: not every figure the tools returned reached the answer. These are counts of what one reading found, not a score; a later evaluation should compare each row and claim of an answer with the results it came from (the completion review, PLAN.md, Phase 5.4–5.6).
 - **Schema discovery used the schema tools.** Every task opened with `info`, `databases`, `tables` or `describe` rather than catalog queries, and found its tables first time; task 5 sampled a system view (`max_rows: 2`) to find its columns after a wrong guess.
 
 ## Follow-ups
@@ -48,7 +48,7 @@ Recorded in PLAN.md (5.6):
 - **Decisions 14 and 15:** the evidence above supports both as decided: keep the CLI's daemon and MCP sessions deferred.
 - **Output (DESIGN.md §5), built 2026-10-22 in `3915347` at the owner's request:**
   - A run that cut values ends with a note saying how to see one whole: `2 values were cut (--max-cell 500); read one in pieces with SUBSTRING, or raise --max-cell` (`max_cell` in MCP; only `raise ...` when the cut values are in a schema command's sections).
-  - Under MCP, the stopped count's note advises `a COUNT(*) query counts every row, as does the profile's exact_count = true`.
+  - Under MCP, the stopped count's note advises `a COUNT_BIG(*) query counts every row, as does the profile's exact_count = true` (`COUNT_BIG` since the review's R44: `COUNT` returns `int`, which a count large enough to be stopped can overflow).
 - **A timeout trial:** a task that runs past the profile's `-t` (60 s by default), or a profile with a lower `query_timeout`.
 - **Agent guidance (Phase 8, the skill):**
   - check a claim about the data with a query before relying on it, or leave it out;
