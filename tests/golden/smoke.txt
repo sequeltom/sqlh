@@ -147,4 +147,5 @@ after_error:varchar(34)
 still runs after a statement error
 -- 1 row
 -- error 208 (severity 16, state 1, line 41): Invalid object name 'dbo.sqlh_no_such_table'.
+-- note: 2 values were cut (--max-cell 500); read one in pieces with SUBSTRING, or raise --max-cell
 -- failed (exit 1): 2 errors, first in batch 4, N ms; <server>/<database>, connect N ms

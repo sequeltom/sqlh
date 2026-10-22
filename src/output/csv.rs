@@ -486,6 +486,8 @@ mod tests {
              -- 2 of 3 rows shown (--max-rows 2); 1 value cut (--max-cell 20)\n\
              -- msg: done\n\
              -- error 208 (severity 16, state 1, line 4): Invalid object name 'dbo.Nope'.\n\
+             -- note: 1 value was cut (--max-cell 20); read one in pieces with SUBSTRING, or \
+             raise --max-cell\n\
              -- failed (exit 1): 1 error, 5 ms\n"
         );
     }

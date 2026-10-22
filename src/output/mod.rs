@@ -639,6 +639,11 @@ pub struct Tally {
     rows_total: u64,
     rows_shown: u64,
     cells_cut: u64,
+    /// Values cut in the whole run, for the note that says how to read one whole: in the
+    /// input's own results, and in a schema command's (labeled) ones, which the reader can't
+    /// read in pieces.
+    values_cut: u64,
+    values_cut_own: u64,
     messages_seen: usize,
     /// Bytes the end of the run needs on top of the two reserves: the tail of the status line
     /// that names the connection (`reserve_ending`). Zero in JSON, which has no such tail.
@@ -679,6 +684,8 @@ impl Tally {
             rows_total: 0,
             rows_shown: 0,
             cells_cut: 0,
+            values_cut: 0,
+            values_cut_own: 0,
             messages_seen: 0,
             ending: 0,
             connection_told: false,
@@ -942,6 +949,11 @@ impl Tally {
 
     pub fn cell_cut(&mut self) {
         self.cells_cut += 1;
+        if self.section.is_some() {
+            self.values_cut_own += 1;
+        } else {
+            self.values_cut += 1;
+        }
     }
 
     /// The count of hidden rows was stopped early (`BatchSink::counting_stopped`), by `by`: the
@@ -1117,6 +1129,9 @@ impl Tally {
                 self.messages_seen - max_messages
             ));
         }
+        if let Some(note) = self.values_cut_note() {
+            notes.push(note);
+        }
         if !self.stopped_batches.is_empty() {
             notes.push(stopped_note(
                 &self.stopped_batches,
@@ -1173,6 +1188,35 @@ impl Tally {
         }
         notes
     }
+
+    /// The run's note that values were cut (DESIGN.md §5.1): how many, by which limit, and how
+    /// to see one whole. Each footer already counts its result's cut values; this says what
+    /// to do about them, once a run. A value cut in the input's own results can be read in
+    /// pieces with `SUBSTRING`, as well as by raising the limit; one cut in a schema command's
+    /// result can only be read by raising it (agent trial 3: a model that couldn't raise the
+    /// limit didn't think of reading the rest in pieces).
+    fn values_cut_note(&self) -> Option<String> {
+        let n = self.values_cut + self.values_cut_own;
+        if n == 0 {
+            return None;
+        }
+        let limit = self.limits.advice.max_cell();
+        let (were, them) = if n == 1 {
+            ("value was", "it")
+        } else {
+            ("values were", "them")
+        };
+        let mut note = format!("{n} {were} cut ({limit} {})", self.limits.max_cell);
+        if self.values_cut > 0 {
+            let _ = write!(
+                note,
+                "; read one in pieces with SUBSTRING, or raise {limit}"
+            );
+        } else {
+            let _ = write!(note, "; raise {limit} to see {them} whole");
+        }
+        Some(note)
+    }
 }
 
 /// `n` floored to one significant digit: 852359 gives 800000, 1003 gives 1000, 99 gives 90, and
@@ -1226,8 +1270,10 @@ fn stopped_note(
     };
     let (exact, longer) = match advice {
         Advice::Cli => ("--exact-count counts every row", "raise -t to count longer"),
+        // A call can't set the profile's exact_count, but it can run a COUNT(*) (agent trial
+        // 3: the model did, unprompted, where the note advised only the profile key).
         Advice::Mcp => (
-            "the profile's exact_count = true counts every row",
+            "a COUNT(*) query counts every row, as does the profile's exact_count = true",
             "a larger timeout counts longer",
         ),
     };
@@ -1551,18 +1597,22 @@ mod tests {
             stopped_note(&[2], true, true, Advice::Cli, false),
             format!("{first}; --exact-count counts every row; raise -t to count longer")
         );
-        // sqlh mcp names what its reader can change: the profile, and the call's timeout.
+        // sqlh mcp names what its reader can change: a COUNT(*) of its own (agent trial 3), the
+        // profile, and the call's timeout.
         assert_eq!(
             stopped_note(&[2], true, true, Advice::Mcp, false),
             format!(
-                "{first}; the profile's exact_count = true counts every row; a larger timeout \
-                 counts longer"
+                "{first}; a COUNT(*) query counts every row, as does the profile's exact_count \
+                 = true; a larger timeout counts longer"
             )
         );
         // A call already at the server's limit is offered no larger timeout.
         assert_eq!(
             stopped_note(&[2], true, true, Advice::Mcp, true),
-            format!("{first}; the profile's exact_count = true counts every row")
+            format!(
+                "{first}; a COUNT(*) query counts every row, as does the profile's exact_count \
+                 = true"
+            )
         );
         assert_eq!(stopped_note(&[2], false, true, Advice::Mcp, true), first);
         // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
@@ -1938,7 +1988,9 @@ mod tests {
             write(Format::Text, &by_read).0,
             "-- result 1\np:nvarchar(max)\tt:varchar(max)\tb:varbinary(max)\n\
              \\--abc…[+5]\théllo…[+7]\t0xABCD…[+1 bytes]\n\
-             -- 1 row; 3 values cut (--max-cell 5)\n-- ok: 1 batch, 3 ms\n"
+             -- 1 row; 3 values cut (--max-cell 5)\n\
+             -- note: 3 values were cut (--max-cell 5); read one in pieces with SUBSTRING, or \
+             raise --max-cell\n-- ok: 1 batch, 3 ms\n"
         );
         // csv: the data, then the footer on the metadata stream.
         let (data, meta) = write(Format::Csv, &by_read);

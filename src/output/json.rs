@@ -806,7 +806,8 @@ mod tests {
                     ],
                     "elapsed_ms": 5, "counting_stopped": false
                 }],
-                "notes": ["ignored sqlcmd flags -W"],
+                "notes": ["ignored sqlcmd flags -W",
+                          "2 values were cut (--max-cell 5); read one in pieces with SUBSTRING, or raise --max-cell"],
                 "ok": false, "exit_code": 1, "summary": "failed (exit 1): 1 error, 9 ms",
                 "elapsed_ms": 9
             })

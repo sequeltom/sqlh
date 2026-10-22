@@ -790,6 +790,55 @@ pub(super) mod tests {
         );
     }
 
+    // The run's note on cut values says how to see one whole (agent trial 3): a value in the
+    // input's own results can be read in pieces with SUBSTRING, one in a schema command's
+    // section only by raising the limit; a run with both counts both and offers both.
+    #[test]
+    fn the_cut_values_note_says_how_to_see_one_whole() {
+        let cut_run = |sectioned: bool, own: bool, finish: &str| {
+            let mut s = TextSink::new(
+                Vec::new(),
+                Limits {
+                    max_cell: 3,
+                    ..Limits::default()
+                },
+            );
+            if sectioned {
+                s.set_sections(&[Section::rows("columns")]);
+                s.columns(&[col("column", "sysname")]).unwrap();
+                s.row(&[Value::Text("abcdef".into())]).unwrap();
+                s.end_rows().unwrap();
+            }
+            if own {
+                s.columns(&[col("v", "varchar(max)")]).unwrap();
+                s.row(&[Value::Text("ghijkl".into())]).unwrap();
+                s.end_rows().unwrap();
+            }
+            s.finish(&summary(finish)).unwrap();
+            text(s)
+        };
+        assert_eq!(
+            cut_run(false, true, "ok: 1 batch, 3 ms"),
+            "-- result 1\nv:varchar(max)\nghi…[+3]\n-- 1 row; 1 value cut (--max-cell 3)\n\
+             -- note: 1 value was cut (--max-cell 3); read one in pieces with SUBSTRING, or \
+             raise --max-cell\n-- ok: 1 batch, 3 ms\n"
+        );
+        assert_eq!(
+            cut_run(true, false, "ok: 1 batch, 3 ms"),
+            "-- columns\ncolumn\nabc…[+3]\n-- 1 row; 1 value cut (--max-cell 3)\n\
+             -- note: 1 value was cut (--max-cell 3); raise --max-cell to see it whole\n\
+             -- ok: 1 batch, 3 ms\n"
+        );
+        let both = cut_run(true, true, "ok: 1 batch, 3 ms");
+        assert!(
+            both.ends_with(
+                "-- note: 2 values were cut (--max-cell 3); read one in pieces with SUBSTRING, \
+                 or raise --max-cell\n-- ok: 1 batch, 3 ms\n"
+            ),
+            "{both}"
+        );
+    }
+
     fn definition_row(body: &str) -> Vec<Value> {
         vec![
             Value::Text("dbo.p".into()),
@@ -2213,6 +2262,8 @@ pub(super) mod tests {
             "-- result 1\nv:varchar(9)\nabcde…[+2]\nabcde…[+2]\n\
              -- 2 of 3 rows shown (max_rows 2); 2 values cut (max_cell 5)\n\
              -- note: 1 more result sets not shown (at most 1 per call)\n\
+             -- note: 2 values were cut (max_cell 5); read one in pieces with SUBSTRING, or \
+             raise max_cell\n\
              -- ok: 1 batch, 3 ms\n"
         );
 
@@ -2249,10 +2300,13 @@ pub(super) mod tests {
         for (timeout_at_limit, advice) in [
             (
                 false,
-                "; the profile's exact_count = true counts every row; a larger timeout counts \
-                 longer",
+                "; a COUNT(*) query counts every row, as does the profile's exact_count = true; \
+                 a larger timeout counts longer",
             ),
-            (true, "; the profile's exact_count = true counts every row"),
+            (
+                true,
+                "; a COUNT(*) query counts every row, as does the profile's exact_count = true",
+            ),
         ] {
             let (mut s, main, _) = sink(Limits {
                 timeout_at_limit,

@@ -769,6 +769,9 @@
   "contract_version": "2.1",
   "elapsed_ms": "N",
   "exit_code": 1,
+  "notes": [
+    "2 values were cut (--max-cell 500); read one in pieces with SUBSTRING, or raise --max-cell"
+  ],
   "ok": false,
   "summary": "failed (exit 1): 2 errors, first in batch 4, N ms"
 }
