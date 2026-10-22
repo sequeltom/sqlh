@@ -444,6 +444,8 @@ Prerequisites, done: the execution correctness findings (Phase 1), dependable ou
 
 The tool tests against the test server (5.4) are built (Live tool tests, above): the `query` happy path, a SQL error and a blocked write (test 1); a timeout and a cancel mid-query (2); reset hygiene, a `USE`, `SET`s, an isolation level and a temp table (3), and the review's comparison (4); a cancel the driver kept (5, where decision 17's "`@@TRANCOUNT` 0" is, inside the next call, its own wrapper's 1, and 0 on the idle session); and two listed profiles and one not listed (6).
 
+**External review of the Phase 5.4–5.6 increment** (`ef321ab..a6a4bc2`, October 21, 2026): accepted with two nonblocking P3 follow-ups, recorded independently in PLAN.md, Phase 5.4–5.6 external completion review. R43: the live timing helper's OUTSIDE bound is a post-completion assertion, not yet an active child watchdog. R44: the new MCP stopped-count advice currently names COUNT(*), whose SQL Server int result can overflow; replace the suggestion with COUNT_BIG(*) in a follow-up. The run-wide cut note, section proxy and bounded log flush are accepted. Standard non-live checks and isolated output/log/permit/watchdog probes were independently run; reported live SQL Server and client trials were reviewed, not rerun. The timeout trial and intermittent count-budget failures remain open.
+
 ## 10. Open questions
 
 Settled by the decisions: cancellation and reuse (17), pool size (19), sessions and their limits (15: none for now). Settled by the external review (2026-10-18): the reuse probe, accepted within decision 19 as built, its ten-second boundary stated and both of its sides kept as tests (§5); and a console event during the end, which the end takes since R36's fix (§2, The end).
