@@ -17,6 +17,10 @@ permissions:
 jobs:
   check:
     runs-on: windows-latest
+    # A run takes about 15 minutes. A test process that hangs is killed by the tests' own
+    # watchdog (tests/cli.rs, `finish`, R43); this bounds anything else, which would
+    # otherwise run to GitHub's 6-hour default.
+    timeout-minutes: 60
 
     steps:
     - uses: actions/checkout@v7

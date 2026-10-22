@@ -24,6 +24,13 @@ struct Run {
 
 fn sqlh() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+    isolated(&mut command).stdin(Stdio::null());
+    command
+}
+
+/// Keeps `command`, and any sqlh it starts, away from the machine's profiles and SQLCMD*
+/// variables.
+fn isolated(command: &mut Command) -> &mut Command {
     // A profiles file that doesn't exist: no profiles, and the real one is never touched.
     let no_profiles = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-profiles.toml");
     command.env("SQLH_CONFIG", no_profiles);
@@ -36,21 +43,140 @@ fn sqlh() -> Command {
     ] {
         command.env_remove(var);
     }
-    command.stdin(Stdio::null());
     command
 }
 
+/// The longest any one run in these tests may take before the watchdog kills it (`finish`):
+/// far above the slowest real run (seconds; well under a minute with the whole live suite
+/// running in parallel), so it fails only a run that hangs, and fails it in minutes, not at
+/// CI's job limit (R43).
+const HANG: Duration = Duration::from_secs(300);
+
+/// Runs `command`, stdout and stderr captured, under the `HANG` watchdog.
 fn run(command: &mut Command) -> Run {
-    let output = command.output().expect("sqlh runs");
-    Run {
-        code: output.status.code().expect("an exit code, not a signal"),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    finish(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sqlh starts"),
+    )
 }
 
 fn sqlh_args(args: &[&str]) -> Run {
     run(sqlh().args(args))
+}
+
+/// Waits for a child started with any streams, under the `HANG` watchdog (`bounded_child`):
+/// what it wrote to the streams that were piped, and its exit code. A hung child fails the
+/// test with what it wrote, where `Command::output` or `Child::wait_with_output` would wait
+/// for good (R43).
+fn finish(child: std::process::Child) -> Run {
+    let b = bounded_child(child, Instant::now(), HANG);
+    assert!(
+        !b.killed,
+        "still running after {HANG:?}, killed:\n{}{}",
+        b.run.stdout, b.run.stderr
+    );
+    b.run
+}
+
+/// How a run under `run_bounded` ended.
+struct Bounded {
+    run: Run,
+    /// From the spawn to the child's end, or to its kill.
+    took: Duration,
+    /// The child was still running at the limit, and was killed.
+    killed: bool,
+    pid: u32,
+}
+
+/// Runs `command`, stdout and stderr captured, and kills it if it hasn't ended within
+/// `limit` (R43): a bound checked once a run has returned can't stop a hang, since the run
+/// never returns. The run, how long it took, and whether it had to be killed.
+fn run_bounded(command: &mut Command, limit: Duration) -> Bounded {
+    let started = Instant::now();
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlh starts");
+    bounded_child(child, started, limit)
+}
+
+/// The watchdog under `run_bounded` and `finish`. The child's piped streams are read while
+/// it runs, so one it fills can't stall it, and what it wrote before a kill is kept for the
+/// failure's message. Past `limit` (counted from `started`) its whole process tree is killed
+/// (`taskkill /T`: the shell tests run sqlh under cmd.exe or PowerShell, and a sqlh left
+/// running would hold the pipes open), then the child is waited for. The readers get
+/// `READERS` to finish after that, so a pipe that some other process still holds can't hold
+/// the watchdog up either; what they had read by then is kept, with a mark that the rest was
+/// left. A piped stdin still in `child` is closed first, as `Child::wait_with_output` does, so
+/// a child that reads it sees its end rather than waiting for the watchdog.
+fn bounded_child(mut child: std::process::Child, started: Instant, limit: Duration) -> Bounded {
+    use std::sync::{Arc, Mutex, mpsc};
+    const READERS: Duration = Duration::from_secs(10);
+    // Reads `pipe` to its end into a shared buffer, and says when it got there.
+    type Drained = (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>);
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> Drained {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (done, ended) = mpsc::channel();
+        let into = Arc::clone(&bytes);
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    into.lock()
+                        .expect("the buffer")
+                        .extend_from_slice(&chunk[..n]);
+                }
+            }
+            let _ = done.send(());
+        });
+        (bytes, ended)
+    }
+    drop(child.stdin.take());
+    let pid = child.id();
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let mut killed = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("child status") {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            killed = true;
+            let tree = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if !tree.is_ok_and(|status| status.success()) {
+                let _ = child.kill();
+            }
+            break child.wait().expect("the killed child is waited for");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let took = started.elapsed();
+    let read = |(bytes, ended): Drained| {
+        let whole = ended.recv_timeout(READERS).is_ok();
+        let mut text = String::from_utf8_lossy(&bytes.lock().expect("the buffer")).into_owned();
+        if !whole {
+            text.push_str("\n[the pipe was still held open by another process]");
+        }
+        text
+    };
+    Bounded {
+        run: Run {
+            code: status.code().expect("an exit code, not a signal"),
+            stdout: read(stdout),
+            stderr: read(stderr),
+        },
+        took,
+        killed,
+        pid,
+    }
 }
 
 /// A stream whose reader is already gone, so every write to it fails: a harness that
@@ -73,7 +199,7 @@ fn run_closed(command: &mut Command, stdout_closed: bool, stderr_closed: bool) -
     } else {
         Stdio::piped()
     });
-    run(command)
+    finish(command.spawn().expect("sqlh starts"))
 }
 
 /// A fresh directory for one test, under target/tmp.
@@ -149,6 +275,68 @@ fn ctrl_break(child: &std::process::Child) {
         "Ctrl+Break wasn't sent (run the tests from a console): {}",
         std::io::Error::last_os_error()
     );
+}
+
+// R43: the watchdog every run in these tests stands on (`run_bounded`, `finish`). A child
+// that won't end is killed at its limit, the run comes back soon after with what the child
+// wrote, and nothing is left running. The child is sqlh reading its script from a stdin that
+// stays open, so it waits before it connects anything. The stdin's writer is dropped after
+// 20 s, so a watchdog that failed to kill would end this test then, with a failure (the
+// time), instead of hanging the suite.
+#[test]
+fn a_bounded_run_kills_a_child_that_never_ends() {
+    // A stdin that closes only after 20 s.
+    let late_eof = || {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(20));
+            drop(writer);
+        });
+        Stdio::from(reader)
+    };
+    let limit = Duration::from_secs(1);
+    let b = run_bounded(sqlh().args(DEAD).stdin(late_eof()), limit);
+    assert!(
+        b.killed,
+        "exit {}: {}{}",
+        b.run.code, b.run.stdout, b.run.stderr
+    );
+    assert!(
+        b.took >= limit && b.took < limit + Duration::from_secs(5),
+        "{:?}",
+        b.took
+    );
+    // Really killed, not only reported as killed: the PID is no longer listed. (This can't
+    // show the wait for it: on Windows a killed process leaves the list at once.)
+    let listed = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", b.pid), "/NH", "/FO", "CSV"])
+        .output()
+        .expect("tasklist runs");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(!listed.contains(&format!("\"{}\"", b.pid)), "{listed}");
+    // sqlh under a shell, as the shell tests run it: the whole tree is killed, so no sqlh is
+    // left holding the pipes, and the readers end at once rather than at their fallback.
+    let mut shell = Command::new("cmd.exe");
+    isolated(&mut shell)
+        .args(["/d", "/c", env!("CARGO_BIN_EXE_sqlh")])
+        .args(DEAD)
+        .stdin(late_eof());
+    let b = run_bounded(&mut shell, limit);
+    assert!(b.killed, "exit {}: {}", b.run.code, b.run.stderr);
+    assert!(
+        b.took < limit + Duration::from_secs(5)
+            && !b.run.stdout.contains("still held open")
+            && !b.run.stderr.contains("still held open"),
+        "{:?}: {}{}",
+        b.took,
+        b.run.stdout,
+        b.run.stderr
+    );
+    // A child that ends on its own isn't killed, and its output is whole.
+    let b = run_bounded(sqlh().args(["--version"]), Duration::from_secs(30));
+    assert!(!b.killed);
+    assert_eq!(b.run.code, 0);
+    assert!(b.run.stdout.starts_with("sqlh "), "{}", b.run.stdout);
 }
 
 #[test]
@@ -261,9 +449,8 @@ fn concurrent_runs_publish_whole_files() {
         "{published_by_b}"
     );
 
-    let a = a.wait_with_output().unwrap();
-    let a_stderr = String::from_utf8_lossy(&a.stderr);
-    assert_eq!(a.status.code(), Some(4), "run A: {a_stderr}");
+    let a = finish(a);
+    assert_eq!(a.code, 4, "run A: {}", a.stderr);
     let published_by_a = fs::read_to_string(&out).unwrap();
     assert!(
         published_by_a.starts_with("-- error: login timeout: ")
@@ -2104,15 +2291,26 @@ fn run_with_stdin(command: &mut Command, input: &[u8]) -> Run {
         .stderr(Stdio::piped())
         .spawn()
         .expect("sqlh starts");
+    let writer = feed(&mut child, input);
+    let r = finish(child);
+    writer
+        .join()
+        .expect("the writer ends")
+        .expect("input is accepted");
+    r
+}
+
+/// Writes `input` to `child`'s piped stdin on a thread of its own, then closes it, so the
+/// watchdog that waits for the child covers the write too (R43): a child that stops reading
+/// would otherwise hold a write longer than the pipe's 4 KiB for good, before any watchdog
+/// started. A kill breaks the pipe, so the writer always ends.
+fn feed(
+    child: &mut std::process::Child,
+    input: &[u8],
+) -> std::thread::JoinHandle<std::io::Result<()>> {
     let mut stdin = child.stdin.take().expect("a piped stdin");
-    std::io::Write::write_all(&mut stdin, input).expect("input is accepted");
-    drop(stdin);
-    let output = child.wait_with_output().expect("sqlh ends");
-    Run {
-        code: output.status.code().expect("an exit code"),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    let input = input.to_vec();
+    std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input))
 }
 
 // PLAN.md 2.13: what a shell pipes to sqlh is whatever its encoding makes of the text. UTF-8
@@ -5444,20 +5642,23 @@ mod live {
                 Ok(child) => child,
                 Err(e) => return failed(e),
             };
-            if let Some(mut stdin) = child.stdin.take()
-                && let Err(e) = std::io::Write::write_all(&mut stdin, sql.as_bytes())
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return failed(e);
+            // The SQL is written on a thread (`feed`), and the run is waited for under the
+            // watchdog without `finish`'s panic: a cleanup calls this while a failed test
+            // unwinds, so a hung run, writing included, is reported as a failed run, as the
+            // others are.
+            let writer = feed(&mut child, sql.as_bytes());
+            let b = bounded_child(child, Instant::now(), HANG);
+            let written = writer.join();
+            if b.killed {
+                return Run {
+                    code: -1,
+                    stdout: b.run.stdout,
+                    stderr: format!("still running after {HANG:?}, killed\n{}", b.run.stderr),
+                };
             }
-            match child.wait_with_output() {
-                Ok(output) => Run {
-                    code: output.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                },
-                Err(e) => failed(e),
+            match written {
+                Ok(Err(e)) => failed(e),
+                _ => b.run,
             }
         }
         fn report(&self, line: &str) {
@@ -6392,14 +6593,9 @@ mod live {
             .expect("sqlh starts")
     }
 
-    /// Waits for a run started with `spawn_live`.
+    /// Waits for a run started with `spawn_live`, under the `HANG` watchdog (`finish`).
     fn collect(child: std::process::Child) -> Run {
-        let output = child.wait_with_output().expect("sqlh finishes");
-        Run {
-            code: output.status.code().expect("an exit code, not a signal"),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
+        finish(child)
     }
 
     /// A background run that is killed when it goes out of scope, so a failed assertion
@@ -7564,7 +7760,10 @@ mod live {
     // to acknowledge the cancel (eight runs at once, each building a 16 MB value) ended the
     // batch at `-t` plus 5 s, as designed, and the run still failed the bound by its connect,
     // 200 to 450 ms under that load (PLAN.md, Phase 5.4, Still open). The outside clock keeps a
-    // looser bound, `OUTSIDE`, so a run that hangs before or after its batch still fails.
+    // looser bound, `OUTSIDE`, enforced while the run goes on (`run_bounded`, R43): a run
+    // still going past it is killed and fails with what it wrote, so a hang before or after
+    // its batch, which sqlh's own clock can't show, fails too, and doesn't hold the suite up.
+    // Until R43 it was checked only once the run had ended, which a hung run never does.
     const GRACE: Duration = Duration::from_secs(5);
     const SETUP: Duration = Duration::from_millis(500);
     const OUTSIDE: Duration = Duration::from_secs(5);
@@ -7595,26 +7794,48 @@ mod live {
         }
     }
 
-    /// Asserts a `-t 1` run kept its bound: sqlh's own time within `-t` plus the grace (and
-    /// `SETUP`), and the whole process within that plus `OUTSIDE`. Returns sqlh's own time.
-    fn within_t(r: &Run, outside: Duration, flags: &[&str]) -> Duration {
-        let own = sqlh_time(r);
+    /// Runs `sql` with `-t 1`, `flags` and `env`, and asserts it kept its bound: the whole
+    /// process within `-t` plus the grace, `SETUP` and `OUTSIDE`, enforced while it runs
+    /// (`run_bounded`: past it the run is killed, and fails here with what it wrote), and
+    /// sqlh's own time within `-t` plus the grace and `SETUP`. The run, and sqlh's own time.
+    fn timed_run(
+        p: &str,
+        db: &str,
+        env: &[(&str, &str)],
+        flags: &[&str],
+        sql: &str,
+    ) -> (Run, Duration) {
         let bound = Duration::from_secs(1) + GRACE + SETUP;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        command
+            .stdin(Stdio::null())
+            .args(["--profile", p, "-d", db])
+            .args(flags)
+            .args(["-t", "1", "-Q", sql]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let b = run_bounded(&mut command, bound + OUTSIDE);
         assert!(
-            own < bound && outside < bound + OUTSIDE,
-            "{flags:?}: sqlh {own:?}, process {outside:?}\n{}{}",
-            r.stdout,
-            r.stderr
+            !b.killed,
+            "{flags:?}: killed after {:?}, still running past -t plus the grace, SETUP and \
+             OUTSIDE\n{}{}",
+            b.took, b.run.stdout, b.run.stderr
         );
-        own
+        let own = sqlh_time(&b.run);
+        assert!(
+            own < bound,
+            "{flags:?}: sqlh {own:?}, process {:?}\n{}{}",
+            b.took,
+            b.run.stdout,
+            b.run.stderr
+        );
+        (b.run, own)
     }
 
     /// A run with `-t 1` that has to be over within `-t` plus the grace; sqlh's own time.
     fn timed(p: &str, db: &str, flags: &[&str], sql: &str) -> (Run, Duration) {
-        let started = Instant::now();
-        let r = live(p, db, &[flags, &["-t", "1", "-Q", sql]].concat());
-        let own = within_t(&r, started.elapsed(), flags);
-        (r, own)
+        timed_run(p, db, &[], flags, sql)
     }
 
     const TIMEOUT_1: &str =
@@ -7771,15 +7992,7 @@ mod live {
     // it within `-t` plus the grace.
     #[cfg(debug_assertions)]
     fn timed_with_work(p: &str, db: &str, work_us: &str, flags: &[&str], sql: &str) -> Run {
-        let started = Instant::now();
-        let r = live_with(
-            p,
-            db,
-            &[("SQLH_DEBUG_ROW_WORK_US", work_us)],
-            &[flags, &["-t", "1", "-Q", sql]].concat(),
-        );
-        within_t(&r, started.elapsed(), flags);
-        r
+        timed_run(p, db, &[("SQLH_DEBUG_ROW_WORK_US", work_us)], flags, sql).0
     }
 
     #[cfg(debug_assertions)]

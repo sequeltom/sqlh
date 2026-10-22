@@ -1270,10 +1270,13 @@ fn stopped_note(
     };
     let (exact, longer) = match advice {
         Advice::Cli => ("--exact-count counts every row", "raise -t to count longer"),
-        // A call can't set the profile's exact_count, but it can run a COUNT(*) (agent trial
-        // 3: the model did, unprompted, where the note advised only the profile key).
+        // A call can't set the profile's exact_count, but it can run a count of its own (agent
+        // trial 3: the model did, unprompted, where the note advised only the profile key).
+        // COUNT_BIG, not COUNT: a count was stopped because the result is large, and COUNT
+        // returns int, which fails past 2,147,483,647 rows (error 8115, or NULL under
+        // ARITHABORT OFF with ANSI_WARNINGS OFF); COUNT_BIG returns bigint (R44).
         Advice::Mcp => (
-            "a COUNT(*) query counts every row, as does the profile's exact_count = true",
+            "a COUNT_BIG(*) query counts every row, as does the profile's exact_count = true",
             "a larger timeout counts longer",
         ),
     };
@@ -1597,23 +1600,32 @@ mod tests {
             stopped_note(&[2], true, true, Advice::Cli, false),
             format!("{first}; --exact-count counts every row; raise -t to count longer")
         );
-        // sqlh mcp names what its reader can change: a COUNT(*) of its own (agent trial 3), the
-        // profile, and the call's timeout.
+        // sqlh mcp names what its reader can change: a count of its own (agent trial 3), the
+        // profile, and the call's timeout. The count is COUNT_BIG, which returns bigint: the
+        // result was large enough to stop the count, and COUNT's int fails past 2,147,483,647
+        // rows (R44).
         assert_eq!(
             stopped_note(&[2], true, true, Advice::Mcp, false),
             format!(
-                "{first}; a COUNT(*) query counts every row, as does the profile's exact_count \
-                 = true; a larger timeout counts longer"
+                "{first}; a COUNT_BIG(*) query counts every row, as does the profile's \
+                 exact_count = true; a larger timeout counts longer"
             )
         );
         // A call already at the server's limit is offered no larger timeout.
         assert_eq!(
             stopped_note(&[2], true, true, Advice::Mcp, true),
             format!(
-                "{first}; a COUNT(*) query counts every row, as does the profile's exact_count \
-                 = true"
+                "{first}; a COUNT_BIG(*) query counts every row, as does the profile's \
+                 exact_count = true"
             )
         );
+        // No advice of either front end names COUNT itself, whose int can overflow.
+        for advice in [Advice::Cli, Advice::Mcp] {
+            for (budget, timeout) in [(true, false), (false, true), (true, true)] {
+                let note = stopped_note(&[2], budget, timeout, advice, false);
+                assert!(!note.contains("COUNT("), "{advice:?}: {note}");
+            }
+        }
         assert_eq!(stopped_note(&[2], false, true, Advice::Mcp, true), first);
         // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
         let batch = |number| BatchInfo {

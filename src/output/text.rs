@@ -2300,12 +2300,13 @@ pub(super) mod tests {
         for (timeout_at_limit, advice) in [
             (
                 false,
-                "; a COUNT(*) query counts every row, as does the profile's exact_count = true; \
-                 a larger timeout counts longer",
+                "; a COUNT_BIG(*) query counts every row, as does the profile's exact_count = \
+                 true; a larger timeout counts longer",
             ),
             (
                 true,
-                "; a COUNT(*) query counts every row, as does the profile's exact_count = true",
+                "; a COUNT_BIG(*) query counts every row, as does the profile's exact_count = \
+                 true",
             ),
         ] {
             let (mut s, main, _) = sink(Limits {
