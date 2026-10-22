@@ -46,9 +46,9 @@ Every call ended with `-- ok` or with an `isError` result the model read correct
 
 Recorded in PLAN.md (5.6):
 - **Decisions 14 and 15:** the evidence above supports both as decided: keep the CLI's daemon and MCP sessions deferred.
-- **For the owner (output, DESIGN.md §5):**
-  - A cut value could say how to read the rest, for example by naming `SUBSTRING` or the cell limit's argument, in the CLI's or MCP's words.
-  - Under MCP, the stopped count's note could advise a `COUNT(*)`, which an agent can run, as well as the profile's `exact_count`, which it can't set.
+- **Output (DESIGN.md §5), built 2026-10-22 in `3915347` at the owner's request:**
+  - A run that cut values ends with a note saying how to see one whole: `2 values were cut (--max-cell 500); read one in pieces with SUBSTRING, or raise --max-cell` (`max_cell` in MCP; only `raise ...` when the cut values are in a schema command's sections).
+  - Under MCP, the stopped count's note advises `a COUNT(*) query counts every row, as does the profile's exact_count = true`.
 - **A timeout trial:** a task that runs past the profile's `-t` (60 s by default), or a profile with a lower `query_timeout`.
 - **Agent guidance (Phase 8, the skill):**
   - check a claim about the data with a query before relying on it, or leave it out;
