@@ -96,6 +96,7 @@ docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect late
                  experiment, memory, Windows shells, agent trials, the MCP reuse spike;
                  upstream-issues.md, the driver problems for the owner to raise upstream))
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   sqlh mcp's spec (built 2026-10-17)
+docs/command-categories.md   Phase 6's design: command categories and their policies (owner decisions D1–D15 pending)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
                  (findings F.., R01–R45; PLAN.md records each one and its fix)
 ```
