@@ -23,11 +23,11 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 2. **D2 Refusal wording:** the unknown-procedure and unknown-DBCC texts and named statements now; the kind and its switch in every refusal with v2. **Decided: (a), decision 23.**
 3. **D3 Contention:** refuse lock-holding hints, REPEATABLE READ and SERIALIZABLE, deadlock priority above LOW, and a lock timeout above the run's (10 s cap when the run has none); SNAPSHOT as a run setting after a live test. **Decided: (a), and SNAPSHOT (i), decision 24.**
 4. **D4 Remote:** (a) allow four-part reads through a DBA's linked server with a note, after the MSDTC test; (b) refuse agent-chosen UNC, URL and variable paths, and fail closed for unlisted path-taking functions. **Decided: D4a(i) and D4b(i), decision 25.**
-5. **D5 Read list round 2:** the argument-checked DBCC commands and procedures, the msdb rule, `#temp` statistics, the exact-shape reads alone outside the wrapper, and `EXECUTE AS USER` reads in the CLI. Recommend all of (a)–(e), each entry gated on its live check; the one-shot `sp_server_diagnostics`, about 5 s on the server, in MCP too once measured.
-6. **D6 Waits:** a `:pause N` line between batches, in the CLI and in MCP's `sql`, capped and client-side; conditional on D3. Recommend (a).
-7. **D7 sqlh-owned reads:** `activity` (sessions, blocking, head blockers) and `errorlog` (newest first), as CLI commands and MCP tools, and `info` reporting the login's view permissions. Recommend (a).
-8. **D8 Showplans in Phase 6:** hygiene only. Recommend (a).
-9. **D9 Small items:** the NOLOCK note, host-disclosure reads stay allowed, the application name per run kind, a refusal of the all-wildcard SAMPLED/DETAILED call, and MCP's session-state holes closed until tested. Recommend yes to each.
+5. **D5 Read list round 2:** the argument-checked DBCC commands and procedures, the msdb rule, `#temp` statistics, the exact-shape reads alone outside the wrapper, and `EXECUTE AS USER` reads in the CLI. Recommend all of (a)–(e), each entry gated on its live check; the one-shot `sp_server_diagnostics`, about 5 s on the server, in MCP too once measured. **Decided: all of (a)–(e), with (a1), decision 26.**
+6. **D6 Waits:** a `:pause N` line between batches, in the CLI and in MCP's `sql`, capped and client-side; conditional on D3. **Decided: (a), 60 s cap, decision 27.**
+7. **D7 sqlh-owned reads:** `activity` (sessions, blocking, head blockers) and `errorlog` (newest first), as CLI commands and MCP tools, and `info` reporting the login's view permissions. **Decided: (a), decision 28.**
+8. **D8 Showplans in Phase 6:** hygiene only. **Decided: (a), decision 29.**
+9. **D9 Small items:** the NOLOCK note, host-disclosure reads stay allowed, the application name per run kind, a refusal of the all-wildcard SAMPLED/DETAILED call, and MCP's session-state holes closed until tested. **Decided: yes to each, decision 30.**
 10. **D10 Deny tier:** the fixed list in every mode, worded as an accident guard, plus `DROP DATABASE` and enabling `xp_cmdshell`, OLE Automation or CLR (any part of the option's name). Recommend (b), and (e), the deny tier reading one literal of dynamic SQL, once D13(b) exists.
 11. **D11 Grants:** the profile's `allow` list (defaulting by `write_policy`), `--allow K` limited to it, and the wrapper per kind (kept only when every granted kind keeps it). Recommend (a), with the local `COPY_ONLY` backup kept in `maintenance` (i).
 12. **D12 Kill:** a `kill` kind (`KILL <session id>`, `sp_stop_job`), no wrapper; an identity-checked kill later. Recommend (a).
@@ -732,7 +732,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Options: all of (a)–(e); (a)–(c) only; none until v2.
 - Trade-offs: every entry needs a live check in the wrapper (§10); (a1) puts a 5 s server-side wait the caller doesn't choose into MCP, where `WAITFOR` stays refused, while (a2) leaves MCP's health check to the DMVs; (d) adds a run mode without the wrapper, narrow and exact; (e) is a common question with no other path.
 - **Recommendation: all of (a)–(e)**, each entry gated on its live check, with (a1) once §10 item 4 has measured the one-shot call's time; (e) in the CLI first.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: all of (a)–(e), with (a1)**, each entry gated on its live check (PLAN.md §6, decision 26).
 
 **D6. Waits (§6.6). Conditional on D3(a).**
 - Options:
@@ -741,7 +741,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) keep refusing; teach two-call deltas.
 - Trade-offs: (a) is new syntax and an output line, but it serves any DMV in both front ends and needs no server worker. (b) holds a worker and doesn't help MCP. (c) costs tokens, gives an uncontrolled interval, and leaves spin loops as the workaround.
 - **Recommendation: (a)**, and the cap's number from the owner.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a), capped at 60 s** (PLAN.md §6, decision 27).
 
 **D7. sqlh-owned reads (§6.7).**
 - Options:
@@ -750,13 +750,13 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) neither.
 - Trade-offs: (a) is new code, output shapes and MCP size (decision 20's gate), and gives MCP a `sp_WhoIsActive` substitute with no trust question. (b) leaves MCP with hand-written DMV joins in an incident.
 - **Recommendation: (a).**
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a)** (PLAN.md §6, decision 28).
 
 **D8. How much showplan work goes into Phase 6 (§8).**
 - Options: (a) hygiene only; (b) also the estimated-plan mode for reads; (c) also estimated plans of writes and procedures, after the detector proof.
 - Trade-offs: the plan modes are output-contract work; hygiene is cheap and ends MCP's dropped connection.
 - **Recommendation: (a) in Phase 6; (b) next; (c) after the proof, with `deny` profiles allowed to plan writes.**
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a) in Phase 6; (b) next; (c) after the proof, with `deny` profiles allowed to plan writes** (PLAN.md §6, decision 29).
 
 **D9. Small items, taken together (§6.10).** Each is yes or no.
 - (a) The NOLOCK note. Alternatives: refuse them and point to `--read-uncommitted` (over-blocks a common habit), or nothing.
@@ -765,7 +765,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - (d) Refuse the literal all-wildcard `SAMPLED`/`DETAILED` call. Alternative: a note (it arrives after the scan) or nothing.
 - (e) Close MCP's session-state holes until tested, with advice to run them with the CLI. Cost: MCP loses `OPEN SYMMETRIC KEY`/`OPEN MASTER KEY` with `DECRYPTBYKEY` reads (F15, I23 pass today) and `SET IDENTITY_INSERT #t` until the reset test passes; the CLI keeps them.
 - **Recommendation: yes to all five.**
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: yes to all five** (PLAN.md §6, decision 30).
 
 ### Part 2: changes (D10–D12 and D15 need D1(b); D13(b), D13(d) and D14(b) don't, apart from their `--allow` mentions)
 
