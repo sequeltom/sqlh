@@ -67,7 +67,7 @@ The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mc
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 40 built, 2 planned.**
+**Tally: 41 built, 2 planned.**
 
 ### Built
 
@@ -97,6 +97,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **No secrets in the transcript.** `-P` is rejected. Passwords live in Windows Credential Manager (or `SQLCMDPASSWORD`), and a stored password is only ever sent to its own server and login, so a profile can't be repointed to harvest it. Each stored password remembers the server, login and encryption it was saved for, so a run that meets a profile mid-edit, or one an interrupted edit left behind, refuses rather than send it elsewhere. *(MVP; bound to its profile since Phase 3)*
 - **`-o` can't hurt the input.** It refuses to write onto an input file, however it is spelled, and replaces the destination whole or not at all. *(Phase 1)*
 - **Dirty reads only on request.** `--read-uncommitted` lets a read-only run read past writers' locks without waiting, and the output says the rows may be uncommitted. It is refused when writes are allowed, so no write is ever based on a dirty read. *(Phase 2.8)*
+- **The error log and server settings are readable without writes.** `xp_readerrorlog` and `sp_readerrorlog` (with `sp_enumerrorlogs` to list the logs), `xp_instance_regread`, `xp_fixeddrives`, `xp_msver` and `sp_configure`'s listing are allowed in read-only runs and through MCP, so an agent can read the SQL Server error log during an investigation. Each is allowed by its exact name, so `xp_cmdshell` and registry writes stay blocked, and `sp_configure` with a value is refused with a pointer to `sys.configurations`. Whether the login may run each one stays the server's decision. *(Phase 6, interim step)*
 
 **Never stuck**
 - **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
@@ -123,7 +124,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 ### Planned
 
-- **A wider read-only allowlist** for DBA workflows (`xp_readerrorlog`, `xp_instance_regread`, showplans) from a categorization of commands, not a longer blocklist. *(Phase 6)*
+- **Commands sorted by what they risk**, so DBA workflows (showplans, community procedures such as `sp_WhoIsActive`) run where it is safe, from a categorization of commands, not a longer blocklist. *(Phase 6)*
 - **A skill and a plugin** that teach agents the investigation workflow and install it in one step. *(Phase 8)*
 
 ## Documents

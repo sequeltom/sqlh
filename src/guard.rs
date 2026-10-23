@@ -200,14 +200,19 @@ const BLOCKED: &[&str] = &[
     "WRITETEXT",
 ];
 
-/// Read-only system procedures that may be executed.
+/// Read-only system procedures that may be executed, each named exactly: a prefix such as
+/// `xp_` would also admit `xp_cmdshell` and `xp_instance_regwrite`. A procedure is here
+/// because it only reads, not because a login may run it: that is the server's call (PLAN.md,
+/// Phase 6). Those that write when given one argument are in `ARG_CHECKS` too.
 const PROCS: &[&str] = &[
     "SP_COLUMNS",
+    "SP_CONFIGURE",
     "SP_DATABASES",
     "SP_DATATYPE_INFO",
     "SP_DEPENDS",
     "SP_DESCRIBE_FIRST_RESULT_SET",
     "SP_DESCRIBE_UNDECLARED_PARAMETERS",
+    "SP_ENUMERRORLOGS",
     "SP_FKEYS",
     "SP_HELP",
     "SP_HELPCONSTRAINT",
@@ -224,6 +229,7 @@ const PROCS: &[&str] = &[
     "SP_HELPUSER",
     "SP_LOCK",
     "SP_PKEYS",
+    "SP_READERRORLOG",
     "SP_SERVER_INFO",
     "SP_SPACEUSED",
     "SP_SPECIAL_COLUMNS",
@@ -232,6 +238,51 @@ const PROCS: &[&str] = &[
     "SP_TABLES",
     "SP_WHO",
     "SP_WHO2",
+    "XP_FIXEDDRIVES",
+    "XP_INSTANCE_REGREAD",
+    "XP_MSVER",
+    "XP_READERRORLOG",
+];
+
+/// An allowlisted procedure that writes when it is given one argument, named or as the second
+/// positional one.
+struct ArgCheck {
+    /// The procedure, upper case, as in `PROCS`.
+    name: &'static str,
+    /// The argument that makes it write, upper case.
+    param: &'static str,
+    /// Why the call is refused when it passes the argument.
+    reason: &'static str,
+    /// What to do instead.
+    instead: &'static str,
+}
+
+const ARG_CHECKS: &[ArgCheck] = &[
+    ArgCheck {
+        name: "SP_CONFIGURE",
+        param: "@CONFIGVALUE",
+        reason: "sp_configure with @configvalue (named, or as the second argument) changes a \
+                 server setting",
+        instead: "Read sys.configurations to see every setting, advanced ones too",
+    },
+    ArgCheck {
+        name: "SP_SPACEUSED",
+        param: "@UPDATEUSAGE",
+        reason: "sp_spaceused with @updateusage (named, or as the second argument) runs DBCC \
+                 UPDATEUSAGE, which writes",
+        instead: "Leave @updateusage out to only read sizes",
+    },
+];
+
+/// The words of `STATEMENT_START` that T-SQL doesn't reserve, so a procedure's argument may
+/// be one of them written bare, as a string (`EXEC sp_configure GET, 1`). Where an argument's
+/// value goes, `passes_argument` reads one as the value, not as the next statement. That can
+/// only refuse more: the main loop still checks every token, and a statement one of them
+/// starts there is refused anyway (`BLOCKED`, or `GET` and `MOVE`, which start only
+/// `CONVERSATION` statements) or is no statement (`THROW` must follow a `;`, which ends the
+/// scan).
+const UNRESERVED_STARTS: &[&str] = &[
+    "DISABLE", "ENABLE", "GET", "MOVE", "RECEIVE", "SEND", "THROW",
 ];
 
 /// DBCC commands that only read.
@@ -324,8 +375,8 @@ const WORK_PER_BYTE: u64 = 3;
 /// how it reads the input once however deeply they nest. A real statement nests a few.
 const MAX_OPEN_TOP: usize = 16_384;
 
-/// How many parentheses (opening and closing) the arguments of `sp_spaceused`, which takes
-/// none, may have.
+/// How many parentheses (opening and closing) the arguments of a procedure in `ARG_CHECKS`,
+/// which takes none, may have.
 const MAX_ARG_PARENS: usize = 8;
 
 /// How much work a batch's classification has done, shared by every `Lexer` copy made for it.
@@ -804,16 +855,25 @@ impl<'a> Guard<'a> {
                 " to run it as written",
             ));
         }
-        if name.eq_ignore_ascii_case("SP_SPACEUSED") {
-            match self.spaceused_updates_usage(&end) {
+        if let Some(arg) = ARG_CHECKS
+            .iter()
+            .find(|arg| arg.name.eq_ignore_ascii_case(name))
+        {
+            // `name;number` calls a numbered procedure (EXECUTE's `module_name [;number]`):
+            // the arguments come after the number. No statement starts with a number, so the
+            // `;` is no statement's end.
+            let args = if end.kind(0) == Some(Kind::Punct(';')) && end.kind(1) == Some(Kind::Num) {
+                end.after(2)
+            } else {
+                end
+            };
+            match self.passes_argument(&args, arg.param) {
                 Some(false) => {}
                 Some(true) => {
                     return Err(Blocked::write_or(
                         line,
-                        "sp_spaceused with @updateusage (named, or as the second \
-                         argument) runs DBCC UPDATEUSAGE, which writes"
-                            .into(),
-                        "Leave @updateusage out to only read sizes".into(),
+                        arg.reason.into(),
+                        arg.instead.into(),
                         "",
                     ));
                 }
@@ -821,8 +881,8 @@ impl<'a> Guard<'a> {
                     return Err(too_complex(
                         line,
                         &format!(
-                            "the arguments of sp_spaceused have more than {MAX_ARG_PARENS} \
-                             parentheses"
+                            "the arguments of {} have more than {MAX_ARG_PARENS} parentheses",
+                            arg.name.to_ascii_lowercase()
                         ),
                     ));
                 }
@@ -866,9 +926,9 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// Whether `sp_spaceused`'s arguments pass `@updateusage`, named or as the second
-    /// positional parameter, or `None` if they have more than `MAX_ARG_PARENS` parentheses.
-    /// `args_start` is the position just past the procedure's name.
+    /// Whether a call's arguments pass `param`, named or as the second positional parameter,
+    /// or `None` if they have more than `MAX_ARG_PARENS` parentheses. `args_start` is the
+    /// position just past the procedure's name, one of `ARG_CHECKS`.
     ///
     /// The scan ends at a `;` or a statement keyword outside parentheses, so the next call's
     /// own scan starts where this one stops. A scan can only read on to a later call (an
@@ -876,11 +936,13 @@ impl<'a> Guard<'a> {
     /// `k`-th call after it has read a parenthesis from each of those calls' arguments, the
     /// ones in between included. With at most `MAX_ARG_PARENS` of them in a scan, no token is
     /// read by more than that many scans, and the work stays linear.
-    fn spaceused_updates_usage(&self, args_start: &Lexer<'a>) -> Option<bool> {
+    fn passes_argument(&self, args_start: &Lexer<'a>, param: &str) -> Option<bool> {
         let mut positional = 0;
         let mut depth = 0usize;
         let mut parens = 0usize;
         let mut arg_start = true;
+        // Just past a named argument's `=`, where its value comes.
+        let mut after_equals = false;
         let mut scan = args_start.clone();
         while let Some(t) = scan.next() {
             if matches!(t.kind, Kind::Punct('(' | ')')) {
@@ -889,9 +951,13 @@ impl<'a> Guard<'a> {
                     return None;
                 }
             }
+            // Where a value goes, an unreserved word is the value (`sp_configure GET, 1`):
+            // it ends no statement.
+            let value = (arg_start || after_equals) && in_list(UNRESERVED_STARTS, t.name);
+            after_equals = depth == 0 && t.kind == Kind::Punct('=');
             match t.kind {
                 Kind::Punct(';') if depth == 0 => break,
-                Kind::Word if depth == 0 && in_list(STATEMENT_START, t.name) => break,
+                Kind::Word if depth == 0 && !value && in_list(STATEMENT_START, t.name) => break,
                 Kind::Punct('(') => depth += 1,
                 Kind::Punct(')') => depth = depth.saturating_sub(1),
                 Kind::Punct(',') if depth == 0 => {
@@ -903,7 +969,7 @@ impl<'a> Guard<'a> {
             if arg_start {
                 arg_start = false;
                 let named = t.kind == Kind::Var && scan.kind(0) == Some(Kind::Punct('='));
-                if named && t.name.eq_ignore_ascii_case("@UPDATEUSAGE") {
+                if named && t.name.eq_ignore_ascii_case(param) {
                     return Some(true);
                 }
                 if !named {
@@ -1503,9 +1569,155 @@ mod tests {
             "EXEC sp_spaceused @objname = N'dbo.T', @updateusage = 'true'",
             "EXEC sp_spaceused @updateusage = N'true'",
             "EXEC sp_spaceused NULL, 'true'",
+            // A procedure number, and a bare value spelled like an unreserved statement
+            // keyword, are read past (found in review, 2026-10-23).
+            "EXEC sp_spaceused;1 N'dbo.T', 'true'",
+            "EXEC sp_spaceused ; 1 @updateusage = 'true'",
+            "EXEC sp_spaceused Move, 'true'",
+            "EXEC sp_spaceused @objname = Move, @updateusage = 'true'",
         ] {
             assert!(blocked(sql).reason.contains("UPDATEUSAGE"), "{sql}");
         }
+        allowed("EXEC sp_spaceused;1 N'dbo.T'");
+    }
+
+    // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and
+    // the configuration listing, each named exactly; the writing neighbours stay blocked.
+    #[test]
+    fn diagnostic_extended_procedures_are_allowed_by_exact_name() {
+        for sql in [
+            "EXEC xp_readerrorlog",
+            "EXEC xp_readerrorlog 0, 1, N'Login failed', NULL, NULL, NULL, N'desc'",
+            "EXEC sys.xp_readerrorlog 1, 2",
+            "EXEC master.dbo.xp_readerrorlog 0, 1, N'error'",
+            "EXEC master.sys.xp_readerrorlog",
+            "EXEC master..xp_readerrorlog",
+            "EXEC [master].[sys].[xp_readerrorlog] 0",
+            "xp_readerrorlog 0, 1",
+            "EXEC sp_readerrorlog",
+            "EXEC sys.sp_readerrorlog 1, 1, N'deadlock'",
+            "EXEC sp_enumerrorlogs 1",
+            "EXEC master.sys.sp_enumerrorlogs",
+            "sp_readerrorlog",
+            "DECLARE @dir nvarchar(4000);\n\
+             EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE',\n\
+             N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', N'BackupDirectory', @dir OUTPUT;\n\
+             SELECT @dir",
+            "EXEC @rc = sys.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'k', N'v'",
+            "EXEC xp_fixeddrives",
+            "EXEC master.sys.xp_fixeddrives",
+            "EXEC xp_msver",
+            "EXEC xp_msver N'ProductVersion'",
+            "EXEC sp_configure",
+            "EXEC sp_configure 'max server memory (MB)'",
+            "EXEC sys.sp_configure @configname = N'max degree of parallelism'",
+            "EXEC sp_configure N'cost threshold for parallelism'; SELECT 1, 2",
+            "EXEC sp_configure\nSELECT 1, 2",
+            "EXEC sp_configure; THROW 50000, N'stop', 1",
+            "EXEC sp_configure;1",
+            "EXEC sp_configure;1 N'max server memory (MB)'",
+            "CREATE TABLE #log (d datetime, p nvarchar(50), t nvarchar(max));\n\
+             INSERT INTO #log EXEC xp_readerrorlog 0, 1;\n\
+             SELECT TOP (20) * FROM #log ORDER BY d DESC",
+        ] {
+            allowed(sql);
+        }
+        // Neighbours that write, run commands or read any key stay blocked, as do names that
+        // only share a prefix with an allowed one.
+        for (sql, what) in [
+            ("EXEC xp_cmdshell 'dir'", "EXEC xp_cmdshell"),
+            (
+                "EXEC master.dbo.xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'k', N'v', N'REG_SZ', N'x'",
+                "EXEC master.dbo.xp_instance_regwrite",
+            ),
+            (
+                "EXEC xp_regwrite N'HKEY_LOCAL_MACHINE', N'k', N'v', N'REG_SZ', N'x'",
+                "EXEC xp_regwrite",
+            ),
+            (
+                "EXEC xp_regdeletevalue N'HKEY_LOCAL_MACHINE', N'k', N'v'",
+                "EXEC xp_regdeletevalue",
+            ),
+            (
+                "EXEC xp_regread N'HKEY_LOCAL_MACHINE', N'k', N'v'",
+                "EXEC xp_regread",
+            ),
+            ("EXEC xp_readerrorlogs", "EXEC xp_readerrorlogs"),
+            ("EXEC xp_readerror", "EXEC xp_readerror"),
+            ("EXEC sp_configure_peer", "EXEC sp_configure_peer"),
+        ] {
+            let b = blocked(sql);
+            assert_eq!(b.reason, format!("{what} would write"), "{sql}");
+        }
+        // Only the local system procedure counts, as for the sp_ ones.
+        for sql in [
+            "EXEC dbo.xp_readerrorlog",
+            "EXEC otherdb.dbo.xp_readerrorlog",
+            "EXEC Lnk.master.dbo.xp_readerrorlog",
+            "Lnk.master.sys.xp_readerrorlog 0, 1",
+            "EXEC tools.sp_configure",
+        ] {
+            assert!(
+                blocked(sql)
+                    .reason
+                    .contains("only a bare, sys. or master. name"),
+                "{sql}"
+            );
+        }
+        // Stacked statements are each checked: an allowed call doesn't carry a write.
+        for (sql, line) in [
+            ("EXEC xp_readerrorlog 0, 1; DELETE dbo.T", 1),
+            ("EXEC xp_msver\nUPDATE dbo.T SET x = 1", 2),
+            ("EXEC sp_readerrorlog\nEXEC xp_cmdshell 'dir'", 2),
+            ("EXEC xp_fixeddrives; EXEC sp_configure\nRECONFIGURE", 2),
+        ] {
+            assert_eq!(blocked(sql).line, line, "{sql}");
+        }
+    }
+
+    #[test]
+    fn sp_configure_with_a_value_is_blocked() {
+        for sql in [
+            "EXEC sp_configure 'show advanced options', 1",
+            "EXEC sys.sp_configure N'max server memory (MB)', 4096; RECONFIGURE",
+            "EXEC sp_configure @configname = N'xp_cmdshell', @configvalue = 1",
+            "EXEC sp_configure @configvalue = 0",
+            "EXEC master.dbo.sp_configure NULL, 1",
+            "sp_configure 'max degree of parallelism', 4",
+            // The procedure number (`name;number`): its arguments follow it.
+            "EXEC sp_configure;1 'show advanced options', 1",
+            "sp_configure;1 'show advanced options', 1",
+            "EXEC master.dbo.sp_configure ;1 @configvalue = 1",
+            "EXEC sp_configure /* n */ ; /* n */ 1 'x', 1",
+            // A bare value spelled like a statement keyword T-SQL doesn't reserve.
+            "EXEC sp_configure GET, 1",
+            "EXEC sp_configure throw, 1",
+            "EXEC sp_configure GET, @configvalue = 1",
+            "EXEC sp_configure @configname = MOVE, @configvalue = 1",
+            "EXEC sp_configure send, 1",
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason,
+                "sp_configure with @configvalue (named, or as the second argument) changes a \
+                 server setting",
+                "{sql}"
+            );
+            assert_eq!(
+                b.advice,
+                "Read sys.configurations to see every setting, advanced ones too, or rerun \
+                 with --allow-write",
+                "{sql}"
+            );
+        }
+        let parens = "(".repeat(MAX_ARG_PARENS);
+        assert_eq!(
+            blocked(&format!("EXEC sp_configure {parens}(")).reason,
+            format!(
+                "this input is too complex for the read-only check: the arguments of \
+                 sp_configure have more than {MAX_ARG_PARENS} parentheses"
+            )
+        );
     }
 
     // PLAN.md 2.15: input that says XACT_ABORT gets exact counting.
@@ -1789,6 +2001,11 @@ mod tests {
             for entry in list {
                 assert_eq!(*entry, entry.to_ascii_uppercase(), "lists are upper case");
             }
+        }
+        // An argument check applies only to a procedure the allowlist admits.
+        for arg in ARG_CHECKS {
+            assert!(PROCS.contains(&arg.name), "{} isn't in PROCS", arg.name);
+            assert_eq!(arg.param, arg.param.to_ascii_uppercase(), "{}", arg.param);
         }
         for entry in BLOCKED {
             assert!(

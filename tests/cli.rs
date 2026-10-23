@@ -10017,6 +10017,147 @@ mod live {
         );
     }
 
+    // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
+    // configuration listing run in the read-only wrapper, from a user database; a value for
+    // sp_configure is refused before anything runs. Whether a login may run each one is the
+    // server's call, and this measures what SQL Server 2025 requires (the table in DESIGN.md
+    // §7): for a login with only read rights, the error-log procedures give the server's own
+    // refusal and xp_fixeddrives no rows, while xp_instance_regread, xp_msver and the
+    // sp_configure listing run; VIEW SERVER STATE or VIEW ANY ERROR LOG opens the sp_ log
+    // procedures, neither opens xp_readerrorlog or xp_fixeddrives, and an EXECUTE grant in
+    // master opens xp_readerrorlog.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_error_log_and_server_reads_run_read_only_and_the_server_decides_who_may() {
+        let (p, db) = target();
+        let has = |r: &Run, code: i32, text: &str| {
+            assert_eq!(r.code, code, "{text}\n{}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(text), "no {text:?} in:\n{}", r.stdout);
+        };
+        let as_owner = |sql: &str| live(&p, &db, &["--max-rows", "2", "-Q", sql]);
+        let log = "LogDate:datetime\tProcessInfo:nvarchar(12)\tText:nvarchar(3999)\n";
+        let archives = "Archive #:int\tDate:nvarchar(259)\tLog File Size (Byte):int\n";
+        let regread = "EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', \
+                       N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', N'LoginMode'";
+        let into_temp = "CREATE TABLE #log (d datetime, p nvarchar(50), t nvarchar(max));\n\
+                         INSERT INTO #log EXEC xp_readerrorlog 0, 1;\n\
+                         SELECT CASE WHEN COUNT_BIG(*) > 0 THEN 'read' END AS n FROM #log";
+
+        has(&as_owner("EXEC xp_readerrorlog 0, 1"), 0, log);
+        has(
+            &as_owner("EXEC sys.sp_readerrorlog 0, 1, N'SQL Server'"),
+            0,
+            log,
+        );
+        has(&as_owner(into_temp), 0, "n:varchar(4)\nread\n");
+        has(&as_owner("EXEC sp_enumerrorlogs"), 0, archives);
+        has(
+            &as_owner(regread),
+            0,
+            "Value:nvarchar(255)\tData:int\nLoginMode\t",
+        );
+        has(
+            &as_owner("EXEC xp_fixeddrives"),
+            0,
+            "drive:nvarchar(1)\tMB free:int\n",
+        );
+        let drives = "CREATE TABLE #d (drive nchar(1), mb int);\n\
+                      INSERT INTO #d EXEC xp_fixeddrives;\n\
+                      SELECT CASE WHEN COUNT_BIG(*) > 0 THEN 'rows' ELSE 'none' END AS n FROM #d";
+        has(&as_owner(drives), 0, "n:varchar(4)\nrows\n");
+        has(
+            &as_owner("EXEC xp_msver N'ProductVersion'"),
+            0,
+            "\tProductVersion\t",
+        );
+        has(
+            &as_owner("EXEC sp_configure"),
+            0,
+            "name:nvarchar(35)\tminimum:int\t",
+        );
+        let r = as_owner("EXEC sp_configure 'show advanced options', 1; RECONFIGURE");
+        has(&r, 5, "; nothing was run. Read sys.configurations");
+        // The server takes a procedure number on sp_configure, so the guard reads past it.
+        has(
+            &as_owner("EXEC sp_configure;1"),
+            0,
+            "name:nvarchar(35)\tminimum:int\t",
+        );
+        let r = as_owner("EXEC sp_configure;1 'show advanced options', 1");
+        has(&r, 5, "; nothing was run. Read sys.configurations");
+
+        // A login with read rights in the scratch database and nothing on the server.
+        let mut reader = Reader::create(&p, &db);
+        // The user in master that the EXECUTE grant below needs: its drop is armed before it is
+        // made, since dropping the login would leave it behind.
+        let login = reader.login.clone();
+        reader.probe.cleanup.arm(format!(
+            "USE master; IF USER_ID(N'{login}') IS NOT NULL DROP USER [{login}];"
+        ));
+        let as_reader = |sql: &str| reader.run(&["--max-rows", "2", "-Q", sql]);
+        let denied = "-- error 229 (severity 14, state 5, proc xp_readerrorlog, line 1): \
+                      The EXECUTE permission was denied on the object 'xp_readerrorlog'";
+        let no_rights = "-- error 27219 (severity 16, state 1, proc sp_readerrorlog, line 11): \
+                         Caller does not have permissions to execute the stored procedure.";
+        let none_to_list = "-- error 27219 (severity 16, state 1, proc sp_enumerrorlogs, line 8): \
+                            Caller does not have permissions to execute the stored procedure.";
+        has(&as_reader("EXEC xp_readerrorlog 0, 1"), 1, denied);
+        has(&as_reader("EXEC sp_readerrorlog 0, 1"), 1, no_rights);
+        has(&as_reader("EXEC sp_enumerrorlogs"), 1, none_to_list);
+        has(
+            &as_reader(regread),
+            0,
+            "Value:nvarchar(255)\tData:int\nLoginMode\t",
+        );
+        has(&as_reader("EXEC xp_fixeddrives"), 0, "-- 0 rows\n");
+        has(
+            &as_reader("EXEC xp_msver N'ProductVersion'"),
+            0,
+            "\tProductVersion\t",
+        );
+        has(
+            &as_reader("EXEC sp_configure"),
+            0,
+            "name:nvarchar(35)\tminimum:int\t",
+        );
+
+        // Server permissions, each alone. Granted to the reader's login, they go with it.
+        let server = |sql: &str| {
+            let r = reader.probe.server.write(&format!("USE master; {sql}"));
+            assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        };
+        let sp_procedures_only = |label: &str| {
+            has(&as_reader("EXEC sp_readerrorlog 0, 1"), 0, log);
+            has(&as_reader("EXEC sp_enumerrorlogs"), 0, archives);
+            has(&as_reader("EXEC xp_readerrorlog 0, 1"), 1, denied);
+            let r = as_reader("EXEC xp_fixeddrives");
+            assert!(
+                r.code == 0 && r.stdout.contains("-- 0 rows\n"),
+                "{label}\n{}",
+                r.stdout
+            );
+        };
+        server(&format!("GRANT VIEW SERVER STATE TO [{login}];"));
+        sp_procedures_only("VIEW SERVER STATE");
+        // VIEW ANY ERROR LOG is SQL Server 2022's.
+        server(&format!(
+            "REVOKE VIEW SERVER STATE FROM [{login}]; GRANT VIEW ANY ERROR LOG TO [{login}];"
+        ));
+        sp_procedures_only("VIEW ANY ERROR LOG");
+
+        // EXECUTE on the procedure, through a user in master (its drop was armed above).
+        server(&format!("REVOKE VIEW ANY ERROR LOG FROM [{login}];"));
+        server(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT EXECUTE ON sys.xp_readerrorlog TO [{login}];"
+        ));
+        has(
+            &reader.run(&["--max-rows", "2", "-Q", "EXEC xp_readerrorlog 0, 1"]),
+            0,
+            log,
+        );
+    }
+
     // docs/mcp-mode.md §5, through sqlh mcp and the test server: calls on one profile share a
     // connection (--pool 1, so they queue and run in order), and nothing one call sets reaches
     // the next. The isolation level is the case the reset doesn't cover (the self-review's
