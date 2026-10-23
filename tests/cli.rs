@@ -113,36 +113,129 @@ fn run_bounded(command: &mut Command, limit: Duration) -> Bounded {
 /// the watchdog up either; what they had read by then is kept, with a mark that the rest was
 /// left. A piped stdin still in `child` is closed first, as `Child::wait_with_output` does, so
 /// a child that reads it sees its end rather than waiting for the watchdog.
-fn bounded_child(mut child: std::process::Child, started: Instant, limit: Duration) -> Bounded {
-    use std::sync::{Arc, Mutex, mpsc};
+fn bounded_child(child: std::process::Child, started: Instant, limit: Duration) -> Bounded {
+    match try_bounded_child(child, started, limit, Faults::NONE) {
+        Ok(b) => b,
+        Err(failed) => panic!(
+            "{}\n{}{}",
+            failed.error, failed.run.stdout, failed.run.stderr
+        ),
+    }
+}
+
+/// Operations of the watchdog a test makes fail on purpose (R45): none outside that test.
+#[derive(Clone, Copy, Default)]
+struct Faults {
+    /// Polling the child's status.
+    status: bool,
+    /// Waiting for the killed child.
+    wait: bool,
+    /// Starting a reader thread.
+    thread: bool,
+    /// Starting `write_never_panicking`'s writer thread.
+    feed: bool,
+}
+
+impl Faults {
+    const NONE: Faults = Faults {
+        status: false,
+        wait: false,
+        thread: false,
+        feed: false,
+    };
+}
+
+/// Why `try_bounded_child` couldn't watch a child to its end: the OS error, and the run as
+/// far as it got (exit code -1), with what the child wrote before it.
+struct WatchFailed {
+    error: std::io::Error,
+    run: Run,
+}
+
+/// `bounded_child`, returning an error where an OS operation fails (polling the child,
+/// waiting for it, starting a reader thread) instead of panicking, for a caller that must
+/// not panic (`write_never_panicking`, R45). The child is then killed and waited for, best
+/// effort, and what it wrote is kept. `faults` makes one of those operations fail, for the
+/// test that shows it.
+fn try_bounded_child(
+    mut child: std::process::Child,
+    started: Instant,
+    limit: Duration,
+    faults: Faults,
+) -> Result<Bounded, WatchFailed> {
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
     const READERS: Duration = Duration::from_secs(10);
+    let injected = |what: &str| std::io::Error::other(format!("{what} (injected)"));
     // Reads `pipe` to its end into a shared buffer, and says when it got there.
     type Drained = (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>);
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> Drained {
+    let drain = |mut pipe: Option<Box<dyn Read + Send>>| -> std::io::Result<Drained> {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (done, ended) = mpsc::channel();
+        if faults.thread {
+            return Err(injected("a reader thread couldn't be started"));
+        }
         let into = Arc::clone(&bytes);
-        std::thread::spawn(move || {
-            if let Some(mut pipe) = pipe {
+        std::thread::Builder::new().spawn(move || {
+            if let Some(pipe) = pipe.as_mut() {
                 let mut chunk = [0u8; 8192];
                 while let Ok(n @ 1..) = pipe.read(&mut chunk) {
                     into.lock()
-                        .expect("the buffer")
+                        .unwrap_or_else(PoisonError::into_inner)
                         .extend_from_slice(&chunk[..n]);
                 }
             }
             let _ = done.send(());
-        });
-        (bytes, ended)
-    }
+        })?;
+        Ok((bytes, ended))
+    };
+    let read = |(bytes, ended): &Drained| {
+        let whole = ended.recv_timeout(READERS).is_ok();
+        let mut text =
+            String::from_utf8_lossy(&bytes.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned();
+        if !whole {
+            text.push_str("\n[the pipe was still held open by another process]");
+        }
+        text
+    };
+    // Kills and waits for the child, best effort, and gives the error with what it wrote.
+    let fail =
+        |child: &mut std::process::Child, error: std::io::Error, streams: [Option<&Drained>; 2]| {
+            let _ = child.kill();
+            let _ = child.wait();
+            let [stdout, stderr] = streams.map(|drained| drained.map(read).unwrap_or_default());
+            WatchFailed {
+                error,
+                run: Run {
+                    code: -1,
+                    stdout,
+                    stderr,
+                },
+            }
+        };
     drop(child.stdin.take());
     let pid = child.id();
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
+    let boxed = |pipe: Box<dyn Read + Send>| Some(pipe);
+    let stdout = match drain(child.stdout.take().and_then(|p| boxed(Box::new(p)))) {
+        Ok(drained) => drained,
+        Err(e) => return Err(fail(&mut child, e, [None, None])),
+    };
+    let stderr = match drain(child.stderr.take().and_then(|p| boxed(Box::new(p)))) {
+        Ok(drained) => drained,
+        Err(e) => return Err(fail(&mut child, e, [Some(&stdout), None])),
+    };
+    let both = [Some(&stdout), Some(&stderr)];
     let mut killed = false;
     let status = loop {
-        if let Some(status) = child.try_wait().expect("child status") {
-            break status;
+        let polled = if faults.status {
+            Err(injected("the child's status couldn't be read"))
+        } else {
+            child.try_wait()
+        };
+        match polled {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return Err(fail(&mut child, e, both)),
         }
         if started.elapsed() >= limit {
             killed = true;
@@ -154,29 +247,29 @@ fn bounded_child(mut child: std::process::Child, started: Instant, limit: Durati
             if !tree.is_ok_and(|status| status.success()) {
                 let _ = child.kill();
             }
-            break child.wait().expect("the killed child is waited for");
+            let waited = if faults.wait {
+                Err(injected("the killed child couldn't be waited for"))
+            } else {
+                child.wait()
+            };
+            match waited {
+                Ok(status) => break status,
+                Err(e) => return Err(fail(&mut child, e, both)),
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let took = started.elapsed();
-    let read = |(bytes, ended): Drained| {
-        let whole = ended.recv_timeout(READERS).is_ok();
-        let mut text = String::from_utf8_lossy(&bytes.lock().expect("the buffer")).into_owned();
-        if !whole {
-            text.push_str("\n[the pipe was still held open by another process]");
-        }
-        text
-    };
-    Bounded {
+    Ok(Bounded {
         run: Run {
-            code: status.code().expect("an exit code, not a signal"),
-            stdout: read(stdout),
-            stderr: read(stderr),
+            code: status.code().unwrap_or(-1),
+            stdout: read(&stdout),
+            stderr: read(&stderr),
         },
         took,
         killed,
         pid,
-    }
+    })
 }
 
 /// A stream whose reader is already gone, so every write to it fails: a harness that
@@ -337,6 +430,68 @@ fn a_bounded_run_kills_a_child_that_never_ends() {
     assert!(!b.killed);
     assert_eq!(b.run.code, 0);
     assert!(b.run.stdout.starts_with("sqlh "), "{}", b.run.stdout);
+}
+
+// R45: the fixtures' write (`Live::write`, `write_never_panicking`) never panics, since a
+// cleanup calls it while a failed test unwinds. Each OS operation the watchdog depends on,
+// made to fail on purpose, comes back as a failed run naming it, with the child killed;
+// so does a run killed at its limit. The write after them, like a cleanup's later steps,
+// still runs. sqlh reads the SQL from stdin and then fails to connect (DEAD, exit 2).
+#[test]
+fn a_cleanup_write_reports_the_watchdogs_failures_instead_of_panicking() {
+    let write = |limit: Duration, faults: Faults| {
+        let mut command = sqlh();
+        command.args(DEAD).args(["-i", "-"]);
+        write_never_panicking(&mut command, "SELECT 1", limit, faults)
+    };
+    let cases = [
+        (
+            Faults {
+                status: true,
+                ..Faults::NONE
+            },
+            HANG,
+            "the child's status couldn't be read (injected)",
+        ),
+        (
+            Faults {
+                wait: true,
+                ..Faults::NONE
+            },
+            Duration::ZERO,
+            "the killed child couldn't be waited for (injected)",
+        ),
+        (
+            Faults {
+                thread: true,
+                ..Faults::NONE
+            },
+            HANG,
+            "a reader thread couldn't be started (injected)",
+        ),
+        (
+            Faults {
+                feed: true,
+                ..Faults::NONE
+            },
+            HANG,
+            "the writer thread couldn't be started (injected)",
+        ),
+        (Faults::NONE, Duration::ZERO, "killed"),
+    ];
+    for (faults, limit, error) in cases {
+        let r = write(limit, faults);
+        assert_eq!(r.code, -1, "{error}: {}{}", r.stdout, r.stderr);
+        assert!(r.stderr.contains(error), "{error}: {}", r.stderr);
+    }
+    // The watchdog itself is whole: a write with nothing injected runs to sqlh's own end.
+    let r = write(HANG, Faults::NONE);
+    assert_eq!(r.code, 2, "{}{}", r.stdout, r.stderr);
+    assert!(
+        last_line(&r.stdout).starts_with("-- failed (exit 2)"),
+        "{}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -2311,6 +2466,70 @@ fn feed(
     let mut stdin = child.stdin.take().expect("a piped stdin");
     let input = input.to_vec();
     std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input))
+}
+
+/// Runs `command` with `sql` on its stdin, under the watchdog at `limit`, and never panics:
+/// a fixture's cleanup calls it (`Live::write`) while a failed test unwinds, where a second
+/// panic would abort the test process. Whatever goes wrong comes back as a failed run (exit
+/// code -1) with the error and what the run wrote: a spawn or write error, a run killed at
+/// `limit`, and an OS error the watchdog meets (`try_bounded_child`, R45). `faults` makes
+/// one of those fail on purpose, for the test that shows it; `feed` makes the writer
+/// thread's start fail.
+fn write_never_panicking(command: &mut Command, sql: &str, limit: Duration, faults: Faults) -> Run {
+    let failed = |error: String, stdout: String, stderr: String| Run {
+        code: -1,
+        stdout,
+        stderr: if stderr.is_empty() {
+            error
+        } else {
+            format!("{error}\n{stderr}")
+        },
+    };
+    let child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => return failed(e.to_string(), String::new(), String::new()),
+    };
+    // The SQL is written on a thread of its own, so the watchdog covers the write too.
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return failed("no piped stdin".into(), String::new(), String::new());
+    };
+    let input = sql.as_bytes().to_vec();
+    let started = if faults.feed {
+        Err(std::io::Error::other(
+            "the writer thread couldn't be started (injected)",
+        ))
+    } else {
+        std::thread::Builder::new().spawn(move || std::io::Write::write_all(&mut stdin, &input))
+    };
+    let writer = match started {
+        Ok(writer) => writer,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return failed(e.to_string(), String::new(), String::new());
+        }
+    };
+    let watched = try_bounded_child(child, Instant::now(), limit, faults);
+    let written = writer.join();
+    match watched {
+        Err(WatchFailed { error, run }) => failed(error.to_string(), run.stdout, run.stderr),
+        Ok(b) if b.killed => failed(
+            format!("still running after {limit:?}, killed"),
+            b.run.stdout,
+            b.run.stderr,
+        ),
+        Ok(b) => match written {
+            Ok(Err(e)) => failed(e.to_string(), b.run.stdout, b.run.stderr),
+            _ => b.run,
+        },
+    }
 }
 
 // PLAN.md 2.13: what a shell pipes to sqlh is whatever its encoding makes of the text. UTF-8
@@ -5626,40 +5845,11 @@ mod live {
             live(&self.profile, &self.database, &["-Q", sql])
         }
         fn write(&self, sql: &str) -> Run {
-            let failed = |e: std::io::Error| Run {
-                code: -1,
-                stdout: String::new(),
-                stderr: e.to_string(),
-            };
-            let child = Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            command
                 .args(["--profile", &self.profile, "-d", &self.database])
-                .args(["--allow-write", "-i", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-            let mut child = match child {
-                Ok(child) => child,
-                Err(e) => return failed(e),
-            };
-            // The SQL is written on a thread (`feed`), and the run is waited for under the
-            // watchdog without `finish`'s panic: a cleanup calls this while a failed test
-            // unwinds, so a hung run, writing included, is reported as a failed run, as the
-            // others are.
-            let writer = feed(&mut child, sql.as_bytes());
-            let b = bounded_child(child, Instant::now(), HANG);
-            let written = writer.join();
-            if b.killed {
-                return Run {
-                    code: -1,
-                    stdout: b.run.stdout,
-                    stderr: format!("still running after {HANG:?}, killed\n{}", b.run.stderr),
-                };
-            }
-            match written {
-                Ok(Err(e)) => failed(e),
-                _ => b.run,
-            }
+                .args(["--allow-write", "-i", "-"]);
+            write_never_panicking(&mut command, sql, HANG, Faults::NONE)
         }
         fn report(&self, line: &str) {
             let _ = writeln!(std::io::stderr(), "{line}");
