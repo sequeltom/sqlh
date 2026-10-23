@@ -63,6 +63,67 @@ In OpenCode, add it to `opencode.json`:
 
 The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mcp-mode.md) has the details.
 
+## Using it
+
+### Profiles
+
+A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line.
+
+```powershell
+sqlh profile add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"
+sqlh profile add local -S . -d AppDb                 # no -U: Windows authentication
+sqlh profile list                                    # every profile; --search TEXT narrows it
+sqlh profile test dev                                # connects once and reports
+sqlh profile rm dev
+```
+
+Without `-U` a profile uses Windows authentication. `profile add` tests the connection as it saves, and the first profile saved becomes the default, used when a run names no server or profile. Running `profile add` again for an existing name updates only the options given. Add `-C` for a server with a self-signed certificate, and `--new-password` to be asked for the password again.
+
+### Queries
+
+```powershell
+sqlh --profile dev -Q "SELECT TOP 5 * FROM dbo.Orders ORDER BY Id DESC"
+sqlh --profile dev -i report.sql -o report.txt       # a script with GO batches, output to a file
+sqlh --profile dev --check -i change.sql             # compile only: syntax and unknown columns
+sqlh --profile dev --format json -Q "SELECT 1 AS x"
+```
+
+Results stop at 100 rows and 500 characters per value unless you raise them (`--max-rows`, `--max-cell`), and a batch times out after 60 seconds (`-t`). The last line always says how the run ended (`-- ok: ...` or `-- failed (exit N): ...`), and the exit code says why (`sqlh --help` lists them).
+
+### Looking at the schema
+
+```powershell
+sqlh --profile dev describe dbo.Orders     # columns, keys, indexes, foreign keys, triggers
+sqlh --profile dev tables Ord*             # tables and views matching a pattern
+sqlh --profile dev find Customer --text    # objects whose name, or with --text whose code, mentions it
+sqlh --profile dev def dbo.usp_GetOrders   # a view's or procedure's source
+sqlh --profile dev deps dbo.Orders         # what it uses and what uses it
+sqlh --profile dev dbs                     # databases;  info: the server, version and connection
+```
+
+### Writing
+
+Every run is read-only unless both the profile and the run allow writes. A new profile refuses writes altogether. To allow them, change the profile's policy, then ask for writes on each run:
+
+```powershell
+sqlh profile add dev --write-policy flag
+sqlh --profile dev --allow-write -Q "UPDATE dbo.Orders SET Status = 'Closed' WHERE Id = 42"
+```
+
+Without `--allow-write`, a write is refused before anything runs (exit 5), with a message that says why and what to do instead. Writes to `#temp` tables and table variables are always allowed. The error log and server state (`sp_readerrorlog`, `xp_readerrorlog`, `sp_configure` without a value, `xp_msver`) can be read without writes; whether the login may run them is up to the server.
+
+### Through MCP
+
+`sqlh mcp --profile NAME [--profile NAME ...]` runs sqlh as an MCP server for a harness (see [Quick start](#quick-start)). Only the profiles listed can be used, and every tool reads only:
+
+| Tool | What it does |
+|---|---|
+| `query` | Runs T-SQL under the read-only guard, as the command line does |
+| `check` | Compiles T-SQL without running it |
+| `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps` | The schema commands above |
+
+Each tool also takes `profile` (needed when several are listed), `database`, `max_rows`, `max_cell`, `timeout` and `format` (`text` or `json`). Connections are kept open between calls, and each call starts on a clean session. Start the server with `--verbose` to see its connections on stderr.
+
 ## Built for agents
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
@@ -134,6 +195,9 @@ This README is the human-facing overview. The other documents, [AGENTS.md](AGENT
 - [docs/VISION.md](docs/VISION.md): what the product is for, and its priorities
 - [docs/PLAN.md](docs/PLAN.md): the current plan of attack
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
+- [docs/mcp-mode.md](docs/mcp-mode.md): `sqlh mcp`, its tools and how it keeps connections
+- [docs/schema-commands.md](docs/schema-commands.md): the schema commands (`describe`, `find`, `deps`, ...)
+- [docs/command-categories.md](docs/command-categories.md): the decided design for sorting commands by risk (Phase 6, not built yet)
 
 ## License
 
