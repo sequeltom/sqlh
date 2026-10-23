@@ -272,6 +272,18 @@ fn try_bounded_child(
     })
 }
 
+/// Whether `bound` is a stopped count's lower bound as sqlh writes it for a result with
+/// `shown` rows shown and at most `most` rows in all (DESIGN.md §5.1, `Tally::rows_total`):
+/// more than the rows shown, since a hidden row was counted; no more than the result has;
+/// and floored to one significant digit, or the rows shown plus one where that is more.
+/// It says nothing of how many rows the server sent within the count's budget, which sqlh
+/// doesn't promise, so no test assumes a throughput (the R45 verification).
+fn is_stopped_bound(bound: u64, shown: u64, most: u64) -> bool {
+    let digits = bound.to_string();
+    let one_digit = digits[1..].bytes().all(|b| b == b'0');
+    bound > shown && bound <= most && (one_digit || bound == shown + 1)
+}
+
 /// A stream whose reader is already gone, so every write to it fails: a harness that
 /// stopped reading. Unlike closing a pipe after spawning, this can't race the child.
 fn closed() -> Stdio {
@@ -492,6 +504,23 @@ fn a_cleanup_write_reports_the_watchdogs_failures_instead_of_panicking() {
         "{}",
         r.stdout
     );
+}
+
+// The check the live count tests now use for a stopped count's bound (`is_stopped_bound`):
+// it takes every bound sqlh can write for 5 rows shown of at most 20,000, the 9,000 that
+// failed the old throughput check among them, and nothing else.
+#[test]
+fn a_stopped_bound_is_checked_for_its_shape_not_a_throughput() {
+    for valid in [6, 9, 10, 90, 100, 9_000, 10_000, 20_000] {
+        assert!(is_stopped_bound(valid, 5, 20_000), "{valid}");
+    }
+    // Not more than the rows shown, more than the result has, or not floored to one digit.
+    for invalid in [0, 5, 30_000, 20_001, 15, 9_500, 12_000] {
+        assert!(!is_stopped_bound(invalid, 5, 20_000), "{invalid}");
+    }
+    // The rows shown plus one, where that is more than the floor (100 shown, 154 counted).
+    assert!(is_stopped_bound(101, 100, 20_000));
+    assert!(!is_stopped_bound(102, 100, 20_000));
 }
 
 #[test]
@@ -7295,16 +7324,11 @@ mod live {
         digits.parse().expect("a number")
     }
 
-    /// One significant digit: a digit followed by zeros.
-    fn one_digit(n: u64) -> bool {
-        let s = n.to_string();
-        s[1..].bytes().all(|b| b == b'0')
-    }
-
     // A large result is cut after about 250 ms of counting, in a second or so rather than
     // the seconds the whole count takes. The footer, the note and the status line say so, the
-    // bound has one significant digit, and the batch after it runs on the same session (the
-    // read-only wrapper transaction survived the cancel).
+    // bound has the shape sqlh gives one (`is_stopped_bound`: more than the 100 shown, one
+    // significant digit or 101, never how many rows arrived in time), and the batch after it
+    // runs on the same session (the read-only wrapper transaction survived the cancel).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_large_result_is_cut_within_about_a_second() {
@@ -7323,11 +7347,7 @@ mod live {
             r.stdout
         );
         let n = bound(&r.stdout);
-        assert!(
-            (100..=5_000_000).contains(&n) && one_digit(n),
-            "{n}\n{}",
-            r.stdout
-        );
+        assert!(is_stopped_bound(n, 100, 5_000_000), "{n}\n{}", r.stdout);
         assert!(
             r.stdout.contains(&format!(
                 "-- 100 of ≥{n} rows shown (--max-rows 100; counting stopped)\n"
@@ -7357,7 +7377,8 @@ mod live {
         let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
         let result = &doc["batches"][0]["events"][0];
         assert_eq!(result["row_count_exact"], false, "{doc}");
-        assert!(one_digit(result["row_count"].as_u64().unwrap()), "{doc}");
+        let n = result["row_count"].as_u64().expect("a row count");
+        assert!(is_stopped_bound(n, 100, 5_000_000), "{doc}");
         assert_eq!(result["truncated"], true);
         assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
         assert!(
@@ -7634,7 +7655,13 @@ mod live {
             started.elapsed()
         );
         assert!(r.stdout.contains(stopped), "{}", r.stdout);
-        assert!([10_000, 20_000].contains(&bound(&r.stdout)), "{}", r.stdout);
+        let n = bound(&r.stdout);
+        assert!(is_stopped_bound(n, 5, 20_000), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!("-- 5 of ≥{n}{stopped}")),
+            "{}",
+            r.stdout
+        );
         assert!(
             r.stdout.contains(
                 "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
@@ -7673,7 +7700,13 @@ mod live {
             started.elapsed()
         );
         assert!(r.stdout.contains(stopped), "{}", r.stdout);
-        assert!([10_000, 20_000].contains(&bound(&r.stdout)), "{}", r.stdout);
+        let n = bound(&r.stdout);
+        assert!(is_stopped_bound(n, 5, 20_000), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!("-- 5 of ≥{n}{stopped}")),
+            "{}",
+            r.stdout
+        );
         assert!(
             r.stdout
                 .contains("so its later statements did not run; --exact-count counts every row\n"),
@@ -7681,18 +7714,21 @@ mod live {
             r.stdout
         );
 
-        // The same stop in JSON: a bound is not an exact count, the batch says it was stopped,
-        // and `truncated` follows the rows that were counted past the ones shown.
+        // The same stop in JSON: the five rows shown, a bound that is not an exact count, the
+        // batch says it was stopped, and `truncated` follows the rows that were counted past
+        // the ones shown. The bound is checked for its shape (`is_stopped_bound`), never for a
+        // throughput: until the R45 verification this case and the two above took only 10,000
+        // or 20,000, and failed on a valid 9,000 (rows the server sent more slowly under the
+        // full parallel run; the 250 ms budget promises no count).
         let r = live(&p, &db, &["--format", "json", "--max-rows", "5", "-Q", sql]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
         let result = &doc["batches"][0]["events"][0];
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(5), "{doc}");
         assert_eq!(result["row_count_exact"], false, "{doc}");
         assert_eq!(result["truncated"], true, "{doc}");
-        assert!(
-            [10_000, 20_000].contains(&result["row_count"].as_u64().unwrap()),
-            "{doc}"
-        );
+        let n = result["row_count"].as_u64().expect("a row count");
+        assert!(is_stopped_bound(n, 5, 20_000), "{doc}");
         assert_eq!(doc["batches"][0]["counting_stopped"], true, "{doc}");
     }
 
@@ -8053,7 +8089,7 @@ mod live {
         let (r, _) = timed(&p, SO, &["--exact-count"], sql);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         let n = bound(&r.stdout);
-        assert!(n >= 101, "{n}\n{}", r.stdout);
+        assert!(is_stopped_bound(n, 100, 10_000_000), "{n}\n{}", r.stdout);
         assert!(
             r.stdout.contains(&format!(
                 "-- 100 of ≥{n} rows shown (--max-rows 100; counting stopped)\n"
