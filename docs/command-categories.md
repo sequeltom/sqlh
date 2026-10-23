@@ -1,6 +1,6 @@
 # Command categories (Phase 6 design)
 
-Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2,808,320 bytes), the commit that holds the interim `EXEC` allowlist step and its review fixes; nothing in it is decided until recorded in PLAN.md §6. It covers PLAN.md Phase 6, steps 1–4, and the interim step's open wording. It replaces an earlier draft written against `eb5f568` and an uncommitted build: every guard verdict here was re-run on `f905385` (Appendix A), and every issue two critiques raised against that draft is answered in Appendix B.
+Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2,808,320 bytes), the commit that holds the interim `EXEC` allowlist step and its review fixes; its decisions D1–D15 were taken on 2026-10-23 and are recorded in PLAN.md §6 as decisions 22–36; each section says where a decision changed or confirmed its recommendation. It covers PLAN.md Phase 6, steps 1–4, and the interim step's open wording. It replaces an earlier draft written against `eb5f568` and an uncommitted build: every guard verdict here was re-run on `f905385` (Appendix A), and every issue two critiques raised against that draft is answered in Appendix B.
 
 ---
 
@@ -16,7 +16,7 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 
 **Two parts**
 - **Part 1 (§6), read-only runs and `sqlh mcp`.** Classifier v2's first increment. It needs D2–D9 and none of D1, and can be built before Part 2. It adds no grant switch.
-- **Part 2 (§7), changes.** It adds the deny tier, the kinds, `--allow`, the profile list and the `execute` tool; those (D10–D12, D15) need D1(b) first. Three of its read-side features use no kind and can be built with Part 1, apart from their `--allow` mentions: one literal of dynamic SQL classified under the caller's policy (D13(b)), sqlh-owned per-database execution (D13(d)), and trusted procedure entries in CLI read-only runs and MCP (D14(b)).
+- **Part 2 (§7), changes.** It adds the deny tier, the kinds, `--allow`, the profile list and the `execute` tool; those (D10–D12, D15) need D1(b) first. Three of its read-side features use no kind and can be built with Part 1, apart from their `--allow` mentions: one literal of dynamic SQL classified under the caller's policy (D13(b)), sqlh-owned per-database execution (D13(d)), and trusted procedure entries in CLI read-only runs and MCP (D14(b)). **Decided (decision 36): no `execute` tool in Phase 6;** Part 2 is CLI only, and column E below describes a later phase.
 
 **Decisions** (§9 has the options and trade-offs). Each is recorded in PLAN.md §6, from decision 22 on (D1 is decision 22).
 1. **D1 Shape and names:** grant six kinds per profile and run, and keep `--allow-write` as the blanket switch. **Decided: (b), decision 22.**
@@ -28,12 +28,12 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 7. **D7 sqlh-owned reads:** `activity` (sessions, blocking, head blockers) and `errorlog` (newest first), as CLI commands and MCP tools, and `info` reporting the login's view permissions. **Decided: (a), decision 28.**
 8. **D8 Showplans in Phase 6:** hygiene only. **Decided: (a), decision 29.**
 9. **D9 Small items:** the NOLOCK note, host-disclosure reads stay allowed, the application name per run kind, a refusal of the all-wildcard SAMPLED/DETAILED call, and MCP's session-state holes closed until tested. **Decided: yes to each, decision 30.**
-10. **D10 Deny tier:** the fixed list in every mode, worded as an accident guard, plus `DROP DATABASE` and enabling `xp_cmdshell`, OLE Automation or CLR (any part of the option's name). Recommend (b), and (e), the deny tier reading one literal of dynamic SQL, once D13(b) exists.
-11. **D11 Grants:** the profile's `allow` list (defaulting by `write_policy`), `--allow K` limited to it, and the wrapper per kind (kept only when every granted kind keeps it). Recommend (a), with the local `COPY_ONLY` backup kept in `maintenance` (i).
-12. **D12 Kill:** a `kill` kind (`KILL <session id>`, `sp_stop_job`), no wrapper; an identity-checked kill later. Recommend (a).
-13. **D13 Dynamic SQL:** literal text classified under the caller's whole policy, plus sqlh-owned per-database execution; drop `sp_MSforeachdb`. Recommend (b) and (d).
-14. **D14 Trusted procedures:** owner-written entries, allowed in the CLI and in MCP under caps (in MCP on a connection closed after the call until a reset test passes), checked in the same batch for signatures and `EXECUTE AS`, with an optional hash pin. Recommend (b).
-15. **D15 The `execute` tool:** a first increment for listed `tuning`, `kill` and `maintenance` only, without `maintenance`'s backup. Recommend (c).
+10. **D10 Deny tier:** the fixed list in every mode, worded as an accident guard, plus `DROP DATABASE` and enabling `xp_cmdshell`, OLE Automation or CLR (any part of the option's name). Recommend (b), and (e), the deny tier reading one literal of dynamic SQL, once D13(b) exists. **Decided: (b) and (e), decision 31.**
+11. **D11 Grants:** the profile's `allow` list (defaulting by `write_policy`), `--allow K` limited to it, and the wrapper per kind (kept only when every granted kind keeps it). Recommend (a), with the local `COPY_ONLY` backup kept in `maintenance` (i). **Decided: (a) with (i), decision 32.**
+12. **D12 Kill:** a `kill` kind (`KILL <session id>`, `sp_stop_job`), no wrapper; an identity-checked kill later. **Decided: (a), decision 33.**
+13. **D13 Dynamic SQL:** literal text classified under the caller's whole policy, plus sqlh-owned per-database execution; drop `sp_MSforeachdb`. **Decided: (b) and (d), decision 34.**
+14. **D14 Trusted procedures:** owner-written entries, allowed in the CLI and in MCP under caps (in MCP on a connection closed after the call until a reset test passes), checked in the same batch for signatures and `EXECUTE AS`, with an optional hash pin. **Decided: (b), decision 35.**
+15. **D15 The `execute` tool:** a first increment for listed `tuning`, `kill` and `maintenance` only, without `maintenance`'s backup. **Decided: (a), none in Phase 6, decision 36.**
 
 ---
 
@@ -248,7 +248,7 @@ Used only in refusal text and the docs, never as a switch. A refusal names its k
 
 ### 5.3 Policy map
 
-Modes: **A** CLI read-only (`flag` or no profile, without `--allow-write`). **B** CLI with `--allow-write` (`flag` with the flag, or `write_policy = "allow"`). **C** a profile with `write_policy = "deny"` (`--allow-write` is a usage error there, as today). **D** `sqlh mcp`'s read tools (decision 16). **E** the future `execute` tool (D15).
+Modes: **A** CLI read-only (`flag` or no profile, without `--allow-write`). **B** CLI with `--allow-write` (`flag` with the flag, or `write_policy = "allow"`). **C** a profile with `write_policy = "deny"` (`--allow-write` is a usage error there, as today). **D** `sqlh mcp`'s read tools (decision 16). **E** the future `execute` tool (D15). **Column E is not built in Phase 6 (decision 36):** it records the design for a later phase.
 
 `--allow K` lifts K in A and C when K is in the profile's `allow` list. That list defaults to every kind under `flag` and `allow`, to none under `deny`, and an explicit list replaces the default (§7.2). "If listed" below means that.
 
@@ -632,6 +632,8 @@ EXEC master.dbo.sp_WhoIsActive @find_block_leaders = 1;
 
 ### 7.8 The `execute` tool (D15)
 
+**Not in Phase 6 (decision 36, D15(a)).** `sqlh mcp` stays read-only; this section is kept as the design for a later phase, after an agent trial with the kinds in the CLI.
+
 - **Offered** only when `sqlh mcp` is launched with `--execute`, and only for listed profiles (decision 18) whose **explicit** `allow` list (not the `flag` default) names at least one kind E allows. In the first increment those are `tuning`, `kill` and `maintenance` (ranks 2–4, §5.4), with `maintenance`'s local `COPY_ONLY` backup left out by default: one call could write a full copy of a database to a path that only looks local, or fill a volume (§7.3), and no investigation needs it. A backup through `execute` would be its own later sub-choice (D15).
 - **Arguments:** `sql`, a required `kinds` array, and the usual `profile`, `database`, `timeout`, `format`, `max_rows`, `max_cell`. `kinds` must cover every kind the classifier finds; a mismatch is a tool error that names the kinds found. The harness's approval prompt then shows what the call will change. It informs the prompt; it doesn't enforce anything beyond what the classifier enforces.
 - **Runs** like `--allow` with those kinds: classifier on, deny tier on, wrapper per kind (§5.5). No blanket (`--allow-write`) ever.
@@ -778,7 +780,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (e) (b), plus the deny tier reading one literal of dynamic SQL with D13(b)'s rule in every mode, `--allow-write` and `--allow unvetted` included.
 - Trade-offs: (b) is a new refusal that offers no flag, and catches only what is named. (c) refuses legitimate write scripts and still misses synonyms and wrappers. (d) is more configuration for a per-server dial. (e) catches W1 and W6 at linear cost, reusing D13(b)'s code; a variable, a concatenation and `EXEC @var` still get past it.
 - **Recommendation: (b), and (e) once D13(b) exists.** Revisit (d) if asked.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (b), and (e) once D13(b) exists; none of the candidates added** (PLAN.md §6, decision 31).
 
 **D11. Grants per kind, and the wrapper per kind (§5.5, §7.2).**
 - Options:
@@ -788,7 +790,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Sub-choice, the local `COPY_ONLY` backup: (i) it stays in `maintenance` (§7.3); (ii) it moves to "other changes". Either way `execute`'s first increment leaves it out (D15).
 - Trade-offs: (a) makes each change visible on its run's command line and keeps `deny` meaningful. (b) is simpler but silent per run. (c) leaves `deny` profiles with nothing. In every option the list is an accident guard (R19). (i) lets a `deny` profile that lists `maintenance` take a copy before a risky fix; one run can also write a full copy of a database to a path that only looks local (§2) or fill a volume. (ii) closes that, at the cost of `--allow-write` for the copy.
 - **Recommendation: (a), with (i)** for the CLI, where the command line shows the target.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a), with (i)** (PLAN.md §6, decision 32).
 
 **D12. Kill (§7.5).**
 - Options:
@@ -797,13 +799,13 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) refuse raw `KILL` everywhere and offer only the identity-checked command.
 - Trade-offs: (a) lets a `deny` profile end a runaway without DML; session-id reuse remains until the later command. (c) is safest but a new command before anything else works.
 - **Recommendation: (a)**, the identity-checked command when agents use `kill`.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a)** (PLAN.md §6, decision 33).
 
 **D13. Dynamic SQL and cross-database work (§7.6).**
 - Options: (a) keep refusing; (b) one literal classified under the caller's whole policy, with the named tests; (c) `sp_MSforeachdb` literals; (d) sqlh-owned per-database execution (`--each-db`, MCP `databases`).
 - Trade-offs: (b) enables faithful parameter-sniffing repros and plan-cache recipes. (c) depends on an undocumented procedure that skips databases. (d) covers the cursor-and-`EXEC (@sql)` loop with nothing dynamic, in both front ends, at the cost of an output shape.
 - **Recommendation: (b) and (d); drop (c).**
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (b) and (d); (c) dropped** (PLAN.md §6, decision 34).
 
 **D14. Trusted community procedures (§7.7).**
 - Options:
@@ -812,7 +814,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) (b), plus built-in templates.
 - Trade-offs: (b) is the owner's trust decision per server, with a check against drift that admits its gaps (time of check vs use, nested code). In MCP, sqlh can't tell which procedures take a session-owned app lock, set session context or open a key, so until §10 item 5's reset test passes for all three, every trusted call costs the next call a login (148–185 ms); after it, trusted calls are pooled like any other. Alternatives: refuse trusted entries in MCP until the test passes, or an owner-set per-entry key (`mcp = true`) after reading the source, which trusts the owner's reading. (c) fails open when the procedures change.
 - **Recommendation: (b)**, starter entries in the docs.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (b), with the connection closed after each trusted call in MCP until the reset test passes** (PLAN.md §6, decision 35).
 
 **D15. The `execute` tool (§7.8; the follow-up to decision 16).**
 - Options:
@@ -821,7 +823,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) `execute` for listed `tuning`, `kill` and `maintenance` only (ranks 2–4), without `maintenance`'s local `COPY_ONLY` backup, with the required `kinds` argument, unpooled connections and the deny tier.
 - Trade-offs: under any `execute` tool the last check is the harness prompt, often set to always allow (decision 16). (c) offers the likeliest real uses (force a plan, end a runaway, update one statistic) and keeps `data` and `unvetted` in the CLI until a trial shows how agents use it. It leaves the backup out because one call could copy a whole database to a path that only looks local, or fill a volume, and no investigation needs it (§7.3). Whether the Query Store procedures are transactional doesn't matter without a wrapper.
 - **Recommendation: (c)** once D10 and D11 are built; (b) after an agent trial.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a), none in Phase 6** (PLAN.md §6, decision 36). The design above is kept for a later phase, after an agent trial with the kinds in the CLI.
 
 ---
 
