@@ -18,8 +18,8 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 - **Part 1 (§6), read-only runs and `sqlh mcp`.** Classifier v2's first increment. It needs D2–D9 and none of D1, and can be built before Part 2. It adds no grant switch.
 - **Part 2 (§7), changes.** It adds the deny tier, the kinds, `--allow`, the profile list and the `execute` tool; those (D10–D12, D15) need D1(b) first. Three of its read-side features use no kind and can be built with Part 1, apart from their `--allow` mentions: one literal of dynamic SQL classified under the caller's policy (D13(b)), sqlh-owned per-database execution (D13(d)), and trusted procedure entries in CLI read-only runs and MCP (D14(b)).
 
-**Decisions** (§9 has the options and trade-offs). Each is recorded in PLAN.md §6, as decision 22 or later.
-1. **D1 Shape and names:** grant six kinds per profile and run, and keep `--allow-write` as the blanket switch. Recommend (b).
+**Decisions** (§9 has the options and trade-offs). Each is recorded in PLAN.md §6, from decision 22 on (D1 is decision 22).
+1. **D1 Shape and names:** grant six kinds per profile and run, and keep `--allow-write` as the blanket switch. **Decided: (b), decision 22.**
 2. **D2 Refusal wording:** the unknown-procedure and unknown-DBCC texts and named statements now; the kind and its switch in every refusal with v2. Recommend (a).
 3. **D3 Contention:** refuse lock-holding hints, REPEATABLE READ and SERIALIZABLE, deadlock priority above LOW, and a lock timeout above the run's (10 s cap when the run has none); SNAPSHOT as a run setting after a live test. Recommend (a).
 4. **D4 Remote:** (a) allow four-part reads through a DBA's linked server with a note, after the MSDTC test; (b) refuse agent-chosen UNC, URL and variable paths, and fail closed for unlisted path-taking functions. Recommend D4a(i) and D4b(i).
@@ -685,7 +685,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Names: `data`, `maintenance`, `tuning`, `kill`, `remote`, `unvetted`. Alternatives: `write` or `writes` for `data` (rejected: `--allow write` next to `--allow-write` reads as the same switch while meaning much less); `procedures` or `code` for `unvetted`; `linked` for `remote` (too narrow: paths too). A seventh kind, `settings`, is not recommended in Phase 6.
 - Trade-offs: (a) leaves a `deny` profile (every new profile, decision 12) no way to `UPDATE STATISTICS`, force a plan or `KILL` short of moving it to `flag`, which opens DML too. (b) adds a profile key, a flag and refusal wording, and `--help` must give up a line elsewhere. (c) breaks existing scripts and agents' habits for little gain over (b).
 - **Recommendation: (b), with these names.** D10–D12 and D15 depend on it; Part 1, D13(b), D13(d) and D14(b) don't.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- **Decided 2026-10-23: (b), with these names** (PLAN.md §6, decision 22).
 
 ### Part 1: read-only runs and `sqlh mcp`
 
@@ -696,7 +696,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) Keep "would write".
 - Trade-offs: (a) changes golden tests twice. (c) keeps steering agents to `--allow-write` for reads, which PLAN.md already calls wrong. Optional within (a): a JSON `kind` member (contract 2.2).
 - **Recommendation: (a)**, without the JSON member until a consumer needs it.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D3. Contention in read-only runs and `sqlh mcp` (§6.4).**
 - Options:
@@ -706,7 +706,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Sub-question, SNAPSHOT: (i) a run setting (`--snapshot`, `snapshot = true`) like decision 7's, after the live test, and then refuse an in-SQL SNAPSHOT with advice naming it; (ii) leave it as today.
 - Trade-offs: (a) over-blocks the rare legitimate SERIALIZABLE read. (c) leaves the one risk the wrapper makes worse, and lets in-SQL `SET`s override decision 7. The cap's 10 s is decision 7's default; the owner may pick another number.
 - **Recommendation: (a), and SNAPSHOT (i)** once the live test passes (it needs the owner's approval, §10).
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D4. Remote reach (§6.5).**
 - **D4a, four-part reads through a DBA-configured linked server:**
@@ -720,7 +720,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (iii) allow all, documented.
   - Trade-offs: (i) newly refuses the textbook variable forms of deadlock-history and audit reads (B35, F20), which pass today; the relative `system_health*.xel` form covers deadlock history. It also makes `RESTORE HEADERONLY|FILELISTONLY|LABELONLY` from a share `remote`: refused in read-only runs and MCP, run alone and without the wrapper under `--allow remote` (§5.5, §6.5). That is P9's main case, another server's backup file before a restore, so with (i) it needs `--allow remote` (Part 2) or a local copy of the file. (iii) lets a misled agent make the service account authenticate to any host.
   - **Recommendation: (i) now, (ii) if audits on shares prove common.**
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D5. Read list round 2 and the reads that need a special path (§6.1–§6.3).**
 - Parts:
@@ -732,7 +732,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Options: all of (a)–(e); (a)–(c) only; none until v2.
 - Trade-offs: every entry needs a live check in the wrapper (§10); (a1) puts a 5 s server-side wait the caller doesn't choose into MCP, where `WAITFOR` stays refused, while (a2) leaves MCP's health check to the DMVs; (d) adds a run mode without the wrapper, narrow and exact; (e) is a common question with no other path.
 - **Recommendation: all of (a)–(e)**, each entry gated on its live check, with (a1) once §10 item 4 has measured the one-shot call's time; (e) in the CLI first.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D6. Waits (§6.6). Conditional on D3(a).**
 - Options:
@@ -741,7 +741,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) keep refusing; teach two-call deltas.
 - Trade-offs: (a) is new syntax and an output line, but it serves any DMV in both front ends and needs no server worker. (b) holds a worker and doesn't help MCP. (c) costs tokens, gives an uncontrolled interval, and leaves spin loops as the workaround.
 - **Recommendation: (a)**, and the cap's number from the owner.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D7. sqlh-owned reads (§6.7).**
 - Options:
@@ -750,13 +750,13 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) neither.
 - Trade-offs: (a) is new code, output shapes and MCP size (decision 20's gate), and gives MCP a `sp_WhoIsActive` substitute with no trust question. (b) leaves MCP with hand-written DMV joins in an incident.
 - **Recommendation: (a).**
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D8. How much showplan work goes into Phase 6 (§8).**
 - Options: (a) hygiene only; (b) also the estimated-plan mode for reads; (c) also estimated plans of writes and procedures, after the detector proof.
 - Trade-offs: the plan modes are output-contract work; hygiene is cheap and ends MCP's dropped connection.
 - **Recommendation: (a) in Phase 6; (b) next; (c) after the proof, with `deny` profiles allowed to plan writes.**
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D9. Small items, taken together (§6.10).** Each is yes or no.
 - (a) The NOLOCK note. Alternatives: refuse them and point to `--read-uncommitted` (over-blocks a common habit), or nothing.
@@ -765,7 +765,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - (d) Refuse the literal all-wildcard `SAMPLED`/`DETAILED` call. Alternative: a note (it arrives after the scan) or nothing.
 - (e) Close MCP's session-state holes until tested, with advice to run them with the CLI. Cost: MCP loses `OPEN SYMMETRIC KEY`/`OPEN MASTER KEY` with `DECRYPTBYKEY` reads (F15, I23 pass today) and `SET IDENTITY_INSERT #t` until the reset test passes; the CLI keeps them.
 - **Recommendation: yes to all five.**
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 ### Part 2: changes (D10–D12 and D15 need D1(b); D13(b), D13(d) and D14(b) don't, apart from their `--allow` mentions)
 
@@ -778,7 +778,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (e) (b), plus the deny tier reading one literal of dynamic SQL with D13(b)'s rule in every mode, `--allow-write` and `--allow unvetted` included.
 - Trade-offs: (b) is a new refusal that offers no flag, and catches only what is named. (c) refuses legitimate write scripts and still misses synonyms and wrappers. (d) is more configuration for a per-server dial. (e) catches W1 and W6 at linear cost, reusing D13(b)'s code; a variable, a concatenation and `EXEC @var` still get past it.
 - **Recommendation: (b), and (e) once D13(b) exists.** Revisit (d) if asked.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D11. Grants per kind, and the wrapper per kind (§5.5, §7.2).**
 - Options:
@@ -788,7 +788,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Sub-choice, the local `COPY_ONLY` backup: (i) it stays in `maintenance` (§7.3); (ii) it moves to "other changes". Either way `execute`'s first increment leaves it out (D15).
 - Trade-offs: (a) makes each change visible on its run's command line and keeps `deny` meaningful. (b) is simpler but silent per run. (c) leaves `deny` profiles with nothing. In every option the list is an accident guard (R19). (i) lets a `deny` profile that lists `maintenance` take a copy before a risky fix; one run can also write a full copy of a database to a path that only looks local (§2) or fill a volume. (ii) closes that, at the cost of `--allow-write` for the copy.
 - **Recommendation: (a), with (i)** for the CLI, where the command line shows the target.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D12. Kill (§7.5).**
 - Options:
@@ -797,13 +797,13 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) refuse raw `KILL` everywhere and offer only the identity-checked command.
 - Trade-offs: (a) lets a `deny` profile end a runaway without DML; session-id reuse remains until the later command. (c) is safest but a new command before anything else works.
 - **Recommendation: (a)**, the identity-checked command when agents use `kill`.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D13. Dynamic SQL and cross-database work (§7.6).**
 - Options: (a) keep refusing; (b) one literal classified under the caller's whole policy, with the named tests; (c) `sp_MSforeachdb` literals; (d) sqlh-owned per-database execution (`--each-db`, MCP `databases`).
 - Trade-offs: (b) enables faithful parameter-sniffing repros and plan-cache recipes. (c) depends on an undocumented procedure that skips databases. (d) covers the cursor-and-`EXEC (@sql)` loop with nothing dynamic, in both front ends, at the cost of an output shape.
 - **Recommendation: (b) and (d); drop (c).**
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D14. Trusted community procedures (§7.7).**
 - Options:
@@ -812,7 +812,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) (b), plus built-in templates.
 - Trade-offs: (b) is the owner's trust decision per server, with a check against drift that admits its gaps (time of check vs use, nested code). In MCP, sqlh can't tell which procedures take a session-owned app lock, set session context or open a key, so until §10 item 5's reset test passes for all three, every trusted call costs the next call a login (148–185 ms); after it, trusted calls are pooled like any other. Alternatives: refuse trusted entries in MCP until the test passes, or an owner-set per-entry key (`mcp = true`) after reading the source, which trusts the owner's reading. (c) fails open when the procedures change.
 - **Recommendation: (b)**, starter entries in the docs.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 **D15. The `execute` tool (§7.8; the follow-up to decision 16).**
 - Options:
@@ -821,7 +821,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) `execute` for listed `tuning`, `kill` and `maintenance` only (ranks 2–4), without `maintenance`'s local `COPY_ONLY` backup, with the required `kinds` argument, unpooled connections and the deny tier.
 - Trade-offs: under any `execute` tool the last check is the harness prompt, often set to always allow (decision 16). (c) offers the likeliest real uses (force a plan, end a runaway, update one statistic) and keeps `data` and `unvetted` in the CLI until a trial shows how agents use it. It leaves the backup out because one call could copy a whole database to a path that only looks local, or fill a volume, and no investigation needs it (§7.3). Whether the Query Store procedures are transactional doesn't matter without a wrapper.
 - **Recommendation: (c)** once D10 and D11 are built; (b) after an agent trial.
-- Recorded in PLAN.md §6 as decision 22 or later.
+- Recorded in PLAN.md §6 as decision 23 or later.
 
 ---
 
