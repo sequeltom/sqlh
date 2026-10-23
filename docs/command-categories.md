@@ -20,9 +20,9 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 
 **Decisions** (§9 has the options and trade-offs). Each is recorded in PLAN.md §6, from decision 22 on (D1 is decision 22).
 1. **D1 Shape and names:** grant six kinds per profile and run, and keep `--allow-write` as the blanket switch. **Decided: (b), decision 22.**
-2. **D2 Refusal wording:** the unknown-procedure and unknown-DBCC texts and named statements now; the kind and its switch in every refusal with v2. Recommend (a).
-3. **D3 Contention:** refuse lock-holding hints, REPEATABLE READ and SERIALIZABLE, deadlock priority above LOW, and a lock timeout above the run's (10 s cap when the run has none); SNAPSHOT as a run setting after a live test. Recommend (a).
-4. **D4 Remote:** (a) allow four-part reads through a DBA's linked server with a note, after the MSDTC test; (b) refuse agent-chosen UNC, URL and variable paths, and fail closed for unlisted path-taking functions. Recommend D4a(i) and D4b(i).
+2. **D2 Refusal wording:** the unknown-procedure and unknown-DBCC texts and named statements now; the kind and its switch in every refusal with v2. **Decided: (a), decision 23.**
+3. **D3 Contention:** refuse lock-holding hints, REPEATABLE READ and SERIALIZABLE, deadlock priority above LOW, and a lock timeout above the run's (10 s cap when the run has none); SNAPSHOT as a run setting after a live test. **Decided: (a), and SNAPSHOT (i), decision 24.**
+4. **D4 Remote:** (a) allow four-part reads through a DBA's linked server with a note, after the MSDTC test; (b) refuse agent-chosen UNC, URL and variable paths, and fail closed for unlisted path-taking functions. **Decided: D4a(i) and D4b(i), decision 25.**
 5. **D5 Read list round 2:** the argument-checked DBCC commands and procedures, the msdb rule, `#temp` statistics, the exact-shape reads alone outside the wrapper, and `EXECUTE AS USER` reads in the CLI. Recommend all of (a)–(e), each entry gated on its live check; the one-shot `sp_server_diagnostics`, about 5 s on the server, in MCP too once measured.
 6. **D6 Waits:** a `:pause N` line between batches, in the CLI and in MCP's `sql`, capped and client-side; conditional on D3. Recommend (a).
 7. **D7 sqlh-owned reads:** `activity` (sessions, blocking, head blockers) and `errorlog` (newest first), as CLI commands and MCP tools, and `info` reporting the login's view permissions. Recommend (a).
@@ -696,7 +696,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (c) Keep "would write".
 - Trade-offs: (a) changes golden tests twice. (c) keeps steering agents to `--allow-write` for reads, which PLAN.md already calls wrong. Optional within (a): a JSON `kind` member (contract 2.2).
 - **Recommendation: (a)**, without the JSON member until a consumer needs it.
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a), without the JSON member** (PLAN.md §6, decision 23).
 
 **D3. Contention in read-only runs and `sqlh mcp` (§6.4).**
 - Options:
@@ -706,7 +706,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
 - Sub-question, SNAPSHOT: (i) a run setting (`--snapshot`, `snapshot = true`) like decision 7's, after the live test, and then refuse an in-SQL SNAPSHOT with advice naming it; (ii) leave it as today.
 - Trade-offs: (a) over-blocks the rare legitimate SERIALIZABLE read. (c) leaves the one risk the wrapper makes worse, and lets in-SQL `SET`s override decision 7. The cap's 10 s is decision 7's default; the owner may pick another number.
 - **Recommendation: (a), and SNAPSHOT (i)** once the live test passes (it needs the owner's approval, §10).
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: (a), and SNAPSHOT (i) after its live test** (PLAN.md §6, decision 24).
 
 **D4. Remote reach (§6.5).**
 - **D4a, four-part reads through a DBA-configured linked server:**
@@ -720,7 +720,7 @@ Each is independent unless it says otherwise. Once decided, each is recorded in 
   - (iii) allow all, documented.
   - Trade-offs: (i) newly refuses the textbook variable forms of deadlock-history and audit reads (B35, F20), which pass today; the relative `system_health*.xel` form covers deadlock history. It also makes `RESTORE HEADERONLY|FILELISTONLY|LABELONLY` from a share `remote`: refused in read-only runs and MCP, run alone and without the wrapper under `--allow remote` (§5.5, §6.5). That is P9's main case, another server's backup file before a restore, so with (i) it needs `--allow remote` (Part 2) or a local copy of the file. (iii) lets a misled agent make the service account authenticate to any host.
   - **Recommendation: (i) now, (ii) if audits on shares prove common.**
-- Recorded in PLAN.md §6 as decision 23 or later.
+- **Decided 2026-10-23: D4a (i), final once the MSDTC question is answered (not yet tested), and D4b (i)** (PLAN.md §6, decision 25).
 
 **D5. Read list round 2 and the reads that need a special path (§6.1–§6.3).**
 - Parts:
