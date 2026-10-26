@@ -136,6 +136,25 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     // A failure before the settings are resolved still keeps to the flags' own limits, and
     // one after keeps to the run's (R08: the cap covers the whole response).
     let flagged = flag_limits(&opts);
+    // `--profile add Dev ...` for `profile add Dev ...`: a profile named like a profile
+    // command that the profiles file doesn't have is that typo, whatever follows it.
+    if let Some(name) = opts.profile.as_deref() {
+        let command = ["add", "list", "test", "rm"]
+            .into_iter()
+            .find(|c| c.eq_ignore_ascii_case(name));
+        let saved = config::load().is_ok_and(|c| c.find(name).is_some());
+        if let (Some(command), false) = (command, saved) {
+            return fail_within(
+                Failure::usage(format!(
+                    "--profile {name} picks a saved profile named {name}, and there is none; \
+                     to manage profiles, leave out the dashes: sqlh profile {command} ..."
+                )),
+                format,
+                flagged,
+                started,
+            );
+        }
+    }
     if opts.write_policy.is_some() || opts.new_password || opts.description.is_some() {
         return fail_within(
             Failure::usage(

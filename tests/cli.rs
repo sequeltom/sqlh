@@ -3366,6 +3366,30 @@ fn profile_list_shows_descriptions_and_searches_them() {
         r.stdout
     );
 
+    // `--profile add Dev ...` for `profile add Dev ...` (found in manual testing, 2026-10-26):
+    // a profile named like a profile command that isn't saved is that typo, named as such.
+    let r = run(sqlh()
+        .args([
+            "--profile",
+            "add",
+            "Dev",
+            "-S",
+            "x",
+            "--description",
+            "d",
+            "-C",
+        ])
+        .env("SQLH_CONFIG", &config));
+    assert_eq!(r.code, 3, "{}", r.stdout);
+    assert!(
+        r.stdout.starts_with(
+            "-- error: --profile add picks a saved profile named add, and there is none; \
+             to manage profiles, leave out the dashes: sqlh profile add ...\n"
+        ),
+        "{}",
+        r.stdout
+    );
+
     // --description is for profile add only; profile add saves it, and refuses one that
     // isn't a single line.
     let r = run(sqlh()
