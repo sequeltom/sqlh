@@ -7,7 +7,7 @@ use std::io::{self, Write};
 
 use super::{
     BatchInfo, Layout, Limits, NAME_CHARS, Output, Section, Summary, Tally, escaped, hex,
-    push_blocked, push_char, push_escaped, push_type,
+    path_as_typed, push_blocked, push_char, push_escaped, push_type,
 };
 use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 
@@ -588,6 +588,17 @@ impl<W: Write> Output for TextSink<W> {
     fn note(&mut self, text: &str) -> io::Result<()> {
         self.flush_affected()?;
         self.write_fitted(&note_layout(text))
+    }
+
+    fn note_with_path(&mut self, text: &str, path: &str) -> io::Result<()> {
+        self.flush_affected()?;
+        let mut layout = Layout::new();
+        layout
+            .text("-- note: ")
+            .part(text)
+            .text(&path_as_typed(path))
+            .text("\n");
+        self.write_fitted(&layout)
     }
 
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()> {

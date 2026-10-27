@@ -314,7 +314,10 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
             )
         })?;
     }
-    let _ = out.note(&format!("saved profile {name} in {}", path.display()));
+    let _ = out.note_with_path(
+        &format!("saved profile {name} in "),
+        &path.display().to_string(),
+    );
     if user.is_some() {
         let how = if kept_password {
             "kept the password stored"
@@ -347,7 +350,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
 fn list(out: &mut Out, search: Option<&str>) -> Result<(usize, usize), Failure> {
     let config = config::load().map_err(Failure::usage)?;
     let path = config::path().map_err(Failure::usage)?;
-    let _ = out.note(&format!("profiles file: {}", path.display()));
+    let _ = out.note_with_path("profiles file: ", &path.display().to_string());
     let needle = search.map(str::to_lowercase);
     let matches = |p: &Profile| match &needle {
         None => true,

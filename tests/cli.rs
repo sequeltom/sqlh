@@ -3313,7 +3313,8 @@ fn profile_list_shows_descriptions_and_searches_them() {
     };
     let note = format!(
         "-- note: profiles file: {}",
-        text_escaped(&config.display().to_string())
+        // As typed, backslashes single (decision 38).
+        config.display()
     );
     let header = "name:text\tdefault:bit\tserver:text\tdatabase:text\tauth:text\tuser:text\t\
                   password:text\twrite_policy:text\tlock_timeout:int\tread_uncommitted:bit\t\

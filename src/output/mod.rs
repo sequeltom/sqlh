@@ -248,6 +248,13 @@ pub trait Output: BatchSink {
     /// A note about the run. Shortened (`…[+N]`) to fit what is left of `--max-output`, or
     /// counted as withheld when not even that fits.
     fn note(&mut self, text: &str) -> io::Result<()>;
+    /// A note that ends with a path, which the text format writes as typed: its backslashes
+    /// aren't doubled (owner decision 38, DESIGN.md §5.1). Only the profile commands write
+    /// one: they are setup a person runs, and nothing decodes the path. The other formats
+    /// write it as any note.
+    fn note_with_path(&mut self, text: &str, path: &str) -> io::Result<()> {
+        self.note(&format!("{text}{path}"))
+    }
     /// The read-only guard refused the input; nothing ran. `advice` says how to get past it.
     /// Shortened to fit like a note, in its variable parts first.
     fn blocked(&mut self, location: &str, reason: &str, advice: &str) -> io::Result<()>;
@@ -1369,6 +1376,21 @@ pub fn push_escaped(out: &mut String, s: &str, max: usize) -> bool {
     cut_count > 0
 }
 
+/// `path` for a person to read and copy: escaped as `escaped` does, except that a backslash
+/// stays single (`Output::note_with_path`). A control character or line break in it is still
+/// escaped, so it can't start a line.
+pub fn path_as_typed(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        if ch == '\\' {
+            out.push(ch);
+        } else {
+            push_char(&mut out, ch);
+        }
+    }
+    out
+}
+
 /// Appends one character in the text format's escaping (see `push_escaped`).
 pub fn push_char(out: &mut String, ch: char) {
     match ch {
@@ -1404,6 +1426,24 @@ mod tests {
         );
         assert_eq!(escaped("héllo wörld", 5), ("héllo…[+6]".into(), true));
         assert_eq!(escaped("abc", 3), ("abc".into(), false));
+    }
+
+    // Decision 38: a path in a profile command's note keeps its backslashes, and nothing else
+    // is let through.
+    #[test]
+    fn a_path_as_typed_keeps_its_backslashes_only() {
+        assert_eq!(
+            path_as_typed(r"C:\Users\tom\AppData\Roaming\sqlh\profiles.toml"),
+            r"C:\Users\tom\AppData\Roaming\sqlh\profiles.toml"
+        );
+        assert_eq!(
+            path_as_typed(r"\\server\share\p.toml"),
+            r"\\server\share\p.toml"
+        );
+        assert_eq!(
+            path_as_typed("C:\\a\tb\nc\u{2028}.toml"),
+            "C:\\a\\tb\\nc\\u2028.toml"
+        );
     }
 
     // R06: C1 controls and the two Unicode-only line breaks are escaped, ordinary Unicode
