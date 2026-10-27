@@ -1753,20 +1753,22 @@ mod tests {
             assert!(drain.deadline().is_none() && drain.cause().is_none());
         });
         runtime().block_on(async {
-            // The budget fires first; the deadline after it does not take its place.
-            let soon = Instant::now() + Duration::from_millis(20);
+            // The budget fires first; the deadline after it does not take its place. The two are
+            // far apart: Windows timers fire on a tick of about 15.6 ms, and a loaded runner can
+            // let two that are closer come due in the same tick (CI, 2026-10-27).
+            let soon = Instant::now() + Duration::from_millis(200);
             let mut drain = Drain::new(Some(Duration::from_millis(5)), Some(soon), &run);
             drain.counted_row();
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(drain.cause(), Some(Cause::Budget));
             assert!(drain.fired() && !drain.deadline_fired());
         });
         runtime().block_on(async {
             // The deadline fires first, and a count stopped by it later keeps that cause.
             let soon = Instant::now() + Duration::from_millis(5);
-            let mut drain = Drain::new(Some(Duration::from_millis(30)), Some(soon), &run);
+            let mut drain = Drain::new(Some(Duration::from_millis(200)), Some(soon), &run);
             drain.counted_row();
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(drain.cause(), Some(Cause::Deadline));
             assert!(drain.deadline_fired() && !drain.fired());
         });
