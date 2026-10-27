@@ -43,7 +43,7 @@ pub enum ProfileCommand {
         name: String,
         opts: Box<Opts>,
     },
-    /// `profile list [--search TEXT]`: the profiles whose name or description contains
+    /// `profiles list [--search TEXT]`: the profiles whose name or description contains
     /// `search` (any case), or all of them.
     List {
         search: Option<String>,
@@ -93,16 +93,16 @@ pub struct Opts {
     pub check: bool,
     pub continue_on_error: bool,
     pub verbose: bool,
-    /// Only for `sqlh profile add`.
+    /// Only for `sqlh profiles add`.
     pub write_policy: Option<WritePolicy>,
     pub format: Option<Format>,
-    /// Only for `sqlh profile add`: prompt for a new password even if one is stored.
+    /// Only for `sqlh profiles add`: prompt for a new password even if one is stored.
     pub new_password: bool,
-    /// Only for `sqlh profile add`: the profile's description; `""` removes it.
+    /// Only for `sqlh profiles add`: the profile's description; `""` removes it.
     pub description: Option<String>,
     /// A schema command (`sqlh describe dbo.T`), named by the first positional word.
     pub command: Option<SchemaCommand>,
-    /// Internal (set by `profile test`): print a `-- note:` describing the connection.
+    /// Internal (set by `profiles test`): print a `-- note:` describing the connection.
     pub show_connection: bool,
     /// sqlcmd flags accepted for compatibility but without effect.
     pub ignored: Vec<String>,
@@ -113,7 +113,11 @@ pub fn parse() -> Result<Command, String> {
 }
 
 fn parse_all(args: Vec<OsString>) -> Result<Command, String> {
-    if args.first().is_some_and(|a| a == "profile") {
+    // `profile` is the older spelling of `profiles` (decision 37); scripts still use it.
+    if args
+        .first()
+        .is_some_and(|a| a == "profiles" || a == "profile")
+    {
         return parse_profile(args.into_iter().skip(1).collect());
     }
     if args.first().is_some_and(|a| a == "mcp") {
@@ -195,7 +199,7 @@ fn parse_mcp(mut p: lexopt::Parser) -> Result<Command, String> {
     Ok(Command::Mcp(Box::new(o)))
 }
 
-const PROFILE_USAGE: &str = "usage: sqlh profile add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] | test NAME | rm NAME";
+const PROFILE_USAGE: &str = "usage: sqlh profiles add NAME -S server [-d db] [-U login] [options] | list [--search TEXT] | test NAME | rm NAME";
 
 fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
@@ -225,7 +229,7 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
                 _ => return Err(PROFILE_USAGE.into()),
             };
             if opts.query.is_some() || !opts.inputs.is_empty() || opts.command.is_some() {
-                return Err("profile add takes connection options only, not SQL".into());
+                return Err("profiles add takes connection options only, not SQL".into());
             }
             ProfileCommand::Add { name, opts }
         }
@@ -247,7 +251,7 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     Ok(Command::Profile(command))
 }
 
-/// `profile list`'s one option, `--search TEXT` (PLAN.md 4.2). The list is text only (owner,
+/// `profiles list`'s one option, `--search TEXT` (PLAN.md 4.2). The list is text only (owner,
 /// 2026-10-13): it is setup an agent reads once, and text is the cheapest format to read.
 fn parse_list(mut p: lexopt::Parser) -> Result<ProfileCommand, String> {
     use lexopt::prelude::*;
@@ -257,7 +261,7 @@ fn parse_list(mut p: lexopt::Parser) -> Result<ProfileCommand, String> {
             Long("search") => search = Some(string(p.value())?),
             _ => {
                 return Err(format!(
-                    "profile list takes --search TEXT only (its output is text), not {}; \
+                    "profiles list takes --search TEXT only (its output is text), not {}; \
                      {PROFILE_USAGE}",
                     arg.unexpected()
                 ));
@@ -291,7 +295,7 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Short('U') | Long("user") => o.user = Some(string(p.value())?),
             Short('P') => {
                 let _ = p.value();
-                return Err("-P is refused: a password on the command line leaks into transcripts and process lists. Save a profile (sqlh profile add) or set SQLCMDPASSWORD".into());
+                return Err("-P is refused: a password on the command line leaks into transcripts and process lists. Save a profile (sqlh profiles add) or set SQLCMDPASSWORD".into());
             }
             Short('Q') | Short('q') | Long("query") => set_query(&mut o, string(p.value())?)?,
             Short('i') | Long("input") => o.inputs.push(string(p.value())?),
@@ -398,7 +402,10 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             o.command = Some(command?);
         }
         None if text => return Err("--text only applies to sqlh find".to_owned()),
-        None if words.first().is_some_and(|w| w == "mcp" || w == "profile") => {
+        None if words
+            .first()
+            .is_some_and(|w| w == "mcp" || w == "profiles" || w == "profile") =>
+        {
             // `sqlh --profile x mcp`: the subcommand has to come first, or it would run as SQL.
             return Err(format!(
                 "{} must come first: sqlh {} ...",
@@ -617,7 +624,7 @@ mod tests {
     #[test]
     fn profile_add_takes_the_lock_settings() {
         match parse_args(&[
-            "profile",
+            "profiles",
             "add",
             "dev",
             "-S",
@@ -630,14 +637,14 @@ mod tests {
                 assert_eq!(opts.lock_timeout, Some(0));
                 assert_eq!(opts.read_uncommitted, Some(false));
             }
-            _ => panic!("expected profile add"),
+            _ => panic!("expected profiles add"),
         }
     }
 
     #[test]
     fn profile_commands() {
         match parse_args(&[
-            "profile",
+            "profiles",
             "add",
             "test",
             "-S",
@@ -652,8 +659,13 @@ mod tests {
                 assert_eq!(opts.server.as_deref(), Some("srv"));
                 assert_eq!(opts.write_policy, Some(WritePolicy::Deny));
             }
-            _ => panic!("expected profile add"),
+            _ => panic!("expected profiles add"),
         }
+        assert!(matches!(
+            parse_args(&["profiles", "list"]),
+            Ok(Command::Profile(ProfileCommand::List { search: None }))
+        ));
+        // The older spelling still works (decision 37).
         assert!(matches!(
             parse_args(&["profile", "list"]),
             Ok(Command::Profile(ProfileCommand::List { search: None }))
@@ -662,9 +674,13 @@ mod tests {
             parse_args(&["profile", "test", "dev"]),
             Ok(Command::Profile(ProfileCommand::Test { .. }))
         ));
-        assert!(parse_args(&["profile", "add", "bad.name"]).is_err());
-        assert!(parse_args(&["profile", "add", "x", "-Q", "SELECT 1"]).is_err());
-        assert!(parse_args(&["profile", "test", "dev", "extra"]).is_err());
+        assert!(matches!(
+            parse_args(&["profiles", "test", "dev"]),
+            Ok(Command::Profile(ProfileCommand::Test { .. }))
+        ));
+        assert!(parse_args(&["profiles", "add", "bad.name"]).is_err());
+        assert!(parse_args(&["profiles", "add", "x", "-Q", "SELECT 1"]).is_err());
+        assert!(parse_args(&["profiles", "test", "dev", "extra"]).is_err());
         assert!(parse_args(&["profile"]).is_err());
     }
 
@@ -705,7 +721,7 @@ mod tests {
             (&["tables", "a", "b"][..], "tables takes one pattern"),
             (&["SELECT 1", "SELECT 2"][..], "SQL was already given"),
             (
-                &["profile", "add", "x", "describe", "y"][..],
+                &["profiles", "add", "x", "describe", "y"][..],
                 "connection options only",
             ),
         ] {
@@ -714,12 +730,12 @@ mod tests {
         }
     }
 
-    // PLAN.md 4.1 and 4.2: `profile add` takes --description; `profile list` takes --search,
+    // PLAN.md 4.1 and 4.2: `profiles add` takes --description; `profiles list` takes --search,
     // and nothing else.
     #[test]
     fn profile_descriptions_and_search() {
         match parse_args(&[
-            "profile",
+            "profiles",
             "add",
             "dev",
             "--description",
@@ -728,21 +744,21 @@ mod tests {
             Ok(Command::Profile(ProfileCommand::Add { opts, .. })) => {
                 assert_eq!(opts.description.as_deref(), Some("prod replica, read-only"));
             }
-            _ => panic!("expected profile add"),
+            _ => panic!("expected profiles add"),
         }
         match parse_args(&["profile", "ls", "--search", "Prod"]) {
             Ok(Command::Profile(ProfileCommand::List { search })) => {
                 assert_eq!(search.as_deref(), Some("Prod"));
             }
-            _ => panic!("expected profile list"),
+            _ => panic!("expected profiles list"),
         }
         // The list is text only (owner, 2026-10-13): --format is refused like any other flag.
-        let only = "profile list takes --search TEXT only (its output is text)";
+        let only = "profiles list takes --search TEXT only (its output is text)";
         for (args, wanted) in [
-            (vec!["profile", "list", "-S", "srv"], only),
-            (vec!["profile", "list", "prod"], only),
-            (vec!["profile", "list", "--format", "json"], only),
-            (vec!["profile", "list", "--search"], "missing argument"),
+            (vec!["profiles", "list", "-S", "srv"], only),
+            (vec!["profiles", "list", "prod"], only),
+            (vec!["profiles", "list", "--format", "json"], only),
+            (vec!["profiles", "list", "--search"], "missing argument"),
         ] {
             let error = parse_args(&args).err().expect("refused");
             assert!(error.contains(wanted), "{args:?}: {error}");

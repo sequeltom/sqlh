@@ -1484,7 +1484,7 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
             let hint = match diagnostics.errors.first().map(|e| e.number) {
                 Some(18456) => hints.pick(
                     "check the login and password (SQLCMDPASSWORD), and that the login may use this database",
-                    "check the profile's login and its saved password (sqlh profile add), and that \
+                    "check the profile's login and its saved password (sqlh profiles add), and that \
                      the login may use this database",
                 ),
                 Some(4060) => hints.pick(
@@ -1552,7 +1552,7 @@ fn tls_hint(detail: &str, hints: Hints) -> Option<&'static str> {
     ]) {
         Some(hints.pick(
             "this machine doesn't trust the server's certificate (typical for a self-signed one): \
-             pass -C, or save it in the profile with: sqlh profile add NAME -C",
+             pass -C, or save it in the profile with: sqlh profiles add NAME -C",
             "this machine doesn't trust the server's certificate (typical for a self-signed one): \
              set trust_server_certificate = true in the profile",
         ))

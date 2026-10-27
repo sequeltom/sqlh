@@ -122,7 +122,7 @@ fn install_panic_hook() {
 }
 
 /// Runs SQL and delivers its output: the user's (`sqlh -Q ...`), or a command's own
-/// (`sqlh profile test`), which `origin` tells apart (`QueryOrigin`).
+/// (`sqlh profiles test`), which `origin` tells apart (`QueryOrigin`).
 pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> Exit {
     let format = opts.format.unwrap_or(Format::Text);
     TEXT_ON_STDOUT.store(
@@ -136,7 +136,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     // A failure before the settings are resolved still keeps to the flags' own limits, and
     // one after keeps to the run's (R08: the cap covers the whole response).
     let flagged = flag_limits(&opts);
-    // `--profile add Dev ...` for `profile add Dev ...`: a profile named like a profile
+    // `--profile add Dev ...` for `profiles add Dev ...`: a profile named like a profile
     // command that the profiles file doesn't have is that typo, whatever follows it.
     if let Some(name) = opts.profile.as_deref() {
         let command = ["add", "list", "test", "rm"]
@@ -147,7 +147,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
             return fail_within(
                 Failure::usage(format!(
                     "--profile {name} picks a saved profile named {name}, and there is none; \
-                     to manage profiles, leave out the dashes: sqlh profile {command} ..."
+                     to manage profiles, leave out the dashes: sqlh profiles {command} ..."
                 )),
                 format,
                 flagged,
@@ -158,7 +158,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     if opts.write_policy.is_some() || opts.new_password || opts.description.is_some() {
         return fail_within(
             Failure::usage(
-                "--write-policy, --new-password and --description only apply to sqlh profile add",
+                "--write-policy, --new-password and --description only apply to sqlh profiles add",
             ),
             format,
             flagged,
@@ -312,7 +312,7 @@ fn stdout_output(format: Format, limits: Limits) -> Out {
     output::create(format, Box::new(io::stdout()), limits)
 }
 
-/// Text output on stdout, for commands that have no --format (`sqlh profile ...`), so the
+/// Text output on stdout, for commands that have no --format (`sqlh profiles ...`), so the
 /// panic hook's text status line (`TEXT_ON_STDOUT`, true unless a run says otherwise) is right
 /// for them.
 pub(crate) fn stdout_sink(limits: Limits) -> Out {
@@ -345,7 +345,7 @@ fn flag_limits(opts: &Opts) -> Limits {
     }
 }
 
-/// couldn't be delivered. For commands without a runtime (`sqlh profile ...`).
+/// couldn't be delivered. For commands without a runtime (`sqlh profiles ...`).
 pub(crate) fn finish_ok(out: &mut Out, detail: &str, started: Instant) -> Exit {
     let closing = Closing::ok(detail, started);
     deliver(out, &closing.summary(), closing.exit)
@@ -353,7 +353,7 @@ pub(crate) fn finish_ok(out: &mut Out, detail: &str, started: Instant) -> Exit {
 
 /// Ends the output with the run's status and returns the exit code. The wait for the reader
 /// blocks the thread and nothing can cut it short but its limit, so this is for what runs
-/// without a runtime: early usage errors and `sqlh profile ...`. A run uses `finish_async`.
+/// without a runtime: early usage errors and `sqlh profiles ...`. A run uses `finish_async`.
 pub(crate) fn finish(out: &mut Out, outcome: RunOutcome, started: Instant) -> Exit {
     let closing = Closing::of(outcome, started, output::Advice::Cli);
     deliver(out, &closing.summary(), closing.exit)

@@ -14,11 +14,11 @@ EXAMPLES  (same in cmd.exe, PowerShell and Git Bash)
   Piped non-ASCII must be UTF-8: chcp 65001 (cmd.exe), $OutputEncoding = [Text.Encoding]::UTF8 (PS 5.1)
 
 CONNECTION
-  --profile NAME  use a saved profile (sqlh profile add makes one; env SQLH_PROFILE). Without -S: the default one
+  --profile NAME  use a saved profile (sqlh profiles add makes one; env SQLH_PROFILE). Without -S: the default one
   -S server       host | host\instance | host,port   (env SQLCMDSERVER; default .)
   -d database     (env SQLCMDDBNAME); default: the profile's, else the login's (often master)
   -E              Windows auth (default without -U)  -Ns|-Nm|-No encrypt strict|mandatory (default)|optional
-  -C              trust the server certificate (self-signed servers); profile add NAME -C saves it
+  -C              trust the server certificate (self-signed servers); profiles add NAME -C saves it
   -U login        SQL login (env SQLCMDUSER); password from the profile or SQLCMDPASSWORD; no -P
   -l seconds      login timeout (default 15; 0 = none), one attempt   -K ReadOnly   -M multi-subnet failover
 
@@ -46,9 +46,9 @@ OUTPUT
 SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
   describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
 
-PROFILES  sqlh profile ... saves and manages them; --profile NAME uses one. Passwords stay in Credential Manager
-  sqlh profile add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
-  sqlh profile list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks)
+PROFILES  sqlh profiles ... saves and manages them; --profile NAME uses one. Passwords stay in Credential Manager
+  sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
+  sqlh profiles list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks)
   sqlh mcp --profile NAME [--profile NAME ...]   MCP server on stdio for harnesses: read-only tools
 
 FORMAT

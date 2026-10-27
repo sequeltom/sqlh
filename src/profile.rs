@@ -1,4 +1,4 @@
-//! `sqlh profile add | list | test | rm` (DESIGN.md §8). `add` is the tool's only
+//! `sqlh profiles add | list | test | rm` (DESIGN.md §8). `add` is the tool's only
 //! interactive command: it reads the password with echo off and stores it in Credential
 //! Manager, so agents can use the profile without ever seeing the password.
 
@@ -17,10 +17,10 @@ use crate::run::{QueryOrigin, RunOutcome};
 use crate::secret::Secret;
 use crate::{console, credman, files};
 
-/// Connection facts for `profile test`: the `info` command's query.
+/// Connection facts for `profiles test`: the `info` command's query.
 use crate::schema::INFO_SQL;
 
-/// What `profile add` and `rm` read and change (F12): the profiles file, the stored passwords
+/// What `profiles add` and `rm` read and change (F12): the profiles file, the stored passwords
 /// and the console. A trait so that tests can make any step fail.
 trait Store {
     /// Holds off other sqlh processes' edits of the profiles until the guard is dropped.
@@ -198,7 +198,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
     let server = profile
         .server
         .clone()
-        .ok_or_else(|| Failure::usage("profile add needs -S server"))?;
+        .ok_or_else(|| Failure::usage("profiles add needs -S server"))?;
     // Before the password is asked for or anything is saved: a run with this server would be
     // refused anyway (DESIGN.md §4.2).
     check_server(&server).map_err(|reason| Failure::usage(format!("-S {reason}")))?;
@@ -227,7 +227,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
             } else {
                 if !store.is_console() {
                     return Err(Failure::usage(
-                        "profile add needs to read a password from the console, but stdin is \
+                        "profiles add needs to read a password from the console, but stdin is \
                          not a console. Run it in a terminal; for automation set \
                          SQLCMDPASSWORD instead",
                     ));
@@ -252,7 +252,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
                 (None, None) => {
                     return Err(Failure::usage(format!(
                         "the stored password {target} is gone; nothing was saved. Rerun sqlh \
-                         profile add {name} --new-password"
+                         profiles add {name} --new-password"
                     )));
                 }
             };
@@ -293,7 +293,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
                     Exit::Internal,
                     format!(
                         "saving the profiles file failed: {e}; and putting back the password \
-                         {target} as it was failed too: {undo}; rerun sqlh profile add {name} \
+                         {target} as it was failed too: {undo}; rerun sqlh profiles add {name} \
                          --new-password, or remove it with: cmdkey /delete:{target}"
                     ),
                 ),
@@ -308,7 +308,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
                 Exit::Internal,
                 format!(
                     "saved profile {name}, but deleting its old password {target} from \
-                     Credential Manager failed: {e}; rerun sqlh profile add {name} -E, or remove \
+                     Credential Manager failed: {e}; rerun sqlh profiles add {name} -E, or remove \
                      it with: cmdkey /delete:{target}"
                 ),
             )
@@ -329,7 +329,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
     if new && opts.write_policy.is_none() {
         let _ = out.note(&format!(
             "{name} refuses writes (write_policy deny, the default for a new profile); \
-             sqlh profile add {name} --write-policy flag lets --allow-write through"
+             sqlh profiles add {name} --write-policy flag lets --allow-write through"
         ));
     }
     if became_default {
@@ -448,7 +448,7 @@ fn remove(name: &str, out: &mut Out, store: &dyn Store) -> Result<(), Failure> {
             });
         }
         return Err(Failure::usage(format!(
-            "no profile named {name:?}; see sqlh profile list"
+            "no profile named {name:?}; see sqlh profiles list"
         )));
     }
     store.save(&config).map_err(Failure::usage)?;
@@ -474,7 +474,7 @@ fn delete_password(name: &str, out: &mut Out, store: &dyn Store) -> Result<bool,
         Err(e) => Err(Failure::new(
             Exit::Internal,
             format!(
-                "deleting {target} from Credential Manager failed: {e}; rerun sqlh profile rm \
+                "deleting {target} from Credential Manager failed: {e}; rerun sqlh profiles rm \
                  {name}, or remove it with: cmdkey /delete:{target}"
             ),
         )),
@@ -597,7 +597,7 @@ mod tests {
         fake
     }
 
-    /// The binding `profile add` gives a password stored for `profile`.
+    /// The binding `profiles add` gives a password stored for `profile`.
     fn bound_to(profile: &Profile) -> Binding {
         Binding {
             user: profile.user.clone().unwrap_or_default(),
@@ -713,7 +713,7 @@ mod tests {
             failure
                 .message
                 .starts_with("saved profile dev, but deleting its old password")
-                && failure.message.contains("rerun sqlh profile add dev -E"),
+                && failure.message.contains("rerun sqlh profiles add dev -E"),
             "{}",
             failure.message
         );
@@ -737,7 +737,7 @@ mod tests {
             failure
                 .message
                 .starts_with("removed profile dev, but deleting sqlh:dev")
-                && failure.message.contains("rerun sqlh profile rm dev"),
+                && failure.message.contains("rerun sqlh profiles rm dev"),
             "{}",
             failure.message
         );
@@ -922,7 +922,7 @@ mod tests {
         let message = run(&fake, true).unwrap_err();
         assert!(
             message.contains("was stored for another server")
-                && message.contains("run: sqlh profile add dev"),
+                && message.contains("run: sqlh profiles add dev"),
             "{message}"
         );
 

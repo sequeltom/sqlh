@@ -16,7 +16,7 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 
 **Two parts**
 - **Part 1 (§6), read-only runs and `sqlh mcp`.** Classifier v2's first increment. It needs D2–D9 and none of D1, and can be built before Part 2. It adds no grant switch.
-- **Part 2 (§7), changes.** It adds the deny tier, the kinds, `--allow`, the profile list and the `execute` tool; those (D10–D12, D15) need D1(b) first. Three of its read-side features use no kind and can be built with Part 1, apart from their `--allow` mentions: one literal of dynamic SQL classified under the caller's policy (D13(b)), sqlh-owned per-database execution (D13(d)), and trusted procedure entries in CLI read-only runs and MCP (D14(b)). **Decided (decision 36): no `execute` tool in Phase 6;** Part 2 is CLI only, and column E below describes a later phase.
+- **Part 2 (§7), changes.** It adds the deny tier, the kinds, `--allow`, the profiles list and the `execute` tool; those (D10–D12, D15) need D1(b) first. Three of its read-side features use no kind and can be built with Part 1, apart from their `--allow` mentions: one literal of dynamic SQL classified under the caller's policy (D13(b)), sqlh-owned per-database execution (D13(d)), and trusted procedure entries in CLI read-only runs and MCP (D14(b)). **Decided (decision 36): no `execute` tool in Phase 6;** Part 2 is CLI only, and column E below describes a later phase.
 
 **Decisions** (§9 has the options and trade-offs). Each is recorded in PLAN.md §6, from decision 22 on (D1 is decision 22).
 1. **D1 Shape and names:** grant six kinds per profile and run, and keep `--allow-write` as the blanket switch. **Decided: (b), decision 22.**
@@ -535,7 +535,7 @@ A lexical pass that runs in **every** mode, `--allow-write` and kind grants incl
 - **Per run:** `--allow KIND[,KIND]` lifts exactly the named kinds for that run, and only kinds in the list; an unlisted kind is a usage error (exit 3): `--allow kill: profile P doesn't allow kill (its allow list is maintenance)`. Each run that kills or rebuilds says so on its command line. `--allow` with `--allow-write` is a usage error. Under `write_policy = "allow"`, a run without `--allow` keeps today's behavior (all writes); a run with `--allow K` gets only K.
 - **In `sqlh mcp`:** the read tools ignore the list (decision 16); the `execute` tool offers listed kinds (D15).
 - **The wrapper per kind and the rules for a run without it:** §5.5.
-- **R19 applies:** `sqlh profile add` would gain a way to write the list, and an agent that can run `profile add` unattended can change it, as it can change `write_policy` (DESIGN.md §7). The list is an accident guard like `deny`, not a control over who may change the server. Human-only profile management would be a separate design.
+- **R19 applies:** `sqlh profiles add` would gain a way to write the list, and an agent that can run `profiles add` unattended can change it, as it can change `write_policy` (DESIGN.md §7). The list is an accident guard like `deny`, not a control over who may change the server. Human-only profile management would be a separate design.
 - **Application name:** `sqlh (allow: K,...)` (D9(c)).
 - **`--help`:** held to 62 lines by a test; `--allow` needs a line, and the kinds are named by every refusal that one lifts.
 

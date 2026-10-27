@@ -58,7 +58,7 @@ pub(crate) enum Plan {
 }
 
 /// Where the line about the connection goes: nowhere, to stderr as a diagnostic
-/// (`--verbose`), or into the output as a note (`profile test`).
+/// (`--verbose`), or into the output as a note (`profiles test`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Report {
     Off,
@@ -209,7 +209,7 @@ impl RunPolicy {
 pub(crate) enum QueryOrigin {
     /// The user's: `-Q`, `-i` or stdin. `$(var)` is substituted and the guard checks it.
     User,
-    /// sqlh's own, written for a command (`sqlh profile test`, and Phase 4's schema
+    /// sqlh's own, written for a command (`sqlh profiles test`, and Phase 4's schema
     /// commands): taken as it is, with no `$(var)` and no guard, since sqlh knows what it
     /// wrote. It always runs as a read-only run, inside the wrapper transaction, even under a
     /// profile that allows writes (`RunPolicy::of`), so a mistake in it can't write.
@@ -777,7 +777,7 @@ async fn run_session(
     started: Instant,
 ) -> Result<Stats, Failure> {
     let timeout = settings.query_timeout;
-    // --verbose and `profile test` say where the time to the first batch went (PLAN.md 2.1).
+    // --verbose and `profiles test` say where the time to the first batch went (PLAN.md 2.1).
     let report = prepared.report != Report::Off;
     let connect_started = Instant::now();
     if report {

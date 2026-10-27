@@ -1,4 +1,4 @@
-//! How long each step of a connect took, for `--verbose` and `profile test` (PLAN.md 2.1):
+//! How long each step of a connect took, for `--verbose` and `profiles test` (PLAN.md 2.1):
 //! the TCP connection, the prelogin reply, the TLS handshake and the login, taken from the
 //! driver's own log events. They arrive through the `log` bridge of the driver's `tracing`.
 //!

@@ -12,7 +12,7 @@ use crate::error::{Exit, Failure};
 use crate::output::{Advice, Limits, Section};
 use crate::run::{Found, Input, Plan, Report, Step};
 
-/// The `profile test` and `info` query. Runs on SQL Server 2012+ and Azure SQL DB without extra
+/// The `profiles test` and `info` query. Runs on SQL Server 2012+ and Azure SQL DB without extra
 /// permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a client-side
 /// fact, printed as a note with the connection line.
 pub const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
@@ -108,7 +108,7 @@ impl Command {
         }
     }
 
-    /// The line about the connection: `info` prints it as a note, like `profile test`.
+    /// The line about the connection: `info` prints it as a note, like `profiles test`.
     pub fn report(&self) -> Report {
         match self {
             Command::Info => Report::Note,

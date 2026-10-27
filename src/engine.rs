@@ -1673,7 +1673,7 @@ mod tests {
             format!(
                 "-- error: cannot connect to {} (SQL login 'fake', encrypt optional): Login failed \
                  for user 'fake'. (error 18456, severity 14); check the profile's login and its \
-                 saved password (sqlh profile add), and that the login may use this database\n\
+                 saved password (sqlh profiles add), and that the login may use this database\n\
                  -- failed (exit 2): connection failed, N ms\n",
                 fake.server
             )

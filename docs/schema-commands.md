@@ -31,7 +31,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 
 | Command | Answers |
 |---|---|
-| `sqlh info` | Server, version, edition, database, login, user, transport, auth scheme, server time; encryption as a note. Same as `profile test`. |
+| `sqlh info` | Server, version, edition, database, login, user, transport, auth scheme, server time; encryption as a note. Same as `profiles test`. |
 | `sqlh dbs` | The databases this login can see, with state and access. |
 | `sqlh tables [pattern]` | Tables and views with estimated rows. |
 | `sqlh describe <object>` | Everything needed to query a table or view, or call a procedure or function. |
@@ -110,7 +110,7 @@ Alias types (`CREATE TYPE Phone FROM varchar(20)`) show their alias name; `descr
 
 ### 6.1 `info`
 
-The `profile test` query already in `src/profile.rs`, moved to `src/schema.rs`, with encryption printed as a note.
+The `profiles test` query already in `src/profile.rs`, moved to `src/schema.rs`, with encryption printed as a note.
 
 ### 6.2 `dbs`
 

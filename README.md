@@ -29,7 +29,7 @@ Releases will be built by GitHub Actions: a signed `sqlh.exe` in a zip with this
 Save a connection once. The password is asked for with echo off and stored in Windows Credential Manager:
 
 ```powershell
-sqlh profile add dev -S myserver -d AppDb -U agent_reader
+sqlh profiles add dev -S myserver -d AppDb -U agent_reader
 ```
 
 Then query:
@@ -70,14 +70,14 @@ The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mc
 A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line.
 
 ```powershell
-sqlh profile add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"
-sqlh profile add local -S . -d AppDb                 # no -U: Windows authentication
-sqlh profile list                                    # every profile; --search TEXT narrows it
-sqlh profile test dev                                # connects once and reports
-sqlh profile rm dev
+sqlh profiles add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"
+sqlh profiles add local -S . -d AppDb                 # no -U: Windows authentication
+sqlh profiles list                                    # every profile; --search TEXT narrows it
+sqlh profiles test dev                                # connects once and reports
+sqlh profiles rm dev
 ```
 
-Without `-U` a profile uses Windows authentication. `profile add` tests the connection as it saves, and the first profile saved becomes the default, used when a run names no server or profile. Running `profile add` again for an existing name updates only the options given. Add `-C` for a server with a self-signed certificate, and `--new-password` to be asked for the password again.
+Without `-U` a profile uses Windows authentication. `profiles add` tests the connection as it saves, and the first profile saved becomes the default, used when a run names no server or profile. Running `profiles add` again for an existing name updates only the options given. Add `-C` for a server with a self-signed certificate, and `--new-password` to be asked for the password again.
 
 ### Queries
 
@@ -106,7 +106,7 @@ sqlh --profile dev dbs                     # databases;  info: the server, versi
 Every run is read-only unless both the profile and the run allow writes. A new profile refuses writes altogether. To allow them, change the profile's policy, then ask for writes on each run:
 
 ```powershell
-sqlh profile add dev --write-policy flag
+sqlh profiles add dev --write-policy flag
 sqlh --profile dev --allow-write -Q "UPDATE dbo.Orders SET Status = 'Closed' WHERE Id = 42"
 ```
 
@@ -154,14 +154,14 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 **Safe to hand to a model**
 - **Read-only by default.** A guard refuses SQL that writes before anything runs, and everything runs in a transaction that is rolled back. This guards against accidents; the database's permissions are the real boundary. *(MVP)*
 - **`--check`.** Compile only: syntax errors and unknown columns, with nothing executed, and the input can't switch the check off. *(MVP; hardened in Phase 1)*
-- **A write policy per profile, and new profiles refuse writes.** `deny` (never), `flag` (needs `--allow-write`) or `allow`; `profile add` makes new profiles `deny`, because an agent in trial 2 added `--allow-write` on its own. Under `deny`, a refusal says the profile doesn't allow writes rather than suggesting a flag that would fail. *(MVP; deny by default and its refusals since Phase 2.16)*
+- **A write policy per profile, and new profiles refuse writes.** `deny` (never), `flag` (needs `--allow-write`) or `allow`; `profiles add` makes new profiles `deny`, because an agent in trial 2 added `--allow-write` on its own. Under `deny`, a refusal says the profile doesn't allow writes rather than suggesting a flag that would fail. *(MVP; deny by default and its refusals since Phase 2.16)*
 - **No secrets in the transcript.** `-P` is rejected. Passwords live in Windows Credential Manager (or `SQLCMDPASSWORD`), and a stored password is only ever sent to its own server and login, so a profile can't be repointed to harvest it. Each stored password remembers the server, login and encryption it was saved for, so a run that meets a profile mid-edit, or one an interrupted edit left behind, refuses rather than send it elsewhere. *(MVP; bound to its profile since Phase 3)*
 - **`-o` can't hurt the input.** It refuses to write onto an input file, however it is spelled, and replaces the destination whole or not at all. *(Phase 1)*
 - **Dirty reads only on request.** `--read-uncommitted` lets a read-only run read past writers' locks without waiting, and the output says the rows may be uncommitted. It is refused when writes are allowed, so no write is ever based on a dirty read. *(Phase 2.8)*
 - **The error log and server settings are readable without writes.** `xp_readerrorlog` and `sp_readerrorlog` (with `sp_enumerrorlogs` to list the logs), `xp_instance_regread`, `xp_fixeddrives`, `xp_msver` and `sp_configure`'s listing are allowed in read-only runs and through MCP, so an agent can read the SQL Server error log during an investigation. Each is allowed by its exact name, so `xp_cmdshell` and registry writes stay blocked, and `sp_configure` with a value is refused with a pointer to `sys.configurations`. Whether the login may run each one stays the server's decision. *(Phase 6, interim step)*
 
 **Never stuck**
-- **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profile add`. *(MVP)*
+- **Never interactive.** No prompts: with nothing to run on a console, it prints usage and exits 3. The one exception is human setup, `sqlh profiles add`. *(MVP)*
 - **Timeouts by default, and real ones.** 60 s per batch and 15 s to log in; sqlcmd's default of none is wrong for agents. sqlh keeps the batch timeout itself, as elapsed time, so a result that streams faster than it is read, a huge value or thousands of tiny results can't outrun it. *(MVP; elapsed time since the Phase 2 review)*
 - **The read-only check can't hang.** Deeply nested or machine-generated SQL is classified in milliseconds, or refused before connecting with what to do (simplify it, split it with `GO`, or `--allow-write` if writes are meant). *(Phase 2 review)*
 - **A blocked query fails fast, and production work comes first.** Every session gives up on a lock after 10 s (error 1222; `--lock-timeout` changes it) and is the one chosen when it deadlocks with ordinary work, so an agent gets a clear error instead of waiting out the query timeout, and a deadlock costs the agent's query, not the application's. *(Phase 2.8)*
@@ -179,7 +179,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Works the same in cmd.exe, PowerShell and Git Bash.** The `--help` examples run unchanged in each, and a test runs them. A Git Bash path (`/c/dir/f.sql`) that cmd.exe or PowerShell can't find is answered with the Windows spelling to use, and sqlh leaves the console's code page as it found it. A path from Explorer's "Copy as path" works as is after `-i` or `-o`. *(Phase 2.13)*
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. *(Phase 2.13)*
 - **The same answers as SSMS.** Session `SET` options match SSMS, so plans and filtered-index behavior match what the DBA sees. *(MVP)*
-- **Profiles say what they're for, and can be searched.** Each profile can carry a one-line description (`sqlh profile add dev --description "prod reporting replica, read-only"`), and `sqlh profile list --search reporting` lists the profiles whose name or description matches, so an agent picks the right server in one call. *(Phase 4.1–4.2)*
+- **Profiles say what they're for, and can be searched.** Each profile can carry a one-line description (`sqlh profiles add dev --description "prod reporting replica, read-only"`), and `sqlh profiles list --search reporting` lists the profiles whose name or description matches, so an agent picks the right server in one call. *(Phase 4.1–4.2)*
 - **One exe, no dependencies.** Under 3 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
 - **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, a runaway `$(var)` expansion is refused at 10 MB before it is built, and the read-only guard checks a 10 MB script in under 60 MB whatever it holds, so one careless query can't exhaust the machine the agent runs on. The old `text`, `ntext` and `image` types are the exception: those values are still read whole. *(Phase 2.7; the guard in 2.14)*
 

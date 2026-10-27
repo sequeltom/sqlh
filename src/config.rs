@@ -130,7 +130,7 @@ pub fn check_description(text: &str) -> Result<(), String> {
 pub struct Profile {
     pub name: String,
     /// One line on what the profile is for (PLAN.md 4.1), for picking a profile; `None` when
-    /// not set. Data, never instructions: whoever can run `profile add` can set it.
+    /// not set. Data, never instructions: whoever can run `profiles add` can set it.
     pub description: Option<String>,
     pub server: Option<String>,
     pub database: Option<String>,
@@ -471,7 +471,7 @@ impl From<Failure> for Attempt {
 }
 
 /// Resolves the run's settings. The profiles file and the stored password are read without
-/// the profiles lock; `profile add` stores a password before it saves the file, so a run can
+/// the profiles lock; `profiles add` stores a password before it saves the file, so a run can
 /// read an old profile and the password an edit is storing for a new server or login. That
 /// password doesn't fit the profile (`fits`) and is never sent: the run takes the lock,
 /// which waits for the edit to finish, and reads both again (R20). If they still don't fit,
@@ -494,7 +494,7 @@ pub fn resolve_with(opts: &Opts, sources: &Sources) -> Result<Settings, Failure>
         Err(Attempt::Mismatch(name)) => Err(Failure::usage(format!(
             "profile {name}'s stored password was stored for another server, login or \
              encryption than the profile now has (an edit of it was cut short), so it isn't \
-             sent; run: sqlh profile add {name}"
+             sent; run: sqlh profiles add {name}"
         ))),
     }
 }
@@ -516,7 +516,7 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
         }
     }) {
         Some(name) => Some(config.find(&name).cloned().ok_or_else(|| {
-            Failure::usage(format!("no profile named {name:?}; see sqlh profile list"))
+            Failure::usage(format!("no profile named {name:?}; see sqlh profiles list"))
         })?),
         None => None,
     };
@@ -675,7 +675,7 @@ fn password(
     let password = (sources.var)("SQLCMDPASSWORD").map(Secret::new);
     password.ok_or_else(|| Attempt::Failed(match profile {
             Some(p) if owns(p) => Failure::usage(format!(
-                "no password stored for profile {0}; run: sqlh profile add {0}",
+                "no password stored for profile {0}; run: sqlh profiles add {0}",
                 p.name
             )),
             Some(p) if p.user.is_some() => Failure::usage(format!(
@@ -686,7 +686,7 @@ fn password(
                 p.user.as_deref().unwrap_or("?")
             )),
             _ => Failure::usage(format!(
-                "SQL login {user} needs a password: save a profile (sqlh profile add NAME -S server -U {user}) or set SQLCMDPASSWORD"
+                "SQL login {user} needs a password: save a profile (sqlh profiles add NAME -S server -U {user}) or set SQLCMDPASSWORD"
             )),
         }))
 }
@@ -848,7 +848,7 @@ fn parse(text: &str) -> Result<Config, String> {
 fn render(config: &Config) -> String {
     let mut out = String::from(
         "# sqlh connection profiles. Passwords are not stored here: they are in Windows\n\
-         # Credential Manager as \"sqlh:<profile>\". `sqlh profile add` rewrites this file.\n",
+         # Credential Manager as \"sqlh:<profile>\". `sqlh profiles add` rewrites this file.\n",
     );
     if let Some(default) = &config.default {
         let _ = writeln!(out, "default = {}", quote(default));
@@ -1097,7 +1097,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 4.1: what `profile add --description` accepts, typed rather than escaped.
+    // PLAN.md 4.1: what `profiles add --description` accepts, typed rather than escaped.
     #[test]
     fn a_description_is_one_line() {
         assert!(check_description("").is_ok());
@@ -1340,7 +1340,7 @@ mod tests {
             ("removal", remove_dev, dev_gone),
         ];
 
-        /// An edit as `profile add` and `rm` make it: under the lock, load (migrating first
+        /// An edit as `profiles add` and `rm` make it: under the lock, load (migrating first
         /// if that is due), change, save.
         fn edit(new: &Path, old: &Path, change: Change) {
             let _lock = files::lock(new, LOCK_WAIT).unwrap();

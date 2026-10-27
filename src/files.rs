@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// An exclusive hold on `<path>.lock`, for one edit of the file at `path` (F12: `profile add`
+/// An exclusive hold on `<path>.lock`, for one edit of the file at `path` (F12: `profiles add`
 /// and `rm` read, change and write the profiles file, and two at once would lose one's
 /// change). The lock file is opened with no sharing, so a second holder can't open it until
 /// the first one's handle closes, which Windows also does when a holder is killed.

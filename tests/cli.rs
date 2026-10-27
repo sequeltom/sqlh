@@ -799,11 +799,11 @@ fn remote_named_pipes_are_refused_before_anything_connects() {
     ]));
     assert_reached_connect(&r, "a flag replaces the profile's server");
 
-    // `profile add` refuses it too, before it asks for a password or saves anything.
+    // `profiles add` refuses it too, before it asks for a password or saves anything.
     let saved = dir.join("saved.toml");
     let r = run(sqlh()
         .env("SQLH_CONFIG", &saved)
-        .args(["profile", "add", "dev", "-S", "np:db01", "-U", "reader"]));
+        .args(["profiles", "add", "dev", "-S", "np:db01", "-U", "reader"]));
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(
         r.stdout
@@ -2315,8 +2315,8 @@ fn a_git_bash_path_that_is_not_found_names_the_windows_spelling() {
     let config = "/c/sqlh-no-such-dir/profiles.toml";
     let hint = text_escaped(&git_bash_hint(r"C:\sqlh-no-such-dir\profiles.toml"));
     for args in [
-        vec!["profile", "list"],
-        vec!["profile", "rm", "nothing"],
+        vec!["profiles", "list"],
+        vec!["profiles", "rm", "nothing"],
         vec!["--profile", "dev", "-Q", "SELECT 1"],
     ] {
         let r = run(sqlh().env("SQLH_CONFIG", config).args(&args));
@@ -3143,9 +3143,9 @@ fn a_profile_with_a_bad_lock_setting_is_a_usage_error() {
     }
 }
 
-// PLAN.md 2.8: `profile add` saves both settings, a later `add` without them keeps them,
+// PLAN.md 2.8: `profiles add` saves both settings, a later `add` without them keeps them,
 // `--read-uncommitted=false` and `--lock-timeout 0` are values that replace them, and
-// `profile list` shows what a run with each profile gets (10 and 0 when nothing is saved).
+// `profiles list` shows what a run with each profile gets (10 and 0 when nothing is saved).
 // The profile points at a dead address, so the connection test at the end of `add` fails
 // (exit 2) after the profile is saved. Windows auth: no password is asked for or stored.
 #[test]
@@ -3155,7 +3155,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     let profiles = |args: &[&str]| run(sqlh().args(args).env("SQLH_CONFIG", &config));
     let saved = || fs::read_to_string(&config).expect("the profiles file");
     let listed = || {
-        let r = profiles(&["profile", "list"]);
+        let r = profiles(&["profiles", "list"]);
         assert_eq!(r.code, 0, "{}", r.stdout);
         let mut lines = r.stdout.lines().filter(|l| !l.starts_with("-- "));
         let header = lines.next().expect("a header").to_owned();
@@ -3170,7 +3170,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     };
 
     let r = profiles(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-locks",
         "-S",
@@ -3206,7 +3206,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     assert!(rows[0].ends_with("\tdeny\t5\t1\t1\tNULL"), "{}", rows[0]);
 
     // Left out, they stay.
-    let r = profiles(&["profile", "add", "sqlh-ut-locks", "-d", "AppDb"]);
+    let r = profiles(&["profiles", "add", "sqlh-ut-locks", "-d", "AppDb"]);
     assert_eq!(r.code, 2, "{}", r.stdout);
     let file = saved();
     assert!(
@@ -3216,7 +3216,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
 
     // Given, they replace: 0 (no limit) and false are values, not "unset".
     let r = profiles(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-locks",
         "--lock-timeout",
@@ -3237,7 +3237,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
 
     // A profile that never mentioned them shows what its runs get.
     let r = profiles(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-plain",
         "-S",
@@ -3265,7 +3265,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     // The out-of-range value is refused before anything is saved.
     let before = saved();
     let r = profiles(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-locks",
         "--lock-timeout",
@@ -3275,7 +3275,7 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     assert_eq!(saved(), before);
 }
 
-// PLAN.md 4.1 and 4.2: `profile list` shows each profile's description as its last column, in
+// PLAN.md 4.1 and 4.2: `profiles list` shows each profile's description as its last column, in
 // text, and `--search` keeps the profiles whose name or description contains the text, in any
 // case. A hostile description stays one field: its backslash is doubled and the rest, `-- `
 // included, stays inside the row. No match is an empty list, not an error. Windows-auth
@@ -3295,7 +3295,7 @@ fn profile_list_shows_descriptions_and_searches_them() {
     .unwrap();
     let list = |args: &[&str]| {
         run(sqlh()
-            .args(["profile", "list"])
+            .args(["profiles", "list"])
             .args(args)
             .env("SQLH_CONFIG", &config))
     };
@@ -3360,13 +3360,13 @@ fn profile_list_shows_descriptions_and_searches_them() {
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(
         r.stdout
-            .contains("profile list takes --search TEXT only (its output is text)")
+            .contains("profiles list takes --search TEXT only (its output is text)")
             && r.stdout.contains("\n-- failed (exit 3): usage error"),
         "{}",
         r.stdout
     );
 
-    // `--profile add Dev ...` for `profile add Dev ...` (found in manual testing, 2026-10-26):
+    // `--profile add Dev ...` for `profiles add Dev ...` (found in manual testing, 2026-10-26):
     // a profile named like a profile command that isn't saved is that typo, named as such.
     let r = run(sqlh()
         .args([
@@ -3384,13 +3384,13 @@ fn profile_list_shows_descriptions_and_searches_them() {
     assert!(
         r.stdout.starts_with(
             "-- error: --profile add picks a saved profile named add, and there is none; \
-             to manage profiles, leave out the dashes: sqlh profile add ...\n"
+             to manage profiles, leave out the dashes: sqlh profiles add ...\n"
         ),
         "{}",
         r.stdout
     );
 
-    // --description is for profile add only; profile add saves it, and refuses one that
+    // --description is for profiles add only; profiles add saves it, and refuses one that
     // isn't a single line.
     let r = run(sqlh()
         .args(["--description", "x", "-Q", "SELECT 1"])
@@ -3398,14 +3398,14 @@ fn profile_list_shows_descriptions_and_searches_them() {
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(
         r.stdout.contains(
-            "--write-policy, --new-password and --description only apply to sqlh profile add"
+            "--write-policy, --new-password and --description only apply to sqlh profiles add"
         ),
         "{}",
         r.stdout
     );
     let r = run(sqlh()
         .args([
-            "profile",
+            "profiles",
             "add",
             "sqlh-ut-b",
             "--description",
@@ -3425,7 +3425,13 @@ fn profile_list_shows_descriptions_and_searches_them() {
         "{saved}"
     );
     let r = run(sqlh()
-        .args(["profile", "add", "sqlh-ut-b", "--description", "two\tlines"])
+        .args([
+            "profiles",
+            "add",
+            "sqlh-ut-b",
+            "--description",
+            "two\tlines",
+        ])
         .env("SQLH_CONFIG", &config));
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(
@@ -3458,7 +3464,7 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
 
     // New, with nothing said: deny, and the note says how to change it.
     let r = with(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-deny",
         "-S",
@@ -3474,7 +3480,7 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
     assert!(
         r.stdout.contains(
             "-- note: sqlh-ut-deny refuses writes (write_policy deny, the default for a new \
-             profile); sqlh profile add sqlh-ut-deny --write-policy flag lets --allow-write \
+             profile); sqlh profiles add sqlh-ut-deny --write-policy flag lets --allow-write \
              through\n"
         ),
         "{}",
@@ -3512,7 +3518,7 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
 
     // New, with the policy given: that policy, no note, and the advice offers the flag.
     let r = with(&[
-        "profile",
+        "profiles",
         "add",
         "sqlh-ut-flag",
         "-S",
@@ -3535,7 +3541,7 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
     );
 
     // Updated without the option: it keeps its policy, and nothing is said about it.
-    let r = with(&["profile", "add", "sqlh-ut-flag", "-d", "AppDb"]);
+    let r = with(&["profiles", "add", "sqlh-ut-flag", "-d", "AppDb"]);
     assert_eq!(r.code, 2, "{}", r.stdout);
     assert!(!r.stdout.contains("refuses writes"), "{}", r.stdout);
     assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
@@ -3557,7 +3563,7 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
         command
             .env_remove("SQLH_CONFIG")
             .env("APPDATA", &appdata)
-            .args(["profile", "list"]);
+            .args(["profiles", "list"]);
         run(&mut command)
     };
 
@@ -3597,7 +3603,7 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     command
         .env("SQLH_CONFIG", &config)
         .env("APPDATA", &elsewhere)
-        .args(["profile", "list"]);
+        .args(["profiles", "list"]);
     let r = run(&mut command);
     assert_eq!(r.code, 0, "{}", r.stdout);
     assert!(config.exists() && !elsewhere.join("sqlh").exists());
