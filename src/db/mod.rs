@@ -671,7 +671,11 @@ impl Session {
             server_certificate: None,
         };
         // One attempt, no retries: the driver would retry a refused connection after 10 s,
-        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner.
+        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner. A count
+        // of 0 also keeps idle connection resiliency off: the driver asks the server for
+        // session recovery only when it is above 0, so it never logs in again behind sqlh's
+        // back, and the engine's one retry on a new connection is the only reconnect (owner
+        // decision 41; docs/notes/driver-0.3.0.md §2).
         context.connect_retry_count = 0;
         // Each TCP connect attempt gets -l seconds and the whole login one more, so an
         // unreachable address fails at TCP (exit 2) and a server that takes the connection
@@ -690,13 +694,17 @@ impl Session {
         } else {
             ApplicationIntent::ReadWrite
         };
-        context.multi_subnet_failover = options.multi_subnet_failover;
+        // Always explicit (owner decision 40): mssql-tds 0.3.0's `None` takes the driver's own
+        // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
+        // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
+        // keeps sqlcmd's rule: one address after another unless -M.
+        context.multi_subnet_failover = Some(options.multi_subnet_failover);
 
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
         let connecting = provider.create_client(context, &source, Some(&cancel.handle));
-        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 wraps
-        // the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
+        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 and 0.3.0
+        // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
         // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
         // a login that never finished leaves nothing to clean up. Only a blocking call, such as
@@ -707,6 +715,14 @@ impl Session {
                 return Err(DbError::Cancelled("cancelled while connecting".into()));
             }
         };
+        // Decision 41's guard: session recovery stays off, so a broken connection is reported,
+        // never silently replaced. A driver that negotiated it anyway would hide a login from
+        // the engine's accounting, so the connect fails instead.
+        if client.is_session_recovery_enabled() {
+            return Err(DbError::Protocol(
+                "the driver negotiated session recovery, which sqlh keeps off".into(),
+            ));
+        }
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
         client.take_info_messages();
         Ok(Session {
@@ -3185,6 +3201,159 @@ pub(crate) mod fake_server {
                 Some(8)
             );
         });
+    }
+
+    /// The FeatureExt ids a LOGIN7 payload asks for (MS-TDS 2.2.6.4). The OffsetLength block's
+    /// ibExtension (bytes 56..58) points at a DWORD holding the FeatureExt block's offset; the
+    /// block is `id u8 | data length u32 LE | data`, repeated, ended by 0xFF.
+    fn login_features(login: &[u8]) -> Vec<u8> {
+        let at = |i: usize, n: usize| login.get(i..i + n);
+        let Some(&[a, b]) = at(56, 2) else {
+            return Vec::new();
+        };
+        let Some(&[c, d, e, f]) = at(usize::from(u16::from_le_bytes([a, b])), 4) else {
+            return Vec::new();
+        };
+        let mut i = u32::from_le_bytes([c, d, e, f]) as usize;
+        let mut ids = Vec::new();
+        while let Some(&[id]) = at(i, 1) {
+            if id == 0xff {
+                break;
+            }
+            let Some(&[g, h, j, k]) = at(i + 1, 4) else {
+                break;
+            };
+            ids.push(id);
+            i += 5 + u32::from_le_bytes([g, h, j, k]) as usize;
+        }
+        ids
+    }
+
+    /// LOGINACK alone (the first token of `login_reply`), for login replies built by hand.
+    fn login_ack() -> Vec<u8> {
+        let reply = login_reply();
+        let length = usize::from(u16::from_le_bytes([reply[1], reply[2]]));
+        reply[..3 + length].to_vec()
+    }
+
+    /// ENVCHANGE Routing (subtype 20, MS-TDS 2.2.7.9): `E3 | length u16 LE | 20 | routing data
+    /// length u16 LE | protocol 0 (TCP) | port u16 LE | server US_VARCHAR | old value, u16 0`.
+    fn env_routing(port: u16, server: &str) -> Vec<u8> {
+        let name: Vec<u8> = server.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let chars = u16::try_from(server.encode_utf16().count()).unwrap();
+        let mut data = vec![0];
+        data.extend(port.to_le_bytes());
+        data.extend(chars.to_le_bytes());
+        data.extend(name);
+        let data_length = u16::try_from(data.len()).unwrap();
+        let mut value = vec![20];
+        value.extend(data_length.to_le_bytes());
+        value.extend(data);
+        value.extend([0, 0]);
+        let mut token = vec![0xe3];
+        token.extend(u16::try_from(value.len()).unwrap().to_le_bytes());
+        token.extend(value);
+        token
+    }
+
+    /// A one-connection fake that answers the prelogin, keeps the LOGIN7's payload, answers it
+    /// with `reply`, then reads until the client goes. The payload is `None` until a LOGIN7
+    /// has arrived.
+    fn serve_login(reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(None));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            if receive(&mut s) != Some(0x12) || write_packet(&mut s, &PRELOGIN_REPLY, true).is_err()
+            {
+                return;
+            }
+            let Some(login) = receive_message(&mut s).filter(|m| m.kind == 0x10) else {
+                return;
+            };
+            *kept.lock().unwrap() = Some(login.payload);
+            if write_packet(&mut s, &reply, true).is_ok() {
+                while receive(&mut s).is_some() {}
+            }
+        });
+        (port, seen)
+    }
+
+    fn connect(server: String) -> Result<Session, DbError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Session::connect(&options(server), &Cancel::new()))
+    }
+
+    // Owner decisions 40 and 41 (docs/notes/driver-0.3.0.md): the login never asks for session
+    // recovery (FeatureExt 0x01), so the driver can't log in again behind sqlh's back, and
+    // multi-subnet failover is set by sqlh itself (off without -M), never the driver's default.
+    // The login does ask for DNS caching (0x0B) and Enhanced Routing (0x0F), which mssql-tds
+    // 0.3.0 always advertises (decisions 42 and 43).
+    #[test]
+    fn the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own() {
+        let (port, seen) = serve_login(login_reply());
+        let session = connect(format!("127.0.0.1,{port}")).expect("connected");
+        assert!(!session.client.is_session_recovery_enabled());
+        let policy = session
+            .client
+            .multi_subnet_failover_policy()
+            .expect("a resolved policy");
+        assert!(!policy.enabled);
+        assert!(matches!(
+            policy.source,
+            mssql_tds::connection::multi_subnet_failover::MultiSubnetFailoverSource::Connection
+        ));
+        let login = seen.lock().unwrap().clone().expect("a LOGIN7");
+        let features = login_features(&login);
+        assert!(!features.contains(&0x01), "{features:02x?}");
+        assert!(
+            features.contains(&0x0b) && features.contains(&0x0f),
+            "{features:02x?}"
+        );
+    }
+
+    // Decision 43: a route (ENVCHANGE 20) after LOGINACK takes the login, with the same
+    // credentials, to the server it names, as it did in 0.2.0; one before LOGINACK is refused
+    // (mssql-tds 0.3.0, [MS-TDS] 2.2.7.9) and no second login is sent. These pin the driver's
+    // behaviour, so a later version that changes it fails here.
+    #[test]
+    fn a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused() {
+        let (target, routed) = serve_login(login_reply());
+        let mut reply = login_ack();
+        reply.extend(env_routing(target, "127.0.0.1"));
+        reply.extend(done(0));
+        let (gateway, _) = serve_login(reply);
+        connect(format!("127.0.0.1,{gateway}")).expect("routed and connected");
+        let login = routed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the login reached the route");
+        assert!(!login_features(&login).is_empty());
+
+        let (target, routed) = serve_login(login_reply());
+        let mut reply = env_routing(target, "127.0.0.1");
+        reply.extend(login_ack());
+        reply.extend(done(0));
+        let (gateway, _) = serve_login(reply);
+        let refused = connect(format!("127.0.0.1,{gateway}"));
+        assert!(
+            matches!(refused, Err(DbError::Connect(_))),
+            "{:?}",
+            refused.err()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            routed.lock().unwrap().is_none(),
+            "no login after a refused route"
+        );
     }
 }
 

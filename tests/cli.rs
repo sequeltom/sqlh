@@ -40,6 +40,8 @@ fn isolated(command: &mut Command) -> &mut Command {
         "SQLCMDDBNAME",
         "SQLCMDUSER",
         "SQLCMDPASSWORD",
+        // mssql-tds 0.3.0 reads it for its failover default, which sqlh never uses (decision 40).
+        "MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT",
     ] {
         command.env_remove(var);
     }
@@ -693,6 +695,32 @@ fn connect_failures_end_the_same_way_every_time() {
         )),
         "{stdout}"
     );
+}
+
+// Decision 40: mssql-tds 0.3.0 takes its multi-subnet failover default from
+// MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT when a connection doesn't set it; sqlh always sets it, so
+// neither "true" (parallel connects) nor a value the driver can't read (which would fail every
+// connect that inherits it) changes a refused connect: one attempt, exit 2, the same text.
+#[test]
+fn the_drivers_failover_default_variable_changes_nothing() {
+    for value in ["true", "garbage"] {
+        let r = run(sqlh()
+            .env("MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT", value)
+            .args(["-S", "127.0.0.1,1", "-Q", "SELECT 1"]));
+        assert_eq!(r.code, 2, "{value}: {}", r.stdout);
+        assert!(
+            r.stdout
+                .starts_with("-- error: cannot connect to 127.0.0.1,1 "),
+            "{value}: {}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("parallel"), "{value}: {}", r.stdout);
+        assert!(
+            !r.stdout.contains("MultiSubnetFailover"),
+            "{value}: {}",
+            r.stdout
+        );
+    }
 }
 
 // PLAN.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with exit 6.
@@ -10046,6 +10074,34 @@ mod live {
             !denied.stdout.contains(&reader.password) && !denied.stderr.contains(&reader.password),
             "the password never appears in the output"
         );
+    }
+
+    // mssql-tds 0.3.0 (docs/notes/driver-0.3.0.md §3): an empty image is 0x, as DESIGN.md §5.1
+    // says, and only a NULL one is NULL; 0.2.0 decoded both as NULL. Checked on the plain row
+    // path and on the column cursor, which a max column puts the result on, in every format.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn an_empty_image_is_0x_and_only_a_null_one_is_null() {
+        let (p, db) = target();
+        let plain = "SELECT CAST(0x AS image) AS e, CAST(NULL AS image) AS n";
+        let cursor = "SELECT CAST(0x AS image) AS e, CAST(NULL AS image) AS n, \
+                      CAST('x' AS varchar(max)) AS m";
+        let r = live(&p, &db, &["-Q", plain]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("e:image\tn:image\n0x\tNULL\n"),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["-Q", cursor]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.contains("\n0x\tNULL\tx\n"), "{}", r.stdout);
+        let r = live(&p, &db, &["--format", "json", "-Q", plain]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.contains(r#""rows":[["0x",null]]"#), "{}", r.stdout);
+        let r = live(&p, &db, &["--format", "csv", "-Q", plain]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.starts_with("e,n\n0x,\n"), "{}", r.stdout);
     }
 
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
