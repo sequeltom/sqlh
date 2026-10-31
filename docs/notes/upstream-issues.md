@@ -15,12 +15,12 @@ Each entry says what was read or observed, in which version, why it matters to s
 - **sqlh's workaround:** remote Named Pipes are refused before connecting (exit 3, with the TCP spelling), and an IPv6 address without a port is sent with port 1433, so the driver uses TCP (DESIGN.md §4, `-S`).
 - **Possible fix:** run the first open on a blocking thread too and bound it by the connect timeout (the open itself can't be cancelled, but the runtime and its timers stay free), or leave remote names on TCP unless Named Pipes are asked for.
 
-### U2. `DiscardRowWriter` allocates what it discards
+### U2. A `RowWriter` can't decline a large value
 
 - **Seen in:** 0.2.0, measuring memory (docs/notes/memory.md, PLAN.md 2.7); half fixed in 0.3.0: `drain_rows` now skips (`ColumnPolicy::SkipAll`), but the `RowWriter` contract still can't decline a value, so the workaround stays (driver-0.3.0.md §5).
-- **What:** a `RowWriter` can't decline a PLP value without the decoder allocating its declared length (`value_destination` has no way to say "skip"), so `DiscardRowWriter`, `drain_rows` and every consumer that wants a prefix of a large value pay for all of it.
+- **What:** a `RowWriter` offered a PLP value can only return a destination or `None`, and `None` makes the decoder allocate the value's declared length (`value_destination` has no way to say "skip"), so `DiscardRowWriter` and every consumer that wants a prefix of a large value pay for all of it. In 0.3.0 `drain_rows` no longer does: it reads with `ColumnPolicy::SkipAll` (rewritten for 0.3.0 in review, 2026-10-31).
 - **sqlh's workaround:** large values are read through the column cursor and cut as they arrive (`src/db/stream.rs`); hidden rows use the cursor's skip.
-- **Possible fix:** a skip or a limit in the writer's contract, or `drain_rows` using `ColumnPolicy::SkipAll` as `drain_result_set_rows` does.
+- **Possible fix:** a skip or a limit in `value_destination`'s contract.
 
 ### U3. `text`, `ntext` and `image` have no streaming path
 

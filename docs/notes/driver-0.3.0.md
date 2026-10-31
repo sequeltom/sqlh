@@ -52,7 +52,7 @@
   - A failed routed hop is final.
 - **sqlh:**
   - In both versions a stored password can go to a host the authenticated server names (Always On read-only routing with `-K ReadOnly`, an Azure gateway). DESIGN.md §8's "a stored password is only ever sent to its own server" was literally untrue already.
-  - R20's threat, an agent repointing a profile, is unaffected: only the server sqlh authenticated, inside its TLS session, can route.
+  - R20's threat, an agent repointing a profile, is unaffected: only the server sqlh authenticated, inside its TLS session, can route; under `-C` or optional encryption the route is as unprotected as the login itself (found in review).
   - The status line and `info` read the database and server the client reports after login, so they show the real target.
 - **Step 2:** fake-server tests that pin it, so a later bump shows a change:
   - type 20 after LOGINACK: the LOGIN7 arrives at a second listener;
@@ -197,18 +197,21 @@ On the local branch `driver-0.3.0`, decisions 40–43 taken (PLAN.md §6).
 **Code (`src/db/` only):**
 - `Cargo.toml` pins `=0.3.0`; `Cargo.lock` changes only the `mssql-tds` line.
 - `multi_subnet_failover = Some(options.multi_subnet_failover)` (decision 40).
-- `Session::connect` fails with a protocol error if the client ever reports session recovery negotiated (decision 41's guard).
+- `Session::connect` fails with a protocol error if the client ever reports session recovery negotiated (decision 41's guard). On 0.3.0 it can't fire, since the driver never asks for recovery with a retry count of 0 (the LOGIN7 test below shows it doesn't); it guards a later version.
+- `connect_error`: under `-M`, the driver's "Connection timeout: ..." from its race of every address is a connect failure, exit 2, `no address accepted a TCP connection within N s (-M tries them all at once)`; it had come out as a missed login deadline, exit 4, naming `-l` + 1 s (found in review, below).
 - Comments: `connect_retry_count = 0` also keeps idle connection resiliency off; `run_until_cancelled` holds in 0.3.0; `db::phases`' texts are 0.3.0's.
-- Exe: 2,894,848 bytes, 250,880 bytes under the 3 MB budget (the trial build measured the driver's own share: +80,896 bytes over 0.2.0 on the same tree, §Summary); the same ten in-box DLLs.
+- Exe: 2,895,360 bytes after the review's fixes, 250,368 bytes under the 3 MB budget (the trial build measured the driver's own share: +80,896 bytes over 0.2.0 on the same tree, §Summary); the same ten in-box DLLs.
 
 **New tests:**
 - `db::fake_server::the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own` reads the LOGIN7's FeatureExt list: no 0x01 (session recovery), 0x0B and 0x0F present; the resolved failover policy is off, from the connection.
-- `db::fake_server::a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused` pins routing (decision 43): an ENVCHANGE 20 after LOGINACK takes the login to the named server; one before it fails the connect, and no second login is sent.
-- `the_drivers_failover_default_variable_changes_nothing` (process test): `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage` leave a refused connect at exit 2 with the sequential text. The variable is scrubbed from every process test (`isolated`).
-- `live::an_empty_image_is_0x_and_only_a_null_one_is_null`: text, json and csv, on the plain row path and on the cursor.
+- `db::fake_server::a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused` pins routing (decision 43): an ENVCHANGE 20 after LOGINACK takes the login to the named server; one before it is refused (`routing ENVCHANGE before LOGINACK`), and so is an Enhanced Routing one, type 21 with a database, that the login didn't acknowledge (`without an Enhanced Routing feature acknowledgement`); a refused route sends no second login. Each refused reply is otherwise a whole login, so a driver that ignored the route would connect and the test fail.
+- `db::tests::a_failover_race_that_times_out_is_a_connect_failure`: the `-M` timeout's wording and exit code, and that the login deadline's keeps its own.
+- `the_drivers_failover_default_variable_changes_nothing` (process test): `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage` leave a refused connect at exit 2 with the sequential refusal itself (`os error 10061`) and none of the driver's own refusal of a bad value (`Usage Error`, the variable's name). The variable is scrubbed from every process test (`isolated`).
+- `ctrl_break_cancels_a_connect` now runs with and without `-M`: exit 6 within 2 s either way.
+- `live::an_empty_image_is_0x_and_only_a_null_one_is_null`: text, json and csv, each on the plain row path and on the cursor.
 - `live::mcp_tools::a_pooled_connection_killed_between_calls_is_replaced_by_the_engines_retry`: `KILL` of the pooled session from another session between calls; the next call reports a connect time and runs on a new connection (`sys.dm_exec_connections.connection_id`). **Found while writing it:** a connection reset gives the session a new `login_time` in `sys.dm_exec_sessions`, so login time can't tell a reused session from a new one; the connection id can.
 
-**Checks:** `scripts/check.ps1 -Live` passes on 0.3.0: 381 unit tests, 95 debug and 89 release process tests, 59 debug and 53 release live tests (the smoke goldens unchanged, `live::mcp_tools`, the `-t 1` timing, lock-timeout, deadlock, Ctrl+Break and harness-kill tests, the memory tests' bounds). `db::spike::spike_reset` passes all seven sections.
+**Checks:** `scripts/check.ps1 -Live` passes on 0.3.0, on the branch with the review's fixes: 382 unit tests, 95 debug and 89 release process tests, 60 debug and 54 release live tests (the smoke goldens unchanged, `live::mcp_tools`, the `-t 1` timing, lock-timeout, deadlock, Ctrl+Break and harness-kill tests, the memory tests' bounds). `db::spike::spike_reset` passes all seven sections.
 
 **Re-measured** (release build, the test server, 2026-10-31):
 
@@ -220,7 +223,7 @@ On the local branch `driver-0.3.0`, decisions 40–43 taken (PLAN.md §6).
 | `-S 2001:db8::5 -l 2` | about 2.05 s | 2.12 s, exit 2 |
 | `-S np:192.0.2.1` | exit 3 | exit 3, 98 ms |
 | the same under `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` / `=garbage` | — | unchanged (exit 2 at 2.13 s; exit 4 at 3.11 s) |
-| `-M -S 192.0.2.1 -l 2` | — | exit 4 at 2.10 s (the login deadline) |
+| `-M -S 192.0.2.1 -l 2` | — | first exit 4 at 2.10 s, worded as a missed login deadline of 3 s although the race had ended at `-l`; since the review's fix, exit 2 at 2.0 s, `no address accepted a TCP connection within 2 s (-M tries them all at once)` |
 | `-M -S localhost,1`; `-M -S 127.0.0.1,1` | — | exit 2 at 2.13 s, "All parallel connection attempts failed" |
 | `-M -S host\INST` (no port) | — | exit 2 at once, "Usage Error: MultiSubnetFailover requires an explicit TCP port for a named instance" |
 | a failed SQL login (a login that doesn't exist) | error 18456 and its hint, exit 2 | the same |
@@ -228,5 +231,13 @@ On the local branch `driver-0.3.0`, decisions 40–43 taken (PLAN.md §6).
 | peak working set: 1 GiB `varchar(max)`; 100 MiB; 20 rows of 50 MB (`--max-rows 1 --exact-count`) | 10.3 MB (19.4 s); 9.7 MB; 9.7 MB (15.8 s) | 10.4 MB (18.8 s); 10.4 MB (2.1 s); 10.4 MB (15.3 s) |
 
 So connect bounds, exit codes, texts, latency and memory are 0.2.0's; `-M`'s rows are new and are in DESIGN.md §4.
+
+**Review (2026-10-31, internal: three lenses over `main..driver-0.3.0`, a verifier per finding; not the external reviewer):** 13 findings confirmed, 4 rejected, all fixed:
+- **P2, an output defect:** under `-M` a race that timed out was reported as a missed login deadline (exit 4, naming `-l` + 1 s) although it ended at `-l`; now a connect failure worded for it (exit 2), with a unit test, and DESIGN.md §4's `-M` row corrected (it had called the mechanism the login deadline, and called `np:`, LocalDB and the local-name cases measured where they were read from the source; a remote `np:` is sqlh's own exit 3).
+- **P2, a record:** the live counts here were from before the last new test; re-run above.
+- **P3, tests that could pass for the wrong reason:** the refused route (its reply lacked the collation, so any driver failed it), the `garbage` value of the failover variable (the driver's own usage error met every assertion), and the empty `image` (json and csv on one path only). Each now fails for the wrong reason too.
+- **P3, planned and missing:** the Enhanced Routing (type 21) test, Ctrl+Break under `-M`, the session-recovery line in DESIGN.md §7 and mcp-mode.md §5, and the DNS cache in mcp-mode.md §5; all added.
+- **P3, wording:** the routing sentence in DESIGN.md §8 and §1.3 above now says it holds only with a checked certificate (not under `-C` or optional encryption); U2 rewritten for 0.3.0; connect-latency.md's "about 80%", which its own figures didn't support, replaced.
+- **Rejected:** that the guard is dead code (it guards a later version, as stated); that 0.2.0 labels left in comments are wrong (they are history); a MB/MiB nit; and that the KILL test could kill another session (the SPID is the test's own pooled connection's, checked by its connection id).
 
 **Not settled:** whether on-prem SQL Server 2025 acknowledges DNS caching (decision 42). A one-off probe through the driver's `test-util` API, never committed, found the test profile's server named by an IP literal, which the driver never caches, so it couldn't tell; checking with a host name would mean sending the profile's stored password to a spelling other than its own, which R20's binding refuses, so it was not done. Still the likely answer: no, an Azure feature [inferred].

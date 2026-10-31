@@ -1484,6 +1484,25 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     let target = format!("{} ({auth}, encrypt {encrypt})", options.server);
     let (detail, hint) = match &error {
+        // Under -M, mssql-tds 0.3.0's race of every address ends at the TCP limit, -l, with
+        // its own "Connection timeout: ..." (parallel_connect.rs). That is no address
+        // answering, as an unreachable one is without -M (exit 2), not a login that didn't
+        // finish (found in review, 2026-10-31).
+        TdsError::TimeoutError(_)
+            if options.multi_subnet_failover
+                && error.to_string().contains("Connection timeout:") =>
+        {
+            (
+                format!(
+                    "no address accepted a TCP connection within {} s (-M tries them all at once)",
+                    options.login_timeout
+                ),
+                hints.pick(
+                    "check the server name and port, or raise -l",
+                    "check the profile's server and port, or raise its login_timeout",
+                ),
+            )
+        }
         TdsError::TimeoutError(_) => {
             return DbError::Timeout(format!(
                 "login timeout: {target} didn't complete the login within {} s; check that it \
@@ -2128,6 +2147,43 @@ mod tests {
         ] {
             assert!(!hint.contains(" -C") && !hint.contains(" -U"), "{hint}");
         }
+    }
+
+    // Found in review (2026-10-31): under -M, mssql-tds 0.3.0's race of every address ends at
+    // -l with "Connection timeout: ..."; that is no address answering, a connect failure (exit
+    // 2) worded for it, not a login that missed its -l + 1 deadline (exit 4). The same error
+    // without -M, and the login deadline's own error under -M, keep the login wording.
+    #[test]
+    fn a_failover_race_that_times_out_is_a_connect_failure() {
+        let race = || {
+            TdsError::TimeoutError(mssql_tds::error::TimeoutErrorType::String(
+                "Connection timeout: Connection attempt timed out".into(),
+            ))
+        };
+        let mut options = fake_server::options("192.0.2.1".into());
+        options.login_timeout = 2;
+        options.multi_subnet_failover = true;
+        match connect_error(race(), &options) {
+            DbError::Connect(words) => assert_eq!(
+                words,
+                "cannot connect to 192.0.2.1 (SQL login 'fake', encrypt optional): no address \
+                 accepted a TCP connection within 2 s (-M tries them all at once); check the \
+                 server name and port, or raise -l"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let login_deadline = TdsError::TimeoutError(mssql_tds::error::TimeoutErrorType::String(
+            "login timed out".into(),
+        ));
+        assert!(matches!(
+            connect_error(login_deadline, &options),
+            DbError::Timeout(words) if words.contains("didn't complete the login within 3 s")
+        ));
+        options.multi_subnet_failover = false;
+        assert!(matches!(
+            connect_error(race(), &options),
+            DbError::Timeout(_)
+        ));
     }
 }
 
@@ -3239,14 +3295,29 @@ pub(crate) mod fake_server {
     /// ENVCHANGE Routing (subtype 20, MS-TDS 2.2.7.9): `E3 | length u16 LE | 20 | routing data
     /// length u16 LE | protocol 0 (TCP) | port u16 LE | server US_VARCHAR | old value, u16 0`.
     fn env_routing(port: u16, server: &str) -> Vec<u8> {
-        let name: Vec<u8> = server.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let chars = u16::try_from(server.encode_utf16().count()).unwrap();
+        env_route(20, port, server, None)
+    }
+
+    /// A routing ENVCHANGE of `subtype`: 20, or 21, Enhanced Routing, whose routing data also
+    /// names a `database` (a US_VARCHAR after the server; mssql-tds 0.3.0's
+    /// `parse_routing_data`).
+    fn env_route(subtype: u8, port: u16, server: &str, database: Option<&str>) -> Vec<u8> {
+        let us_varchar = |text: &str| {
+            let mut field = u16::try_from(text.encode_utf16().count())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            field.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            field
+        };
         let mut data = vec![0];
         data.extend(port.to_le_bytes());
-        data.extend(chars.to_le_bytes());
-        data.extend(name);
+        data.extend(us_varchar(server));
+        if let Some(database) = database {
+            data.extend(us_varchar(database));
+        }
         let data_length = u16::try_from(data.len()).unwrap();
-        let mut value = vec![20];
+        let mut value = vec![subtype];
         value.extend(data_length.to_le_bytes());
         value.extend(data);
         value.extend([0, 0]);
@@ -3319,40 +3390,67 @@ pub(crate) mod fake_server {
         );
     }
 
+    /// A connect to a gateway whose login reply is `reply`, with a second fake listening as the
+    /// route's target: the connect's outcome, and whether a LOGIN7 reached the target.
+    fn route_through(reply: impl FnOnce(u16) -> Vec<u8>) -> (Result<Session, DbError>, bool) {
+        let (target, routed) = serve_login(login_reply());
+        let (gateway, _) = serve_login(reply(target));
+        let outcome = connect(format!("127.0.0.1,{gateway}"));
+        // A refused route sends nothing more; give a route that was followed time to land.
+        std::thread::sleep(Duration::from_millis(200));
+        let reached = routed.lock().unwrap().is_some();
+        (outcome, reached)
+    }
+
+    /// `login_reply` with `token` placed after its LOGINACK (`after_ack`) or before it: every
+    /// other token a login needs is there, so a driver that ignored the route would connect,
+    /// and a test that expects a refusal fails.
+    fn login_reply_with(token: Vec<u8>, after_ack: bool) -> Vec<u8> {
+        let ack = login_ack();
+        let rest = login_reply()[ack.len()..].to_vec();
+        if after_ack {
+            [ack, token, rest].concat()
+        } else {
+            [token, ack, rest].concat()
+        }
+    }
+
     // Decision 43: a route (ENVCHANGE 20) after LOGINACK takes the login, with the same
     // credentials, to the server it names, as it did in 0.2.0; one before LOGINACK is refused
-    // (mssql-tds 0.3.0, [MS-TDS] 2.2.7.9) and no second login is sent. These pin the driver's
-    // behaviour, so a later version that changes it fails here.
+    // (mssql-tds 0.3.0, [MS-TDS] 2.2.7.9), and so is an Enhanced Routing one (21, which can
+    // also name a database) that the login's FEATUREEXTACK didn't acknowledge. A refused route
+    // sends no second login. Each refused reply is otherwise a whole login, so a driver that
+    // ignored the route would connect: these pin the driver's behaviour, and a later version
+    // that changes it fails here (refusals strengthened in review, 2026-10-31).
     #[test]
     fn a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused() {
-        let (target, routed) = serve_login(login_reply());
-        let mut reply = login_ack();
-        reply.extend(env_routing(target, "127.0.0.1"));
-        reply.extend(done(0));
-        let (gateway, _) = serve_login(reply);
-        connect(format!("127.0.0.1,{gateway}")).expect("routed and connected");
-        let login = routed
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("the login reached the route");
-        assert!(!login_features(&login).is_empty());
+        let (followed, reached) =
+            route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), true));
+        assert!(followed.is_ok(), "{:?}", followed.err());
+        assert!(reached, "the login reached the route");
 
-        let (target, routed) = serve_login(login_reply());
-        let mut reply = env_routing(target, "127.0.0.1");
-        reply.extend(login_ack());
-        reply.extend(done(0));
-        let (gateway, _) = serve_login(reply);
-        let refused = connect(format!("127.0.0.1,{gateway}"));
+        let (early, reached) =
+            route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), false));
         assert!(
-            matches!(refused, Err(DbError::Connect(_))),
+            matches!(&early, Err(DbError::Connect(words))
+                if words.contains("routing ENVCHANGE before LOGINACK")),
             "{:?}",
-            refused.err()
+            early.err()
         );
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reached, "no login after a refused route");
+
+        let (unacknowledged, reached) = route_through(|target| {
+            login_reply_with(env_route(21, target, "127.0.0.1", Some("sales")), true)
+        });
         assert!(
-            routed.lock().unwrap().is_none(),
-            "no login after a refused route"
+            matches!(&unacknowledged, Err(DbError::Connect(words))
+                if words.contains("without an Enhanced Routing feature acknowledgement")),
+            "{:?}",
+            unacknowledged.err()
+        );
+        assert!(
+            !reached,
+            "no login after an unacknowledged Enhanced Routing route"
         );
     }
 }

@@ -715,8 +715,19 @@ fn the_drivers_failover_default_variable_changes_nothing() {
             r.stdout
         );
         assert!(!r.stdout.contains("parallel"), "{value}: {}", r.stdout);
+        // The driver's own refusal of a value it can't read names the variable, as a usage
+        // error, at once: a connect that inherited the default (strengthened in review,
+        // 2026-10-31).
+        for inherited in [
+            "MultiSubnetFailover",
+            "MULTISUBNET_FAILOVER_DEFAULT",
+            "Usage Error",
+        ] {
+            assert!(!r.stdout.contains(inherited), "{value}: {}", r.stdout);
+        }
+        // The sequential refusal itself, by its code: the text is in the system's language.
         assert!(
-            !r.stdout.contains("MultiSubnetFailover"),
+            r.stdout.contains("(os error 10061)"),
             "{value}: {}",
             r.stdout
         );
@@ -724,13 +735,26 @@ fn the_drivers_failover_default_variable_changes_nothing() {
 }
 
 // PLAN.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with exit 6.
+// With -M too, whose connect races every address (mssql-tds 0.3.0; docs/notes/driver-0.3.0.md
+// §7, added in review, 2026-10-31).
 #[cfg(windows)]
 #[test]
 fn ctrl_break_cancels_a_connect() {
+    for failover in [false, true] {
+        ctrl_break_cancels_a_connect_with(failover);
+    }
+}
+
+#[cfg(windows)]
+fn ctrl_break_cancels_a_connect_with(failover: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    let mut command = sqlh();
+    if failover {
+        command.arg("-M");
+    }
     let mut child = spawn_in_group(
-        sqlh()
+        command
             .args(["-S", &server, "-l", "30", "-Q", "SELECT 1"])
             .stdout(Stdio::piped()),
     );
@@ -10096,12 +10120,17 @@ mod live {
         let r = live(&p, &db, &["-Q", cursor]);
         assert_eq!(r.code, 0, "{}", r.stdout);
         assert!(r.stdout.contains("\n0x\tNULL\tx\n"), "{}", r.stdout);
-        let r = live(&p, &db, &["--format", "json", "-Q", plain]);
-        assert_eq!(r.code, 0, "{}", r.stdout);
-        assert!(r.stdout.contains(r#""rows":[["0x",null]]"#), "{}", r.stdout);
-        let r = live(&p, &db, &["--format", "csv", "-Q", plain]);
-        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
-        assert!(r.stdout.starts_with("e,n\n0x,\n"), "{}", r.stdout);
+        for (sql, json_rows, csv) in [
+            (plain, r#""rows":[["0x",null]]"#, "e,n\n0x,\n"),
+            (cursor, r#""rows":[["0x",null,"x"]]"#, "e,n,m\n0x,,x\n"),
+        ] {
+            let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(r.stdout.contains(json_rows), "{}", r.stdout);
+            let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            assert!(r.stdout.starts_with(csv), "{}", r.stdout);
+        }
     }
 
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
