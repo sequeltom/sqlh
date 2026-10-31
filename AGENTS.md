@@ -201,5 +201,5 @@ Driver upgrade: local branch `driver-0.3.0`, `048aa89..7b28076`, externally revi
 MCP client feedback (2026-10-31, docs/notes/mcp-client-feedback.md): built decision 45, which amends decision 6. External review of `157334f..8ae9eff` requests R48 [P2] (multi-result diagnostics/earlier GO settings can still lose output while saying ok) and R49 [P2] (info still applies max_cell while refusing its override). See PLAN.md, R47 and decision 45 external review; the increment is not yet accepted. Independent non-live checks and synthetic MCP/TDS probes passed/reproduced the findings; owner live results were reviewed, not rerun.
 - A capped result in a batch with later statements counts for 5 s so they run (`guard::several_outputs`, `db::LATER_STATEMENTS_BUDGET`).
 - A run that still loses them ends `-- partial:` (exit 0).
-- In MCP: `query` takes `exact_count`, limit descriptions give their defaults, and `info` takes no limits.
+- In MCP: `query` takes `exact_count`, limit descriptions give their defaults, and `info` takes no `max_rows` (but `max_cell`, R49).
 - Planned: `definition` paging, and the dial name, AG role and time zone in `info` (PLAN.md, MCP client feedback).

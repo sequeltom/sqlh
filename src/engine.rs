@@ -2025,4 +2025,110 @@ mod tests {
              -- failed (exit 6): cancelled, N ms; ?/master, connect N ms\n"
         );
     }
+
+    /// One call of `request` on a fake whose `at`th SQL batch is a `Turn::Pause` of `wait`
+    /// (two rows, the wait, then a second result), with `max_rows 1`, so the second row is a
+    /// hidden one whose count runs through the wait.
+    fn paused(request: Request, at: usize, wait: Duration) -> Called {
+        let fake = serve_pool(vec![Conn::new().at(at, Turn::Pause(wait))]);
+        let mut profile = mcp_settings(&fake, 30);
+        profile.limits.max_rows = 1;
+        let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+        block_on(call_with(&engine, request, 30, &Cancel::new()))
+    }
+
+    // R48: an option that adds output (in its own batch or an earlier one) and a DBCC command
+    // give a batch more output than its statements say. A slow result there gets the longer
+    // count, so the output after it arrives, and the run is `ok`; the deterministic case the
+    // reviewer drove the release exe through.
+    #[test]
+    fn output_that_diagnostics_add_after_a_slow_result_arrives() {
+        for (sql, at) in [
+            ("SET STATISTICS XML ON; SELECT 1", 2),
+            ("SET STATISTICS PROFILE ON\nGO\nSELECT 1", 3),
+            ("DBCC SHOW_STATISTICS ('dbo.t', 'ix_t')", 2),
+        ] {
+            let called = paused(request(sql), at, Duration::from_secs(1));
+            assert_eq!(called.exit, Exit::Ok, "{sql}: {}", called.text);
+            assert!(
+                called
+                    .text
+                    .contains("-- 1 of 2 rows shown (max_rows 1)\n-- result 2\n")
+                    && !called.text.contains("counting stopped"),
+                "{sql}: {}",
+                called.text
+            );
+            assert!(
+                called.elapsed >= Duration::from_secs(1),
+                "{sql}: {:?}",
+                called.elapsed
+            );
+        }
+    }
+
+    // R48, the other side: a pause longer than the 5 s count is cut there, and the run says
+    // the rest of the batch didn't run (`partial`, exit 0), never `ok`.
+    #[test]
+    fn a_diagnostic_result_still_cut_after_the_longer_count_is_partial() {
+        let called = paused(
+            request("SET STATISTICS XML ON; SELECT 1"),
+            2,
+            Duration::from_secs(8),
+        );
+        assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+        assert!(
+            called.elapsed >= Duration::from_secs(5) && called.elapsed < Duration::from_secs(8),
+            "{:?}",
+            called.elapsed
+        );
+        assert!(!called.text.contains("-- result 2\n"), "{}", called.text);
+        let text = untimed(&called.text);
+        assert!(
+            text.contains(
+                "-- note: counting stopped in batch 1: the rest of that batch was cancelled, so \
+                 its later statements did not run; put each query in its own batch (GO) to \
+                 keep them; a COUNT_BIG(*) query counts every row, as does exact_count = true\n\
+                 -- partial: 1 batch, counting stopped in 1, the rest of batch 1 not run, N ms"
+            ),
+            "{text}"
+        );
+    }
+
+    // The controls: a plain single query keeps the 250 ms count (its stop cancels nothing it
+    // could show, so the run is `ok` and the note says only that the total is a lower bound),
+    // and `exact_count` waits the pause out.
+    #[test]
+    fn a_plain_query_keeps_the_short_count_and_exact_count_waits() {
+        let called = paused(request("SELECT 1"), 2, Duration::from_secs(1));
+        assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+        assert!(
+            called.elapsed < Duration::from_secs(1),
+            "{:?}",
+            called.elapsed
+        );
+        assert!(
+            called
+                .text
+                .contains("-- note: counting stopped in batch 1, so its total is a lower bound")
+                && called
+                    .text
+                    .contains("\n-- ok: 1 batch, counting stopped in 1, "),
+            "{}",
+            called.text
+        );
+        let exact = Request {
+            exact_count: true,
+            ..request("SELECT 1")
+        };
+        let called = paused(exact, 2, Duration::from_secs(1));
+        assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+        assert!(
+            called
+                .text
+                .contains("-- 1 of 2 rows shown (max_rows 1)\n-- result 2\n")
+                && !called.text.contains("counting stopped"),
+            "{}",
+            called.text
+        );
+    }
 }

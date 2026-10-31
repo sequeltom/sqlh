@@ -55,8 +55,9 @@ struct Tool {
     name: &'static str,
     description: &'static str,
     args: &'static [Arg],
-    /// Whether `max_rows` and `max_cell` mean anything for it (`info` returns one short row).
-    limits: bool,
+    /// Whether `max_rows` means anything for it: `info` returns one row. `max_cell` always
+    /// does, since a profile's or the launch's small limit cuts `info`'s values too (R49).
+    rows: bool,
 }
 
 /// The tools, in `tools/list` order.
@@ -76,7 +77,7 @@ const TOOLS: &[Tool] = &[
             still run; `-- partial:` means some didn't, so put each query in its own GO batch. \
             format json gives the same as one JSON document.",
         args: &[Arg::Sql, Arg::ExactCount],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "check",
@@ -84,21 +85,21 @@ const TOOLS: &[Tool] = &[
             binding errors only. A missing table is reported only when a query runs, because \
             SQL Server defers its name resolution.",
         args: &[Arg::Sql],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "info",
         description: "The server, its version and edition, the database, the login and \
             user, the transport, the auth scheme and the server's time.",
         args: &[],
-        limits: false,
+        rows: false,
     },
     Tool {
         name: "databases",
         description: "The databases on the server, with their state, whether this login \
             can use them, compatibility level, recovery model, read-only flag and collation.",
         args: &[],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "tables",
@@ -106,7 +107,7 @@ const TOOLS: &[Tool] = &[
             or a glob with * and ? (case-insensitive), matched against the name or \
             schema.name.",
         args: &[Arg::OptionalPattern],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "describe",
@@ -115,7 +116,7 @@ const TOOLS: &[Tool] = &[
             triggers, parameters. Works for system views too (sys.dm_exec_requests). Use it \
             before writing queries against unfamiliar tables.",
         args: &[Arg::Object],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "find",
@@ -123,14 +124,14 @@ const TOOLS: &[Tool] = &[
             with * and ?); with in_definitions, also the module bodies that contain it, with \
             the first matching line.",
         args: &[Arg::Pattern, Arg::InDefinitions],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "definition",
         description: "The source of a view, procedure, function or trigger, as a block framed \
             by its line count.",
         args: &[Arg::Object],
-        limits: true,
+        rows: true,
     },
     Tool {
         name: "deps",
@@ -138,7 +139,7 @@ const TOOLS: &[Tool] = &[
             references, foreign keys and synonyms, with the column or constraint that holds \
             each reference.",
         args: &[Arg::Object],
-        limits: true,
+        rows: true,
     },
 ];
 
@@ -234,19 +235,19 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 json!({"type": "string", "minLength": 1, "maxLength": 128, "description":
                     "A database to run in, instead of the profile's."}),
             );
-            if tool.limits {
-                let (rows, cell) = limit_descriptions(tool.name, launch);
+            let (rows, cell) = limit_descriptions(tool.name, launch);
+            if tool.rows {
                 properties.insert(
                     "max_rows".into(),
                     json!({"type": "integer", "minimum": 0, "maximum": MAX_ROWS_ARG,
                         "description": rows}),
                 );
-                properties.insert(
-                    "max_cell".into(),
-                    json!({"type": "integer", "minimum": 0, "maximum": MAX_CELL_ARG,
-                        "description": cell}),
-                );
             }
+            properties.insert(
+                "max_cell".into(),
+                json!({"type": "integer", "minimum": 0, "maximum": MAX_CELL_ARG,
+                    "description": cell}),
+            );
             properties.insert(
                 "timeout".into(),
                 json!({"type": "integer", "minimum": 1,
@@ -359,20 +360,16 @@ pub(crate) fn echo(name: &str) -> String {
 /// as `integer` (`the_numeric_arguments_are_the_schemas_integers`).
 pub(crate) const NUMERIC_ARGS: [&str; 3] = ["max_rows", "max_cell", "timeout"];
 
-/// The arguments `tool` takes: its own, then those every tool takes, `max_rows` and `max_cell`
-/// only where its `limits` are on (all but `info`).
+/// The arguments `tool` takes: its own, then those every tool takes, `max_rows` only where it
+/// applies (all but `info`, R49).
 fn takes(tool: &Tool) -> Vec<&'static str> {
-    let limits: &[&str] = if tool.limits {
-        &["max_rows", "max_cell"]
-    } else {
-        &[]
-    };
+    let rows: &[&str] = if tool.rows { &["max_rows"] } else { &[] };
     tool.args
         .iter()
         .map(|arg| arg_name(*arg))
         .chain(["profile", "database"])
-        .chain(limits.iter().copied())
-        .chain(["timeout", "format"])
+        .chain(rows.iter().copied())
+        .chain(["max_cell", "timeout", "format"])
         .collect()
 }
 
@@ -692,11 +689,11 @@ mod tests {
                 .map(|(name, _)| name.as_str())
                 .collect();
             integers.sort_unstable();
-            // `info` takes no limits (its one short row has nothing to cut).
+            // `info` takes no max_rows (it returns one row), but max_cell (R49).
             let mut wanted: Vec<&str> = NUMERIC_ARGS
                 .iter()
                 .copied()
-                .filter(|arg| tool["name"] != "info" || *arg == "timeout")
+                .filter(|arg| tool["name"] != "info" || *arg != "max_rows")
                 .collect();
             wanted.sort_unstable();
             assert_eq!(integers, wanted, "{}", tool["name"]);
@@ -704,8 +701,9 @@ mod tests {
     }
 
     // MCP client feedback (2026-10-31, decision 45): the schemas state each limit's default,
-    // `check` says its SQL is compiled, not run, `info` takes no limits, and `query` alone
-    // takes `exact_count`, which a call then passes on to the run.
+    // `check` says its SQL is compiled, not run, `info` takes no max_rows (but max_cell, which
+    // a small configured limit still applies to its values, R49), and `query` alone takes
+    // `exact_count`, which a call then passes on to the run.
     #[test]
     fn the_schemas_state_their_defaults_and_exact_count_reaches_the_run() {
         let schema = |tools: &Value, name: &str| {
@@ -738,7 +736,12 @@ mod tests {
         );
         assert!(check.get("exact_count").is_none());
         let info = schema(&tools, "info");
-        assert!(info.get("max_rows").is_none() && info.get("max_cell").is_none());
+        assert!(info.get("max_rows").is_none(), "{info}");
+        assert_eq!(
+            info["max_cell"]["description"],
+            "Characters shown per value (default 500, or the profile's max_cell); 0 shows all \
+             (within the size limit)."
+        );
         let describe = schema(&tools, "describe");
         assert!(
             describe["max_rows"]["description"]
@@ -779,6 +782,14 @@ mod tests {
             );
         }
         let one = launch(&["test"]);
+        // R49: info's values can be read whole under a small configured max_cell.
+        let Ok(planned) = plan(
+            &call(json!({"name": "info", "arguments": {"max_cell": 0}})),
+            &one,
+        ) else {
+            panic!("info takes max_cell");
+        };
+        assert_eq!(planned.max_cell, Some(0));
         let exact = |args: Value| {
             let planned = plan(&call(json!({"name": "query", "arguments": args})), &one)
                 .unwrap_or_else(|_| panic!("planned"));
@@ -978,10 +989,12 @@ mod tests {
                  exact_count, profile, database, max_rows, max_cell, timeout, format)",
                 &one,
             ),
-            // `info` takes no limits; `exact_count` is query's alone, and a boolean.
+            // `info` takes no max_rows (R49: but max_cell); `exact_count` is query's alone, and
+            // a boolean.
             (
                 json!({"name": "info", "arguments": {"max_rows": 5}}),
-                "unknown argument max_rows (info takes profile, database, timeout, format)",
+                "unknown argument max_rows (info takes profile, database, max_cell, timeout, \
+                 format)",
                 &one,
             ),
             (

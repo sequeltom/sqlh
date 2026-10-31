@@ -2591,6 +2591,12 @@ pub(crate) mod fake_server {
         /// Never answer it, nor anything after it, the attention included: a server that has
         /// stopped responding.
         Silent,
+        /// Send a result's first two rows and no end, wait this long, then end it and send a
+        /// second result of one row: a slow result with more output after it in the batch, as
+        /// `SET STATISTICS XML` or `DBCC SHOW_STATISTICS` give (R48). An attention during the
+        /// wait is acknowledged (DONE ATTN) and the rest is never sent, as a cancelled batch's
+        /// isn't.
+        Pause(Duration),
         /// Send a result's first rows, then close the connection: a server lost mid-reply.
         Drop,
     }
@@ -2898,6 +2904,33 @@ pub(crate) mod fake_server {
                         return End::Client;
                     }
                     write_packet(&mut s, &done_attn(), true)
+                }
+                Turn::Pause(wait) => {
+                    reply.extend(int_rows_open(2));
+                    if write_packet(&mut s, &reply, false).is_err() {
+                        return End::Client;
+                    }
+                    // A message during the wait is the attention (nothing else may come while
+                    // a reply is open); none by its end, and the rest of the batch follows.
+                    let _ = s.set_read_timeout(Some(wait));
+                    let mut peeked = [0u8; 1];
+                    let early = s.peek(&mut peeked);
+                    let _ = s.set_read_timeout(None);
+                    match early {
+                        Ok(0) => return End::Client,
+                        Ok(_) => {
+                            match receive_message(&mut s) {
+                                Some(next) if next.kind == 6 => {}
+                                _ => return End::Client,
+                            }
+                            write_packet(&mut s, &done_attn(), true)
+                        }
+                        Err(_) => {
+                            let mut rest = done_token(0x11, 0xc1, 2);
+                            rest.extend(int_rows(1));
+                            write_packet(&mut s, &rest, true)
+                        }
+                    }
                 }
                 Turn::Silent => {
                     while receive(&mut s).is_some() {}

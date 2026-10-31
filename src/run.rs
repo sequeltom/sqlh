@@ -1069,12 +1069,16 @@ pub(crate) async fn run_opened(
     let mut stats = Stats::default();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
     let mut number = 0;
+    let mut output_modes = false;
     'batches: for (index, batch) in batches.iter().enumerate() {
         out.set_sections(sections.get(index).map_or(&[], Vec::as_slice));
         // A stopped count cancels the rest of the batch; where that could cancel a later
         // statement's output, the count runs longer first, and a stop is reported as the rest
-        // of the batch not run (decision 45, DESIGN.md §4.4).
-        let later_statements = guard::several_outputs(&batch.sql);
+        // of the batch not run (decision 45, DESIGN.md §4.4). An option that adds output
+        // (`SET STATISTICS XML ON`) lasts for the session, so it makes this batch and every
+        // later one such a batch (R48).
+        output_modes = output_modes || guard::sets_output_modes(&batch.sql);
+        let later_statements = output_modes || guard::several_outputs(&batch.sql);
         let counting = if later_statements {
             counting.with_later_statements()
         } else {

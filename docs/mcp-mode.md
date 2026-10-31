@@ -164,7 +164,7 @@ Or check a project-scoped `.mcp.json` into the repo:
 
 ## 4. Tools
 
-Short names are used, because clients prefix them with the server name (Claude Code shows `mcp__sqlh__query`). The order below is the `tools/list` order. Every tool also takes `profile` (§3), `database?` (1–128 characters), `timeout?` (seconds, at least 1; below) and `format?` (`text`/`json`), and every tool but `info` takes `max_rows?` (0–10,000) and `max_cell?` (0–1,000,000). `info` returns one short row, which no limit cuts, so it doesn't offer them since decision 45 (MCP client feedback, 2026-10-31); a call that passes one gets the unknown-argument error. `max_rows: 0` shows every row and `max_cell: 0` every value whole, within the server's `--max-output`, as `--max-rows 0` and `--max-cell 0` do in the CLI.
+Short names are used, because clients prefix them with the server name (Claude Code shows `mcp__sqlh__query`). The order below is the `tools/list` order. Every tool also takes `profile` (§3), `database?` (1–128 characters), `max_cell?` (0–1,000,000), `timeout?` (seconds, at least 1; below) and `format?` (`text`/`json`), and every tool but `info` takes `max_rows?` (0–10,000). `info` returns one row, so it doesn't offer `max_rows` since decision 45 (MCP client feedback, 2026-10-31); a call that passes it gets the unknown-argument error. Decision 45 had dropped `max_cell` from `info` too, but a profile's or the launch's small `max_cell` still cuts `info`'s values, and its note advises raising it, so it is back (R49). `max_rows: 0` shows every row and `max_cell: 0` every value whole, within the server's `--max-output`, as `--max-rows 0` and `--max-cell 0` do in the CLI.
 
 | Tool | Arguments | What it does |
 |---|---|---|

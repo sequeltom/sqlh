@@ -502,9 +502,38 @@ const SILENT_STARTS: &[&str] = &[
     "USE",
 ];
 
-/// The words that make output come several times: a procedure's results, and a loop's
-/// (`WHILE`, `GOTO`), which repeats the statements in it. Each counts as two.
-const REPEATING_STARTS: &[&str] = &["EXEC", "EXECUTE", "GOTO", "WHILE"];
+/// The words that make output come several times: a procedure's results, a loop's (`WHILE`,
+/// `GOTO`), which repeats the statements in it, and a `DBCC` command's (`SHOW_STATISTICS`
+/// returns its header, density vector and histogram as three results; R48). Each counts as
+/// two.
+const REPEATING_STARTS: &[&str] = &["DBCC", "EXEC", "EXECUTE", "GOTO", "WHILE"];
+
+/// Whether `token`, after a `SET`, names a session option that adds output to the statements
+/// after it: `STATISTICS` (`PROFILE` and `XML` add a result after each query's own, `IO` and
+/// `TIME` messages) or a `SHOWPLAN_` option, whose plans come in place of each statement's
+/// results (R48). `OFF` matches as well as `ON`: erring toward more output is the safe way.
+fn adds_output(token: Token<'_>) -> bool {
+    token.is_word("STATISTICS")
+        || (token.kind == Kind::Word
+            && token
+                .name
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SHOWPLAN_")))
+}
+
+/// Whether `sql` sets a session option that adds output (`adds_output`, R48): it lasts for the
+/// rest of the session, so the batches after this one can show more than their statements say,
+/// and a stopped count in any of them could cancel it (`run::run_opened`). One pass over the
+/// text, like `mentions_xact_abort`.
+pub fn sets_output_modes(sql: &str) -> bool {
+    let mut lex = Lexer::new(sql);
+    while let Some(token) = lex.next() {
+        if token.is_word("SET") && lex.ahead(0).is_some_and(adds_output) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Whether more than one of the statements in `sql` can return rows or messages (decision 45,
 /// DESIGN.md §4.4). A stopped count of hidden rows cancels the rest of its batch, so a batch
@@ -513,9 +542,11 @@ const REPEATING_STARTS: &[&str] = &["EXEC", "EXECUTE", "GOTO", "WHILE"];
 ///
 /// It errs toward yes, never toward no: a wrong yes costs a few seconds of counting, a wrong no
 /// would cancel statements unseen. At parenthesis depth 0 it counts each word that starts a
-/// statement, except the `SILENT_STARTS`; one of the `REPEATING_STARTS`, or a batch that is an
-/// implicit procedure call, counts as two, since a procedure can return several results and a
-/// loop repeats its statements' output. Two words continue a
+/// statement, except the `SILENT_STARTS`; one of the `REPEATING_STARTS`, a `SET` of an option
+/// that adds output (`adds_output`, R48), or a batch that is an implicit procedure call, counts
+/// as two, since a procedure can return several results, a loop repeats its statements' output,
+/// and such an option adds output to the statements after it (an earlier batch's is
+/// `sets_output_modes`). Two words continue a
 /// statement and aren't counted: the query after a common table expression (`WITH c AS (...)
 /// SELECT`), and a `SELECT` after `UNION`, `EXCEPT` or `INTERSECT` (and `ALL`). A `WITH` starts
 /// a common table expression only at the start of the batch or after `;`, `BEGIN` or `ELSE`,
@@ -540,7 +571,8 @@ pub fn several_outputs(sql: &str) -> bool {
     let mut statement_boundary = true;
     let mut cte_query_next = false;
     let mut set_operand_next = false;
-    for token in start {
+    let mut lex = start;
+    while let Some(token) = lex.next() {
         let boundary = statement_boundary;
         statement_boundary = false;
         match token.kind {
@@ -581,7 +613,9 @@ pub fn several_outputs(sql: &str) -> bool {
                         cte_query_next = true;
                         outputs += 1;
                     }
-                } else if in_list(REPEATING_STARTS, token.name) {
+                } else if in_list(REPEATING_STARTS, token.name)
+                    || (token.is_word("SET") && lex.ahead(0).is_some_and(adds_output))
+                {
                     outputs += 2;
                 } else if in_list(STATEMENT_START, token.name)
                     && !in_list(SILENT_STARTS, token.name)
@@ -1877,6 +1911,16 @@ mod tests {
             // A query in parentheses is a statement too.
             "(SELECT a FROM t); SELECT b FROM u",
             "SELECT b FROM u; (SELECT a FROM t)",
+            // R48: options that add output to every query after them, and DBCC commands, whose
+            // results come several to a statement (SHOW_STATISTICS: header, density,
+            // histogram).
+            "SET STATISTICS XML ON; SELECT * FROM t",
+            "SET STATISTICS PROFILE ON\nSELECT * FROM t",
+            "set statistics io, time on; select * from t",
+            "SET SHOWPLAN_XML ON",
+            "SET STATISTICS XML OFF; SELECT * FROM t",
+            "DBCC SHOW_STATISTICS ('dbo.t', 'ix_t')",
+            "DBCC SHOW_STATISTICS ('dbo.t', 'ix_t') WITH HISTOGRAM",
         ] {
             assert!(several_outputs(sql), "{sql}");
         }
@@ -1901,9 +1945,40 @@ mod tests {
             "SELECT 'EXEC p; SELECT 2' AS s -- SELECT 3",
             "/* SELECT 1 */ SELECT 2",
             "label: SELECT 1",
+            "SET NOCOUNT ON; SET LOCK_TIMEOUT 0; SELECT * FROM t",
+            "SELECT 'SET STATISTICS XML ON' AS s",
             "",
         ] {
             assert!(!several_outputs(sql), "{sql}");
+        }
+    }
+
+    // R48: a SET of an option that adds output lasts for the session, so the run treats every
+    // batch from its own on as one whose stop could cancel output.
+    #[test]
+    fn options_that_add_output_are_found_for_the_batches_after_them() {
+        for sql in [
+            "SET STATISTICS PROFILE ON",
+            "SET STATISTICS XML ON; SELECT 1",
+            "set statistics io on",
+            "SET STATISTICS IO, TIME ON",
+            "SET SHOWPLAN_ALL ON",
+            "SET SHOWPLAN_TEXT ON",
+            "set showplan_xml on",
+            "SET STATISTICS XML OFF",
+        ] {
+            assert!(sets_output_modes(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t",
+            "SET NOCOUNT ON",
+            "SELECT 'SET STATISTICS XML ON' AS s -- SET STATISTICS IO ON",
+            "/* SET SHOWPLAN_XML ON */ SELECT 1",
+            "DBCC SHOW_STATISTICS ('dbo.t', 'ix_t')",
+            "SELECT * FROM sys.stats",
+            "",
+        ] {
+            assert!(!sets_output_modes(sql), "{sql}");
         }
     }
 

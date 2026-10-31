@@ -17,7 +17,7 @@ The owner ran `sqlh mcp` (`0.1.0-dev.5`) from Claude Desktop against a real envi
 2. **`≥N` is a lower bound with no per-call way to make it exact.** The models read `≥` right; `exact_count` existed only as a profile key. **Done:** `query` takes `exact_count`.
 3. **The defaults weren't in the schema.** The 100 rows and 500 characters showed only in the output. **Done:** each tool's `max_rows` and `max_cell` descriptions give its default.
 4. **`NT SERVICE\\SQLSERVERAGENT`** was read as an escaping artifact. It is the documented escaping (decision 11: a value can be decoded exactly). **Done:** the `query` description and the instructions say `\\` is one backslash.
-5. **`max_rows` and `max_cell` on `info` do nothing.** **Done:** `info` no longer takes them. They stay on `databases`, which returns a row per database.
+5. **`max_rows` and `max_cell` on `info` do nothing.** Half right. **Done:** `info` no longer takes `max_rows`, since it returns one row. `databases` keeps it, since it returns a row per database. `max_cell` was dropped too at first, but a profile's or the launch's small `max_cell` still cuts `info`'s values, so it is back (review R49).
 6. **`check`'s `sql` said "The T-SQL to run".** **Done:** "The T-SQL to compile (not run)."
 
 ## What one reported
