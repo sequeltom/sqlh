@@ -12,7 +12,7 @@ publish = false
 # JSON-RPC for sqlh mcp (docs/mcp-mode.md §8): Value and json! only, no derive; 65 KB of the exe (spike 5.1).
 serde_json = "1"
 # Preview driver: pin exactly and read the changelog before bumping. Only src/db/ may use it.
-mssql-tds = "=0.2.0"
+mssql-tds = "=0.3.0"
 # mssql-tds already pulls tokio with "full"; we name only what we use.
 tokio = { version = "1", default-features = false, features = ["rt", "time", "signal", "macros", "sync"] }
 lexopt = "0.3"

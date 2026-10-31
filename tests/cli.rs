@@ -40,6 +40,8 @@ fn isolated(command: &mut Command) -> &mut Command {
         "SQLCMDDBNAME",
         "SQLCMDUSER",
         "SQLCMDPASSWORD",
+        // mssql-tds 0.3.0 reads it for its failover default, which sqlh never uses (decision 40).
+        "MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT",
     ] {
         command.env_remove(var);
     }
@@ -695,14 +697,64 @@ fn connect_failures_end_the_same_way_every_time() {
     );
 }
 
+// Decision 40: mssql-tds 0.3.0 takes its multi-subnet failover default from
+// MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT when a connection doesn't set it; sqlh always sets it, so
+// neither "true" (parallel connects) nor a value the driver can't read (which would fail every
+// connect that inherits it) changes a refused connect: one attempt, exit 2, the same text.
+#[test]
+fn the_drivers_failover_default_variable_changes_nothing() {
+    for value in ["true", "garbage"] {
+        let r = run(sqlh()
+            .env("MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT", value)
+            .args(["-S", "127.0.0.1,1", "-Q", "SELECT 1"]));
+        assert_eq!(r.code, 2, "{value}: {}", r.stdout);
+        assert!(
+            r.stdout
+                .starts_with("-- error: cannot connect to 127.0.0.1,1 "),
+            "{value}: {}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("parallel"), "{value}: {}", r.stdout);
+        // The driver's own refusal of a value it can't read names the variable, as a usage
+        // error, at once: a connect that inherited the default (strengthened in review,
+        // 2026-10-31).
+        for inherited in [
+            "MultiSubnetFailover",
+            "MULTISUBNET_FAILOVER_DEFAULT",
+            "Usage Error",
+        ] {
+            assert!(!r.stdout.contains(inherited), "{value}: {}", r.stdout);
+        }
+        // The sequential refusal itself, by its code: the text is in the system's language.
+        assert!(
+            r.stdout.contains("(os error 10061)"),
+            "{value}: {}",
+            r.stdout
+        );
+    }
+}
+
 // PLAN.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with exit 6.
+// With -M too, whose connect races every address (mssql-tds 0.3.0; docs/notes/driver-0.3.0.md
+// §7, added in review, 2026-10-31).
 #[cfg(windows)]
 #[test]
 fn ctrl_break_cancels_a_connect() {
+    for failover in [false, true] {
+        ctrl_break_cancels_a_connect_with(failover);
+    }
+}
+
+#[cfg(windows)]
+fn ctrl_break_cancels_a_connect_with(failover: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = format!("127.0.0.1,{}", listener.local_addr().unwrap().port());
+    let mut command = sqlh();
+    if failover {
+        command.arg("-M");
+    }
     let mut child = spawn_in_group(
-        sqlh()
+        command
             .args(["-S", &server, "-l", "30", "-Q", "SELECT 1"])
             .stdout(Stdio::piped()),
     );
@@ -10048,6 +10100,39 @@ mod live {
         );
     }
 
+    // mssql-tds 0.3.0 (docs/notes/driver-0.3.0.md §3): an empty image is 0x, as DESIGN.md §5.1
+    // says, and only a NULL one is NULL; 0.2.0 decoded both as NULL. Checked on the plain row
+    // path and on the column cursor, which a max column puts the result on, in every format.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn an_empty_image_is_0x_and_only_a_null_one_is_null() {
+        let (p, db) = target();
+        let plain = "SELECT CAST(0x AS image) AS e, CAST(NULL AS image) AS n";
+        let cursor = "SELECT CAST(0x AS image) AS e, CAST(NULL AS image) AS n, \
+                      CAST('x' AS varchar(max)) AS m";
+        let r = live(&p, &db, &["-Q", plain]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("e:image\tn:image\n0x\tNULL\n"),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["-Q", cursor]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(r.stdout.contains("\n0x\tNULL\tx\n"), "{}", r.stdout);
+        for (sql, json_rows, csv) in [
+            (plain, r#""rows":[["0x",null]]"#, "e,n\n0x,\n"),
+            (cursor, r#""rows":[["0x",null,"x"]]"#, "e,n,m\n0x,,x\n"),
+        ] {
+            let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(r.stdout.contains(json_rows), "{}", r.stdout);
+            let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            assert!(r.stdout.starts_with(csv), "{}", r.stdout);
+        }
+    }
+
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
     // configuration listing run in the read-only wrapper, from a user database; a value for
     // sp_configure is refused before anything runs. Whether a login may run each one is the
@@ -11397,6 +11482,42 @@ mod live {
             assert!(
                 !everything.contains(&reader.password),
                 "the password never shows"
+            );
+        }
+
+        // Decisions 19 and 41 (docs/notes/driver-0.3.0.md §2): a pooled connection killed on
+        // the server between two calls is replaced by the engine's own retry, on a new login
+        // that the call reports as connect time, never by the driver's session recovery,
+        // which sqlh keeps off. The kill is of this test's own server's session.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn a_pooled_connection_killed_between_calls_is_replaced_by_the_engines_retry() {
+            let (p, db) = target();
+            let mut mcp = Mcp::on(&p);
+            // The connection's id, not the session's login time: a reset gives the session a
+            // new login_time (seen live), while the connection keeps its id until it closes.
+            let who = "SELECT @@SPID AS spid, CAST(c.connection_id AS varchar(36)) AS connection \
+                 FROM sys.dm_exec_connections AS c WHERE c.session_id = @@SPID";
+            let first = ok_document(&mcp.call(1, "query", json!({"sql": who, "format": "json"})));
+            let before = result_sets(&first)[0][0].clone();
+            let spid = before["spid"].as_i64().expect("a session id");
+            let reused = ok_document(&mcp.call(2, "query", json!({"sql": who, "format": "json"})));
+            assert_eq!(reused["connect_ms"], 0, "the same connection: {reused}");
+            assert_eq!(result_sets(&reused)[0][0], before, "the same connection");
+
+            let killed = live(&p, &db, &["--allow-write", "-Q", &format!("KILL {spid}")]);
+            assert_eq!(killed.code, 0, "{}", killed.stdout);
+
+            let after_kill =
+                ok_document(&mcp.call(3, "query", json!({"sql": who, "format": "json"})));
+            assert!(
+                after_kill["connect_ms"].as_u64() > Some(0),
+                "a new login: {after_kill}"
+            );
+            let after = result_sets(&after_kill)[0][0].clone();
+            assert_ne!(
+                after["connection"], before["connection"],
+                "a new connection: {after:?} after {before:?}"
             );
         }
     }

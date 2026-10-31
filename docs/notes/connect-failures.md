@@ -46,3 +46,7 @@ Measured later the same day, for the refusal of remote Named Pipes (the first co
 
 Moved to [upstream-issues.md](upstream-issues.md) (2026-10-17), the one list the owner files from: the remote Named Pipe open that blocks the runtime is U1, and the withdrawn cancel-during-connect issue is listed there as withdrawn.
 
+
+## mssql-tds 0.3.0 (2026-10-31)
+
+Re-measured on the upgrade: every row above holds (a refused connect 2.14 s, an unroutable address 2.11 s, `localhost,1` 4.18 s or exit 4 at 3.11 s with `-l 2`, IPv6 2.12 s, `np:` to a remote host exit 3), because sqlh sets multi-subnet failover off itself (owner decision 40); the driver's `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT` changes none of them. `-M`'s new behaviour is in DESIGN.md §4, and the whole table in [driver-0.3.0.md](driver-0.3.0.md) §8.

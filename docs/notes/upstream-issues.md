@@ -2,7 +2,7 @@
 
 The one list of driver problems worth raising with Microsoft's [mssql-rs](https://github.com/microsoft/mssql-rs) (`mssql-tds`). **The owner files them; agents add to this list and never file anything themselves** (owner, 2026-10-17). Upstream takes issues, not pull requests (AGENTS.md).
 
-Before filing one: check upstream's `main` (0.3.0 when these were read; crates.io has 0.2.0), since the API moves and a problem may be gone; search the existing issues; and keep sqlh's workaround in our code either way, since sqlh pins an exact version.
+Before filing one: check upstream's `main` (sqlh pins 0.3.0 since 2026-10-31; U1–U6 were re-read in it, docs/notes/driver-0.3.0.md §5), since the API moves and a problem may be gone; search the existing issues; and keep sqlh's workaround in our code either way, since sqlh pins an exact version.
 
 Each entry says what was read or observed, in which version, why it matters to sqlh, what sqlh does about it, and a possible fix.
 
@@ -10,28 +10,28 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 ### U1. The first open of a remote Named Pipe blocks the async runtime
 
-- **Seen in:** 0.2.0, reading the source (docs/notes/connect-failures.md, PLAN.md 2.4).
+- **Seen in:** 0.2.0, reading the source (docs/notes/connect-failures.md, PLAN.md 2.4); still in 0.3.0 (`named_pipes.rs:89`; docs/notes/driver-0.3.0.md §5).
 - **What:** `open_named_pipe_with_retry` calls tokio's `ClientOptions::open`, a synchronous `CreateFileW`, inside the async fn, whether the pipe came from the protocol waterfall, an `np:` prefix or a UNC path. For an unreachable host that stalls every timer, cancellation and task for about 21 s (SMB's own timeout), and the error that comes back is the pipe's instead of the TCP timeout. The retry after `ERROR_PIPE_BUSY` is not part of this: its `WaitNamedPipeW` already runs on `spawn_blocking`. Related: an IPv6 address can't take a `tcp:` prefix, so without a port it gets the waterfall and the same freeze.
 - **sqlh's workaround:** remote Named Pipes are refused before connecting (exit 3, with the TCP spelling), and an IPv6 address without a port is sent with port 1433, so the driver uses TCP (DESIGN.md §4, `-S`).
 - **Possible fix:** run the first open on a blocking thread too and bound it by the connect timeout (the open itself can't be cancelled, but the runtime and its timers stay free), or leave remote names on TCP unless Named Pipes are asked for.
 
-### U2. `DiscardRowWriter` allocates what it discards
+### U2. A `RowWriter` can't decline a large value
 
-- **Seen in:** 0.2.0, measuring memory (docs/notes/memory.md, PLAN.md 2.7).
-- **What:** a `RowWriter` can't decline a PLP value without the decoder allocating its declared length (`value_destination` has no way to say "skip"), so `DiscardRowWriter`, `drain_rows` and every consumer that wants a prefix of a large value pay for all of it.
+- **Seen in:** 0.2.0, measuring memory (docs/notes/memory.md, PLAN.md 2.7); half fixed in 0.3.0: `drain_rows` now skips (`ColumnPolicy::SkipAll`), but the `RowWriter` contract still can't decline a value, so the workaround stays (driver-0.3.0.md §5).
+- **What:** a `RowWriter` offered a PLP value can only return a destination or `None`, and `None` makes the decoder allocate the value's declared length (`value_destination` has no way to say "skip"), so `DiscardRowWriter` and every consumer that wants a prefix of a large value pay for all of it. In 0.3.0 `drain_rows` no longer does: it reads with `ColumnPolicy::SkipAll` (rewritten for 0.3.0 in review, 2026-10-31).
 - **sqlh's workaround:** large values are read through the column cursor and cut as they arrive (`src/db/stream.rs`); hidden rows use the cursor's skip.
-- **Possible fix:** a skip or a limit in the writer's contract, or `drain_rows` using `ColumnPolicy::SkipAll` as `drain_result_set_rows` does.
+- **Possible fix:** a skip or a limit in `value_destination`'s contract.
 
 ### U3. `text`, `ntext` and `image` have no streaming path
 
-- **Seen in:** 0.2.0 (docs/notes/memory.md).
+- **Seen in:** 0.2.0 (docs/notes/memory.md); unchanged in 0.3.0 (`MAX_ALLOC_SIZE` still 100 MB).
 - **What:** the pull cursor returns them as `CursorColumn::Value`, fully decoded, and the decoder refuses a value over 100 MB (`MAX_ALLOC_SIZE`), a limit the PLP types don't have.
 - **sqlh's workaround:** none possible above the driver; the limitation is documented (DESIGN.md §11, README).
 - **Possible fix:** the same cursor streaming the PLP types get.
 
 ### U4. No receipt for an acknowledged attention
 
-- **Seen in:** 0.2.0, reading the source and on SQL Server 2025 (docs/notes/mcp-reuse-spike.md §2, `Session::failure`'s comment in `src/db/mod.rs`).
+- **Seen in:** 0.2.0, reading the source and on SQL Server 2025 (docs/notes/mcp-reuse-spike.md §2, `Session::failure`'s comment in `src/db/mod.rs`); unchanged in 0.3.0 (its new `cancel_query` maps an error on a live connection to `Ok`, which is no receipt).
 - **What:** after a cancel, a caller can learn only whether the connection was marked dead (`is_connection_dead()`). A kept connection follows an acknowledged attention (DONE with the ATTN flag), but also a cancel that came before the request was sent, and a half-sent request withdrawn with EOM|IGNORE, where the server confirmed nothing. The settlement marker is private, and `send_attention_with_timeout` would send a new attention rather than report on the old one.
 - **Why it matters:** a pool deciding whether to reuse a connection after a cancel, and a user told whether the server confirmed it, both want the receipt.
 - **sqlh's workaround:** owner decision 17, as amended: a connection the driver kept is reused, and the next call's reset, whose acknowledgement the driver verifies, is the check; a dead one is discarded. Messages say only what was observed ("the connection stayed usable"), never that the server confirmed.
@@ -39,14 +39,14 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 ### U5. Withdrawing a half-sent request waits up to 120 s, without the cancel
 
-- **Seen in:** 0.2.0 (PLAN.md, Phase 2 follow-up, R15 B).
+- **Seen in:** 0.2.0 (PLAN.md, Phase 2 follow-up, R15 B); fixed in 0.3.0 for callers that opt in (`CancelHandle::set_cancel_timeout_secs`), which sqlh doesn't yet; `settle_within` stays either way (driver-0.3.0.md §2).
 - **What:** a request cancelled between two of its packets is withdrawn (EOM|IGNORE) and its DONE awaited in `withdraw_sent_message` for up to 120 s, with the cancel removed and no bound from the caller's timeout; an attention, by contrast, gets 5 s.
 - **sqlh's workaround:** `settle_within`: a batch's work races `-t` plus a 5 s grace; past it the work is dropped where it stands and the session retired (exit 4).
 - **Possible fix:** bound the withdrawal by the operation's timeout or the attention's 5 s, and keep the cancel honored while it waits.
 
 ### U6. `SqlString::decode` panics on malformed UTF-8
 
-- **Seen in:** 0.2.0 (docs/notes/memory.md). Already upstream's own **#310**: add a comment or a reproduction there rather than a new issue.
+- **Seen in:** 0.2.0 (docs/notes/memory.md). Already upstream's own **#310**: add a comment or a reproduction there rather than a new issue; unchanged in 0.3.0 (`sql_string.rs:346`).
 - **What:** under a UTF-8 collation, `String::from_utf8(...).unwrap()` panics on a malformed value.
 - **sqlh's workaround:** sqlh's cutter decodes with replacement, so a malformed value shows U+FFFD where the driver's path would have panicked.
 
@@ -54,7 +54,7 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 - **Seen in:** 0.3.0, reading the source (docs/notes/driver-0.3.0.md §1.2; owner decision 42).
 - **What:** LOGIN7 always advertises DNS caching (feature 0x0B), and when a server acknowledges it the addresses the name resolved to are kept in a process-wide cache with no TTL (`connection/dns_cache.rs`), used whenever a later lookup of that name fails. The module is crate-private and the feature is always requested, so a client can't opt out.
-- **Why it matters to sqlh:** `sqlh mcp` is a long-lived process; in a DNS outage, its login, with a SQL password, goes to the addresses the name had at the last accepted login, which TLS covers only by the certificate's name (not under `-C` or optional encryption).
+- **Why it matters to sqlh:** `sqlh mcp` is a long-lived process; in a DNS outage, its login, with a SQL password, goes to the addresses the name had at the last accepted login, which TLS covers only by the certificate's name, and only where the certificate is checked (strict; mandatory without `-C`; optional only when the server requires full encryption and `-C` is off).
 - **sqlh's workaround:** none (resolving names itself would break Kerberos SPNs); documented in DESIGN.md §8.
 - **Possible fix:** a `ClientContext` option to not advertise 0x0B or not use the cache, or a TTL.
 

@@ -671,7 +671,11 @@ impl Session {
             server_certificate: None,
         };
         // One attempt, no retries: the driver would retry a refused connection after 10 s,
-        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner.
+        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner. A count
+        // of 0 also keeps idle connection resiliency off: the driver asks the server for
+        // session recovery only when it is above 0, so it never logs in again behind sqlh's
+        // back, and the engine's one retry on a new connection is the only reconnect (owner
+        // decision 41; docs/notes/driver-0.3.0.md §2).
         context.connect_retry_count = 0;
         // Each TCP connect attempt gets -l seconds and the whole login one more, so an
         // unreachable address fails at TCP (exit 2) and a server that takes the connection
@@ -690,13 +694,17 @@ impl Session {
         } else {
             ApplicationIntent::ReadWrite
         };
-        context.multi_subnet_failover = options.multi_subnet_failover;
+        // Always explicit (owner decision 40): mssql-tds 0.3.0's `None` takes the driver's own
+        // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
+        // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
+        // keeps sqlcmd's rule: one address after another unless -M.
+        context.multi_subnet_failover = Some(options.multi_subnet_failover);
 
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
         let connecting = provider.create_client(context, &source, Some(&cancel.handle));
-        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 wraps
-        // the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
+        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 and 0.3.0
+        // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
         // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
         // a login that never finished leaves nothing to clean up. Only a blocking call, such as
@@ -707,6 +715,14 @@ impl Session {
                 return Err(DbError::Cancelled("cancelled while connecting".into()));
             }
         };
+        // Decision 41's guard: session recovery stays off, so a broken connection is reported,
+        // never silently replaced. A driver that negotiated it anyway would hide a login from
+        // the engine's accounting, so the connect fails instead.
+        if client.is_session_recovery_enabled() {
+            return Err(DbError::Protocol(
+                "the driver negotiated session recovery, which sqlh keeps off".into(),
+            ));
+        }
         // Login chatter: "Changed database context to ...", "Changed language setting to ...".
         client.take_info_messages();
         Ok(Session {
@@ -1468,6 +1484,25 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     let target = format!("{} ({auth}, encrypt {encrypt})", options.server);
     let (detail, hint) = match &error {
+        // Under -M, mssql-tds 0.3.0's race of every address ends at the TCP limit, -l, with
+        // its own "Connection timeout: ..." (parallel_connect.rs). That is no address
+        // answering, as an unreachable one is without -M (exit 2), not a login that didn't
+        // finish (found in review, 2026-10-31).
+        TdsError::TimeoutError(_)
+            if options.multi_subnet_failover
+                && error.to_string().contains("Connection timeout:") =>
+        {
+            (
+                format!(
+                    "no address accepted a TCP connection within {} s (-M tries them all at once)",
+                    options.login_timeout
+                ),
+                hints.pick(
+                    "check the server name and port, or raise -l",
+                    "check the profile's server and port, or raise its login_timeout",
+                ),
+            )
+        }
         TdsError::TimeoutError(_) => {
             return DbError::Timeout(format!(
                 "login timeout: {target} didn't complete the login within {} s; check that it \
@@ -1534,7 +1569,31 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     // The direct Schannel path reports TLS failures as generic errors carrying SSPI status
     // names, so match the text too.
-    let hint = tls_hint(&detail, hints).unwrap_or(hint);
+    let tls = tls_hint(&detail, hints);
+    let certificate = tls.is_some()
+        || matches!(
+            error,
+            TdsError::TlsError(_)
+                | TdsError::TlsHandshakeError { .. }
+                | TdsError::NoServerCertificate
+                | TdsError::CertificateExpired
+                | TdsError::CertificateMismatch
+        );
+    // Strict encryption checks the certificate even when it is trusted (mssql-tds
+    // `resolve_tls_validation`), so under -Ns a hint to trust it would only fail again (R46).
+    let hint = if certificate && matches!(options.encrypt, Encrypt::Strict) {
+        hints.pick(
+            "strict encryption checks the server's certificate even with -C, and needs SQL Server \
+             2022 or later: connect by the name on the certificate, from a machine that trusts \
+             its issuer, or use -Nm, where -C applies",
+            "strict encryption checks the server's certificate even with \
+             trust_server_certificate = true, and needs SQL Server 2022 or later: connect by the \
+             name on the certificate, from a machine that trusts its issuer, or set encrypt = \
+             \"mandatory\" in the profile, where trust applies",
+        )
+    } else {
+        tls.unwrap_or(hint)
+    };
     let mut message = format!("cannot connect to {target}: {detail}");
     if !hint.is_empty() {
         message.push_str("; ");
@@ -2112,6 +2171,89 @@ mod tests {
         ] {
             assert!(!hint.contains(" -C") && !hint.contains(" -U"), "{hint}");
         }
+    }
+
+    // R46: strict encryption checks the certificate even with -C, so its certificate failures
+    // never suggest trusting it; the same failures under mandatory still do.
+    #[test]
+    fn a_certificate_failure_under_strict_encryption_offers_no_trust() {
+        let mut options = fake_server::options("db01".into());
+        let words = |options: &super::ConnectOptions, error: TdsError| match connect_error(
+            error, options,
+        ) {
+            DbError::Connect(words) => words,
+            other => panic!("{other:?}"),
+        };
+        // The direct Schannel path's form, matched by its text (`tls_hint`).
+        let untrusted = || {
+            TdsError::ImplementationError(
+                "Schannel TLS handshake failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)".into(),
+            )
+        };
+        options.encrypt = super::Encrypt::Strict;
+        options.trust_server_certificate = true;
+        for hints in [Hints::Flags, Hints::Profile] {
+            options.hints = hints;
+            for error in [
+                untrusted(),
+                TdsError::CertificateMismatch,
+                TdsError::NoServerCertificate,
+            ] {
+                let hint = words(&options, error);
+                assert!(
+                    hint.contains("strict encryption checks the server's certificate even with")
+                        && !hint.contains("pass -C")
+                        && !hint.contains("= true in the profile to")
+                        && !hint.contains("needs trust_server_certificate"),
+                    "{hint}"
+                );
+            }
+        }
+        assert!(words(&options, TdsError::CertificateExpired).ends_with("where trust applies"));
+        options.hints = Hints::Flags;
+        assert!(words(&options, untrusted()).ends_with("or use -Nm, where -C applies"));
+        options.encrypt = super::Encrypt::Mandatory;
+        assert!(words(&options, untrusted()).contains("pass -C"));
+        // A failure that isn't the certificate's keeps its own hint under strict.
+        options.encrypt = super::Encrypt::Strict;
+        assert!(words(&options, TdsError::ConnectionClosed("x".into())).ends_with("try host,port"));
+    }
+
+    // Found in review (2026-10-31): under -M, mssql-tds 0.3.0's race of every address ends at
+    // -l with "Connection timeout: ..."; that is no address answering, a connect failure (exit
+    // 2) worded for it, not a login that missed its -l + 1 deadline (exit 4). The same error
+    // without -M, and the login deadline's own error under -M, keep the login wording.
+    #[test]
+    fn a_failover_race_that_times_out_is_a_connect_failure() {
+        let race = || {
+            TdsError::TimeoutError(mssql_tds::error::TimeoutErrorType::String(
+                "Connection timeout: Connection attempt timed out".into(),
+            ))
+        };
+        let mut options = fake_server::options("192.0.2.1".into());
+        options.login_timeout = 2;
+        options.multi_subnet_failover = true;
+        match connect_error(race(), &options) {
+            DbError::Connect(words) => assert_eq!(
+                words,
+                "cannot connect to 192.0.2.1 (SQL login 'fake', encrypt optional): no address \
+                 accepted a TCP connection within 2 s (-M tries them all at once); check the \
+                 server name and port, or raise -l"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let login_deadline = TdsError::TimeoutError(mssql_tds::error::TimeoutErrorType::String(
+            "login timed out".into(),
+        ));
+        assert!(matches!(
+            connect_error(login_deadline, &options),
+            DbError::Timeout(words) if words.contains("didn't complete the login within 3 s")
+        ));
+        options.multi_subnet_failover = false;
+        assert!(matches!(
+            connect_error(race(), &options),
+            DbError::Timeout(_)
+        ));
     }
 }
 
@@ -3185,6 +3327,250 @@ pub(crate) mod fake_server {
                 Some(8)
             );
         });
+    }
+
+    /// The FeatureExt ids a LOGIN7 payload asks for (MS-TDS 2.2.6.4). The OffsetLength block's
+    /// ibExtension (bytes 56..58) points at a DWORD holding the FeatureExt block's offset; the
+    /// block is `id u8 | data length u32 LE | data`, repeated, ended by 0xFF.
+    fn login_features(login: &[u8]) -> Vec<u8> {
+        let at = |i: usize, n: usize| login.get(i..i + n);
+        let Some(&[a, b]) = at(56, 2) else {
+            return Vec::new();
+        };
+        let Some(&[c, d, e, f]) = at(usize::from(u16::from_le_bytes([a, b])), 4) else {
+            return Vec::new();
+        };
+        let mut i = u32::from_le_bytes([c, d, e, f]) as usize;
+        let mut ids = Vec::new();
+        while let Some(&[id]) = at(i, 1) {
+            if id == 0xff {
+                break;
+            }
+            let Some(&[g, h, j, k]) = at(i + 1, 4) else {
+                break;
+            };
+            ids.push(id);
+            i += 5 + u32::from_le_bytes([g, h, j, k]) as usize;
+        }
+        ids
+    }
+
+    /// LOGINACK alone (the first token of `login_reply`), for login replies built by hand.
+    fn login_ack() -> Vec<u8> {
+        let reply = login_reply();
+        let length = usize::from(u16::from_le_bytes([reply[1], reply[2]]));
+        reply[..3 + length].to_vec()
+    }
+
+    /// ENVCHANGE Routing (subtype 20, MS-TDS 2.2.7.9): `E3 | length u16 LE | 20 | routing data
+    /// length u16 LE | protocol 0 (TCP) | port u16 LE | server US_VARCHAR | old value, u16 0`.
+    fn env_routing(port: u16, server: &str) -> Vec<u8> {
+        env_route(20, port, server, None)
+    }
+
+    /// A routing ENVCHANGE of `subtype`: 20, or 21, Enhanced Routing, whose routing data also
+    /// names a `database` (a US_VARCHAR after the server; mssql-tds 0.3.0's
+    /// `parse_routing_data`).
+    fn env_route(subtype: u8, port: u16, server: &str, database: Option<&str>) -> Vec<u8> {
+        let us_varchar = |text: &str| {
+            let mut field = u16::try_from(text.encode_utf16().count())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            field.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            field
+        };
+        let mut data = vec![0];
+        data.extend(port.to_le_bytes());
+        data.extend(us_varchar(server));
+        if let Some(database) = database {
+            data.extend(us_varchar(database));
+        }
+        let data_length = u16::try_from(data.len()).unwrap();
+        let mut value = vec![subtype];
+        value.extend(data_length.to_le_bytes());
+        value.extend(data);
+        value.extend([0, 0]);
+        let mut token = vec![0xe3];
+        token.extend(u16::try_from(value.len()).unwrap().to_le_bytes());
+        token.extend(value);
+        token
+    }
+
+    /// A one-connection fake that answers the prelogin, keeps the LOGIN7's payload, answers it
+    /// with `reply`, then reads until the client goes. The payload is `None` until a LOGIN7
+    /// has arrived.
+    fn serve_login(reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(None));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            if receive(&mut s) != Some(0x12) || write_packet(&mut s, &PRELOGIN_REPLY, true).is_err()
+            {
+                return;
+            }
+            let Some(login) = receive_message(&mut s).filter(|m| m.kind == 0x10) else {
+                return;
+            };
+            *kept.lock().unwrap() = Some(login.payload);
+            if write_packet(&mut s, &reply, true).is_ok() {
+                while receive(&mut s).is_some() {}
+            }
+        });
+        (port, seen)
+    }
+
+    fn connect(server: String) -> Result<Session, DbError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Session::connect(&options(server), &Cancel::new()))
+    }
+
+    // Owner decisions 40 and 41 (docs/notes/driver-0.3.0.md): the login never asks for session
+    // recovery (FeatureExt 0x01), so the driver can't log in again behind sqlh's back, and
+    // multi-subnet failover is set by sqlh itself (off without -M), never the driver's default.
+    // The login does ask for DNS caching (0x0B) and Enhanced Routing (0x0F), which mssql-tds
+    // 0.3.0 always advertises (decisions 42 and 43).
+    #[test]
+    fn the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own() {
+        let (port, seen) = serve_login(login_reply());
+        let session = connect(format!("127.0.0.1,{port}")).expect("connected");
+        assert!(!session.client.is_session_recovery_enabled());
+        let policy = session
+            .client
+            .multi_subnet_failover_policy()
+            .expect("a resolved policy");
+        assert!(!policy.enabled);
+        assert!(matches!(
+            policy.source,
+            mssql_tds::connection::multi_subnet_failover::MultiSubnetFailoverSource::Connection
+        ));
+        let login = seen.lock().unwrap().clone().expect("a LOGIN7");
+        let features = login_features(&login);
+        assert!(!features.contains(&0x01), "{features:02x?}");
+        assert!(
+            features.contains(&0x0b) && features.contains(&0x0f),
+            "{features:02x?}"
+        );
+    }
+
+    /// A connect to a gateway whose login reply is `reply`, with a second fake listening as the
+    /// route's target: the connect's outcome, and the LOGIN7 that reached the target, if any.
+    fn route_through(
+        reply: impl FnOnce(u16) -> Vec<u8>,
+    ) -> (Result<Session, DbError>, Option<Vec<u8>>) {
+        let (target, routed) = serve_login(login_reply());
+        let (gateway, _) = serve_login(reply(target));
+        let outcome = connect(format!("127.0.0.1,{gateway}"));
+        // A refused route sends nothing more; give a route that was followed time to land.
+        std::thread::sleep(Duration::from_millis(200));
+        let reached = routed.lock().unwrap().clone();
+        (outcome, reached)
+    }
+
+    /// FEATUREEXTACK (0xAE, MS-TDS 2.2.7.11) acknowledging one feature: `id | data length u32
+    /// LE | data`, then the 0xFF terminator.
+    fn feature_ext_ack(id: u8, data: &[u8]) -> Vec<u8> {
+        let mut token = vec![0xae, id];
+        token.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+        token.extend(data);
+        token.push(0xff);
+        token
+    }
+
+    /// The database a LOGIN7 payload asks for: ibDatabase and cchDatabase (bytes 68..72 of the
+    /// OffsetLength block, MS-TDS 2.2.6.4), UTF-16 characters.
+    fn login_database(login: &[u8]) -> Option<String> {
+        let field = |i: usize| {
+            login
+                .get(i..i + 2)
+                .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        let (offset, chars) = (field(68)?, field(70)?);
+        let units: Vec<u16> = login
+            .get(offset..offset + 2 * chars)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
+            .collect();
+        String::from_utf16(&units).ok()
+    }
+
+    /// `login_reply` with `token` placed after its LOGINACK (`after_ack`) or before it: every
+    /// other token a login needs is there, so a driver that ignored the route would connect,
+    /// and a test that expects a refusal fails.
+    fn login_reply_with(token: Vec<u8>, after_ack: bool) -> Vec<u8> {
+        let ack = login_ack();
+        let rest = login_reply()[ack.len()..].to_vec();
+        if after_ack {
+            [ack, token, rest].concat()
+        } else {
+            [token, ack, rest].concat()
+        }
+    }
+
+    // Decision 43: a route (ENVCHANGE 20) after LOGINACK takes the login, with the same
+    // credentials, to the server it names, as it did in 0.2.0; one before LOGINACK is refused
+    // (mssql-tds 0.3.0, [MS-TDS] 2.2.7.9), and so is an Enhanced Routing one (21, which can
+    // also name a database) that the login's FEATUREEXTACK didn't acknowledge. A refused route
+    // sends no second login. Each refused reply is otherwise a whole login, so a driver that
+    // ignored the route would connect: these pin the driver's behaviour, and a later version
+    // that changes it fails here (refusals strengthened in review, 2026-10-31).
+    #[test]
+    fn a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused() {
+        let (followed, reached) =
+            route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), true));
+        assert!(followed.is_ok(), "{:?}", followed.err());
+        assert!(reached.is_some(), "the login reached the route");
+
+        let (early, reached) =
+            route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), false));
+        assert!(
+            matches!(&early, Err(DbError::Connect(words))
+                if words.contains("routing ENVCHANGE before LOGINACK")),
+            "{:?}",
+            early.err()
+        );
+        assert!(reached.is_none(), "no login after a refused route");
+
+        let (unacknowledged, reached) = route_through(|target| {
+            login_reply_with(env_route(21, target, "127.0.0.1", Some("sales")), true)
+        });
+        assert!(
+            matches!(&unacknowledged, Err(DbError::Connect(words))
+                if words.contains("without an Enhanced Routing feature acknowledgement")),
+            "{:?}",
+            unacknowledged.err()
+        );
+        assert!(
+            reached.is_none(),
+            "no login after an unacknowledged Enhanced Routing route"
+        );
+    }
+
+    // The external review's judgment 4 (2026-10-31): an acknowledged Enhanced Routing route
+    // (ENVCHANGE 21) that names a database is followed, and the routed LOGIN7 asks for that
+    // database in place of the login's own; the routed login asks for no session recovery
+    // either (decision 41). The driver's FEATUREEXTACK check is the one the unacknowledged case
+    // above fails, so this pins both sides of it.
+    #[test]
+    fn an_acknowledged_enhanced_route_takes_the_login_to_its_database() {
+        let (followed, reached) = route_through(|target| {
+            let route = env_route(21, target, "127.0.0.1", Some("sales"));
+            login_reply_with([feature_ext_ack(0x0f, &[1]), route].concat(), true)
+        });
+        assert!(followed.is_ok(), "{:?}", followed.err());
+        let login = reached.expect("the login reached the route");
+        assert_eq!(login_database(&login).as_deref(), Some("sales"));
+        let features = login_features(&login);
+        assert!(!features.contains(&0x01), "{features:02x?}");
     }
 }
 
