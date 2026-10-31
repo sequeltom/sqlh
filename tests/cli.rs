@@ -7389,7 +7389,7 @@ mod live {
         assert!(
             r.stdout.contains(
                 "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
-                 so its later statements did not run; --exact-count counts every row\n"
+                 so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"
             ),
             "{}",
             r.stdout
@@ -7696,7 +7696,7 @@ mod live {
         assert!(
             r.stdout.contains(
                 "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
-                 so its later statements did not run; raise -t to count longer\n"
+                 so its later statements did not run; put each query in its own batch (GO) to keep them; raise -t to count longer\n"
             ),
             "{}",
             r.stdout
@@ -7740,7 +7740,7 @@ mod live {
         );
         assert!(
             r.stdout
-                .contains("so its later statements did not run; --exact-count counts every row\n"),
+                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"),
             "{}",
             r.stdout
         );
@@ -8130,7 +8130,7 @@ mod live {
         );
         assert!(
             r.stdout
-                .contains("so its later statements did not run; raise -t to count longer\n"),
+                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; raise -t to count longer\n"),
             "{}",
             r.stdout
         );
@@ -8174,7 +8174,7 @@ mod live {
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert!(
             r.stdout
-                .contains("so its later statements did not run; --exact-count counts every row\n"),
+                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"),
             "{}",
             r.stdout
         );

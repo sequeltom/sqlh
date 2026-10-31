@@ -986,7 +986,7 @@ mod tests {
                 r#""rows":[[1]],"row_count":1,"row_count_exact":true,"truncated":false,"#,
                 r#""cells_cut":0}],"elapsed_ms":1,"counting_stopped":false}],"#,
                 r#""notes":["counting stopped in batch 1: the rest of that batch was cancelled, "#,
-                r#"so its later statements did not run; --exact-count counts every row"],"#,
+                r#"so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row"],"#,
                 r#""ok":true,"exit_code":0,"summary":"ok: 2 batches, counting stopped in 1, 7 ms","#,
                 r#""elapsed_ms":7}"#,
                 "\n"
@@ -1085,7 +1085,7 @@ mod tests {
                     r#"{{"batch":2,"source":"-Q","line":6,"events":[{}],"#,
                     r#""elapsed_ms":5,"counting_stopped":true}}],"#,
                     r#""notes":["counting stopped in batches 1, 2: the rest of each was "#,
-                    r#"cancelled, so their later statements did not run; --exact-count counts "#,
+                    r#"cancelled, so their later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts "#,
                     r#"every row; raise -t to count longer"],"#,
                     r#""ok":true,"exit_code":0,"#,
                     r#""summary":"ok: 2 batches, counting stopped in 2, 7 ms","elapsed_ms":7}}"#,

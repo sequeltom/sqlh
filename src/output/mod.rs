@@ -1259,7 +1259,7 @@ fn stopped_note(
     let mut note = if batches.len() == 1 {
         format!(
             "counting stopped in batch {}: the rest of that batch was cancelled, so its later \
-             statements did not run",
+             statements did not run; put each query in its own batch (GO) to keep them",
             shown[0]
         )
     } else {
@@ -1271,7 +1271,7 @@ fn stopped_note(
         };
         format!(
             "counting stopped in batches {}{more}: the rest of each was cancelled, so their \
-             later statements did not run",
+             later statements did not run; put each query in its own batch (GO) to keep them",
             shown.join(", ")
         )
     };
@@ -1601,21 +1601,21 @@ mod tests {
             note(&[4]),
             format!(
                 "counting stopped in batch 4: the rest of that batch was cancelled, so its \
-                 later statements did not run{tail}"
+                 later statements did not run; put each query in its own batch (GO) to keep them{tail}"
             )
         );
         assert_eq!(
             note(&[2, 3, 4, 5, 6]),
             format!(
                 "counting stopped in batches 2, 3, 4, 5, 6: the rest of each was cancelled, so \
-                 their later statements did not run{tail}"
+                 their later statements did not run; put each query in its own batch (GO) to keep them{tail}"
             )
         );
         assert_eq!(
             note(&[2, 3, 4, 5, 6, 7, 8, 9]),
             format!(
                 "counting stopped in batches 2, 3, 4, 5, 6 (+3 more): the rest of each was \
-                 cancelled, so their later statements did not run{tail}"
+                 cancelled, so their later statements did not run; put each query in its own batch (GO) to keep them{tail}"
             )
         );
     }
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn the_notes_advice_follows_what_stopped_the_count() {
         let first = "counting stopped in batch 2: the rest of that batch was cancelled, so its \
-                     later statements did not run";
+                     later statements did not run; put each query in its own batch (GO) to keep them";
         assert_eq!(
             stopped_note(&[2], true, false, Advice::Cli, false),
             format!("{first}; --exact-count counts every row")
@@ -1687,7 +1687,7 @@ mod tests {
             t.limit_notes(),
             [
                 "counting stopped in batch 1: the rest of that batch was cancelled, so its \
-                 later statements did not run; raise -t to count longer"
+                 later statements did not run; put each query in its own batch (GO) to keep them; raise -t to count longer"
             ]
         );
         t.begin_batch(&batch(2));
@@ -1697,7 +1697,7 @@ mod tests {
             t.limit_notes(),
             [
                 "counting stopped in batches 1, 2: the rest of each was cancelled, so their \
-                 later statements did not run; --exact-count counts every row; raise -t to \
+                 later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row; raise -t to \
                  count longer"
             ]
         );

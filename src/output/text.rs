@@ -1378,7 +1378,7 @@ pub(super) mod tests {
              1\n\
              -- 1 row\n\
              -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
-             later statements did not run; --exact-count counts every row\n\
+             later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n\
              -- ok: 2 batches, counting stopped in 1, 7 ms\n"
         );
     }
@@ -1465,7 +1465,7 @@ pub(super) mod tests {
                  {rows}\
                  -- 10 of ≥10 rows shown (--max-rows 10; counting stopped)\n\
                  -- note: counting stopped in batches 1, 2: the rest of each was cancelled, so \
-                 their later statements did not run; --exact-count counts every row; raise -t \
+                 their later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row; raise -t \
                  to count longer\n\
                  -- ok: 2 batches, counting stopped in 2, 7 ms\n"
             )
@@ -2339,7 +2339,7 @@ pub(super) mod tests {
                      {rows}\
                      -- 10 of ≥10 rows shown (max_rows 10; counting stopped)\n\
                      -- note: counting stopped in batches 1, 2: the rest of each was cancelled, so \
-                     their later statements did not run{advice}\n\
+                     their later statements did not run; put each query in its own batch (GO) to keep them{advice}\n\
                      -- ok: 2 batches, counting stopped in 2, 7 ms\n"
                 ),
                 "at the server's limit: {timeout_at_limit}"
@@ -2365,7 +2365,7 @@ pub(super) mod tests {
                 "-- result 1\nn:int\n{rows}\
                  -- 10 of ≥10 rows shown (max_rows 10; counting stopped)\n\
                  -- note: counting stopped in batch 1: the rest of that batch was cancelled, so its \
-                 later statements did not run\n\
+                 later statements did not run; put each query in its own batch (GO) to keep them\n\
                  -- ok: 1 batch, counting stopped in 1, 7 ms\n"
             )
         );
