@@ -253,7 +253,7 @@ Short names are used, because clients prefix them with the server name (Claude C
 
 The `definition` tool's two refusals advised CLI commands (`sqlh describe X`, `sqlh def B`) until `05032c0`; `schema::def_steps` now takes the `Advice` and names the tools and their argument (the two rows above; schema-commands.md §6.6).
 
-**Decision 45 external review (October 31, 2026, `157334f..8ae9eff`):** R47's build-version fix is closed, but the MCP increment needs R48 [P2] and R49 [P2]. Known multi-result diagnostics can still be cut at 250 ms and report ok with only a lower-bound note; info can still inherit a cell cap and advise raising max_cell while refusing that argument. These are independently reproduced output/schema gaps, not accepted semantics. PLAN.md, R47 and decision 45 external review, records fixes and acceptance criteria. The ordinary partial/exact-count controls and non-live suite passed; live/client sessions were not independently rerun.
+**Decision 45 external review and fix verification (October 31, 2026):** R47 closed in `157334f..8ae9eff`; R48 and R49 closed in `8ae9eff..2b0f130`. Known multi-result diagnostics and output-affecting modes set before GO now receive the longer count and partial accounting; info again accepts max_cell, so inherited cell limits can be raised per call. The increment is accepted with nonblocking P3 R50, a new test's exact-duration assertion that falsely failed just below one second. Three focused reruns, the full non-live rerun and independent synthetic MCP/TDS probes passed; live/client sessions were not independently rerun. PLAN.md, R48/R49 fix verification, records the evidence and follow-up.
 
 ## 5. Connections
 

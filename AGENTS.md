@@ -101,7 +101,7 @@ docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect late
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   sqlh mcp's spec (built 2026-10-17)
 docs/command-categories.md   Phase 6's design: command categories and their policies (decided 2026-10-23: PLAN.md §6, decisions 22–36)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
-                 (findings F.., R01–R49; PLAN.md records each one and its fix)
+                 (findings F.., R01–R50; PLAN.md records each one and its fix)
 ```
 
 Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (PLAN.md 3.5, 3.6).
@@ -198,7 +198,7 @@ The plan of attack is [docs/PLAN.md](docs/PLAN.md), derived from [docs/VISION.md
 
 Driver upgrade: local branch `driver-0.3.0`, `048aa89..7b28076`, externally reviewed on October 31, 2026. No blocking code finding; accepted with nonblocking P3 R46, correcting the optional/Strict certificate wording by negotiated TLS mode (PLAN.md, Driver 0.3.0 external review). Independent non-live checks and synthetic routing/USE/reset/connect/TLS-policy probes passed; owner live tests and measurements were reviewed, not rerun. R46 and the same rule's strict-hint defect are fixed in `e7dc9fb`, closed by external verification of `7b28076..e7dc9fb` on October 31, 2026, with no new finding. Non-live checks and six synthetic end-to-end TLS/protocol probes passed, including MCP profile hints; the positive type-21 test passed. The upgrade is merged into `main` as `1dd341f` (PLAN.md, R46 fix verification). The on-prem DNS acknowledgement is measured (2026-10-31, event-only recorder in a throwaway worktree): the test server's verdict is `allowed=false`, so its cache never holds it (driver-0.3.0.md §8). Planned, not started: Azure SQL support and testing (PLAN.md, after Phase 8), whose scope is an owner decision.
 
-MCP client feedback (2026-10-31, docs/notes/mcp-client-feedback.md): built decision 45, which amends decision 6. External review of `157334f..8ae9eff` requests R48 [P2] (multi-result diagnostics/earlier GO settings can still lose output while saying ok) and R49 [P2] (info still applies max_cell while refusing its override). See PLAN.md, R47 and decision 45 external review; the increment is not yet accepted. Independent non-live checks and synthetic MCP/TDS probes passed/reproduced the findings; owner live results were reviewed, not rerun.
+MCP client feedback (2026-10-31, docs/notes/mcp-client-feedback.md): built decision 45, which amends decision 6. External verification of `8ae9eff..2b0f130` closes R48 [P2] (multi-result diagnostics and preceding-GO modes now get the longer count and honest partial accounting) and R49 [P2] (info takes max_cell again). The increment is accepted with nonblocking P3 R50: the new diagnostic-tail test falsely failed its exact one-second floor at 999.7969 ms. Three focused reruns and the full non-live rerun passed; independent synthetic MCP/TDS and recognizer probes verified both fixes, the short/exact/deadline controls and per-call reset. See PLAN.md, R48/R49 fix verification. Owner live results were reviewed, not rerun.
 - A capped result in a batch with later statements counts for 5 s so they run (`guard::several_outputs`, `db::LATER_STATEMENTS_BUDGET`).
 - A run that still loses them ends `-- partial:` (exit 0).
 - In MCP: `query` takes `exact_count`, limit descriptions give their defaults, and `info` takes no `max_rows` (but `max_cell`, R49).
