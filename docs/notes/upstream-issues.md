@@ -50,6 +50,22 @@ Each entry says what was read or observed, in which version, why it matters to s
 - **What:** under a UTF-8 collation, `String::from_utf8(...).unwrap()` panics on a malformed value.
 - **sqlh's workaround:** sqlh's cutter decodes with replacement, so a malformed value shows U+FFFD where the driver's path would have panicked.
 
+### U7. The DNS cache can't be turned off
+
+- **Seen in:** 0.3.0, reading the source (docs/notes/driver-0.3.0.md §1.2; owner decision 42).
+- **What:** LOGIN7 always advertises DNS caching (feature 0x0B), and when a server acknowledges it the addresses the name resolved to are kept in a process-wide cache with no TTL (`connection/dns_cache.rs`), used whenever a later lookup of that name fails. The module is crate-private and the feature is always requested, so a client can't opt out.
+- **Why it matters to sqlh:** `sqlh mcp` is a long-lived process; in a DNS outage, its login, with a SQL password, goes to the addresses the name had at the last accepted login, which TLS covers only by the certificate's name (not under `-C` or optional encryption).
+- **sqlh's workaround:** none (resolving names itself would break Kerberos SPNs); documented in DESIGN.md §8.
+- **Possible fix:** a `ClientContext` option to not advertise 0x0B or not use the cache, or a TTL.
+
+### U8. A route can't be refused
+
+- **Seen in:** 0.2.0 and 0.3.0, reading the source (docs/notes/driver-0.3.0.md §1.3; owner decision 43).
+- **What:** an ENVCHANGE routing token (type 20, and in 0.3.0 type 21 with a database) makes the provider log in to the named host with the same `ClientContext`, the password included; 0.3.0 always advertises Enhanced Routing (0x0F). There is no option to refuse or confirm a route.
+- **Why it matters to sqlh:** a stored password then reaches a host sqlh didn't name; acceptable as the server's decision (Always On read-only routing), but a tool that binds a password to one server would want the choice.
+- **sqlh's workaround:** none; documented in DESIGN.md §8, and pinned by fake-server tests in the 0.3.0 upgrade.
+- **Possible fix:** a `ClientContext` option to fail on a routing token, or a callback to approve its target.
+
 ## Decided not to raise
 
 - **The password in debug packet dumps** (owner decision 9, 2026-10-12): at debug level the driver hex-dumps every TDS packet before encryption, the login packet included. sqlh's own rule is the defense: no general logger while the driver runs (AGENTS.md, Driver logging). Re-check the dump when bumping the driver.

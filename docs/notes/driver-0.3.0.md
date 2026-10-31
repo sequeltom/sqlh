@@ -157,6 +157,8 @@
 
 ## 6. Decisions for the owner
 
+**All four taken as recommended on 2026-10-31:** PLAN.md §6, decisions 40 (failover), 41 (session recovery), 42 (DNS cache) and 43 (routing).
+
 1. **Multi-subnet failover:** sqlh passes `Some(false)` unless `-M`, never the driver's default or its environment variable. Recommended; it is what step 2 does.
 2. **Session recovery stays off:** `connect_retry_count = 0`, and the engine's one retry (decision 19) is the only reconnect, with a guard and a test. Recommended; it records what sqlh already does.
 3. **The DNS cache:** accept it, documented, with the opt-out request upstream; check whether on-prem SQL Server acknowledges it. Recommended.
