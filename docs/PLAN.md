@@ -990,6 +990,27 @@ Raised 2026-10-10. Not a VISION priority: the exe is the product, and these are 
 
 Phase 5 chose MCP first (decision 14), so step 2 is built (5.3); the local daemon, (b), is deferred, and would be added beside it on the same engine, not instead of it.
 
+### Azure SQL support and testing (owner, 2026-10-31; planned, not started)
+
+The owner put Azure SQL on the roadmap after the DNS-cache check: the on-prem test server answers `allowed=false`, so decision 42's residual risk is likely Azure's alone, and nothing about Azure has been tested. VISION.md lists Azure as "not a first-release requirement", to be assessed before any commitment. This task is that assessment, then the testing; it changes no first-release scope until the owner decides (step 1). (M–L)
+
+1. **Scope, an owner decision for §6:**
+   - which targets: Azure SQL Database, Azure SQL Managed Instance, or both (Managed Instance is much closer to on-prem);
+   - which authentication: SQL logins first, or Microsoft Entra ID too (none is built: sqlh has SQL and Windows SSPI only, and the driver's federated-auth support is unverified for sqlh);
+   - the promise: supported, or "tested opportunistically" (DESIGN.md §12).
+2. **A test target, the owner's:** provisioned by the owner, its cost the owner's call, and reached through a profile made with `sqlh profiles add` on the owner's machine. Its server name and credentials never go in the repo, as for `test`.
+3. **Analysis, no code:** each difference with its evidence and its effect on sqlh, in `docs/notes/azure-sql.md`, before any change. Watch points known now (unverified on Azure unless marked):
+   - **`USE` is unsupported in Azure SQL Database** (from Microsoft's documentation, not tested). This affects `sqlh mcp`'s per-call `database` (a `USE`, decision 15, mcp-mode.md §5), `dbs` and other schema commands, decision 34's per-database runs, and three-part names. `-d` is the login's database, so it should still work.
+   - **Gateway routing:** Azure's redirect connection policy routes the login (ENVCHANGE 20, or 21 with a database). Decision 43 follows it with the same credentials. R20's binding is by the profile's name, and the certificate is checked against each hop's own name (R46). Check what `info`, the status line and JSON's `connection` report after a route.
+   - **The DNS cache** (decision 42, U7): likely acknowledged by Azure. Rerun the event-only recorder (driver-0.3.0.md §8, DNS acknowledgement) against the target.
+   - **The reset:** on Azure SQL Database, `sp_reset_connection` also resets the isolation level (Phase 5.2 and 5.3, built 2026-10-17, the isolation-level finding). The session setup sets the level on every call anyway, so `db::spike::spike_reset`'s SERIALIZABLE assertion needs a per-edition expectation.
+   - **Server-level features** absent from Azure SQL Database: the error log and the other `xp_` allowlist entries (DESIGN.md §7), `sp_configure`, `KILL` of other sessions (decision 33), server permissions (`VIEW SERVER STATE` becomes `VIEW DATABASE STATE`). The refusals and server errors an agent gets should stay clear.
+   - **Transient faults and latency:** Azure's transient login errors (for example 40613) and an internet round trip. Check them against connect-failures.md's bounds and the engine's one silent retry (decision 19).
+   - **Encryption:** Azure requires it, and supports strict (TDS 8). `-No` should still end in full TLS there, checked (R46).
+   - **The live tests' own needs:** a scratch database (`sqlh_test`, made by the fixtures), `CREATE LOGIN` for `Reader` (a contained user in Azure SQL Database), `KILL` in the MCP retry test, and setting the compatibility level (decision 21). These decide which tests can run there.
+4. **Live run:** the smoke script and the live suite against the target. Classify each failure as expected (a missing feature), a sqlh defect, or a documentation gap, and record the results in the note.
+5. **Changes:** catalog SQL with Azure-specific paths needs a supported-target decision and a maintenance justification (AGENTS.md, Catalog SQL). Fixes land with tests, and with DESIGN.md (§1, §12) and, if support is promised, the README.
+
 ## 5. Sequencing rationale
 
 - **1.1 (F04) first.** It is the only finding where the tool states something false while possibly executing writes.
