@@ -14,6 +14,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "src/build_version.rs"]
+mod build_version;
+
 /// The text fields, in the US English, Unicode string table (`040904B0`). The version fields
 /// are added from the build.
 const STRINGS: [(&str, &str); 6] = [
@@ -26,21 +29,22 @@ const STRINGS: [(&str, &str); 6] = [
 ];
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=SQLH_VERSION");
-    println!("cargo:rerun-if-env-changed=SQLH_BUILD");
-
+    // The version is checked whole before anything is printed (R47): a line break in it would
+    // end Cargo's directive, and the code would report a version the resource doesn't hold.
     let cargo = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
     let version = match env::var("SQLH_VERSION") {
-        // The release workflow's: Cargo.toml's version, or it with a pre-release part. Any
-        // other value would give the text and the numeric versions different numbers.
-        Ok(given) if given == cargo || given.starts_with(&format!("{cargo}-")) => given,
-        Ok(given) => panic!(
-            "SQLH_VERSION={given} isn't Cargo.toml's version {cargo} or {cargo}-<pre-release>"
-        ),
+        // The release workflow's: Cargo.toml's version, or it with a pre-release part.
+        Ok(given) => match build_version::checked(&given, &cargo) {
+            Ok(()) => given,
+            Err(why) => panic!("{why}"),
+        },
         Err(env::VarError::NotPresent) => format!("{cargo}-local"),
         Err(env::VarError::NotUnicode(_)) => panic!("SQLH_VERSION isn't valid Unicode"),
     };
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/build_version.rs");
+    println!("cargo:rerun-if-env-changed=SQLH_VERSION");
+    println!("cargo:rerun-if-env-changed=SQLH_BUILD");
     println!("cargo:rustc-env=SQLH_BUILT_VERSION={version}");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")

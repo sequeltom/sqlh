@@ -3,6 +3,9 @@
 //! share the execution core (`run`).
 
 mod app;
+// build.rs's check of SQLH_VERSION, compiled here only for its tests.
+#[cfg(test)]
+mod build_version;
 mod cli;
 mod config;
 mod console;

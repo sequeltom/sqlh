@@ -36,7 +36,8 @@ Don't trade these away.
 
 ```
 build.rs         the version (SQLH_VERSION, else Cargo.toml's with -local) and the Windows
-                 version resource, written as a .res file the linker takes (decision 44)
+                 version resource, written as a .res file the linker takes (decision 44);
+                 src/build_version.rs checks SQLH_VERSION (R47), shared with the lib's tests
 src/main.rs      the binary: calls sqlh::main; everything else is the library (src/lib.rs)
 src/app.rs       the command: arguments, output and its closing lines (Closing), -o publication,
                  the panic net and last-resort diagnostics; profile commands use it
@@ -105,7 +106,7 @@ archive/         git-ignored, never pushed: archive/reviews/ holds the external 
 
 Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (PLAN.md 3.5, 3.6).
 
-The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and links it as a .res file, with no rc.exe and no crate (DESIGN.md §4). A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only. External review of `7fed369..157334f` on October 31, 2026 accepted decision 44 with nonblocking P3 R47: tighten SQLH_VERSION validation before Cargo output, since malformed suffixes can split the code/resource identity. Resource layout, SDK comparison, native queries, default non-live checks and local verification-span probes passed; the hosted dispatch was still in progress at the recorded snapshot (PLAN.md, Versioning external review).
+The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and links it as a .res file, with no rc.exe and no crate (DESIGN.md §4). A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only. External review of `7fed369..157334f` on October 31, 2026 accepted decision 44 with nonblocking P3 R47: tighten SQLH_VERSION validation before Cargo output, since malformed suffixes can split the code/resource identity. R47 is fixed (`src/build_version.rs`), awaiting external verification. Resource layout, SDK comparison, native queries, default non-live checks and local verification-span probes passed; the hosted dispatch was still in progress at the recorded snapshot (PLAN.md, Versioning external review).
 
 ## Commands
 
