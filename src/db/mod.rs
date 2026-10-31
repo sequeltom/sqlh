@@ -1569,7 +1569,31 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     // The direct Schannel path reports TLS failures as generic errors carrying SSPI status
     // names, so match the text too.
-    let hint = tls_hint(&detail, hints).unwrap_or(hint);
+    let tls = tls_hint(&detail, hints);
+    let certificate = tls.is_some()
+        || matches!(
+            error,
+            TdsError::TlsError(_)
+                | TdsError::TlsHandshakeError { .. }
+                | TdsError::NoServerCertificate
+                | TdsError::CertificateExpired
+                | TdsError::CertificateMismatch
+        );
+    // Strict encryption checks the certificate even when it is trusted (mssql-tds
+    // `resolve_tls_validation`), so under -Ns a hint to trust it would only fail again (R46).
+    let hint = if certificate && matches!(options.encrypt, Encrypt::Strict) {
+        hints.pick(
+            "strict encryption checks the server's certificate even with -C, and needs SQL Server \
+             2022 or later: connect by the name on the certificate, from a machine that trusts \
+             its issuer, or use -Nm, where -C applies",
+            "strict encryption checks the server's certificate even with \
+             trust_server_certificate = true, and needs SQL Server 2022 or later: connect by the \
+             name on the certificate, from a machine that trusts its issuer, or set encrypt = \
+             \"mandatory\" in the profile, where trust applies",
+        )
+    } else {
+        tls.unwrap_or(hint)
+    };
     let mut message = format!("cannot connect to {target}: {detail}");
     if !hint.is_empty() {
         message.push_str("; ");
@@ -2147,6 +2171,52 @@ mod tests {
         ] {
             assert!(!hint.contains(" -C") && !hint.contains(" -U"), "{hint}");
         }
+    }
+
+    // R46: strict encryption checks the certificate even with -C, so its certificate failures
+    // never suggest trusting it; the same failures under mandatory still do.
+    #[test]
+    fn a_certificate_failure_under_strict_encryption_offers_no_trust() {
+        let mut options = fake_server::options("db01".into());
+        let words = |options: &super::ConnectOptions, error: TdsError| match connect_error(
+            error, options,
+        ) {
+            DbError::Connect(words) => words,
+            other => panic!("{other:?}"),
+        };
+        // The direct Schannel path's form, matched by its text (`tls_hint`).
+        let untrusted = || {
+            TdsError::ImplementationError(
+                "Schannel TLS handshake failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)".into(),
+            )
+        };
+        options.encrypt = super::Encrypt::Strict;
+        options.trust_server_certificate = true;
+        for hints in [Hints::Flags, Hints::Profile] {
+            options.hints = hints;
+            for error in [
+                untrusted(),
+                TdsError::CertificateMismatch,
+                TdsError::NoServerCertificate,
+            ] {
+                let hint = words(&options, error);
+                assert!(
+                    hint.contains("strict encryption checks the server's certificate even with")
+                        && !hint.contains("pass -C")
+                        && !hint.contains("= true in the profile to")
+                        && !hint.contains("needs trust_server_certificate"),
+                    "{hint}"
+                );
+            }
+        }
+        assert!(words(&options, TdsError::CertificateExpired).ends_with("where trust applies"));
+        options.hints = Hints::Flags;
+        assert!(words(&options, untrusted()).ends_with("or use -Nm, where -C applies"));
+        options.encrypt = super::Encrypt::Mandatory;
+        assert!(words(&options, untrusted()).contains("pass -C"));
+        // A failure that isn't the certificate's keeps its own hint under strict.
+        options.encrypt = super::Encrypt::Strict;
+        assert!(words(&options, TdsError::ConnectionClosed("x".into())).ends_with("try host,port"));
     }
 
     // Found in review (2026-10-31): under -M, mssql-tds 0.3.0's race of every address ends at
@@ -3391,15 +3461,46 @@ pub(crate) mod fake_server {
     }
 
     /// A connect to a gateway whose login reply is `reply`, with a second fake listening as the
-    /// route's target: the connect's outcome, and whether a LOGIN7 reached the target.
-    fn route_through(reply: impl FnOnce(u16) -> Vec<u8>) -> (Result<Session, DbError>, bool) {
+    /// route's target: the connect's outcome, and the LOGIN7 that reached the target, if any.
+    fn route_through(
+        reply: impl FnOnce(u16) -> Vec<u8>,
+    ) -> (Result<Session, DbError>, Option<Vec<u8>>) {
         let (target, routed) = serve_login(login_reply());
         let (gateway, _) = serve_login(reply(target));
         let outcome = connect(format!("127.0.0.1,{gateway}"));
         // A refused route sends nothing more; give a route that was followed time to land.
         std::thread::sleep(Duration::from_millis(200));
-        let reached = routed.lock().unwrap().is_some();
+        let reached = routed.lock().unwrap().clone();
         (outcome, reached)
+    }
+
+    /// FEATUREEXTACK (0xAE, MS-TDS 2.2.7.11) acknowledging one feature: `id | data length u32
+    /// LE | data`, then the 0xFF terminator.
+    fn feature_ext_ack(id: u8, data: &[u8]) -> Vec<u8> {
+        let mut token = vec![0xae, id];
+        token.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+        token.extend(data);
+        token.push(0xff);
+        token
+    }
+
+    /// The database a LOGIN7 payload asks for: ibDatabase and cchDatabase (bytes 68..72 of the
+    /// OffsetLength block, MS-TDS 2.2.6.4), UTF-16 characters.
+    fn login_database(login: &[u8]) -> Option<String> {
+        let field = |i: usize| {
+            login
+                .get(i..i + 2)
+                .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        let (offset, chars) = (field(68)?, field(70)?);
+        let units: Vec<u16> = login
+            .get(offset..offset + 2 * chars)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
+            .collect();
+        String::from_utf16(&units).ok()
     }
 
     /// `login_reply` with `token` placed after its LOGINACK (`after_ack`) or before it: every
@@ -3427,7 +3528,7 @@ pub(crate) mod fake_server {
         let (followed, reached) =
             route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), true));
         assert!(followed.is_ok(), "{:?}", followed.err());
-        assert!(reached, "the login reached the route");
+        assert!(reached.is_some(), "the login reached the route");
 
         let (early, reached) =
             route_through(|target| login_reply_with(env_routing(target, "127.0.0.1"), false));
@@ -3437,7 +3538,7 @@ pub(crate) mod fake_server {
             "{:?}",
             early.err()
         );
-        assert!(!reached, "no login after a refused route");
+        assert!(reached.is_none(), "no login after a refused route");
 
         let (unacknowledged, reached) = route_through(|target| {
             login_reply_with(env_route(21, target, "127.0.0.1", Some("sales")), true)
@@ -3449,9 +3550,27 @@ pub(crate) mod fake_server {
             unacknowledged.err()
         );
         assert!(
-            !reached,
+            reached.is_none(),
             "no login after an unacknowledged Enhanced Routing route"
         );
+    }
+
+    // The external review's judgment 4 (2026-10-31): an acknowledged Enhanced Routing route
+    // (ENVCHANGE 21) that names a database is followed, and the routed LOGIN7 asks for that
+    // database in place of the login's own; the routed login asks for no session recovery
+    // either (decision 41). The driver's FEATUREEXTACK check is the one the unacknowledged case
+    // above fails, so this pins both sides of it.
+    #[test]
+    fn an_acknowledged_enhanced_route_takes_the_login_to_its_database() {
+        let (followed, reached) = route_through(|target| {
+            let route = env_route(21, target, "127.0.0.1", Some("sales"));
+            login_reply_with([feature_ext_ack(0x0f, &[1]), route].concat(), true)
+        });
+        assert!(followed.is_ok(), "{:?}", followed.err());
+        let login = reached.expect("the login reached the route");
+        assert_eq!(login_database(&login).as_deref(), Some("sales"));
+        let features = login_features(&login);
+        assert!(!features.contains(&0x01), "{features:02x?}");
     }
 }
 

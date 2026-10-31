@@ -54,7 +54,7 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 - **Seen in:** 0.3.0, reading the source (docs/notes/driver-0.3.0.md §1.2; owner decision 42).
 - **What:** LOGIN7 always advertises DNS caching (feature 0x0B), and when a server acknowledges it the addresses the name resolved to are kept in a process-wide cache with no TTL (`connection/dns_cache.rs`), used whenever a later lookup of that name fails. The module is crate-private and the feature is always requested, so a client can't opt out.
-- **Why it matters to sqlh:** `sqlh mcp` is a long-lived process; in a DNS outage, its login, with a SQL password, goes to the addresses the name had at the last accepted login, which TLS covers only by the certificate's name (not under `-C` or optional encryption).
+- **Why it matters to sqlh:** `sqlh mcp` is a long-lived process; in a DNS outage, its login, with a SQL password, goes to the addresses the name had at the last accepted login, which TLS covers only by the certificate's name, and only where the certificate is checked (strict; mandatory without `-C`; optional only when the server requires full encryption and `-C` is off).
 - **sqlh's workaround:** none (resolving names itself would break Kerberos SPNs); documented in DESIGN.md §8.
 - **Possible fix:** a `ClientContext` option to not advertise 0x0B or not use the cache, or a TTL.
 
