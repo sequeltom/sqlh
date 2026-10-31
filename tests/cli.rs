@@ -11455,5 +11455,41 @@ mod live {
                 "the password never shows"
             );
         }
+
+        // Decisions 19 and 41 (docs/notes/driver-0.3.0.md §2): a pooled connection killed on
+        // the server between two calls is replaced by the engine's own retry, on a new login
+        // that the call reports as connect time, never by the driver's session recovery,
+        // which sqlh keeps off. The kill is of this test's own server's session.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn a_pooled_connection_killed_between_calls_is_replaced_by_the_engines_retry() {
+            let (p, db) = target();
+            let mut mcp = Mcp::on(&p);
+            // The connection's id, not the session's login time: a reset gives the session a
+            // new login_time (seen live), while the connection keeps its id until it closes.
+            let who = "SELECT @@SPID AS spid, CAST(c.connection_id AS varchar(36)) AS connection \
+                 FROM sys.dm_exec_connections AS c WHERE c.session_id = @@SPID";
+            let first = ok_document(&mcp.call(1, "query", json!({"sql": who, "format": "json"})));
+            let before = result_sets(&first)[0][0].clone();
+            let spid = before["spid"].as_i64().expect("a session id");
+            let reused = ok_document(&mcp.call(2, "query", json!({"sql": who, "format": "json"})));
+            assert_eq!(reused["connect_ms"], 0, "the same connection: {reused}");
+            assert_eq!(result_sets(&reused)[0][0], before, "the same connection");
+
+            let killed = live(&p, &db, &["--allow-write", "-Q", &format!("KILL {spid}")]);
+            assert_eq!(killed.code, 0, "{}", killed.stdout);
+
+            let after_kill =
+                ok_document(&mcp.call(3, "query", json!({"sql": who, "format": "json"})));
+            assert!(
+                after_kill["connect_ms"].as_u64() > Some(0),
+                "a new login: {after_kill}"
+            );
+            let after = result_sets(&after_kill)[0][0].clone();
+            assert_ne!(
+                after["connection"], before["connection"],
+                "a new connection: {after:?} after {before:?}"
+            );
+        }
     }
 }

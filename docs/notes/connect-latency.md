@@ -75,3 +75,5 @@ target\release\sqlh.exe profile test test                         # the same ste
 ```
 
 Default builds leave the feature out. Listening to the driver's logging keeps all of its log formatting in the exe, which adds 270 KB (about 12%), so a default build's `--verbose` line reports only the connect total and the session setup.
+
+**mssql-tds 0.3.0 (2026-10-31):** three runs with `--features timing --verbose` gave tcp 6–41 ms, prelogin 4, TLS 23–74, login 162–171, and 197–292 ms in all: the same shape, the login still about 80% of the connect. `db::phases` still finds every event it times ([driver-0.3.0.md](driver-0.3.0.md) §8).

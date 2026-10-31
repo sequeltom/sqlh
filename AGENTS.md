@@ -114,7 +114,7 @@ The exe's version is `SQLH_VERSION` at build time if set (the release workflow s
 **Day to day:** `pwsh scripts/check.ps1` runs every check below that needs no server and stops at the first failure; `pwsh scripts/check.ps1 -Live` adds the live tests. Run it before every commit that touches code. The individual commands:
 
 ```powershell
-cargo build --release                               # ~2.7 MB exe (budget 3 MB); full LTO takes ~1–2 min
+cargo build --release                               # ~2.9 MB exe (budget 3 MB); full LTO takes ~1–2 min
 cargo test                                          # unit + process-level tests; no server needed
 cargo test --release --test cli                     # process-level tests against the release exe
 cargo build --release --features timing             # --verbose also times each connect step (dev builds; +270 KB)

@@ -189,3 +189,44 @@
 9. A failed login's text and hint (18456).
 10. `live::mcp_tools`, `db::spike::spike_reset`, the `-t 1` timing tests, the lock-timeout, deadlock and Ctrl+Break tests, harness kill (harness-kill.md).
 11. New: after a connect and after an MCP call, session recovery reports off and no recovery has happened; `KILL` a pooled session's SPID from another session between two calls, and the next call shows the engine's retry (`connect` above 0 ms) and a fresh session.
+
+## 8. Step 2: the upgrade, as built and measured (2026-10-31)
+
+On the local branch `driver-0.3.0`, decisions 40–43 taken (PLAN.md §6).
+
+**Code (`src/db/` only):**
+- `Cargo.toml` pins `=0.3.0`; `Cargo.lock` changes only the `mssql-tds` line.
+- `multi_subnet_failover = Some(options.multi_subnet_failover)` (decision 40).
+- `Session::connect` fails with a protocol error if the client ever reports session recovery negotiated (decision 41's guard).
+- Comments: `connect_retry_count = 0` also keeps idle connection resiliency off; `run_until_cancelled` holds in 0.3.0; `db::phases`' texts are 0.3.0's.
+- Exe: 2,894,848 bytes, 250,880 bytes under the 3 MB budget (the trial build measured the driver's own share: +80,896 bytes over 0.2.0 on the same tree, §Summary); the same ten in-box DLLs.
+
+**New tests:**
+- `db::fake_server::the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own` reads the LOGIN7's FeatureExt list: no 0x01 (session recovery), 0x0B and 0x0F present; the resolved failover policy is off, from the connection.
+- `db::fake_server::a_route_after_the_login_acknowledgement_is_followed_and_one_before_it_is_refused` pins routing (decision 43): an ENVCHANGE 20 after LOGINACK takes the login to the named server; one before it fails the connect, and no second login is sent.
+- `the_drivers_failover_default_variable_changes_nothing` (process test): `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage` leave a refused connect at exit 2 with the sequential text. The variable is scrubbed from every process test (`isolated`).
+- `live::an_empty_image_is_0x_and_only_a_null_one_is_null`: text, json and csv, on the plain row path and on the cursor.
+- `live::mcp_tools::a_pooled_connection_killed_between_calls_is_replaced_by_the_engines_retry`: `KILL` of the pooled session from another session between calls; the next call reports a connect time and runs on a new connection (`sys.dm_exec_connections.connection_id`). **Found while writing it:** a connection reset gives the session a new `login_time` in `sys.dm_exec_sessions`, so login time can't tell a reused session from a new one; the connection id can.
+
+**Checks:** `scripts/check.ps1 -Live` passes on 0.3.0: 381 unit tests, 95 debug and 89 release process tests, 59 debug and 53 release live tests (the smoke goldens unchanged, `live::mcp_tools`, the `-t 1` timing, lock-timeout, deadlock, Ctrl+Break and harness-kill tests, the memory tests' bounds). `db::spike::spike_reset` passes all seven sections.
+
+**Re-measured** (release build, the test server, 2026-10-31):
+
+| Measurement | 0.2.0 (the notes) | 0.3.0 |
+|---|---|---|
+| `-S 127.0.0.1,1 -l 15` | about 2.1 s, exit 2 | 2.14 s, exit 2 |
+| `-S 192.0.2.1 -l 2` | 2.0 s, exit 2, "timed out after 2000ms" | 2.11 s, exit 2, the same text |
+| `-S localhost,1`; with `-l 2` | 4.1 s, exit 2; 3.1 s, exit 4 | 4.18 s, exit 2; 3.11 s, exit 4 |
+| `-S 2001:db8::5 -l 2` | about 2.05 s | 2.12 s, exit 2 |
+| `-S np:192.0.2.1` | exit 3 | exit 3, 98 ms |
+| the same under `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` / `=garbage` | — | unchanged (exit 2 at 2.13 s; exit 4 at 3.11 s) |
+| `-M -S 192.0.2.1 -l 2` | — | exit 4 at 2.10 s (the login deadline) |
+| `-M -S localhost,1`; `-M -S 127.0.0.1,1` | — | exit 2 at 2.13 s, "All parallel connection attempts failed" |
+| `-M -S host\INST` (no port) | — | exit 2 at once, "Usage Error: MultiSubnetFailover requires an explicit TCP port for a named instance" |
+| a failed SQL login (a login that doesn't exist) | error 18456 and its hint, exit 2 | the same |
+| connect steps, `--features timing --verbose`, three runs | tcp 5, prelogin 6, TLS 26, login 150, total 195 ms (medians) | tcp 6–41, prelogin 4, TLS 23–74, login 162–171, total 197–292 ms |
+| peak working set: 1 GiB `varchar(max)`; 100 MiB; 20 rows of 50 MB (`--max-rows 1 --exact-count`) | 10.3 MB (19.4 s); 9.7 MB; 9.7 MB (15.8 s) | 10.4 MB (18.8 s); 10.4 MB (2.1 s); 10.4 MB (15.3 s) |
+
+So connect bounds, exit codes, texts, latency and memory are 0.2.0's; `-M`'s rows are new and are in DESIGN.md §4.
+
+**Not settled:** whether on-prem SQL Server 2025 acknowledges DNS caching (decision 42). A one-off probe through the driver's `test-util` API, never committed, found the test profile's server named by an IP literal, which the driver never caches, so it couldn't tell; checking with a host name would mean sending the profile's stored password to a spelling other than its own, which R20's binding refuses, so it was not done. Still the likely answer: no, an Azure feature [inferred].
