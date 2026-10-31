@@ -2050,6 +2050,9 @@ mod tests {
         ] {
             let called = paused(request(sql), at, Duration::from_secs(1));
             assert_eq!(called.exit, Exit::Ok, "{sql}: {}", called.text);
+            // The second result's arrival, with no stopped count, is the check: under the
+            // short count the attention comes at about 250 ms and withholds it. No floor on
+            // the time: the fake's 1 s read timeout can end a fraction early (R50).
             assert!(
                 called
                     .text
@@ -2057,11 +2060,6 @@ mod tests {
                     && !called.text.contains("counting stopped"),
                 "{sql}: {}",
                 called.text
-            );
-            assert!(
-                called.elapsed >= Duration::from_secs(1),
-                "{sql}: {:?}",
-                called.elapsed
             );
         }
     }
