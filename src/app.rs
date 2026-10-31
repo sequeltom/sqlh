@@ -244,6 +244,7 @@ fn request(opts: &Opts) -> Result<Request, Failure> {
                 command.report()
             },
             database: None,
+            exact_count: false,
         });
     }
     let input = match (&opts.query, opts.inputs.is_empty()) {
@@ -267,6 +268,7 @@ fn request(opts: &Opts) -> Result<Request, Failure> {
         continue_on_error: opts.continue_on_error,
         report,
         database: None,
+        exact_count: false,
     })
 }
 
@@ -739,6 +741,7 @@ mod tests {
             result,
             errors,
             stopped_batches,
+            cut_batches: Vec::new(),
         };
         let clean = Closing::of(
             outcome(Ok(stats()), 0, 0),
@@ -806,6 +809,71 @@ mod tests {
         );
     }
 
+    // Decision 45: a run whose stopped count cancelled later statements isn't `ok`, though it
+    // exits 0: the status line says `partial` and names the batches whose rest didn't run,
+    // and a failure adds the same words. A stop that cancelled nothing stays `ok`.
+    #[test]
+    fn a_run_that_lost_statements_to_a_stopped_count_is_partial() {
+        let stats = || Stats {
+            batches_run: 3,
+            ..Stats::default()
+        };
+        let outcome = |result, errors, cut_batches: Vec<usize>| RunOutcome {
+            result,
+            errors,
+            stopped_batches: 2,
+            cut_batches,
+        };
+        let close = |o| Closing::of(o, Instant::now(), output::Advice::Mcp);
+        let partial = close(outcome(Ok(stats()), 0, vec![3]));
+        assert_eq!(partial.exit, Exit::Ok);
+        assert!(
+            partial.status.starts_with(
+                "partial: 3 batches, counting stopped in 2, the rest of batch 3 not run, "
+            ) && partial.status.ends_with(" ms"),
+            "{}",
+            partial.status
+        );
+        let many = close(outcome(Ok(stats()), 0, (1..=7).collect()));
+        assert!(
+            many.status.starts_with(
+                "partial: 3 batches, counting stopped in 2, the rest of batches 1, 2, 3, 4, 5 \
+                 (+2 more) not run, "
+            ),
+            "{}",
+            many.status
+        );
+        let ok = close(outcome(Ok(stats()), 0, Vec::new()));
+        assert!(
+            ok.status
+                .starts_with("ok: 3 batches, counting stopped in 2, "),
+            "{}",
+            ok.status
+        );
+        let failed = close(outcome(Ok(stats()), 1, vec![2]));
+        assert_eq!(failed.exit, Exit::SqlError);
+        assert!(
+            failed.status.starts_with("failed (exit 1): 1 error")
+                && failed
+                    .status
+                    .contains(", counting stopped in 2, the rest of batch 2 not run, "),
+            "{}",
+            failed.status
+        );
+        let timeout = close(outcome(
+            Err(Failure::new(Exit::Timeout, "query timeout")),
+            0,
+            vec![1],
+        ));
+        assert!(
+            timeout.status.starts_with(
+                "failed (exit 4): timeout, counting stopped in 2, the rest of batch 1 not run, "
+            ),
+            "{}",
+            timeout.status
+        );
+    }
+
     // In sqlh mcp the status line names no command-line flag: a usage error doesn't point at
     // --help, and the batches a SQL error left unrun don't offer --continue-on-error.
     #[test]
@@ -818,6 +886,7 @@ mod tests {
             }),
             errors: 1,
             stopped_batches: 0,
+            cut_batches: Vec::new(),
         };
         let usage = || RunOutcome::new(Err(Failure::usage("bad")));
         for (advice, skip_tail, usage_label) in [

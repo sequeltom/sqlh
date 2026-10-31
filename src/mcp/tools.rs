@@ -30,8 +30,9 @@ const MAX_SQL_BYTES: usize = 1 << 20;
 /// schema command's own defaults then leave alone (schema-commands.md §4).
 pub(crate) struct Launch {
     pub(crate) profiles: Vec<Profile>,
-    pub(crate) rows_given: bool,
-    pub(crate) cell_given: bool,
+    /// `--max-rows` and `--max-cell` at launch, if given: they are every call's default then.
+    pub(crate) max_rows: Option<u64>,
+    pub(crate) max_cell: Option<usize>,
 }
 
 pub(crate) struct Profile {
@@ -47,12 +48,15 @@ enum Arg {
     Pattern,
     OptionalPattern,
     InDefinitions,
+    ExactCount,
 }
 
 struct Tool {
     name: &'static str,
     description: &'static str,
     args: &'static [Arg],
+    /// Whether `max_rows` and `max_cell` mean anything for it (`info` returns one short row).
+    limits: bool,
 }
 
 /// The tools, in `tools/list` order.
@@ -63,9 +67,16 @@ const TOOLS: &[Tool] = &[
             everything runs in a transaction that is rolled back. Several batches separated by \
             GO are allowed; temp tables last only within one call. The result is sqlh's compact \
             text: `-- ` lines are metadata, the header is name:type, rows are tab-separated, \
-            NULL is NULL, and the last line is the status. Limits cut long results and say so; \
-            raise max_rows only when you need more.",
-        args: &[Arg::Sql],
+            NULL is NULL, and the last line is the status: `-- ok:`, `-- partial:` or \
+            `-- failed`. Values are escaped: `\\\\` is one backslash, `\\t` a tab, `\\n` a \
+            newline, and `…[+N]` ends a value cut N characters short. Limits cut long results \
+            and say so; raise max_rows only when you need more. `≥N` rows is a lower bound: \
+            the hidden rows were counted only briefly (exact_count counts them all). A capped \
+            result with more statements after it in its batch is counted for up to 5 s so they \
+            still run; `-- partial:` means some didn't, so put each query in its own GO batch. \
+            format json gives the same as one JSON document.",
+        args: &[Arg::Sql, Arg::ExactCount],
+        limits: true,
     },
     Tool {
         name: "check",
@@ -73,18 +84,21 @@ const TOOLS: &[Tool] = &[
             binding errors only. A missing table is reported only when a query runs, because \
             SQL Server defers its name resolution.",
         args: &[Arg::Sql],
+        limits: true,
     },
     Tool {
         name: "info",
         description: "The server, its version and edition, the database, the login and \
             user, the transport, the auth scheme and the server's time.",
         args: &[],
+        limits: false,
     },
     Tool {
         name: "databases",
         description: "The databases on the server, with their state, whether this login \
             can use them, compatibility level, recovery model, read-only flag and collation.",
         args: &[],
+        limits: true,
     },
     Tool {
         name: "tables",
@@ -92,6 +106,7 @@ const TOOLS: &[Tool] = &[
             or a glob with * and ? (case-insensitive), matched against the name or \
             schema.name.",
         args: &[Arg::OptionalPattern],
+        limits: true,
     },
     Tool {
         name: "describe",
@@ -100,6 +115,7 @@ const TOOLS: &[Tool] = &[
             triggers, parameters. Works for system views too (sys.dm_exec_requests). Use it \
             before writing queries against unfamiliar tables.",
         args: &[Arg::Object],
+        limits: true,
     },
     Tool {
         name: "find",
@@ -107,12 +123,14 @@ const TOOLS: &[Tool] = &[
             with * and ?); with in_definitions, also the module bodies that contain it, with \
             the first matching line.",
         args: &[Arg::Pattern, Arg::InDefinitions],
+        limits: true,
     },
     Tool {
         name: "definition",
         description: "The source of a view, procedure, function or trigger, as a block framed \
             by its line count.",
         args: &[Arg::Object],
+        limits: true,
     },
     Tool {
         name: "deps",
@@ -120,8 +138,30 @@ const TOOLS: &[Tool] = &[
             references, foreign keys and synonyms, with the column or constraint that holds \
             each reference.",
         args: &[Arg::Object],
+        limits: true,
     },
 ];
+
+/// The `max_rows` and `max_cell` descriptions for `tool`, each with the call's default: the
+/// launch's `--max-rows` or `--max-cell` if given, else the schema command's own
+/// (`schema::Command::limits`), else the profile's or sqlh's.
+fn limit_descriptions(tool: &str, launch: &Launch) -> (String, String) {
+    let rows = match (launch.max_rows, tool) {
+        (Some(n), _) => format!("default {n}"),
+        (None, "describe" | "deps" | "definition") => "default 2000".into(),
+        (None, _) => "default 100, or the profile's max_rows".into(),
+    };
+    let cell = match (launch.max_cell, tool) {
+        (Some(0), _) | (None, "definition") => "default: no limit".into(),
+        (Some(n), _) => format!("default {n}"),
+        (None, "describe" | "deps") => "default 4000".into(),
+        (None, _) => "default 500, or the profile's max_cell".into(),
+    };
+    (
+        format!("Rows shown per result set ({rows}); 0 shows all (within the size limit)."),
+        format!("Characters shown per value ({cell}); 0 shows all (within the size limit)."),
+    )
+}
 
 /// The `tools/list` array, for these profiles.
 pub(crate) fn definitions(launch: &Launch) -> Value {
@@ -135,8 +175,21 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 let (name, schema, needed) = match arg {
                     Arg::Sql => (
                         "sql",
-                        json!({"type": "string", "minLength": 1, "description": "The T-SQL to run."}),
+                        json!({"type": "string", "minLength": 1, "description":
+                        if tool.name == "check" {
+                            "The T-SQL to compile (not run)."
+                        } else {
+                            "The T-SQL to run."
+                        }}),
                         true,
+                    ),
+                    Arg::ExactCount => (
+                        "exact_count",
+                        json!({"type": "boolean", "description":
+                            "Count every hidden row of a capped result instead of stopping \
+                             early (default false), so later statements in the batch run \
+                             unless the timeout ends the count."}),
+                        false,
                     ),
                     Arg::Object => (
                         "object",
@@ -181,16 +234,19 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 json!({"type": "string", "minLength": 1, "maxLength": 128, "description":
                     "A database to run in, instead of the profile's."}),
             );
-            properties.insert(
-                "max_rows".into(),
-                json!({"type": "integer", "minimum": 0, "maximum": MAX_ROWS_ARG,
-                    "description": "Rows shown per result set; 0 shows all (within the size limit)."}),
-            );
-            properties.insert(
-                "max_cell".into(),
-                json!({"type": "integer", "minimum": 0, "maximum": MAX_CELL_ARG,
-                    "description": "Characters shown per value; 0 shows all (within the size limit)."}),
-            );
+            if tool.limits {
+                let (rows, cell) = limit_descriptions(tool.name, launch);
+                properties.insert(
+                    "max_rows".into(),
+                    json!({"type": "integer", "minimum": 0, "maximum": MAX_ROWS_ARG,
+                        "description": rows}),
+                );
+                properties.insert(
+                    "max_cell".into(),
+                    json!({"type": "integer", "minimum": 0, "maximum": MAX_CELL_ARG,
+                        "description": cell}),
+                );
+            }
             properties.insert(
                 "timeout".into(),
                 json!({"type": "integer", "minimum": 1,
@@ -244,7 +300,9 @@ pub(crate) fn instructions(launch: &Launch) -> String {
         "sqlh runs read-only T-SQL against SQL Server. Profiles: {}.{choose} Use `describe`, \
          `find` or `deps` before writing queries against unfamiliar tables. Results come in a \
          compact text format: `-- ` lines are metadata, the header is `name:type`, rows are \
-         tab-separated, NULL is `NULL`, and the last line is the status. Results are cut at \
+         tab-separated, NULL is `NULL`, `\\\\` is one backslash, and the last line is the \
+         status: `-- ok:`, `-- partial:` (a stopped row count kept later statements of its batch \
+         from running; put each query in its own GO batch) or `-- failed`. Results are cut at \
          row and size limits, which the output says; raise `max_rows` only when you need \
          more. Every call is read-only (writes are refused and rolled back) and starts fresh: \
          temp tables last only within one call.",
@@ -267,6 +325,8 @@ pub(crate) struct Planned {
     max_rows: Option<u64>,
     max_cell: Option<usize>,
     timeout: Option<u32>,
+    /// `exact_count`: count every hidden row (decision 45; `query` only).
+    exact_count: bool,
     pub(crate) format: Format,
 }
 
@@ -299,10 +359,22 @@ pub(crate) fn echo(name: &str) -> String {
 /// as `integer` (`the_numeric_arguments_are_the_schemas_integers`).
 pub(crate) const NUMERIC_ARGS: [&str; 3] = ["max_rows", "max_cell", "timeout"];
 
-/// The arguments every tool takes, after its own.
-const COMMON_ARGS: [&str; 6] = [
-    "profile", "database", "max_rows", "max_cell", "timeout", "format",
-];
+/// The arguments `tool` takes: its own, then those every tool takes, `max_rows` and `max_cell`
+/// only where its `limits` are on (all but `info`).
+fn takes(tool: &Tool) -> Vec<&'static str> {
+    let limits: &[&str] = if tool.limits {
+        &["max_rows", "max_cell"]
+    } else {
+        &[]
+    };
+    tool.args
+        .iter()
+        .map(|arg| arg_name(*arg))
+        .chain(["profile", "database"])
+        .chain(limits.iter().copied())
+        .chain(["timeout", "format"])
+        .collect()
+}
 
 /// Checks a `tools/call`'s name and arguments against the tool's schema (`Refused`); anything
 /// the run itself finds wrong (a bad object name, a refused write, a SQL error) is a tool error
@@ -354,21 +426,14 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
         message: format!("invalid arguments for {}: {why}", tool.name),
         format,
     };
+    let known = takes(tool);
     for key in args.keys() {
-        let known = COMMON_ARGS.contains(&key.as_str())
-            || tool.args.iter().any(|arg| arg_name(*arg) == key);
-        if !known {
-            let takes: Vec<&str> = tool
-                .args
-                .iter()
-                .map(|arg| arg_name(*arg))
-                .chain(COMMON_ARGS)
-                .collect();
+        if !known.contains(&key.as_str()) {
             return Err(invalid(&format!(
                 "unknown argument {} ({} takes {})",
                 echo(key),
                 tool.name,
-                takes.join(", ")
+                known.join(", ")
             )));
         }
     }
@@ -433,11 +498,15 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
     let max_rows = number("max_rows", 0, MAX_ROWS_ARG)?;
     let max_cell = number("max_cell", 0, MAX_CELL_ARG)?.map(|n| n as usize);
     let timeout = number("timeout", 1, u64::from(u32::MAX))?.map(|n| n as u32);
-    let in_definitions = match args.get("in_definitions") {
-        None => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(invalid("in_definitions must be true or false")),
+    let flag = |key: &str| -> Result<bool, Refused> {
+        match args.get(key) {
+            None => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(invalid(&format!("{key} must be true or false"))),
+        }
     };
+    let in_definitions = flag("in_definitions")?;
+    let exact_count = flag("exact_count")?;
     let what = match tool.name {
         "query" | "check" => What::Sql {
             sql: required("sql")?,
@@ -464,6 +533,7 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
         max_rows,
         max_cell,
         timeout,
+        exact_count,
         format,
     })
 }
@@ -474,6 +544,7 @@ fn arg_name(arg: Arg) -> &'static str {
         Arg::Object => "object",
         Arg::Pattern | Arg::OptionalPattern => "pattern",
         Arg::InDefinitions => "in_definitions",
+        Arg::ExactCount => "exact_count",
     }
 }
 
@@ -503,7 +574,11 @@ pub(crate) async fn execute(
     let settings = engine.settings(planned.profile);
     let mut limits: Limits = settings.limits;
     if let What::Command(command) = &planned.what {
-        command.limits(&mut limits, launch.rows_given, launch.cell_given);
+        command.limits(
+            &mut limits,
+            launch.max_rows.is_some(),
+            launch.max_cell.is_some(),
+        );
     }
     if let Some(rows) = planned.max_rows {
         limits.max_rows = rows;
@@ -576,6 +651,7 @@ fn prepare(
         continue_on_error: false,
         report,
         database: planned.database.clone(),
+        exact_count: planned.exact_count,
     };
     run::prepare(request, settings, origin)
 }
@@ -593,8 +669,8 @@ mod tests {
                     description: Some(format!("{n} server")),
                 })
                 .collect(),
-            rows_given: false,
-            cell_given: false,
+            max_rows: None,
+            max_cell: None,
         }
     }
 
@@ -616,10 +692,102 @@ mod tests {
                 .map(|(name, _)| name.as_str())
                 .collect();
             integers.sort_unstable();
-            let mut wanted = NUMERIC_ARGS.to_vec();
+            // `info` takes no limits (its one short row has nothing to cut).
+            let mut wanted: Vec<&str> = NUMERIC_ARGS
+                .iter()
+                .copied()
+                .filter(|arg| tool["name"] != "info" || *arg == "timeout")
+                .collect();
             wanted.sort_unstable();
             assert_eq!(integers, wanted, "{}", tool["name"]);
         }
+    }
+
+    // MCP client feedback (2026-10-31, decision 45): the schemas state each limit's default,
+    // `check` says its SQL is compiled, not run, `info` takes no limits, and `query` alone
+    // takes `exact_count`, which a call then passes on to the run.
+    #[test]
+    fn the_schemas_state_their_defaults_and_exact_count_reaches_the_run() {
+        let schema = |tools: &Value, name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["inputSchema"]["properties"]
+                .clone()
+        };
+        let tools = definitions(&launch(&["test"]));
+        let query = schema(&tools, "query");
+        assert_eq!(
+            query["max_rows"]["description"],
+            "Rows shown per result set (default 100, or the profile's max_rows); 0 shows all \
+             (within the size limit)."
+        );
+        assert_eq!(
+            query["max_cell"]["description"],
+            "Characters shown per value (default 500, or the profile's max_cell); 0 shows all \
+             (within the size limit)."
+        );
+        assert_eq!(query["exact_count"]["type"], "boolean");
+        assert_eq!(query["sql"]["description"], "The T-SQL to run.");
+        let check = schema(&tools, "check");
+        assert_eq!(
+            check["sql"]["description"],
+            "The T-SQL to compile (not run)."
+        );
+        assert!(check.get("exact_count").is_none());
+        let info = schema(&tools, "info");
+        assert!(info.get("max_rows").is_none() && info.get("max_cell").is_none());
+        let describe = schema(&tools, "describe");
+        assert!(
+            describe["max_rows"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("(default 2000)")
+                && describe["max_cell"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("(default 4000)"),
+            "{describe}"
+        );
+        let definition = schema(&tools, "definition");
+        assert!(
+            definition["max_cell"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("(default: no limit)"),
+            "{definition}"
+        );
+        // A launch's own limits are every tool's default.
+        let mut given = launch(&["test"]);
+        given.max_rows = Some(25);
+        given.max_cell = Some(0);
+        let tools = definitions(&given);
+        for name in ["query", "describe", "definition"] {
+            let props = schema(&tools, name);
+            assert!(
+                props["max_rows"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("(default 25)")
+                    && props["max_cell"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("(default: no limit)"),
+                "{name}: {props}"
+            );
+        }
+        let one = launch(&["test"]);
+        let exact = |args: Value| {
+            let planned = plan(&call(json!({"name": "query", "arguments": args})), &one)
+                .unwrap_or_else(|_| panic!("planned"));
+            let settings = run::unconnected_settings(false);
+            prepare(&planned, &settings).unwrap().exact_count()
+        };
+        assert!(exact(json!({"sql": "SELECT 1", "exact_count": true})));
+        assert!(!exact(json!({"sql": "SELECT 1", "exact_count": false})));
+        assert!(!exact(json!({"sql": "SELECT 1"})));
     }
 
     #[test]
@@ -806,8 +974,24 @@ mod tests {
             ),
             (
                 json!({"name": "query", "arguments": {"sql": "x", "rows": 1}}),
-                "invalid arguments for query: unknown argument rows (query takes sql, profile, \
-                 database, max_rows, max_cell, timeout, format)",
+                "invalid arguments for query: unknown argument rows (query takes sql, \
+                 exact_count, profile, database, max_rows, max_cell, timeout, format)",
+                &one,
+            ),
+            // `info` takes no limits; `exact_count` is query's alone, and a boolean.
+            (
+                json!({"name": "info", "arguments": {"max_rows": 5}}),
+                "unknown argument max_rows (info takes profile, database, timeout, format)",
+                &one,
+            ),
+            (
+                json!({"name": "tables", "arguments": {"exact_count": true}}),
+                "unknown argument exact_count",
+                &one,
+            ),
+            (
+                json!({"name": "query", "arguments": {"sql": "x", "exact_count": 1}}),
+                "exact_count must be true or false",
                 &one,
             ),
             (

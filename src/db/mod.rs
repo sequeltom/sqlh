@@ -294,6 +294,12 @@ async fn wait_for_output(
 /// How long a read-only run goes on counting the rows it does not show (DESIGN.md §4.4).
 pub const COUNT_BUDGET: Duration = Duration::from_millis(250);
 
+/// The count's budget in a batch where a stop could cancel a later statement's output
+/// (decision 45, `guard::several_outputs`): long enough that a modest result over a slow link
+/// (about 600 wide rows took the whole 250 ms on one client's) ends inside it, so the batch runs
+/// whole, and short enough that a huge one still answers within seconds.
+pub const LATER_STATEMENTS_BUDGET: Duration = Duration::from_secs(5);
+
 /// What stopped a count of hidden rows (`BatchSink::counting_stopped`). The output tells the
 /// two apart in its advice: the budget is lifted by `--exact-count`, `-t` by raising it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +346,17 @@ impl Counting {
         budget: Some(COUNT_BUDGET),
         timeout_stops: true,
     };
+
+    /// This counting for a batch whose later statements a stop would cancel (decision 45): a
+    /// bounded count gets `LATER_STATEMENTS_BUDGET`; an exact one stays exact.
+    pub fn with_later_statements(self) -> Counting {
+        Counting {
+            budget: self
+                .budget
+                .map(|budget| budget.max(LATER_STATEMENTS_BUDGET)),
+            ..self
+        }
+    }
 }
 
 /// How much work, in ticks, a loop does between looks at the clock (`Pace`). A hidden row is
@@ -1716,6 +1733,21 @@ mod tests {
         let (bounded, exact) = (Counting::BOUNDED, Counting::EXACT);
         assert!(bounded.timeout_stops && bounded.budget.is_some());
         assert!(!exact.timeout_stops);
+    }
+
+    // Decision 45: a batch whose later statements a stop would cancel counts for longer; an
+    // exact count stays exact, and what `-t` may stop is unchanged.
+    #[test]
+    fn a_batch_with_later_statements_counts_for_longer() {
+        let longer = Counting::BOUNDED.with_later_statements();
+        assert_eq!(longer.budget, Some(super::LATER_STATEMENTS_BUDGET));
+        assert!(longer.timeout_stops);
+        assert_eq!(Counting::EXACT.with_later_statements(), Counting::EXACT);
+        let exact_stoppable = Counting {
+            budget: None,
+            timeout_stops: true,
+        };
+        assert_eq!(exact_stoppable.with_later_statements(), exact_stoppable);
     }
 
     /// Work of sqlh's own that waits for nothing: what a loop over rows already in the read

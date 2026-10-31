@@ -987,6 +987,33 @@ Hosted run 41238698571 was read through gh, with no mutation. The last saved sna
 
 Evidence: artifacts/version-review-check.log, artifacts/version-review-probes.json, artifacts/version-review-cargo-probe.json, artifacts/version-review-verify-probe.json, artifacts/version-review-hosted-run.json and corresponding ignored scratch probes/reference resources. Prior artifacts preserved. Only review/status documents and ignored synthetic artifacts changed; no production/test source, Cargo, hosted configuration, owner/client state, commit or push action.
 
+### MCP client feedback (October 31, 2026)
+
+The owner ran `sqlh mcp` from Claude Desktop (chat and Cowork) against a real SQL Server 2016 in an availability group; [notes/mcp-client-feedback.md](notes/mcp-client-feedback.md) keeps the findings, without the environment's names. Decision 45 (§6) came from the first item.
+1. **Built (2026-10-31), decision 45:**
+   - a capped result in a batch with later statements counts for 5 s, so they run;
+   - a run that still loses them ends `-- partial:` (exit 0) and names the batches;
+   - a single-output batch's note says only that its total is a lower bound.
+   Tests:
+   - `guard::tests::several_outputs_counts_the_statements_a_stop_could_cancel`;
+   - `db::tests::a_batch_with_later_statements_counts_for_longer`;
+   - `app::tests::a_run_that_lost_statements_to_a_stopped_count_is_partial`;
+   - `output::tests::the_note_says_the_rest_did_not_run_only_where_it_could_show_something`;
+   - live: `a_capped_result_lets_the_later_statements_run_or_the_run_is_partial`, run against the test server: 200,000 rows let the later statements run; a three-way cross join ends `partial` after 5 s.
+   The live tests that pinned the old note were updated, and their batches made single-statement where they test the 250 ms path.
+2. **Built, the MCP schema:**
+   - `query` takes `exact_count`;
+   - `info` takes no `max_rows` or `max_cell`;
+   - each limit's description gives its default;
+   - `check`'s `sql` says it is compiled, not run;
+   - the `query` description and the instructions give the status forms, the escapes, `≥N` and the `GO` advice;
+   - the MCP advice names `exact_count = true` in place of the profile's key.
+   Test: `mcp::tools::tests::the_schemas_state_their_defaults_and_exact_count_reaches_the_run`, plus refusals in `calls_are_checked_against_the_schema`.
+3. **Planned, not started:**
+   - (a) paging for `definition` (a line range), since a 63,000-character procedure only reached the model through the client's fallback file;
+   - (b) `info`: the name the connection dialed, the availability group role (`sys.dm_hadr_availability_replica_states`, which needs `VIEW SERVER STATE`), and the time zone name where the server has `CURRENT_TIMEZONE()` (2019 and later). Its catalog SQL must still run on 2016, which the client used.
+4. **Declined:** a key=value status line (`format: json` is that), cut markers moved to a footer, and the `definition` line count (correct). The reasons are in the note.
+
 ### Setting the default profile (owner, 2026-10-26, from manual testing; planned, not started)
 
 `profiles.toml` has a top-level `default = "NAME"` (DESIGN.md §3 and §8: used when no `--profile`, no `SQLH_PROFILE` and no `-S`/`SQLCMDSERVER` is given), but nothing in the CLI sets it after the first `profiles add` (which makes the first profile the default, `profile.rs`, `became_default`). `profiles rm` of the default clears it silently (`Config::remove`), so removing the first of three profiles leaves two profiles, no default and no CLI way to choose one; the only fix is editing the file. `--help` mentions the default only as "Without -S: the default one" on the `--profile` line. (S)

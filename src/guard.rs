@@ -480,6 +480,124 @@ pub fn mentions_xact_abort(sql: &str) -> bool {
     Lexer::new(sql).any(|t| t.is_word("XACT_ABORT"))
 }
 
+/// The words of `STATEMENT_START` whose statements return nothing a reader would miss: no rows,
+/// no messages. A stopped count that cancels one of them loses nothing it would show.
+const SILENT_STARTS: &[&str] = &[
+    "BEGIN",
+    "BREAK",
+    "CLOSE",
+    "COMMIT",
+    "CONTINUE",
+    "DEALLOCATE",
+    "DECLARE",
+    "ELSE",
+    "END",
+    "IF",
+    "OPEN",
+    "RETURN",
+    "REVERT",
+    "ROLLBACK",
+    "SAVE",
+    "SET",
+    "USE",
+];
+
+/// The words that make output come several times: a procedure's results, and a loop's
+/// (`WHILE`, `GOTO`), which repeats the statements in it. Each counts as two.
+const REPEATING_STARTS: &[&str] = &["EXEC", "EXECUTE", "GOTO", "WHILE"];
+
+/// Whether more than one of the statements in `sql` can return rows or messages (decision 45,
+/// DESIGN.md §4.4). A stopped count of hidden rows cancels the rest of its batch, so a batch
+/// with one such statement loses nothing to it, and one with more gets the longer count
+/// (`db::LATER_STATEMENTS_BUDGET`) so its later statements still run.
+///
+/// It errs toward yes, never toward no: a wrong yes costs a few seconds of counting, a wrong no
+/// would cancel statements unseen. At parenthesis depth 0 it counts each word that starts a
+/// statement, except the `SILENT_STARTS`; one of the `REPEATING_STARTS`, or a batch that is an
+/// implicit procedure call, counts as two, since a procedure can return several results and a
+/// loop repeats its statements' output. Two words continue a
+/// statement and aren't counted: the query after a common table expression (`WITH c AS (...)
+/// SELECT`), and a `SELECT` after `UNION`, `EXCEPT` or `INTERSECT` (and `ALL`). A `WITH` starts
+/// a common table expression only at the start of the batch or after `;`, `BEGIN` or `ELSE`,
+/// as T-SQL requires; elsewhere it is a table hint, `ROLLUP`, `TIES` and the like. One pass
+/// over the text, like `mentions_xact_abort`, so it needs no budget.
+pub fn several_outputs(sql: &str) -> bool {
+    let start = Lexer::new(sql);
+    let mut outputs = match start.ahead(0) {
+        Some(first) if first.kind == Kind::Quoted => 2,
+        Some(first)
+            if first.kind == Kind::Word
+                && !in_list(STATEMENT_START, first.name)
+                && start.kind(1) != Some(Kind::Punct(':')) =>
+        {
+            2
+        }
+        _ => 0,
+    };
+    let mut depth = 0usize;
+    // Where a `WITH` may start a common table expression: the batch's start, or after `;`,
+    // `BEGIN` or `ELSE`.
+    let mut statement_boundary = true;
+    let mut cte_query_next = false;
+    let mut set_operand_next = false;
+    for token in start {
+        let boundary = statement_boundary;
+        statement_boundary = false;
+        match token.kind {
+            Kind::Punct('(') => {
+                // A query in parentheses where a statement starts: `(SELECT 1) UNION ...`.
+                if boundary && depth == 0 {
+                    outputs += 1;
+                }
+                depth += 1;
+                set_operand_next = false;
+            }
+            Kind::Punct(')') => depth = depth.saturating_sub(1),
+            Kind::Punct(';') => statement_boundary = depth == 0,
+            Kind::Word if depth == 0 => {
+                if token.is_word("BEGIN") || token.is_word("ELSE") {
+                    statement_boundary = true;
+                }
+                if token.is_word("UNION") || token.is_word("EXCEPT") || token.is_word("INTERSECT") {
+                    set_operand_next = true;
+                    continue;
+                }
+                if token.is_word("ALL") && set_operand_next {
+                    continue;
+                }
+                let continues = (set_operand_next && token.is_word("SELECT"))
+                    || (cte_query_next
+                        && in_list(
+                            &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"],
+                            token.name,
+                        ));
+                set_operand_next = false;
+                if continues {
+                    cte_query_next = false;
+                    continue;
+                }
+                if token.is_word("WITH") {
+                    if boundary {
+                        cte_query_next = true;
+                        outputs += 1;
+                    }
+                } else if in_list(REPEATING_STARTS, token.name) {
+                    outputs += 2;
+                } else if in_list(STATEMENT_START, token.name)
+                    && !in_list(SILENT_STARTS, token.name)
+                {
+                    outputs += 1;
+                }
+            }
+            _ => set_operand_next = false,
+        }
+        if outputs >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
 /// therefore doesn't depend on how many tokens the input has (PLAN.md 2.14); only a
@@ -1718,6 +1836,75 @@ mod tests {
                  sp_configure have more than {MAX_ARG_PARENS} parentheses"
             )
         );
+    }
+
+    // Decision 45: a batch gets the longer count when a stopped count could cancel output from
+    // a later statement. It may say yes where nothing would be lost (the cost is a longer
+    // count), never no where something would.
+    #[test]
+    fn several_outputs_counts_the_statements_a_stop_could_cancel() {
+        for sql in [
+            // The client's case: three queries, no GO.
+            "SELECT * FROM dbo.Account; SELECT 'second statement ran'; SELECT COUNT(*) FROM t",
+            "SELECT a FROM t SELECT b FROM u",
+            "select a from t\nselect b from u",
+            // A procedure can return several results.
+            "EXEC sp_helpdb",
+            "EXECUTE dbo.p @a = 1",
+            "sp_helpdb",
+            "[dbo].[p]",
+            "SET NOCOUNT ON; EXEC sp_who2",
+            // Messages count too.
+            "SELECT * FROM t; PRINT 'done'",
+            "SELECT * FROM t\nRAISERROR('x', 10, 1)",
+            "DBCC TRACESTATUS; SELECT 1",
+            // Both branches, either may run after the other's statements.
+            "IF @x = 1 SELECT a FROM t ELSE SELECT b FROM t",
+            "BEGIN TRY SELECT a FROM t END TRY BEGIN CATCH SELECT ERROR_MESSAGE() END CATCH",
+            "WHILE @i < 3 BEGIN SELECT @i; SET @i += 1 END; SELECT 2",
+            // A loop repeats its one SELECT: a stop in one pass cancels the passes after it.
+            "DECLARE @i int = 0; WHILE @i < 3 BEGIN SELECT * FROM t; SET @i += 1; END",
+            "again: SELECT * FROM t; IF @@ROWCOUNT > 0 GOTO again",
+            // A second CTE statement is a second statement.
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c; WITH d AS (SELECT 2 AS b) SELECT * FROM d",
+            "SELECT 1; WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            // A hint's WITH starts nothing, but what follows the statement still counts.
+            "SELECT * FROM t WITH (NOLOCK) SELECT 2",
+            "SELECT * FROM t WHERE x IN (1, 2) SELECT 2",
+            // Over-counting is allowed: the assignment returns nothing, but costs only a count.
+            "DECLARE @n int; SELECT @n = COUNT(*) FROM t; SELECT * FROM t",
+            "INSERT #t SELECT a FROM t; SELECT * FROM #t",
+            // A query in parentheses is a statement too.
+            "(SELECT a FROM t); SELECT b FROM u",
+            "SELECT b FROM u; (SELECT a FROM t)",
+        ] {
+            assert!(several_outputs(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT a FROM t;",
+            "SET NOCOUNT ON; SELECT * FROM t",
+            "DECLARE @d date = GETDATE(); SELECT * FROM t WHERE d < @d",
+            "USE msdb; SELECT * FROM dbo.sysjobhistory",
+            "DECLARE @x int = (SELECT COUNT(*) FROM t); SELECT * FROM u",
+            "SELECT * FROM t WITH (NOLOCK)",
+            "SELECT TOP (5) WITH TIES a FROM t ORDER BY a",
+            "SELECT a, COUNT(*) FROM t GROUP BY a WITH ROLLUP",
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            "WITH c (a) AS (SELECT 1), d AS (SELECT 2 AS b) SELECT * FROM c, d",
+            "SELECT a FROM t UNION SELECT a FROM u",
+            "SELECT a FROM t UNION ALL SELECT a FROM u EXCEPT SELECT a FROM v",
+            "SELECT a FROM t INTERSECT (SELECT a FROM u)",
+            "(SELECT a FROM t) UNION (SELECT a FROM u)",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.a)",
+            "IF @x = 1 SELECT a FROM t",
+            "SELECT 'EXEC p; SELECT 2' AS s -- SELECT 3",
+            "/* SELECT 1 */ SELECT 2",
+            "label: SELECT 1",
+            "",
+        ] {
+            assert!(!several_outputs(sql), "{sql}");
+        }
     }
 
     // PLAN.md 2.15: input that says XACT_ABORT gets exact counting.

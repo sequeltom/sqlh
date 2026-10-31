@@ -37,7 +37,7 @@ EXECUTION
 OUTPUT
   --format F      text (default) | json (one document; exit status last) | csv (data; -- lines on stderr)
   --max-rows N    rows per result set (default 100; 0 = all, within --max-output). Read-only runs count the rest for
-                  250 ms, then stop: "≥N" means the rest of that batch did not run (--exact-count counts all)
+                  250 ms (5 s if statements follow in its batch): "≥N" is a lower bound (--exact-count counts all)
   --max-cell N    characters per value (default 500)   --max-results N  result sets (default 20)
   --max-output N  total output bytes (default 1000000; 0 = no limit); the run still finishes
   -o file         write output to a file (replaced whole when the run ends; never an input)
@@ -55,8 +55,8 @@ FORMAT
   "-- " lines are metadata: "-- result N", a header of name:type columns, tab-separated rows,
   "-- N rows". NULL is NULL; the string 'NULL' is \NULL. Escapes \t \n \r \\ (one backslash) cover
   values and the names and paths in -- lines. A cut value ends …[+N]. Errors map to input lines.
-  The last line is "-- ok: ..." or "-- failed (exit N): ...", unless exit 7 or 10 cut it off.
+  Last line: "-- ok: ...", "-- partial: ..." (exit 0; a stopped count cut statements) or "-- failed (exit N): ...".
 
 EXIT CODES
-  0 ok  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled
-  7 output not delivered (the reader went away or stalled, or -o failed)  10 internal error
+  0 ok or partial  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled
+  7 output not delivered (reader gone or stalled, or -o failed)  10 internal error (both may lose the last line)

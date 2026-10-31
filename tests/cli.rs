@@ -7483,15 +7483,13 @@ mod live {
     // the seconds the whole count takes. The footer, the note and the status line say so, the
     // bound has the shape sqlh gives one (`is_stopped_bound`: more than the 100 shown, one
     // significant digit or 101, never how many rows arrived in time), and the batch after it
-    // runs on the same session (the read-only wrapper transaction survived the cancel).
+    // runs on the same session (the read-only wrapper transaction survived the cancel). The
+    // batch has one statement, so the stop cancels nothing and the run is `ok` (decision 45).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_large_result_is_cut_within_about_a_second() {
         let (p, _) = target();
-        let sql = format!(
-            "{}; PRINT 'after'\nGO\nSELECT @@TRANCOUNT AS open_trans",
-            votes(5_000_000)
-        );
+        let sql = format!("{}\nGO\nSELECT @@TRANCOUNT AS open_trans", votes(5_000_000));
         let started = Instant::now();
         let r = live(&p, SO, &["-Q", &sql]);
         let elapsed = started.elapsed();
@@ -7512,13 +7510,12 @@ mod live {
         );
         assert!(
             r.stdout.contains(
-                "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
-                 so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"
+                "-- note: counting stopped in batch 1, so its total is a lower bound; \
+                 --exact-count counts every row\n"
             ),
             "{}",
             r.stdout
         );
-        assert!(!r.stdout.contains("-- msg: after"), "{}", r.stdout);
         // The next batch ran, in the transaction the wrapper opened.
         assert!(r.stdout.contains("open_trans:int\n1\n"), "{}", r.stdout);
         let status = last_line(&r.stdout);
@@ -7540,7 +7537,7 @@ mod live {
             doc["notes"][0]
                 .as_str()
                 .unwrap()
-                .starts_with("counting stopped in batch 1: "),
+                .starts_with("counting stopped in batch 1, so its total is a lower bound"),
             "{doc}"
         );
         assert!(
@@ -7645,12 +7642,77 @@ mod live {
         );
     }
 
+    // Decision 45, the MCP client's case: a capped result with more statements after it in the
+    // same batch. One that ends inside the longer count (5 s) lets them run, and the run is
+    // `ok` with an exact total. One that doesn't is cut after 5 s, not 250 ms: its later
+    // statement doesn't run, and the note and the status line (`partial`, exit 0) say so.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_capped_result_lets_the_later_statements_run_or_the_run_is_partial() {
+        let (p, _) = target();
+        let sql = format!(
+            "{}; SELECT 'second statement ran' AS s; SELECT 3 AS third",
+            votes(200_000)
+        );
+        let r = live(&p, SO, &["-Q", &sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout
+                .contains("-- 100 of 200000 rows shown (--max-rows 100)\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("\nsecond statement ran\n") && r.stdout.contains("third:int\n3\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
+        assert!(
+            last_line(&r.stdout).starts_with("-- ok: 1 batch, "),
+            "{}",
+            r.stdout
+        );
+
+        // Far more rows than 5 s can count: a three-way cross join.
+        let huge = "SELECT TOP (2000000000) a.column_id FROM sys.all_columns AS a \
+                    CROSS JOIN sys.all_columns AS b CROSS JOIN sys.all_columns AS c; \
+                    SELECT 'second statement ran' AS s";
+        let started = Instant::now();
+        let r = live(&p, SO, &["-Q", huge]);
+        let elapsed = started.elapsed();
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(15),
+            "{elapsed:?}\n{}",
+            r.stdout
+        );
+        assert!(r.stdout.contains("; counting stopped)\n"), "{}", r.stdout);
+        assert!(!r.stdout.contains("second statement ran"), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "-- note: counting stopped in batch 1: the rest of that batch was cancelled, so \
+                 its later statements did not run; put each query in its own batch (GO) to keep \
+                 them; --exact-count counts every row\n"
+            ),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            last_line(&r.stdout).starts_with(
+                "-- partial: 1 batch, counting stopped in 1, the rest of batch 1 not run, "
+            ),
+            "{}",
+            r.stdout
+        );
+    }
+
     // `GO n`: each repeat is its own batch with its own count; the note names them.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_repeated_batch_stops_counting_in_each_run() {
         let (p, _) = target();
-        let sql = format!("{}; PRINT 'after'\nGO 3", votes(5_000_000));
+        let sql = format!("{}\nGO 3", votes(5_000_000));
         let r = live(&p, SO, &["-Q", &sql]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert_eq!(
@@ -7659,10 +7721,9 @@ mod live {
             "{}",
             r.stdout
         );
-        assert!(!r.stdout.contains("-- msg: after"), "{}", r.stdout);
         assert!(
             r.stdout.contains(
-                "-- note: counting stopped in batches 1, 2, 3: the rest of each was cancelled"
+                "-- note: counting stopped in batches 1, 2, 3, so their totals are lower bounds"
             ),
             "{}",
             r.stdout
@@ -7819,8 +7880,8 @@ mod live {
         );
         assert!(
             r.stdout.contains(
-                "-- note: counting stopped in batch 1: the rest of that batch was cancelled, \
-                 so its later statements did not run; put each query in its own batch (GO) to keep them; raise -t to count longer\n"
+                "-- note: counting stopped in batch 1, so its total is a lower bound; raise -t \
+                 to count longer\n"
             ),
             "{}",
             r.stdout
@@ -7864,7 +7925,7 @@ mod live {
         );
         assert!(
             r.stdout
-                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"),
+                .contains("so its total is a lower bound; --exact-count counts every row\n"),
             "{}",
             r.stdout
         );
@@ -8254,7 +8315,7 @@ mod live {
         );
         assert!(
             r.stdout
-                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; raise -t to count longer\n"),
+                .contains("so its total is a lower bound; raise -t to count longer\n"),
             "{}",
             r.stdout
         );
@@ -8298,7 +8359,7 @@ mod live {
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert!(
             r.stdout
-                .contains("so its later statements did not run; put each query in its own batch (GO) to keep them; --exact-count counts every row\n"),
+                .contains("so its total is a lower bound; --exact-count counts every row\n"),
             "{}",
             r.stdout
         );
@@ -8339,7 +8400,8 @@ mod live {
     // after the first few; only the deadline bounds the batch. With writes allowed it is exit
     // 4. In a read-only run the deadline can land while one of the hidden rows is being read,
     // which is the owner's exception (exit 0, a stopped count), or between results, which is a
-    // failure (exit 4): either ends the run inside the bound.
+    // failure (exit 4): either ends the run inside the bound. The loop's later passes don't run
+    // after a stop, so a stopped run is `partial` (decision 45).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn many_small_results_are_bounded_by_t() {
@@ -8357,7 +8419,9 @@ mod live {
         match r.code {
             4 => assert!(r.stdout.contains(TIMEOUT_1), "{}", r.stdout),
             0 => assert!(
-                last_line(&r.stdout).starts_with("-- ok: 1 batch, counting stopped in 1, "),
+                last_line(&r.stdout).starts_with(
+                    "-- partial: 1 batch, counting stopped in 1, the rest of batch 1 not run, "
+                ),
                 "{}",
                 r.stdout
             ),

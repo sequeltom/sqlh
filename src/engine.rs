@@ -541,6 +541,7 @@ mod tests {
             continue_on_error: false,
             report: Report::Off,
             database: None,
+            exact_count: false,
         }
     }
 
@@ -2004,11 +2005,11 @@ mod tests {
 
     // A count of hidden rows that sqlh stopped (`max_rows 1`, then two hidden rows and the
     // count's 250 ms) and the server never confirmed (exit 6, after the driver's 5 s): the way
-    // to read every row is the profile's exact_count. The result it was cut in gets no footer,
+    // to read every row is the call's exact_count. The result it was cut in gets no footer,
     // as when a lost connection ends a run inside a result
     // (`a_connection_lost_mid_run_is_not_retried`); the error says the rows shown are complete.
     #[test]
-    fn in_mcp_an_unconfirmed_count_stop_names_the_profiles_exact_count() {
+    fn in_mcp_an_unconfirmed_count_stop_names_exact_count() {
         let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: false })]);
         let mut profile = mcp_settings(&fake, 30);
         profile.limits.max_rows = 1;
@@ -2019,8 +2020,8 @@ mod tests {
             untimed(&called.text),
             "-- result 1\nx:int\n1\n\
              -- error: stopped counting the rows that are not shown, but the server didn't \
-             confirm the cancel, so the connection was closed; the rows shown are complete (the \
-             profile's exact_count = true reads every row instead)\n\
+             confirm the cancel, so the connection was closed; the rows shown are complete \
+             (exact_count = true reads every row instead)\n\
              -- failed (exit 6): cancelled, N ms; ?/master, connect N ms\n"
         );
     }

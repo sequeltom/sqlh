@@ -213,8 +213,8 @@ fn resolve(opts: &McpOpts) -> Result<(Vec<(String, config::Settings)>, Launch), 
     }
     let launch = Launch {
         profiles: described,
-        rows_given: opts.max_rows.is_some(),
-        cell_given: opts.max_cell.is_some(),
+        max_rows: opts.max_rows,
+        max_cell: opts.max_cell,
     };
     Ok((profiles, launch))
 }
@@ -1578,8 +1578,8 @@ mod tests {
                 name: "fake".into(),
                 description: None,
             }],
-            rows_given: false,
-            cell_given: false,
+            max_rows: None,
+            max_cell: None,
         };
         let (out, written) = std_mpsc::channel::<String>();
         let server = Rc::new(Server::new(engine, launch, out, log));

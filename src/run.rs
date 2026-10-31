@@ -83,6 +83,10 @@ pub(crate) struct Request {
     /// A database to switch to for this run (`USE`), after the session setup: an MCP call's
     /// `database`. The CLI connects to its database instead (`-d`), so it passes `None`.
     pub(crate) database: Option<String>,
+    /// Count every hidden row, on top of the settings' `exact_count`: an MCP call's
+    /// `exact_count` (decision 45). The CLI's `--exact-count` is in the settings, so it passes
+    /// `false`.
+    pub(crate) exact_count: bool,
 }
 
 /// Session options matching SSMS, so plans and filtered/computed-column indexes behave as
@@ -224,6 +228,8 @@ pub(crate) struct RunOutcome {
     pub(crate) errors: u32,
     /// The batches whose count of hidden rows was stopped (DESIGN.md §4.4).
     pub(crate) stopped_batches: usize,
+    /// Of those, the batches whose later statements the stop cancelled (decision 45), by number.
+    pub(crate) cut_batches: Vec<usize>,
 }
 
 impl RunOutcome {
@@ -233,6 +239,7 @@ impl RunOutcome {
             result,
             errors: 0,
             stopped_batches: 0,
+            cut_batches: Vec::new(),
         }
     }
 
@@ -270,14 +277,26 @@ impl Closing {
     pub(crate) fn of(outcome: RunOutcome, started: Instant, advice: output::Advice) -> Closing {
         let ms = started.elapsed().as_millis();
         let exit = outcome.exit();
-        // A stopped count is in the status line, so that a reader of that line alone learns
-        // that part of the input was cancelled (DESIGN.md §5.1).
-        let stopped = match outcome.stopped_batches {
+        // A stopped count is in the status line, and so are the batches whose rest it
+        // cancelled, so that a reader of that line alone learns that part of the input didn't
+        // run (DESIGN.md §5.1, decision 45).
+        let mut stopped = match outcome.stopped_batches {
             0 => String::new(),
             n => format!(", counting stopped in {n}"),
         };
+        stopped.push_str(&rest_not_run(&outcome.cut_batches));
         let errors = outcome.errors;
         match outcome.result {
+            // Exit 0, but the input didn't all run: `partial`, never `ok` (decision 45).
+            Ok(stats) if exit == Exit::Ok && !outcome.cut_batches.is_empty() => {
+                let s = if stats.batches_run == 1 { "" } else { "es" };
+                Closing {
+                    exit,
+                    status: format!("partial: {} batch{s}{stopped}, {ms} ms", stats.batches_run),
+                    error: None,
+                    elapsed_ms: ms,
+                }
+            }
             Ok(stats) if exit == Exit::Ok => {
                 let s = if stats.batches_run == 1 { "" } else { "es" };
                 Closing::ok(&format!("{} batch{s}{stopped}", stats.batches_run), started)
@@ -334,6 +353,33 @@ impl Closing {
     }
 }
 
+/// The most batches the status line names whose rest a stopped count cancelled; the rest are
+/// counted. The status line is never shortened, so a run of a thousand repeats must not make
+/// it long.
+const CUT_BATCHES_NAMED: usize = 5;
+
+/// `, the rest of batch 2 not run`, `, the rest of batches 1, 3 not run`, or nothing.
+fn rest_not_run(cut: &[usize]) -> String {
+    let named: Vec<String> = cut
+        .iter()
+        .take(CUT_BATCHES_NAMED)
+        .map(usize::to_string)
+        .collect();
+    match named.len() {
+        0 => String::new(),
+        1 => format!(", the rest of batch {} not run", named[0]),
+        _ => {
+            let more = cut.len() - named.len();
+            let more = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            format!(", the rest of batches {}{more} not run", named.join(", "))
+        }
+    }
+}
+
 /// Ends `out` with the outcome's closing lines (the error, the limit notes and the status
 /// line), for an output with no delivery to wait for: an MCP call's, in memory. Returns the
 /// exit code; an output that refused the closing lines out of order is an internal error.
@@ -359,7 +405,13 @@ pub(crate) struct Accounting {
     errors: u32,
     batch_max_severity: i32,
     batch_stopped: bool,
+    /// The batch being run: its number, and whether a stop would cancel a later statement's
+    /// output (`guard::several_outputs`).
+    batch_number: usize,
+    batch_later_statements: bool,
     stopped_batches: usize,
+    /// The batches whose stopped count cancelled the rest (decision 45), by number.
+    cut_batches: Vec<usize>,
 }
 
 impl Accounting {
@@ -369,12 +421,15 @@ impl Accounting {
             result,
             errors: self.errors,
             stopped_batches: self.stopped_batches,
+            cut_batches: self.cut_batches,
         }
     }
 
-    fn begin_batch(&mut self) {
+    fn begin_batch(&mut self, number: usize, later_statements: bool) {
         self.batch_max_severity = 0;
         self.batch_stopped = false;
+        self.batch_number = number;
+        self.batch_later_statements = later_statements;
     }
 
     /// Whether the batch being run reported an error (severity 11 or more).
@@ -410,9 +465,13 @@ impl BatchSink for Counted<'_> {
     }
     fn counting_stopped(&mut self, by: Stop) {
         self.out.counting_stopped(by);
-        if !self.counts.batch_stopped {
-            self.counts.batch_stopped = true;
-            self.counts.stopped_batches += 1;
+        let counts = &mut *self.counts;
+        if !counts.batch_stopped {
+            counts.batch_stopped = true;
+            counts.stopped_batches += 1;
+            if counts.batch_later_statements {
+                counts.cut_batches.push(counts.batch_number);
+            }
         }
     }
     fn end_rows(&mut self) -> io::Result<()> {
@@ -449,6 +508,42 @@ pub(crate) struct Prepared {
     blocked: Option<(String, guard::Blocked)>,
     /// `Request::database`.
     database: Option<String>,
+    /// `Request::exact_count`.
+    exact_count: bool,
+}
+
+impl Prepared {
+    /// Whether the request asked to count every hidden row (`Request::exact_count`).
+    #[cfg(test)]
+    pub(crate) fn exact_count(&self) -> bool {
+        self.exact_count
+    }
+}
+
+/// Settings for a run that never connects, for tests that stop before the session.
+#[cfg(test)]
+pub(crate) fn unconnected_settings(allow_write: bool) -> Settings {
+    Settings {
+        connect: db::ConnectOptions {
+            server: "127.0.0.1,1".into(),
+            database: None,
+            auth: db::Auth::Integrated,
+            encrypt: db::Encrypt::Mandatory,
+            trust_server_certificate: false,
+            login_timeout: 1,
+            read_only_intent: false,
+            multi_subnet_failover: false,
+            hints: db::Hints::Flags,
+        },
+        limits: output::Limits::default(),
+        query_timeout: 60,
+        allow_write,
+        writes_off: None,
+        lock_timeout: 10,
+        read_uncommitted: false,
+        exact_count: false,
+        profile: None,
+    }
 }
 
 /// A command's steps as batches of its one source, with their sections.
@@ -496,6 +591,7 @@ pub(crate) fn prepare(
             report: request.report,
             blocked: None,
             database: request.database,
+            exact_count: request.exact_count,
         });
     }
     let sources = load_sources(&request.input)?;
@@ -523,6 +619,7 @@ pub(crate) fn prepare(
         report: request.report,
         blocked,
         database: request.database,
+        exact_count: request.exact_count,
     })
 }
 
@@ -964,12 +1061,25 @@ pub(crate) async fn run_opened(
     let xact_abort = batches
         .iter()
         .any(|batch| guard::mentions_xact_abort(&batch.sql));
-    let counting = counting_for(policy.allow_write, settings.exact_count, xact_abort);
+    let counting = counting_for(
+        policy.allow_write,
+        settings.exact_count || prepared.exact_count,
+        xact_abort,
+    );
     let mut stats = Stats::default();
     let total: usize = batches.iter().map(|b| b.repeat as usize).sum();
     let mut number = 0;
     'batches: for (index, batch) in batches.iter().enumerate() {
         out.set_sections(sections.get(index).map_or(&[], Vec::as_slice));
+        // A stopped count cancels the rest of the batch; where that could cancel a later
+        // statement's output, the count runs longer first, and a stop is reported as the rest
+        // of the batch not run (decision 45, DESIGN.md §4.4).
+        let later_statements = guard::several_outputs(&batch.sql);
+        let counting = if later_statements {
+            counting.with_later_statements()
+        } else {
+            counting
+        };
         for run in 1..=batch.repeat {
             number += 1;
             // A cancel ends the batch it reaches; this makes sure no later one starts.
@@ -1003,9 +1113,10 @@ pub(crate) async fn run_opened(
                 run,
                 runs: batch.repeat,
                 started_ms: started.elapsed().as_millis(),
+                later_statements,
             })
             .map_err(output_failure)?;
-            counts.begin_batch();
+            counts.begin_batch(number, later_statements);
             let mut sink = Counted {
                 out: &mut *out,
                 counts: &mut *counts,
@@ -1225,7 +1336,7 @@ pub(crate) fn db_failure(error: DbError, advice: output::Advice) -> Failure {
         DbError::CountStopUnconfirmed => {
             let instead = match advice {
                 output::Advice::Cli => "--exact-count reads every row instead",
-                output::Advice::Mcp => "the profile's exact_count = true reads every row instead",
+                output::Advice::Mcp => "exact_count = true reads every row instead",
             };
             Failure::new(
                 Exit::Cancelled,
@@ -1379,7 +1490,7 @@ mod tests {
             (output::Advice::Cli, "--exact-count reads every row instead"),
             (
                 output::Advice::Mcp,
-                "the profile's exact_count = true reads every row instead",
+                "exact_count = true reads every row instead",
             ),
         ] {
             let failure = db_failure(DbError::CountStopUnconfirmed, advice);
@@ -1499,29 +1610,8 @@ mod tests {
         assert!(exact.budget.is_none() && !exact.timeout_stops);
     }
 
-    /// Settings for a run that never connects: the tests here stop before the session.
     fn settings(allow_write: bool) -> Settings {
-        Settings {
-            connect: db::ConnectOptions {
-                server: "127.0.0.1,1".into(),
-                database: None,
-                auth: db::Auth::Integrated,
-                encrypt: db::Encrypt::Mandatory,
-                trust_server_certificate: false,
-                login_timeout: 1,
-                read_only_intent: false,
-                multi_subnet_failover: false,
-                hints: db::Hints::Flags,
-            },
-            limits: output::Limits::default(),
-            query_timeout: 60,
-            allow_write,
-            writes_off: None,
-            lock_timeout: 10,
-            read_uncommitted: false,
-            exact_count: false,
-            profile: None,
-        }
+        super::unconnected_settings(allow_write)
     }
 
     fn query(sql: &str) -> Request {
@@ -1533,6 +1623,7 @@ mod tests {
             continue_on_error: false,
             report: Report::Off,
             database: None,
+            exact_count: false,
         }
     }
 
@@ -1616,6 +1707,7 @@ mod tests {
         use crate::output::{Format, Limits};
         let mut out = output::create(Format::Text, Box::new(io::sink()), Limits::default());
         let mut counts = Accounting::default();
+        // Batch 3 has later statements a stop cancels (decision 45); batch 2 has none.
         let batch = |number| BatchInfo {
             number,
             total: 3,
@@ -1626,6 +1718,7 @@ mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: number == 3,
         };
         let message = |severity| ServerMessage {
             number: if severity > 10 { 208 } else { 0 },
@@ -1638,7 +1731,7 @@ mod tests {
         let mut failed = Vec::new();
         for number in 1..=3 {
             out.begin_batch(&batch(number)).unwrap();
-            counts.begin_batch();
+            counts.begin_batch(number, number == 3);
             let mut sink = Counted {
                 out: &mut *out,
                 counts: &mut counts,
@@ -1665,6 +1758,7 @@ mod tests {
         assert_eq!(failed, [true, false, true]);
         assert_eq!(counts.errors, 4);
         assert_eq!(counts.stopped_batches, 2);
+        assert_eq!(counts.cut_batches, [3]);
 
         // An error the output budget withholds still counts: it happened.
         #[derive(Clone, Default)]
@@ -1690,7 +1784,7 @@ mod tests {
         };
         let mut out = output::create(Format::Text, Box::new(written.clone()), limits);
         let mut counts = Accounting::default();
-        counts.begin_batch();
+        counts.begin_batch(1, false);
         let mut sink = Counted {
             out: &mut *out,
             counts: &mut counts,

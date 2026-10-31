@@ -199,6 +199,10 @@ pub struct BatchInfo<'a> {
     /// `Summary::elapsed_ms` and `Output::end_batch` read, so a batch's duration is a
     /// difference of two readings and no sink has to look at the time itself.
     pub started_ms: u128,
+    /// Whether a stopped count in this batch would cancel a later statement's output
+    /// (`guard::several_outputs`, decision 45): then the note says the rest didn't run, and
+    /// otherwise only that the total is a lower bound.
+    pub later_statements: bool,
 }
 
 impl BatchInfo<'_> {
@@ -636,6 +640,10 @@ pub struct Tally {
     batch_stopped: bool,
     /// The batches (by number, in order) in which a count was stopped.
     stopped_batches: Vec<usize>,
+    /// Whether a stop in the current batch cancels a later statement's output
+    /// (`BatchInfo::later_statements`), and the batches whose stop did (decision 45).
+    batch_later_statements: bool,
+    cut_batches: Vec<usize>,
     /// What stopped them, for the note's advice: the budget (`--exact-count` lifts it), `-t`
     /// (raising it does).
     stopped_by_budget: bool,
@@ -684,6 +692,8 @@ impl Tally {
             batch_number: 0,
             batch_stopped: false,
             stopped_batches: Vec::new(),
+            batch_later_statements: false,
+            cut_batches: Vec::new(),
             stopped_by_budget: false,
             stopped_by_timeout: false,
             withheld: Withheld::default(),
@@ -878,6 +888,7 @@ impl Tally {
         self.line_map.extend_from_slice(batch.line_map);
         self.batch_number = batch.number;
         self.batch_stopped = false;
+        self.batch_later_statements = batch.later_statements;
         // A batch starts with no result open. One that a failure cut short is closed by the
         // sink (json marks it interrupted), and must not leave every event refused.
         self.rows_open = false;
@@ -964,7 +975,8 @@ impl Tally {
     }
 
     /// The count of hidden rows was stopped early (`BatchSink::counting_stopped`), by `by`: the
-    /// rest of the batch was cancelled and the result set's total is a lower bound.
+    /// rest of the batch was cancelled and the result set's total is a lower bound. Where the
+    /// batch had later statements that could show something, they didn't run (decision 45).
     pub fn stop_counting(&mut self, by: Stop) {
         self.stopped = true;
         self.batch_stopped = true;
@@ -974,6 +986,9 @@ impl Tally {
         }
         if self.stopped_batches.last() != Some(&self.batch_number) {
             self.stopped_batches.push(self.batch_number);
+            if self.batch_later_statements {
+                self.cut_batches.push(self.batch_number);
+            }
         }
     }
 
@@ -1142,6 +1157,7 @@ impl Tally {
         if !self.stopped_batches.is_empty() {
             notes.push(stopped_note(
                 &self.stopped_batches,
+                &self.cut_batches,
                 self.stopped_by_budget,
                 self.stopped_by_timeout,
                 self.limits.advice,
@@ -1239,51 +1255,73 @@ pub fn floor_digit(n: u64) -> u64 {
 /// The most batches the note about stopped counts names; the rest are counted.
 const NOTE_BATCHES: usize = 5;
 
-/// The run's note that counting stopped (DESIGN.md §5.1): where, what that cost, and the way
-/// to count further. A stopped count cancels the rest of its batch, and nothing else says its
-/// later statements didn't run. The advice follows what stopped the counts: the budget, which
-/// `--exact-count` lifts (a run that has it can't be stopped by the budget, so it is never
-/// advised to it again), or `-t`, which only raising it lifts. A run with both kinds gets both.
-fn stopped_note(
-    batches: &[usize],
-    by_budget: bool,
-    by_timeout: bool,
-    advice: Advice,
-    timeout_at_limit: bool,
-) -> String {
+/// `2` or `1, 2, 3, 4, 5 (+3 more)`: the batches a note names.
+fn batch_list(batches: &[usize]) -> String {
     let shown: Vec<String> = batches
         .iter()
         .take(NOTE_BATCHES)
         .map(usize::to_string)
         .collect();
-    let mut note = if batches.len() == 1 {
-        format!(
-            "counting stopped in batch {}: the rest of that batch was cancelled, so its later \
-             statements did not run; put each query in its own batch (GO) to keep them",
-            shown[0]
-        )
+    let more = batches.len() - shown.len();
+    if more > 0 {
+        format!("{} (+{more} more)", shown.join(", "))
     } else {
-        let more = batches.len() - shown.len();
-        let more = if more > 0 {
-            format!(" (+{more} more)")
-        } else {
-            String::new()
-        };
-        format!(
-            "counting stopped in batches {}{more}: the rest of each was cancelled, so their \
-             later statements did not run; put each query in its own batch (GO) to keep them",
-            shown.join(", ")
-        )
+        shown.join(", ")
+    }
+}
+
+/// The run's note that counting stopped (DESIGN.md §5.1): where, what that cost, and the way
+/// to count further. A stopped count cancels the rest of its batch; where that rest could show
+/// something (`cut`, decision 45), nothing else says its later statements didn't run. In the
+/// other batches it cancelled nothing, and the note says only that their totals are lower
+/// bounds. The advice follows what stopped the counts: the budget, which `--exact-count` lifts
+/// (a run that has it can't be stopped by the budget, so it is never advised to it again), or
+/// `-t`, which only raising it lifts. A run with both kinds gets both.
+fn stopped_note(
+    batches: &[usize],
+    cut: &[usize],
+    by_budget: bool,
+    by_timeout: bool,
+    advice: Advice,
+    timeout_at_limit: bool,
+) -> String {
+    let (one, all) = (batches.len() == 1, cut.len() == batches.len());
+    let stopped = if one {
+        format!("counting stopped in batch {}", batch_list(batches))
+    } else {
+        format!("counting stopped in batches {}", batch_list(batches))
+    };
+    let mut note = match (cut.len(), one, all) {
+        (0, true, _) => format!("{stopped}, so its total is a lower bound"),
+        (0, false, _) => format!("{stopped}, so their totals are lower bounds"),
+        (_, true, _) => format!(
+            "{stopped}: the rest of that batch was cancelled, so its later statements did not \
+             run; put each query in its own batch (GO) to keep them"
+        ),
+        (_, false, true) => format!(
+            "{stopped}: the rest of each was cancelled, so their later statements did not run; \
+             put each query in its own batch (GO) to keep them"
+        ),
+        (1, false, false) => format!(
+            "{stopped}: the rest of batch {} was cancelled, so its later statements did not run; \
+             put each query in its own batch (GO) to keep them",
+            batch_list(cut)
+        ),
+        (_, false, false) => format!(
+            "{stopped}: the rest of batches {} was cancelled, so their later statements did not \
+             run; put each query in its own batch (GO) to keep them",
+            batch_list(cut)
+        ),
     };
     let (exact, longer) = match advice {
         Advice::Cli => ("--exact-count counts every row", "raise -t to count longer"),
-        // A call can't set the profile's exact_count, but it can run a count of its own (agent
-        // trial 3: the model did, unprompted, where the note advised only the profile key).
-        // COUNT_BIG, not COUNT: a count was stopped because the result is large, and COUNT
+        // A count of its own comes first (agent trial 3: the model ran one, unprompted, where
+        // the note advised only the profile key), then the call's own `exact_count` (decision
+        // 45). COUNT_BIG, not COUNT: a count was stopped because the result is large, and COUNT
         // returns int, which fails past 2,147,483,647 rows (error 8115, or NULL under
         // ARITHABORT OFF with ANSI_WARNINGS OFF); COUNT_BIG returns bigint (R44).
         Advice::Mcp => (
-            "a COUNT_BIG(*) query counts every row, as does the profile's exact_count = true",
+            "a COUNT_BIG(*) query counts every row, as does exact_count = true",
             "a larger timeout counts longer",
         ),
     };
@@ -1595,7 +1633,8 @@ mod tests {
 
     #[test]
     fn the_note_names_the_batches_where_counting_stopped() {
-        let note = |batches: &[usize]| stopped_note(batches, true, false, Advice::Cli, false);
+        let note =
+            |batches: &[usize]| stopped_note(batches, batches, true, false, Advice::Cli, false);
         let tail = "; --exact-count counts every row";
         assert_eq!(
             note(&[4]),
@@ -1620,6 +1659,62 @@ mod tests {
         );
     }
 
+    // Decision 45: a stop in a batch with one statement that shows anything cancels nothing,
+    // and the note says only that the total is a lower bound; where only some stopped batches
+    // had later statements, the note names those as the ones whose rest didn't run.
+    #[test]
+    fn the_note_says_the_rest_did_not_run_only_where_it_could_show_something() {
+        let tail = "; --exact-count counts every row";
+        let note = |batches: &[usize], cut: &[usize]| {
+            stopped_note(batches, cut, true, false, Advice::Cli, false)
+        };
+        assert_eq!(
+            note(&[1], &[]),
+            format!("counting stopped in batch 1, so its total is a lower bound{tail}")
+        );
+        assert_eq!(
+            note(&[1, 3], &[]),
+            format!("counting stopped in batches 1, 3, so their totals are lower bounds{tail}")
+        );
+        assert_eq!(
+            note(&[1, 3], &[3]),
+            format!(
+                "counting stopped in batches 1, 3: the rest of batch 3 was cancelled, so its \
+                 later statements did not run; put each query in its own batch (GO) to keep \
+                 them{tail}"
+            )
+        );
+        assert_eq!(
+            note(&[1, 2, 3], &[2, 3]),
+            format!(
+                "counting stopped in batches 1, 2, 3: the rest of batches 2, 3 was cancelled, \
+                 so their later statements did not run; put each query in its own batch (GO) to \
+                 keep them{tail}"
+            )
+        );
+        // Through the tally, which takes it from the batch.
+        let batch = |number, later_statements| BatchInfo {
+            number,
+            total: 2,
+            source: "-Q",
+            multi_source: false,
+            line: 1,
+            line_map: &[],
+            run: 1,
+            runs: 1,
+            started_ms: 0,
+            later_statements,
+        };
+        let mut t = Tally::new(Limits::default());
+        t.begin_batch(&batch(1, false));
+        t.start_result();
+        t.stop_counting(Stop::Budget);
+        t.begin_batch(&batch(2, true));
+        t.start_result();
+        t.stop_counting(Stop::Budget);
+        assert_eq!(t.limit_notes(), [note(&[1, 2], &[2])]);
+    }
+
     // PLAN.md 2.15: the advice follows what stopped the count. `--exact-count` lifts the
     // budget and nothing else, so a run that `-t` stopped is told to raise `-t` instead,
     // which is also what a run that already has `--exact-count` needs; a run with both kinds
@@ -1629,44 +1724,44 @@ mod tests {
         let first = "counting stopped in batch 2: the rest of that batch was cancelled, so its \
                      later statements did not run; put each query in its own batch (GO) to keep them";
         assert_eq!(
-            stopped_note(&[2], true, false, Advice::Cli, false),
+            stopped_note(&[2], &[2], true, false, Advice::Cli, false),
             format!("{first}; --exact-count counts every row")
         );
         assert_eq!(
-            stopped_note(&[2], false, true, Advice::Cli, false),
+            stopped_note(&[2], &[2], false, true, Advice::Cli, false),
             format!("{first}; raise -t to count longer")
         );
         assert_eq!(
-            stopped_note(&[2], true, true, Advice::Cli, false),
+            stopped_note(&[2], &[2], true, true, Advice::Cli, false),
             format!("{first}; --exact-count counts every row; raise -t to count longer")
         );
         // sqlh mcp names what its reader can change: a count of its own (agent trial 3), the
-        // profile, and the call's timeout. The count is COUNT_BIG, which returns bigint: the
+        // call's exact_count (decision 45), and the call's timeout. The count is COUNT_BIG, which returns bigint: the
         // result was large enough to stop the count, and COUNT's int fails past 2,147,483,647
         // rows (R44).
         assert_eq!(
-            stopped_note(&[2], true, true, Advice::Mcp, false),
+            stopped_note(&[2], &[2], true, true, Advice::Mcp, false),
             format!(
-                "{first}; a COUNT_BIG(*) query counts every row, as does the profile's \
-                 exact_count = true; a larger timeout counts longer"
+                "{first}; a COUNT_BIG(*) query counts every row, as does exact_count = true; a \
+                 larger timeout counts longer"
             )
         );
         // A call already at the server's limit is offered no larger timeout.
         assert_eq!(
-            stopped_note(&[2], true, true, Advice::Mcp, true),
-            format!(
-                "{first}; a COUNT_BIG(*) query counts every row, as does the profile's \
-                 exact_count = true"
-            )
+            stopped_note(&[2], &[2], true, true, Advice::Mcp, true),
+            format!("{first}; a COUNT_BIG(*) query counts every row, as does exact_count = true")
         );
         // No advice of either front end names COUNT itself, whose int can overflow.
         for advice in [Advice::Cli, Advice::Mcp] {
             for (budget, timeout) in [(true, false), (false, true), (true, true)] {
-                let note = stopped_note(&[2], budget, timeout, advice, false);
+                let note = stopped_note(&[2], &[2], budget, timeout, advice, false);
                 assert!(!note.contains("COUNT("), "{advice:?}: {note}");
             }
         }
-        assert_eq!(stopped_note(&[2], false, true, Advice::Mcp, true), first);
+        assert_eq!(
+            stopped_note(&[2], &[2], false, true, Advice::Mcp, true),
+            first
+        );
         // Through the tally: batch 1 stopped by the budget, batch 2 by `-t`.
         let batch = |number| BatchInfo {
             number,
@@ -1678,6 +1773,7 @@ mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: true,
         };
         let mut t = Tally::new(Limits::default());
         t.begin_batch(&batch(1));
@@ -2138,6 +2234,7 @@ mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: false,
         });
         assert!(tally.outside_rows("a message").is_ok());
     }
@@ -2286,6 +2383,7 @@ mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: false,
         });
         assert!(OutOfOrder::is(&t.reserve_ending(0, 10).unwrap_err()));
         assert_eq!(t.note_room(0), 1_000_000 - STATUS_RESERVE as usize);
@@ -2449,6 +2547,7 @@ mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: false,
         };
         assert_eq!(batch.location(), "line 14");
         batch.multi_source = true;

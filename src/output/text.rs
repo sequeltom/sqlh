@@ -691,6 +691,7 @@ pub(super) mod tests {
             run: 1,
             runs: 1,
             started_ms: 0,
+            later_statements: true,
         }
     }
 
@@ -2302,7 +2303,7 @@ pub(super) mod tests {
     }
 
     // PLAN.md 2.15's stopped counts in sqlh mcp, exact output: the footer names max_rows, and the
-    // note offers the profile's exact_count for a count the budget stopped and a larger timeout
+    // note offers the call's exact_count for a count the budget stopped and a larger timeout
     // for one -t stopped, but no larger timeout to a call that has the server's limit
     // (`Limits::timeout_at_limit`), so a count only -t stopped gets no advice at all.
     #[test]
@@ -2311,13 +2312,12 @@ pub(super) mod tests {
         for (timeout_at_limit, advice) in [
             (
                 false,
-                "; a COUNT_BIG(*) query counts every row, as does the profile's exact_count = \
-                 true; a larger timeout counts longer",
+                "; a COUNT_BIG(*) query counts every row, as does exact_count = true; a larger \
+                 timeout counts longer",
             ),
             (
                 true,
-                "; a COUNT_BIG(*) query counts every row, as does the profile's exact_count = \
-                 true",
+                "; a COUNT_BIG(*) query counts every row, as does exact_count = true",
             ),
         ] {
             let (mut s, main, _) = sink(Limits {
