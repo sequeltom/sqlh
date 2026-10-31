@@ -132,7 +132,7 @@ These long flags are our own:
 |---|---|
 | `--profile NAME` | Connection profile (§8). Env: `SQLH_PROFILE`. |
 | `--format text\|json\|csv` | Output format (§5). Default `text`. `md` is planned. |
-| `--max-rows N` | Rows shown per result set. Default 100; 0 means unlimited. |
+| `--max-rows N` | Rows shown per result set. Default 100; 0 means unlimited by this limit: `--max-output` (1 MB by default) still caps the whole response, and its footer names it (`-- 14448 of 52000 rows shown (--max-output)`), so every row needs `--max-output 0` as well. |
 | `--max-cell N` | Characters shown per cell. Default 500; 0 means unlimited. |
 | `--max-results N` | Result sets shown per run. Default 20. The rest are counted, not printed. Messages are capped at 100. |
 | `--max-output N` | Bytes of output per run, across stdout and stderr. Default 1000000; 0 means no limit, and otherwise it must be at least 4096. See §4.4. |
@@ -613,7 +613,7 @@ Names: `describe`, `def` and `deps` take up to four parts, each plain or delimit
 
 Catalog SQL must be validated on SQL Server 2025 Standard for the first release. Prefer inexpensive portability toward the candidate SQL Server 2016 floor, but evaluate compatibility costs rather than enforcing the earlier SQL Server 2012 restriction. Azure-specific constraints remain relevant to future expansion and are not first-release gates.
 
-The commands are canned SQL run through the normal pipeline, with `describe`'s lists aggregated server-side: by `STRING_AGG ... WITHIN GROUP` (SQL Server 2017+) at the database's compatibility level 110 and up, and by the ordered `FOR XML PATH` form, which every level parses, only at level 100 (which refuses `WITHIN GROUP`) or when the lookup returns no level (`schema::Aggregate`, `d6237da`; the threshold 110 since `2504b7c`, R37, where it had been 130). Only there can a name with a character XML can't carry make `describe` fail; schema-commands.md §3 explains why.
+The commands are canned SQL run through the normal pipeline, with `describe`'s lists aggregated server-side: by `STRING_AGG ... WITHIN GROUP` on SQL Server 2017 and later (the lookup reads `SERVERPROPERTY('ProductMajorVersion')`; 2016 has no `STRING_AGG`, 2026-10-31) at the database's compatibility level 110 and up, and by the ordered `FOR XML PATH` form, which every level parses, only at level 100 (which refuses `WITHIN GROUP`) or when the lookup returns no level (`schema::Aggregate`, `d6237da`; the threshold 110 since `2504b7c`, R37, where it had been 130). Only there can a name with a character XML can't carry make `describe` fail; schema-commands.md §3 explains why.
 
 ## 10. MCP mode (built 2026-10-17, PLAN.md 5.2 and 5.3; decided 2026-10-15 to 2026-10-17)
 

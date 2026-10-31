@@ -36,7 +36,7 @@ EXECUTION
 
 OUTPUT
   --format F      text (default) | json (one document; exit status last) | csv (data; -- lines on stderr)
-  --max-rows N    rows shown per result set (default 100; 0 = all). Read-only runs count the rest for
+  --max-rows N    rows per result set (default 100; 0 = all, within --max-output). Read-only runs count the rest for
                   250 ms, then stop: "≥N" means the rest of that batch did not run (--exact-count counts all)
   --max-cell N    characters per value (default 500)   --max-results N  result sets (default 20)
   --max-output N  total output bytes (default 1000000; 0 = no limit); the run still finishes
