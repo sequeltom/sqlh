@@ -1902,10 +1902,10 @@ fn verbose_runs_stay_within_max_output() {
     }
 }
 
-/// The version the binary under test was built with (`SQLH_VERSION`, else Cargo.toml's), as
-/// `src/app.rs` picks it.
+/// The version the binary under test was built with, as `build.rs` picks it (`SQLH_VERSION`,
+/// else Cargo.toml's with `-local`; decision 44).
 fn sqlh_version() -> &'static str {
-    option_env!("SQLH_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    env!("SQLH_BUILT_VERSION")
 }
 
 /// The JSON contract version `--version` reports: `sqlh 0.1.0 (json contract 2.1)`.
@@ -1973,6 +1973,78 @@ fn version_reports_the_json_contract() {
         format!("sqlh {} (json contract 2.1)\n", sqlh_version())
     );
     assert_eq!(contract_version(), "2.1");
+}
+
+// Decision 44: a build made outside the release workflow says so (`-local`), so it can't pass
+// for a release of the same number.
+#[test]
+fn a_build_outside_the_release_workflow_is_marked_local() {
+    let expected = match option_env!("SQLH_VERSION") {
+        Some(given) => given.to_owned(),
+        None => format!("{}-local", env!("CARGO_PKG_VERSION")),
+    };
+    assert_eq!(sqlh_version(), expected);
+}
+
+// Decision 44: the exe carries its version in its Windows version resource, which Explorer's
+// Properties > Details shows, and it is the one `--version` reports. The text fields hold the
+// whole version; the numbers are major.minor.patch and the release workflow's run number
+// (SQLH_BUILD, 0 for any other build), flagged pre-release when the version has a pre-release
+// part. Read through Windows PowerShell 5.1, which asks Windows for it (FileVersionInfo).
+#[cfg(windows)]
+#[test]
+fn the_exe_carries_its_version_in_its_windows_properties() {
+    let exe = env!("CARGO_BIN_EXE_sqlh").replace('\'', "''");
+    let script = format!(
+        "$v = (Get-Item -LiteralPath '{exe}').VersionInfo\r\n\
+         '{{0}}.{{1}}.{{2}}.{{3}}' -f $v.FileMajorPart, $v.FileMinorPart, $v.FileBuildPart, \
+         $v.FilePrivatePart\r\n\
+         '{{0}}.{{1}}.{{2}}.{{3}}' -f $v.ProductMajorPart, $v.ProductMinorPart, \
+         $v.ProductBuildPart, $v.ProductPrivatePart\r\n\
+         $v.FileVersion; $v.ProductVersion; $v.ProductName; $v.FileDescription; \
+         $v.CompanyName; $v.LegalCopyright; $v.OriginalFilename; $v.InternalName; \
+         $v.IsPreRelease"
+    );
+    let r = Shell::PowerShell51.run(&script, Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    let numbers = format!(
+        "{}.{}.{}.{}",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH"),
+        option_env!("SQLH_BUILD").unwrap_or("0")
+    );
+    let version = sqlh_version();
+    let prerelease = if version.contains('-') {
+        "True"
+    } else {
+        "False"
+    };
+    let expected = [
+        numbers.as_str(),
+        &numbers,
+        version,
+        version,
+        "sqlh",
+        "sqlh - SQL Server query tool for agents",
+        "Tom Willwerth",
+        "Copyright (c) 2026 Tom Willwerth",
+        "sqlh.exe",
+        "sqlh",
+        prerelease,
+    ];
+    assert_eq!(
+        r.stdout.lines().collect::<Vec<_>>(),
+        expected,
+        "{}",
+        r.stderr
+    );
+    let reported = sqlh_args(&["--version"]);
+    assert!(
+        reported.stdout.starts_with(&format!("sqlh {version} (")),
+        "{}",
+        reported.stdout
+    );
 }
 
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line

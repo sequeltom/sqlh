@@ -1,4 +1,4 @@
-sqlh - SQL Server query tool for agents. Read-only by default; compact typed output.
+sqlh - SQL Server query tool for agents. Read-only by default; compact typed output. --version, --help
 
 USAGE
   sqlh [connection] [options] -Q "SQL"          (or the SQL as the only argument)
