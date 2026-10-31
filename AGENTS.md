@@ -100,12 +100,12 @@ docs/DESIGN.md   the spec;  docs/notes/  findings (M0 driver spike, connect late
 docs/schema-commands.md   the schema commands' spec (built);  docs/mcp-mode.md   sqlh mcp's spec (built 2026-10-17)
 docs/command-categories.md   Phase 6's design: command categories and their policies (decided 2026-10-23: PLAN.md §6, decisions 22–36)
 archive/         git-ignored, never pushed: archive/reviews/ holds the external code reviews
-                 (findings F.., R01–R46; PLAN.md records each one and its fix)
+                 (findings F.., R01–R47; PLAN.md records each one and its fix)
 ```
 
 Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (PLAN.md 3.5, 3.6).
 
-The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and links it as a .res file, with no rc.exe and no crate (DESIGN.md §4). A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only.
+The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and links it as a .res file, with no rc.exe and no crate (DESIGN.md §4). A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only. External review of `7fed369..157334f` on October 31, 2026 accepted decision 44 with nonblocking P3 R47: tighten SQLH_VERSION validation before Cargo output, since malformed suffixes can split the code/resource identity. Resource layout, SDK comparison, native queries, default non-live checks and local verification-span probes passed; the hosted dispatch was still in progress at the recorded snapshot (PLAN.md, Versioning external review).
 
 ## Commands
 
