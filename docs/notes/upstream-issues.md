@@ -66,6 +66,14 @@ Each entry says what was read or observed, in which version, why it matters to s
 - **sqlh's workaround:** none; documented in DESIGN.md §8, and pinned by fake-server tests in the 0.3.0 upgrade.
 - **Possible fix:** a `ClientContext` option to fail on a routing token, or a callback to approve its target.
 
+### U9. The SPN's name lookup blocks the async runtime
+
+- **Seen in:** 0.3.0, measured and read in the source (docs/notes/connect-latency.md, Windows authentication; `security/spn.rs`, `security/windows/sspi_context.rs:102`).
+- **What:** with no `server_spn`, Windows auth canonicalizes the host with blocking `dns_lookup` calls inside the async connect: a reverse lookup for an address, forward and reverse for a short name. The function's own comment says to consider a blocking task pool. For an address with no PTR record it took about 5 s here, and it stalls every timer, cancellation and task meanwhile, so a login timeout shorter than the lookup fails a healthy server.
+- **Why it matters to sqlh:** a workstation outside a domain connecting by address pays it on every CLI call, a short `-l` fails with a message that blames the server, and in `sqlh mcp` one connect holds up every call.
+- **sqlh's workaround:** `db::spn_if_lookup_is_slow` runs the same lookup on its own thread first and, past 500 ms, sets `server_spn` so the driver skips it (DESIGN.md §4.2, `-E`). The driver's lookup still runs on the runtime thread when sqlh's came back in time.
+- **Possible fix:** run the lookup on `spawn_blocking`, inside the connect's timeout and cancel, with a bound of its own; failing that, an option to skip canonicalization.
+
 ## Decided not to raise
 
 - **The password in debug packet dumps** (owner decision 9, 2026-10-12): at debug level the driver hex-dumps every TDS packet before encryption, the login packet included. sqlh's own rule is the defense: no general logger while the driver runs (AGENTS.md, Driver logging). Re-check the dump when bumping the driver.

@@ -25,6 +25,7 @@ use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting, TdsRes
 use mssql_tds::datatypes::row_writer::DiscardRowWriter;
 use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage};
 use mssql_tds::message::login_options::ApplicationIntent;
+use mssql_tds::security::{canonicalize_hostname, make_spn};
 
 pub use value::Value;
 
@@ -668,7 +669,14 @@ impl Session {
         context.application_name = "sqlh".into();
         context.database = options.database.clone().unwrap_or_default();
         match &options.auth {
-            Auth::Integrated => context.tds_authentication_method = TdsAuthenticationMethod::SSPI,
+            Auth::Integrated => {
+                context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+                context.server_spn =
+                    spn_if_lookup_is_slow(&options.server, SPN_LOOKUP_BUDGET, cancel, |host| {
+                        canonicalize_hostname(&host);
+                    })
+                    .await?;
+            }
             Auth::Sql { user, password } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::Password;
                 context.user_name = user.clone();
@@ -1410,6 +1418,81 @@ fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
     (None, server)
 }
 
+/// How long Windows auth's name lookup gets before sqlh stops waiting for it. A name server
+/// answers well inside this; what it cuts is a lookup that falls through to NetBIOS, about 5 s
+/// for an address with no PTR record (notes/connect-latency.md, Windows authentication).
+const SPN_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
+
+/// The SPN sqlh gives the driver for a TCP `-S`, or `None` to let the driver build its own.
+/// The driver's lookup is a blocking call on the runtime thread (upstream-issues.md U9): it runs
+/// before any timer can fire, so `-l` can't bound it, a cancel can't reach it, and `sqlh mcp`'s
+/// other calls wait. So the same lookup runs here first, on its own thread.
+///
+/// In time, the driver is left to it: its own lookup repeats a recent answer, and it builds the
+/// SPN for each hop, which a fixed one would get wrong after a routing redirect. Past the budget,
+/// the SPN names the host as given, which is what the driver falls back to when the lookup fails.
+async fn spn_if_lookup_is_slow(
+    server: &str,
+    budget: Duration,
+    cancel: &Cancel,
+    lookup: impl FnOnce(String) + Send + 'static,
+) -> Result<Option<String>, DbError> {
+    let Some((host, spn)) = host_and_spn(server) else {
+        return Ok(None);
+    };
+    tokio::select! {
+        slow = outlasts(budget, move || lookup(host)) => Ok(slow.then_some(spn)),
+        () = cancel.cancelled() => Err(DbError::Cancelled("cancelled while connecting".into())),
+    }
+}
+
+/// Whether `work` is still running after `budget`. Its thread is left behind if so: a lookup
+/// can't be cancelled, ends by itself, and process exit doesn't wait for it, as it would for
+/// `spawn_blocking` when the runtime drops.
+async fn outlasts(budget: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    let started = std::thread::Builder::new().spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    started.is_err() || tokio::time::timeout(budget, finished).await.is_err()
+}
+
+/// A TCP `-S`'s host and its SPN, read the way the driver's parser does
+/// (`datasource_parser.rs`): a port replaces an instance, and no port is 1433. `None` for a pipe,
+/// shared memory, LocalDB, the DAC or a bad port, whose SPN stays the driver's. An instance's
+/// port comes from SQL Browser only later, so its SPN names the instance (`client_context.rs`,
+/// `server_spn`).
+fn host_and_spn(server: &str) -> Option<(String, String)> {
+    let source = data_source(server);
+    let (protocol, rest) = split_protocol(&source);
+    if matches!(protocol, Some("np" | "lpc" | "admin"))
+        || rest.starts_with(r"\\")
+        || rest.to_ascii_lowercase().starts_with("(localdb)")
+    {
+        return None;
+    }
+    let (rest, port) = match rest.split_once(',') {
+        Some((rest, parameter)) => {
+            let port = parameter.split('\\').next().unwrap_or_default().trim();
+            (rest.trim_end(), Some(port.parse::<u16>().ok()?))
+        }
+        None => (rest, None),
+    };
+    let (host, instance) = match rest.split_once('\\') {
+        Some((host, instance)) => (host.trim_end(), Some(instance.trim())),
+        None => (rest, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let spn = match port {
+        Some(port) => make_spn(host, None, port),
+        None => make_spn(host, instance, 1433),
+    };
+    Some((host.to_owned(), spn))
+}
+
 /// Refuses a Named Pipes request to another machine, with a message for a usage error
 /// (DESIGN.md §4.2). The driver opens a pipe with a synchronous `CreateFileW` on its runtime
 /// thread, so for an unreachable host a run is stuck for about 21 s while SMB gives up, past
@@ -1662,7 +1745,7 @@ mod tests {
     use super::{
         Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
         PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
-        split_protocol, tcp_form, tls_hint, wait_for_output,
+        host_and_spn, split_protocol, spn_if_lookup_is_slow, tcp_form, tls_hint, wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
@@ -2037,6 +2120,123 @@ mod tests {
         ] {
             assert_eq!(split_protocol(server), (protocol, rest), "{server}");
         }
+    }
+
+    #[test]
+    fn a_tcp_server_gets_the_spn_the_driver_would_fall_back_to() {
+        for (server, host, spn) in [
+            ("192.0.2.1", "192.0.2.1", "MSSQLSvc/192.0.2.1:1433"),
+            ("192.0.2.1,1500", "192.0.2.1", "MSSQLSvc/192.0.2.1:1500"),
+            ("tcp:db01,1500", "db01", "MSSQLSvc/db01:1500"),
+            ("TCP:db01", "db01", "MSSQLSvc/db01:1433"),
+            (r"db01\SALES", "db01", "MSSQLSvc/db01:SALES"),
+            // A port replaces the instance, in either order.
+            (r"db01\SALES,1500", "db01", "MSSQLSvc/db01:1500"),
+            (r"db01,1500\SALES", "db01", "MSSQLSvc/db01:1500"),
+            ("db01 , 1500", "db01", "MSSQLSvc/db01:1500"),
+            ("2001:db8::1", "2001:db8::1", "MSSQLSvc/2001:db8::1:1433"),
+            (
+                "2001:db8::1,1500",
+                "2001:db8::1",
+                "MSSQLSvc/2001:db8::1:1500",
+            ),
+        ] {
+            let expected = Some((host.to_owned(), spn.to_owned()));
+            assert_eq!(host_and_spn(server), expected, "{server}");
+        }
+        for server in [
+            "np:db01",
+            "lpc:db01",
+            "admin:db01",
+            r"\\db01\pipe\sql\query",
+            r"(localdb)\MSSQLLocalDB",
+            "db01,notaport",
+            "",
+        ] {
+            assert_eq!(host_and_spn(server), None, "{server}");
+        }
+    }
+
+    // notes/connect-latency.md, Windows authentication: a slow lookup gets an SPN so the driver
+    // skips its own, and holds neither the runtime nor a cancel while it runs.
+    #[test]
+    fn a_slow_lookup_gives_the_driver_an_spn_and_blocks_nothing() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let cancel = Cancel::new();
+        let (spn, ticks) = runtime().block_on(async {
+            let lookup = spn_if_lookup_is_slow(
+                "192.0.2.1,1500",
+                Duration::from_millis(50),
+                &cancel,
+                move |_| {
+                    let _ = held.recv_timeout(Duration::from_secs(30));
+                },
+            );
+            tokio::pin!(lookup);
+            let mut ticks = 0;
+            loop {
+                tokio::select! {
+                    spn = &mut lookup => break (spn, ticks),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => ticks += 1,
+                }
+            }
+        });
+        drop(release);
+        assert_eq!(spn.unwrap().as_deref(), Some("MSSQLSvc/192.0.2.1:1500"));
+        assert!(ticks > 0, "the lookup held the runtime");
+    }
+
+    #[test]
+    fn a_lookup_in_time_leaves_the_spn_to_the_driver() {
+        let (seen, host) = std::sync::mpsc::channel();
+        let cancel = Cancel::new();
+        let spn = runtime()
+            .block_on(spn_if_lookup_is_slow(
+                r"db01\SALES",
+                Duration::from_secs(60),
+                &cancel,
+                move |host| seen.send(host).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(spn, None);
+        assert_eq!(host.recv().unwrap(), "db01");
+    }
+
+    #[test]
+    fn a_pipe_is_not_looked_up() {
+        let cancel = Cancel::new();
+        let spn = runtime()
+            .block_on(spn_if_lookup_is_slow(
+                "np:db01",
+                Duration::from_secs(60),
+                &cancel,
+                |_| panic!("looked up"),
+            ))
+            .unwrap();
+        assert_eq!(spn, None);
+    }
+
+    #[test]
+    fn a_cancel_ends_the_wait_for_a_lookup() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let root = Cancel::new();
+        let cancel = root.child();
+        let started = Instant::now();
+        let result = runtime().block_on(async {
+            let lookup =
+                spn_if_lookup_is_slow("192.0.2.1", Duration::from_secs(60), &cancel, move |_| {
+                    let _ = held.recv_timeout(Duration::from_secs(30));
+                });
+            tokio::pin!(lookup);
+            tokio::select! {
+                result = &mut lookup => return result,
+                () = tokio::time::sleep(Duration::from_millis(10)) => root.cancel(),
+            }
+            lookup.await
+        });
+        drop(release);
+        assert!(matches!(result, Err(DbError::Cancelled(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     // DESIGN.md §4.2: a Named Pipes request to another machine is refused, with the TCP form

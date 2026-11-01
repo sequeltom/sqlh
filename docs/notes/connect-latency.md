@@ -54,11 +54,31 @@ Before connecting, sqlh spends about 3 ms on startup, settings and the Credentia
 - **Phase 5 is needed:** an agent turn pays about 200 ms of connecting here before its query runs. Reusing a connection (MCP, or a local daemon) pays the login once.
 
 Not measured:
-- Windows authentication, which skips the password hash but isn't available on this setup. It would also test the inference: a much shorter login step on the same server would point at the hashing.
 - Other servers and networks: older SQL Server versions, other hardware, a wired or remote link.
 - The split of the login interval (a server-side trace would show it).
 - Strict encryption (TDS 8.0), and a second login within one process.
 - The release target, SQL Server 2025 Standard over a real network (checklist in PLAN.md §7).
+
+## Windows authentication (2026-11-01)
+
+Decision 50's check, mssql-tds 0.3.0, on the same server and Wi-Fi link: a workstation outside any domain, a local Windows user of the same name and password on the server, `-S <address>,1433 -E -C`. `auth_scheme` is NTLM and `SUSER_SNAME()` is the server's local user. Kerberos is unchecked (no domain here).
+
+| Run | Connect |
+|---|---|
+| SQL login, by address | 246–266 ms (timing build: login 186 ms) |
+| Windows auth, by address, before the fix | 4,671–5,085 ms (timing build: login 4,562–5,000 ms) |
+| Windows auth, by address, with the fix | 571–725 ms, NTLM |
+| Windows auth, through a local relay to the same server | 31–94 ms, NTLM |
+| .NET SqlClient (Framework, pooling off), Windows auth, by address | 9,631–9,776 ms |
+
+- **Almost all of the 5 s is a failed reverse name lookup on the client, not the login.** With no server SPN set, the driver builds `MSSQLSvc/<host>:<port>` through `make_spn_canonicalized`, whose `lookup_addr` is a blocking `getnameinfo`. For an address with no PTR record it fails after 4,533–4,997 ms here (`Dns.GetHostEntry` alone, timed), about NetBIOS's wait (inference: the adapter has NetBIOS over TCP/IP at its default). The failure's fallback is the address itself. A loopback name skips the lookup, which is why the relay's run, on `127.0.0.1`, shows the login without it. SSPI's first token takes about 1 ms, and SqlClient, which pays about twice the wait, shows sqlh isn't alone in this.
+- **The call blocks the runtime it's on,** so nothing else runs until it returns (upstream-issues.md U9). Before the fix:
+  - `-l 1` and `-l 3` against a healthy server: exit 4 after about 5 s, "didn't complete the login within 2 s; check that it is a reachable SQL Server and not overloaded". The deadline passes during the lookup, and the message blames the server. `-l 8` connects.
+  - `sqlh mcp`: two calls at once, each needing a connection, both answered at about 9.1 s; the lookups run one after the other and hold up every call and its cancel. A call on the pooled connection afterwards: 6 ms.
+- **The fix (owner's choice, 2026-11-01; DESIGN.md §4.2, `-E`):** sqlh runs the same lookup on a thread of its own and waits 500 ms. In time, the driver is left to it; past that, sqlh sets `server_spn` to what the driver's failure gives, so the driver makes no lookup. The 500 ms is an estimate, unmeasured against a real PTR answer. Measured after it, on the same server and link: `-l 1` and `-l 3` connect (576 and 612 ms, exit 0); `sqlh mcp`'s two calls at once are answered at 616 ms, the pooled one at 9 ms, and the process ends in 6 ms with its lookups still running; the SQL login is unchanged (207–240 ms). No test covers this end to end, since the fake server has no SSPI and a local address skips the lookup: the unit tests inject the lookup, and these runs were by hand.
+- **The hashing inference holds up.** The same login without the password hash is 31–94 ms all told, against about 250 ms for the SQL login: most of a SQL login's connect is work a Windows login doesn't do. This still doesn't split the interval.
+
+Not measured: a server with a PTR record (a name the lookup finds), a short name whose reverse lookup fails (the same code path), and a domain. A lookup that would succeed but takes over 500 ms now gets an SPN with the host as written, so Kerberos would need an SPN for that name; Kerberos remains unchecked.
 
 ## The driver logs packets in clear text at debug level
 
