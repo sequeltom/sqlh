@@ -20,7 +20,7 @@ The primary workflow is an agent with limited context making several queries acr
 | TDS driver | Microsoft `mssql-tds` (MIT, preview). **Decided** |
 | Default output | Compact typed text (TSV-like), §5.1. **Decided** |
 | Writes | Read-only by default, §7. **Decided** |
-| Auth | SQL login and Windows integrated (SSPI). No Entra ID for now. **Decided** |
+| Auth | SQL login and Windows integrated (SSPI), both in the first release's scope (decision 50). No Entra ID for now; hosted MCP plans it (decision 47). **Decided** |
 | sqlcmd compatibility | Core flags, `GO` and `$(var)`. Agent-specific features get long flags. **Decided** |
 | First-release target | `sqlh.exe` on Windows x64 workstations (validated on Windows 11), connecting to SQL Server 2025 Standard, which is remote in about 90% of use cases. Running on the database server is not a first-release target. A workstation is the CLI's primary target; an MCP server may also run on an application server (decision 1 as amended 2026-11-01; decision 47). **Decided** |
 | Compatibility | SQL Server 2016 SP3 and later supported for reading, tested on the owner's 2016 instance; 2025 stays the main validation target (decision 49). A Windows 10 / Windows Server 2016 floor for the machine sqlh runs on is a candidate, conditional on acceptable technical debt. Other targets need separate assessment. **Decided** |
