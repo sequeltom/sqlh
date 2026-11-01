@@ -1103,7 +1103,7 @@ Classifier v2 implements the result. Showplan support (`SET SHOWPLAN_XML`, summa
 
 ### Phase 7: evidence-based evaluations (VISION priority 5)
 
-Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor, the md format, and what SmartScreen and antivirus make of the signed exe on locked-down workstations (the signing itself is task 3.6). Agent trial 3 ran on 2026-10-21 (task 5.6) and covered the row and value limits; its timeout trial is still open. Whether the count budgets (250 ms, and decision 45's 5 s) are right now comes from real sessions as well as trials: the first real-environment feedback (2026-10-31, MCP client feedback above) produced decision 45.
+Exact row counts (from 2.6 and real sessions), the Windows 10 / Windows Server 2016 client floor (the SQL Server 2016 floor is decided: decision 49), the md format, and what SmartScreen and antivirus make of the signed exe on locked-down workstations (the signing itself is task 3.6). Agent trial 3 ran on 2026-10-21 (task 5.6) and covered the row and value limits; its timeout trial is still open. Whether the count budgets (250 ms, and decision 45's 5 s) are right now comes from real sessions as well as trials: the first real-environment feedback (2026-10-31, MCP client feedback above) produced decision 45.
 
 ### Phase 8: delivery to agents (skill, connector, plugin)
 
@@ -1157,6 +1157,14 @@ A colleague of the owner asked for Cowork-style access: claude.ai's remote conne
 - **Alternatives:**
   - **Backup, open for reconsideration (decision 47):** (a) a shared read-only login per profile on the host (a group-managed service account with Windows auth, or a SQL login whose password comes from the host's secrets; sqlh maps callers to the profiles they may use and records who ran what). It works on any version, SQL Server 2016 included, but every caller has that login's permissions, which are then the boundary. Not built; revisit if a server without Entra needs hosting.
   - **Not planned:** (b) a SQL login per caller stored on the host (every password entered and rotated on a shared server), and (d) Kerberos delegation from the token's user to an Active Directory account (domain-administrator delegation settings).
+
+### SQL Server 2016 support (decision 49, owner, 2026-11-01; planned, waiting on the owner's 2016 instance)
+
+1. **The instance, the owner's:** SQL Server 2016 SP3 (Developer edition is free) on a machine the workstation reaches, with mixed-mode authentication (the `Reader` tests make SQL logins) and a login with the rights the 2025 `test` profile has. The owner makes its profile with `sqlh profiles add` (a name such as `test2016`); its server name and credentials stay out of the repo, as for `test`.
+2. **The scratch database:** `tests/fixtures/sqlh_test.sql` creates `sqlh_test` there; check that the script itself runs on 2016.
+3. **First run:** the smoke script and the live suite with `SQLH_TEST_PROFILE` naming the 2016 profile, debug and release. Classify each failure: a sqlh defect (catalog SQL that needs a later version), a test that assumes 2025 (strict encryption needs 2022 or later; 2016's highest compatibility level is 130, which decision 21's level test must use; error text or catalog columns that differ), or a known version difference to document.
+4. **Fixes:** defects fixed in sqlh with tests; a test that depends on the version asks the server (`SERVERPROPERTY('ProductMajorVersion')`) and states its 2016 expectation, never skips silently; the smoke golden files normalize the server's version already, so a difference in them is a finding.
+5. **Running it:** `scripts/check.ps1 -Live` takes one profile; decide then whether it runs the suite once per listed profile or the 2016 run stays a separate step before a release. CI can't reach either server, so both stay the owner's live runs.
 
 ## 5. Sequencing rationale
 
@@ -1243,8 +1251,13 @@ Decided 2026-10-11, except where an item gives a later date:
 48. **The CLI is optimized for local, offline and small models; no daemon; MCP is the recommendation for frontier models (owner decision, 2026-11-01).** The CLI's audience is agents on local or offline models such as Qwen in OpenCode (agent trial 3), generally on GPUs with 24 GB of VRAM or less. When a choice trades their context or their reading for something else, theirs wins: compact output, a short `--help`, fewer calls per answer, and results that say what to do next. The user docs recommend MCP for frontier models (README, Quick start), whose context barely notices sqlh's tool definitions and which get connection reuse there.
     - **No daemon behind the CLI (decision 14's deferral stands, now with evidence; decision 46's open question (c) closed):** in agent trial 3, 47 calls across ten tasks took 1,844 s, about 39 s a call, mostly the model's own generating and reading; a connect is 195 ms on the dev LAN (about 0.5% of that) and 585 ms in the real environment of 2026-10-31 (about 1.5%). A daemon's costs (auto-start, stale processes, idle exit, pipe security, cancellation across processes, harnesses that kill it with their commands) buy too little for these agents. A script's batches, split by `GO`, already share one connect.
     - **Reopen it** only if a measurement shows the connect is a material share of real CLI turns (a fast model over a slow link, say).
+49. **SQL Server 2016 SP3 and later are supported for reading, tested on a 2016 instance of the owner's (owner decision, 2026-11-01).** It replaces the "candidate 2016 floor" for the database server: real use already runs there (the owner's availability group on SQL Server 2016 SP3 Enterprise, 2026-10-31, where everything worked, `describe` after its 2016 fix). Catalog SQL must run on 2016 SP3; a feature that needs a later version says so in its output on an older server instead of failing (the planned time-zone name in `info` needs `CURRENT_TIMEZONE()`, 2019 and later); the smoke script and the live tests run against the 2016 instance as well as the 2025 test server. SQL Server 2025 stays the main validation target. The plan: "SQL Server 2016 support" (§4).
+    - **Why:** without a 2016 test, a change can break the version in real use unnoticed, as `describe`'s `STRING_AGG ... WITHIN GROUP` once did.
+    - **Not changed:** a Windows 10 / Windows Server 2016 floor for the machine sqlh runs on stays a candidate (VISION.md); Managed Instance and Azure SQL follow their own plan; SQL Server 2012 and 2014 are not targets.
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
+
+- [ ] SQL Server 2016 SP3 (decision 49): the smoke script and the live tests pass against the owner's 2016 instance, version-specific tests with their 2016 expectations
 
 - [ ] Clean Windows 11 x64 workstation (§6.1): runs with no installs, `dumpbin` imports are in-box only, and the size is within budget
 - [ ] Against a remote SQL Server 2025 over a real network: connect latency measured (2.1 measured the dev LAN; the release environment is still to do), encryption modes mandatory and strict
