@@ -1,6 +1,6 @@
 # Product vision
 
-Owner direction recorded 2026-10-10. This document sets product priorities; [DESIGN.md](DESIGN.md) describes current behavior and technical proposals. When older plans conflict with this direction, update those plans before implementing them.
+Owner direction recorded 2026-10-10, updated 2026-11-01 (decision 46). This document sets product priorities; [DESIGN.md](DESIGN.md) describes current behavior and technical proposals. When older plans conflict with this direction, update those plans before implementing them.
 
 ## Purpose and primary workflow
 
@@ -8,13 +8,15 @@ sqlh is a fast, context-efficient SQL Server investigation tool for agents worki
 
 The primary user is an agent with limited context that makes several queries while answering a person's question. Each call should return enough useful information to choose the next step without filling the context window with repetitive metadata or excessive data. Focused schema discovery, concise diagnostics, and easy recovery from an unhelpful query support that workflow.
 
+The command-line tool is the center. sqlh is first a CLI for shell-driven agents, small-context models included, because it costs their context least: its `--help` is read once and only when needed, while an MCP server's tool definitions are sent with every request. `sqlh mcp` is a second front end on the same execution core for MCP hosts. When the two compete for design, size or effort, the CLI comes first. (Owner decision, 2026-11-01; PLAN.md §6, decision 46.)
+
 Large analytics processes and bulk data movement are secondary use cases. Their throughput and completeness requirements should not dictate the main interaction model. Human-led sessions do not imply an interactive CLI: the agent-facing tool should still have predictable, noninteractive execution, with the existing profile-setup exception.
 
 ## Speed and recovery
 
 The goal is to make each turn faster. Evaluate the time to the next useful answer, the overhead of repeated calls, the amount of context consumed, and the time needed to cancel and start again.
 
-Connection reuse is a product priority because the primary workflow makes repeated calls. MCP and persistent sessions are possible delivery mechanisms; their detailed implementation remains a design decision. Reuse must preserve execution policy, isolation between calls, and reliable cleanup.
+Connection reuse is a product priority because the primary workflow makes repeated calls. Today reuse comes through `sqlh mcp` (decisions 14–20); reuse for the CLI itself, a local daemon behind it, is an open question (decision 46). Reuse must preserve execution policy, isolation between calls, and reliable cleanup.
 
 Quick cancellation is essential. An agent must be able to bail out of a slow or misdirected query and try again promptly. Cancellation must remain dependable during connection setup, execution, output delivery, and cleanup.
 
