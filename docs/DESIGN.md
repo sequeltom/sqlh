@@ -26,7 +26,7 @@ The primary workflow is an agent with limited context making several queries acr
 | Compatibility expansion | Candidate Windows Server 2016 / SQL Server 2016 floor, conditional on acceptable technical debt. Other targets need separate assessment. **Decided** |
 | Test server | The owner's existing remote server. Its details stay out of the repo. **Decided** |
 | Workflow | Repeated agent queries in human-led DBA/developer sessions; low context consumption and quick cancellation. **Decided** |
-| Modes | The one-shot CLI, which is the center (decision 46), and `sqlh mcp`, a stdio MCP server whose read-only, stateless calls reuse open connections through a library engine (§10; built 2026-10-17, accepted by external review 2026-10-18). A daemon behind the CLI and sessions across calls are deferred until evidence shows the need; agent trial 3 (2026-10-21) found none. **Decided** (owner decisions 14–20, PLAN.md §6) |
+| Modes | The one-shot CLI, which is the center (decision 46), and `sqlh mcp`, a stdio MCP server whose read-only, stateless calls reuse open connections through a library engine (§10; built 2026-10-17, accepted by external review 2026-10-18). A daemon behind the CLI and sessions across calls are deferred until evidence shows the need; agent trial 3 (2026-10-21) found none, and the CLI, optimized for small local models, connects on every call (decision 48). **Decided** (owner decisions 14–20, PLAN.md §6) |
 
 ### Why mssql-tds
 

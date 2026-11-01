@@ -471,4 +471,4 @@ Settled by the decisions: cancellation and reuse (17), pool size (19), sessions 
 - **structuredContent:** worth adding as an option (`format: "structured"`) once a client benefits from it? Not by default (§4).
 - **Resources:** expose the schema as resources (`sqlh://schema/dbo.Users`) for clients that browse resources? Tools cover the need, so it's deferred.
 - **The `database` argument:** allow switching databases per call, or pin to the profile's database? As designed it's allowed: permissions still bound it, it's explicit in every call, and the reset keeps it from leaking. Revisit if it surprises anyone.
-- **Sessions and a daemon:** add them on the same engine only if an agent trial shows the need (decisions 14, 15).
+- **Sessions and a daemon:** add them on the same engine only if an agent trial shows the need (decisions 14, 15). The daemon behind the CLI stays deferred, now with evidence (decision 48).

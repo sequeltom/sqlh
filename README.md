@@ -49,7 +49,9 @@ Orders	2026-09-30T14:02:11.483
 
 `--format json` and `--format csv` are also available. `sqlh --help` is the full reference; it's written to be read by models.
 
-To give a harness such as Claude Code or OpenCode sqlh's commands as tools, with connections kept open between calls, add it as an MCP server (list each profile it may use):
+**Command line or MCP?** The command line is built for local and offline models, such as Qwen on a GPU with 24 GB or less: the agent reads `sqlh --help` once, when it needs it, and each call returns compact output. An MCP server's tool definitions go out with every request (3,000–4,000 tokens for sqlh's), which a frontier model barely notices and a small one can't spare. With a frontier model, such as Claude, use MCP: native tools, and connections kept open between calls.
+
+To give a harness such as Claude Code or OpenCode sqlh's commands as tools, add it as an MCP server (list each profile it may use):
 
 ```powershell
 claude mcp add sqlh -- sqlh mcp --profile dev
