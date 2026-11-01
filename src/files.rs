@@ -283,11 +283,25 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sqlh-files-{test}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// `OwnScratch` of tests/cli.rs, in %TEMP% since a unit test has no `CARGO_TARGET_TMPDIR`:
+    /// removed on drop, so also when an assertion fails. Make it before anything a test opens
+    /// in it, which then closes first: Windows won't remove an open file.
+    struct OwnScratch(PathBuf);
+
+    impl OwnScratch {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("sqlh-files-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for OwnScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -303,8 +317,8 @@ mod tests {
     // that says why; once the first lets go, the lock is free again.
     #[test]
     fn the_profiles_lock_is_held_by_one_edit_at_a_time() {
-        let dir = dir("lock");
-        let profiles = dir.join("sub").join("profiles.toml");
+        let dir = OwnScratch::new("lock");
+        let profiles = dir.0.join("sub").join("profiles.toml");
         let first = lock(&profiles, Duration::ZERO).expect("the first edit takes it");
         let started = Instant::now();
         let second = lock(&profiles, Duration::from_millis(300))
@@ -320,31 +334,31 @@ mod tests {
         );
         drop(first);
         assert!(lock(&profiles, Duration::ZERO).is_ok());
-        assert_eq!(names(&dir.join("sub")), ["profiles.toml.lock"]);
+        assert_eq!(names(&dir.0.join("sub")), ["profiles.toml.lock"]);
     }
 
     // F12: the profiles file is replaced whole through a `.partial` file of this run's own,
     // which leaves nothing behind.
     #[test]
     fn replace_writes_the_whole_file_and_leaves_nothing_else() {
-        let dir = dir("replace");
-        let target = dir.join("profiles.toml");
+        let dir = OwnScratch::new("replace");
+        let target = dir.0.join("profiles.toml");
         std::fs::write(&target, "old").unwrap();
         replace(&target, b"new contents").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new contents");
-        assert_eq!(names(&dir), ["profiles.toml"]);
+        assert_eq!(names(&dir.0), ["profiles.toml"]);
     }
 
     #[test]
     fn identifies_aliases_and_hard_links() {
-        let dir = dir("identity");
-        let a = dir.join("a.sql");
-        let b = dir.join("b.sql");
-        let link = dir.join("link.sql");
+        let dir = OwnScratch::new("identity");
+        let a = dir.0.join("a.sql");
+        let b = dir.0.join("b.sql");
+        let link = dir.0.join("link.sql");
         std::fs::write(&a, "SELECT 1").unwrap();
         std::fs::write(&b, "SELECT 1").unwrap();
         std::fs::hard_link(&a, &link).unwrap();
-        let alias = dir.join(".").join("A.SQL");
+        let alias = dir.0.join(".").join("A.SQL");
         assert!(same_file(&a, &a));
         assert!(
             same_file(&a, &alias),
@@ -352,18 +366,17 @@ mod tests {
         );
         assert!(same_file(&a, &link), "a hard link is the same file");
         assert!(!same_file(&a, &b), "same contents, different file");
-        assert!(!same_file(&a, &dir.join("missing.sql")));
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!same_file(&a, &dir.0.join("missing.sql")));
     }
 
     // R01: two runs never share a .partial file, and neither takes over a file it didn't create.
     #[cfg(windows)]
     #[test]
     fn partial_files_are_new_and_private() {
-        let dir = dir("partial");
-        let target = dir.join("out.txt");
+        let dir = OwnScratch::new("partial");
+        let target = dir.0.join("out.txt");
         let pid = std::process::id();
-        let squatter = dir.join(format!("out.txt.{pid}-0.partial"));
+        let squatter = dir.0.join(format!("out.txt.{pid}-0.partial"));
         std::fs::write(&squatter, "not ours").unwrap();
 
         let first = Partial::create(&target).unwrap();
@@ -373,7 +386,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&squatter).unwrap(), "not ours");
         // Nobody else can write to, or rename, a run's .partial file while it's open.
         assert!(OpenOptions::new().write(true).open(&first.path).is_err());
-        assert!(std::fs::rename(&first.path, dir.join("stolen.txt")).is_err());
+        assert!(std::fs::rename(&first.path, dir.0.join("stolen.txt")).is_err());
 
         let mut writer = first.writer().unwrap();
         writer.write_all(b"first").unwrap();
@@ -388,10 +401,9 @@ mod tests {
         drop(second);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
         assert_eq!(
-            names(&dir),
+            names(&dir.0),
             ["out.txt".into(), format!("out.txt.{pid}-0.partial")]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(windows)]
@@ -399,10 +411,8 @@ mod tests {
     fn devices_are_streams() {
         let nul = OpenOptions::new().write(true).open("NUL").unwrap();
         assert!(is_stream(&nul));
-        let dir = dir("stream");
-        let file = File::create(dir.join("f.txt")).unwrap();
+        let dir = OwnScratch::new("stream");
+        let file = File::create(dir.0.join("f.txt")).unwrap();
         assert!(!is_stream(&file));
-        drop(file);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
