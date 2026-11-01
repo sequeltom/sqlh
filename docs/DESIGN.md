@@ -22,7 +22,7 @@ The primary workflow is an agent with limited context making several queries acr
 | Writes | Read-only by default, §7. **Decided** |
 | Auth | SQL login and Windows integrated (SSPI). No Entra ID for now. **Decided** |
 | sqlcmd compatibility | Core flags, `GO` and `$(var)`. Agent-specific features get long flags. **Decided** |
-| First-release target | `sqlh.exe` on Windows x64 workstations (validated on Windows 11), connecting to SQL Server 2025 Standard, which is remote in about 90% of use cases. Running on the database server is not a first-release target. **Decided** |
+| First-release target | `sqlh.exe` on Windows x64 workstations (validated on Windows 11), connecting to SQL Server 2025 Standard, which is remote in about 90% of use cases. Running on the database server is not a first-release target. A workstation is the CLI's primary target; an MCP server may also run on an application server (decision 1 as amended 2026-11-01; decision 47). **Decided** |
 | Compatibility expansion | Candidate Windows Server 2016 / SQL Server 2016 floor, conditional on acceptable technical debt. Other targets need separate assessment. **Decided** |
 | Test server | The owner's existing remote server. Its details stay out of the repo. **Decided** |
 | Workflow | Repeated agent queries in human-led DBA/developer sessions; low context consumption and quick cancellation. **Decided** |
