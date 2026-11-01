@@ -1103,7 +1103,7 @@ Classifier v2 implements the result. Showplan support (`SET SHOWPLAN_XML`, summa
 
 ### Phase 7: evidence-based evaluations (VISION priority 5)
 
-Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor, the md format, and what SmartScreen and antivirus make of the signed exe on locked-down workstations (the signing itself is task 3.6). Agent trial 3 (from trial 2): tasks that meet the row, value and time limits without the model being able to raise them first (rules that forbid changing limits, or results whose size is unknown up front), to see how it reads `≥N … counting stopped`, `…[+N]` and a timeout, and whether 250 ms is the right count budget.
+Exact row counts (from 2.6 and real sessions), the Windows/SQL Server 2016 floor, the md format, and what SmartScreen and antivirus make of the signed exe on locked-down workstations (the signing itself is task 3.6). Agent trial 3 ran on 2026-10-21 (task 5.6) and covered the row and value limits; its timeout trial is still open. Whether the count budgets (250 ms, and decision 45's 5 s) are right now comes from real sessions as well as trials: the first real-environment feedback (2026-10-31, MCP client feedback above) produced decision 45.
 
 ### Phase 8: delivery to agents (skill, connector, plugin)
 
