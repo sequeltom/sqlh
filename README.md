@@ -128,7 +128,7 @@ Each tool also takes `profile` (needed when several are listed), `database`, `ma
 
 ## Built for agents
 
-What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
+What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md) and [docs/history/plan-history.md](docs/history/plan-history.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
 **Tally: 42 built, 2 planned.**
 

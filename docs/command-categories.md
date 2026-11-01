@@ -349,7 +349,7 @@ Each argument check uses literals only, with today's argument scanner and its ca
 
 **Stays out:** `xp_regread` (any key, not mapped to the instance) and `xp_enumerrorlogs` (`sp_enumerrorlogs` covers it), as built in the interim step (PLAN.md Phase 6, Built); both fall to `unvetted`.
 
-**What these additions keep:** none of them takes an app lock or sets session context, and none waits as `WAITFOR` does, once `sp_server_diagnostics`'s repeat form is refused. So the letter of PLAN.md 5.4's MCP rule holds (§6.11). One addition is not instant: the one-shot `sp_server_diagnostics` runs about 5 s on the server, on a preemptive thread at high priority [doc], a bounded internal wait the caller doesn't choose. D5 accepts it in MCP explicitly, or keeps it to the CLI.
+**What these additions keep:** none of them takes an app lock or sets session context, and none waits as `WAITFOR` does, once `sp_server_diagnostics`'s repeat form is refused. So the letter of plan-history.md 5.4's MCP rule holds (§6.11). One addition is not instant: the one-shot `sp_server_diagnostics` runs about 5 s on the server, on a preemptive thread at high priority [doc], a bounded internal wait the caller doesn't choose. D5 accepts it in MCP explicitly, or keeps it to the CLI.
 
 **Doc fix that rides along:** DESIGN.md §7 says "`sp_helptrigger` and other `sp_help*`", but the code lists exact names: `sp_helprotect` passes (A25) and `sp_help_revlogin` (A24), `sp_helplogins` (F11) and `sp_helpsrvrolemember` (J16) are refused. §7 should list the names.
 
@@ -497,7 +497,7 @@ All are sqlh's own SQL (exempt from the classifier, always read-only, inside the
 
 ### 6.11 What Part 1 keeps
 
-- **PLAN.md 5.4's MCP rule:** `WAITFOR`, app locks and session context stay out of reach of every MCP call. Round 2 adds none of the three; it does add one bounded internal wait, the one-shot `sp_server_diagnostics`'s about 5 s, which D5 accepts for MCP or keeps to the CLI (§6.1). The pause is client-side (§6.6), and D13's literal recursion inherits the rule (§7.6).
+- **plan-history.md 5.4's MCP rule:** `WAITFOR`, app locks and session context stay out of reach of every MCP call. Round 2 adds none of the three; it does add one bounded internal wait, the one-shot `sp_server_diagnostics`'s about 5 s, which D5 accepts for MCP or keeps to the CLI (§6.1). The pause is client-side (§6.6), and D13's literal recursion inherits the rule (§7.6).
 - The qualifier rule, the work budget and its "too complex" refusals, `--check`'s NOEXEC rule, `##` refusals, `NEXT VALUE FOR`, the transaction invariant, and the exemption of sqlh's own SQL.
 
 ---

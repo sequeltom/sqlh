@@ -1,4 +1,4 @@
-//! Output delivery (PLAN.md 2.3, review F07): a thread does the writing, so a reader that
+//! Output delivery (plan-history.md 2.3, review F07): a thread does the writing, so a reader that
 //! stops reading can't block the async runtime.
 //!
 //! - The sinks write into `ChannelWriter`s, which hand full chunks (never more than `CHUNK`
@@ -732,7 +732,7 @@ mod tests {
         drop(release);
     }
 
-    // PLAN.md 2.4: after a cancel, finishing waits a second, not the stall limit, and once
+    // plan-history.md 2.4: after a cancel, finishing waits a second, not the stall limit, and once
     // it has given up, dropping the delivery doesn't wait again.
     #[test]
     fn a_shorter_wait_gives_up_for_good() {
@@ -910,8 +910,8 @@ mod tests {
         });
     }
 
-    // PLAN.md 2.4: time with nothing to write isn't a stall. A run that was quiet for longer
-    // than the limit, then wrote its last lines to a reader that keeps up, is delivered.
+    // plan-history.md 2.4: time with nothing to write isn't a stall. A run that was quiet for
+    // longer than the limit, then wrote its last lines to a reader that keeps up, is delivered.
     #[test]
     fn quiet_time_is_not_a_stall() {
         let sink = Sink::default();

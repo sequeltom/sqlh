@@ -1529,7 +1529,7 @@ mod tests {
         assert_eq!(hex(&[0xAB, 0xCD, 0xEF], 5), ("0xABCD".into(), 1));
     }
 
-    // PLAN.md 2.15: a stopped count reports its first digit.
+    // plan-history.md 2.15: a stopped count reports its first digit.
     #[test]
     fn a_count_is_floored_to_one_significant_digit() {
         for (n, floored) in [
@@ -1567,7 +1567,7 @@ mod tests {
         t
     }
 
-    // PLAN.md 2.15: flooring must not make the output say that nothing was hidden. Once a
+    // plan-history.md 2.15: flooring must not make the output say that nothing was hidden. Once a
     // hidden row was counted the bound is above the rows shown, whatever the floor says, and
     // `rows_hidden` (JSON's `truncated`) reads the raw count.
     #[test]
@@ -1715,7 +1715,7 @@ mod tests {
         assert_eq!(t.limit_notes(), [note(&[1, 2], &[2])]);
     }
 
-    // PLAN.md 2.15: the advice follows what stopped the count. `--exact-count` lifts the
+    // plan-history.md 2.15: the advice follows what stopped the count. `--exact-count` lifts the
     // budget and nothing else, so a run that `-t` stopped is told to raise `-t` instead,
     // which is also what a run that already has `--exact-count` needs; a run with both kinds
     // of stop gets both.
@@ -2024,8 +2024,8 @@ mod tests {
         assert_eq!(unlimited.closing_room(7), usize::MAX);
     }
 
-    // PLAN.md 2.7: the read cuts a large value to `cell_limit()` characters as it arrives. With
-    // `--max-cell` that is the limit itself; without, the output budget in characters, since a
+    // plan-history.md 2.7: the read cuts a large value to `cell_limit()` characters as it arrives.
+    // With `--max-cell` that is the limit itself; without, the output budget in characters, since a
     // value longer than the whole response can only be withheld; with neither, no limit.
     #[test]
     fn the_cell_limit_is_what_the_sink_can_show() {
@@ -2045,8 +2045,8 @@ mod tests {
         assert_eq!(Tally::new(Limits::default()).cell_limit(), 500);
     }
 
-    // PLAN.md 2.7: a value the read cut (`TextCut`, `BinCut`) is written exactly as the same
-    // value is when the sink cuts it: the same bytes and the same count of values cut, in
+    // plan-history.md 2.7: a value the read cut (`TextCut`, `BinCut`) is written exactly as the
+    // same value is when the sink cuts it: the same bytes and the same count of values cut, in
     // every format. The first column starts with `--`, which the text format guards.
     #[test]
     fn a_value_cut_by_the_read_is_written_like_one_cut_by_the_sink() {
@@ -2177,7 +2177,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 2.11: the description of the connection is a piece of the body, counted when
+    // plan-history.md 2.11: the description of the connection is a piece of the body, counted when
     // the budget has no room for it.
     #[test]
     fn a_withheld_connection_description_is_counted() {
@@ -2196,7 +2196,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 2.12: a result set is open from `columns` to `end_rows`, whether it is shown
+    // plan-history.md 2.12: a result set is open from `columns` to `end_rows`, whether it is shown
     // or hidden, and while it is open nothing but rows is taken. Refusing changes nothing.
     #[test]
     fn events_are_refused_while_a_result_set_is_open() {
@@ -2256,7 +2256,7 @@ mod tests {
 
     // R08: the reserve is sized for the widest footer plus the longest status line main.rs
     // builds (the JSON equivalent is tested in json.rs). If a status line grows, this is the
-    // test that says the reserve must too. The tail that says where the run went (PLAN.md
+    // test that says the reserve must too. The tail that says where the run went (plan-history.md
     // 2.11) is not in it: its length depends on the names, so it is reserved exactly, on top
     // (`Tally::reserve_ending`, tested below).
     #[test]
@@ -2297,10 +2297,10 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.11, DESIGN.md §4.4: the status line's tail (`; db01/master, connect 195 ms`)
-    // is held back from the budget by its own length, on top of both reserves, so the status
-    // line, which is never shortened, fits whatever the names hold, and a short tail costs the
-    // body a few bytes rather than the widest one's worth.
+    // plan-history.md 2.11, DESIGN.md §4.4: the status line's tail
+    // (`; db01/master, connect 195 ms`) is held back from the budget by its own length, on top of
+    // both reserves, so the status line, which is never shortened, fits whatever the names hold,
+    // and a short tail costs the body a few bytes rather than the widest one's worth.
     #[test]
     fn the_status_tail_is_reserved_on_top_of_both_reserves() {
         let tally = |max_output| {

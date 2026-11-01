@@ -1,5 +1,5 @@
 //! Process-level tests: they run the real `sqlh` binary and check exit codes, files and
-//! output, which unit tests can't (PLAN.md Phase 1). Run them against the release binary
+//! output, which unit tests can't (plan-history.md Phase 1). Run them against the release binary
 //! too: `cargo test --release --test cli`.
 //!
 //! Every test is isolated from the machine: no real profiles, no SQLCMD* variables. Tests
@@ -647,7 +647,7 @@ fn concurrent_runs_publish_whole_files() {
     assert_eq!(names(&dir), ["out.txt"]);
 }
 
-// PLAN.md 2.4: a refused connection fails after one attempt (it took 14 s with the driver's
+// plan-history.md 2.4: a refused connection fails after one attempt (it took 14 s with the driver's
 // retries), and a server that takes the connection but never answers hits the login deadline,
 // -l plus one second. Neither depends on which timer fires first.
 #[test]
@@ -734,9 +734,9 @@ fn the_drivers_failover_default_variable_changes_nothing() {
     }
 }
 
-// PLAN.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with exit 6.
-// With -M too, whose connect races every address (mssql-tds 0.3.0; docs/notes/driver-0.3.0.md
-// §7, added in review, 2026-10-31).
+// plan-history.md 2.4: Ctrl+Break ends a connect that is waiting on the server, at once, with
+// exit 6. With -M too, whose connect races every address (mssql-tds 0.3.0;
+// docs/notes/driver-0.3.0.md §7, added in review, 2026-10-31).
 #[cfg(windows)]
 #[test]
 fn ctrl_break_cancels_a_connect() {
@@ -1750,7 +1750,7 @@ fn early_errors_stay_within_max_output_in_every_format() {
     }
 }
 
-// PLAN.md 2.11, owner decision 10: the status line says where a run went only when it got
+// plan-history.md 2.11, owner decision 10: the status line says where a run went only when it got
 // there. A usage error, a guard refusal and a failed connect end as they always did, in text
 // and in csv (where the status line is on stderr), with no server, database or connect time.
 #[test]
@@ -1780,7 +1780,7 @@ fn a_run_that_never_connected_has_no_connection_tail() {
     }
 }
 
-// PLAN.md 2.13, owner decision 11, DESIGN.md §5.1: paths in `-- ` lines follow the escape
+// plan-history.md 2.13, owner decision 11, DESIGN.md §5.1: paths in `-- ` lines follow the escape
 // rule, and input is never escaped. A path as Explorer's "Copy as path" writes it, in double
 // quotes with single backslashes and spaces in the folder and file names, is taken exactly as
 // typed after -i and -o in cmd.exe and in PowerShell. The folders are named so that a backslash
@@ -1927,7 +1927,7 @@ fn contract_version() -> String {
     contract.to_owned()
 }
 
-// PLAN.md 2.11: the JSON document starts with its contract version, which `--version`
+// plan-history.md 2.11: the JSON document starts with its contract version, which `--version`
 // reports, and a run that never connected (a failed connect, a guard refusal, an error in the
 // input, nothing to run) has no description of a connection and no connect time.
 #[test]
@@ -1960,7 +1960,7 @@ fn json_documents_start_with_the_contract_version() {
     }
 }
 
-// PLAN.md 2.11: `--version` names the JSON contract version after the program's own, in
+// plan-history.md 2.11: `--version` names the JSON contract version after the program's own, in
 // `sqlh 0.1.0 (json contract 2.1)` form, and nothing else. The contract is pinned here: a
 // new version is an updated DESIGN.md §5.2 and an updated test.
 #[test]
@@ -2118,8 +2118,8 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
-// PLAN.md 2.14: the read-only guard takes memory in proportion to the size of the input, not to
-// the number of tokens in it. It used to keep about 56 bytes for each token: 10 MB of
+// plan-history.md 2.14: the read-only guard takes memory in proportion to the size of the input,
+// not to the number of tokens in it. It used to keep about 56 bytes for each token: 10 MB of
 // one-character tokens peaked at 795 MB of working set, 9.9 MB of `SELECT 1` lines at 233 MB.
 // Now it keeps none, and each run below peaks at about what it takes without the guard (36 MB:
 // the input as read, as decoded and as split into batches), 54 MB for the one whose refusal
@@ -2333,8 +2333,8 @@ fn run_measured(command: &mut Command) -> (Run, usize) {
     (run, counters.peak_working_set)
 }
 
-// PLAN.md 2.7: $(var) substitution is checked against the 10 MB limit while the text is built,
-// so a reference repeated 200,000 times to a 3,000-byte value is refused when it reaches the
+// plan-history.md 2.7: $(var) substitution is checked against the 10 MB limit while the text is
+// built, so a reference repeated 200,000 times to a 3,000-byte value is refused when it reaches the
 // limit, not after it has been expanded: that would be 600 MB, and the whole run now takes a
 // few megabytes more than the file it reads.
 #[cfg(windows)]
@@ -2366,7 +2366,8 @@ fn odd_length_utf16_is_rejected() {
     assert!(r.stdout.contains("odd number of bytes"), "{}", r.stdout);
 }
 
-// PLAN.md 2.13, Windows shells and paths. The measurements are in docs/notes/windows-shells.md.
+// plan-history.md 2.13, Windows shells and paths. The measurements are in
+// docs/notes/windows-shells.md.
 
 /// The text format writes a backslash as two (DESIGN.md §5.1).
 fn text_escaped(text: &str) -> String {
@@ -2510,7 +2511,7 @@ fn spellings(dir: &Path, rel: &str) -> Vec<(&'static str, String)> {
     forms
 }
 
-// PLAN.md 2.13: -i, -o and SQLH_CONFIG take C:\dir, C:/dir, mixed slashes, relative paths
+// plan-history.md 2.13: -i, -o and SQLH_CONFIG take C:\dir, C:/dir, mixed slashes, relative paths
 // (with . and ..), UNC paths and paths with spaces. A blocked statement ends the run at the
 // guard (exit 5) without connecting, so exit 5 means the input was read, the output file got
 // the refusal, and (for SQLH_CONFIG) the profile was found: without it the exit would be 3.
@@ -2685,8 +2686,8 @@ fn write_never_panicking(command: &mut Command, sql: &str, limit: Duration, faul
     }
 }
 
-// PLAN.md 2.13: what a shell pipes to sqlh is whatever its encoding makes of the text. UTF-8
-// with or without a BOM, and UTF-16 with one (what `>` in Windows PowerShell 5.1 writes), are
+// plan-history.md 2.13: what a shell pipes to sqlh is whatever its encoding makes of the text.
+// UTF-8 with or without a BOM, and UTF-16 with one (what `>` in Windows PowerShell 5.1 writes), are
 // read as they are. Anything else (cmd.exe at an OEM code page, PowerShell with $OutputEncoding
 // set to the console's) isn't valid UTF-8 and is refused with what to change. Text already
 // turned into "?" can't be told from a question mark; DESIGN.md §4.1 and --help warn about it.
@@ -2789,7 +2790,7 @@ fn schema_commands_refuse_what_they_cannot_answer_before_connecting() {
     }
 }
 
-// AGENTS.md: models read --help, so it stays short. PLAN.md 2.13 holds it at 62 lines.
+// AGENTS.md: models read --help, so it stays short. plan-history.md 2.13 holds it at 62 lines.
 #[test]
 fn help_stays_within_its_line_budget() {
     let r = sqlh_args(&["--help"]);
@@ -2899,8 +2900,8 @@ impl Shell {
     }
 }
 
-// PLAN.md 2.13: the examples in --help run as written in cmd.exe, Windows PowerShell 5.1 and
-// PowerShell 7, the shells a person (or an agent's harness) is likely to be in. (Git Bash is
+// plan-history.md 2.13: the examples in --help run as written in cmd.exe, Windows PowerShell 5.1
+// and PowerShell 7, the shells a person (or an agent's harness) is likely to be in. (Git Bash is
 // checked by hand: docs/notes/windows-shells.md.) A listener that closes every connection
 // stands in for the server, and `myserver` is swapped for it, so the run gets as far as the
 // connect (exit 2) only if the shell handed sqlh the arguments the help meant: the input file
@@ -3002,8 +3003,8 @@ fn the_help_examples_run_as_written_in_every_shell() {
     }
 }
 
-// PLAN.md 2.13, DESIGN.md §4.1: `-Q "..."` with single quotes inside reaches sqlh as typed in
-// every shell, a space, brackets and a non-ASCII letter included. A blocked statement shows the
+// plan-history.md 2.13, DESIGN.md §4.1: `-Q "..."` with single quotes inside reaches sqlh as typed
+// in every shell, a space, brackets and a non-ASCII letter included. A blocked statement shows the
 // name it writes to, so the refusal proves what arrived. The same line with a character that
 // belongs to a shell would not: DESIGN.md lists them, and docs/notes/windows-shells.md has the
 // measurements, so they aren't re-run here.
@@ -3035,7 +3036,7 @@ fn the_documented_q_form_reaches_sqlh_intact_in_every_shell() {
     }
 }
 
-// PLAN.md 2.13: sqlh leaves the console's code page as it found it. It used to switch the
+// plan-history.md 2.13: sqlh leaves the console's code page as it found it. It used to switch the
 // console to UTF-8 whenever stdout was a console and never switch back, so every program run
 // afterwards in that console (and every later PowerShell 5.1 session) inherited UTF-8. The
 // switch was never needed: Rust writes a console as UTF-16. The check needs a console that
@@ -3091,7 +3092,7 @@ fn windows_profile_ignores_sqlcmduser() {
     assert!(r.stdout.contains("(Windows auth,"), "{}", r.stdout);
 }
 
-// PLAN.md 2.8: --lock-timeout is whole seconds, 0 means no limit, and the most that
+// plan-history.md 2.8: --lock-timeout is whole seconds, 0 means no limit, and the most that
 // SET LOCK_TIMEOUT can hold is 2,147,483 s. Anything else is a usage error found before
 // anything connects (exit 3, where the dead address would give 2).
 #[test]
@@ -3125,7 +3126,7 @@ fn a_bad_lock_timeout_is_a_usage_error() {
     }
 }
 
-// PLAN.md 2.8, owner decision 7: READ UNCOMMITTED is for read-only runs. Asked for on the
+// plan-history.md 2.8, owner decision 7: READ UNCOMMITTED is for read-only runs. Asked for on the
 // command line in a run that can write, it is a usage error that says why; saved in a
 // profile, it is ignored in such a run. Switched off explicitly, it is no conflict.
 #[test]
@@ -3214,7 +3215,7 @@ fn read_uncommitted_with_writes_is_a_usage_error() {
     );
 }
 
-// PLAN.md 2.8: the profile keys are checked like the others, with the line in the message.
+// plan-history.md 2.8: the profile keys are checked like the others, with the line in the message.
 #[test]
 fn a_profile_with_a_bad_lock_setting_is_a_usage_error() {
     let dir = scratch("lock_setting_profiles");
@@ -3267,7 +3268,7 @@ fn a_profile_with_a_bad_lock_setting_is_a_usage_error() {
     }
 }
 
-// PLAN.md 2.8: `profiles add` saves both settings, a later `add` without them keeps them,
+// plan-history.md 2.8: `profiles add` saves both settings, a later `add` without them keeps them,
 // `--read-uncommitted=false` and `--lock-timeout 0` are values that replace them, and
 // `profiles list` shows what a run with each profile gets (10 and 0 when nothing is saved).
 // The profile points at a dead address, so the connection test at the end of `add` fails
@@ -3399,8 +3400,8 @@ fn profile_add_saves_the_lock_settings_and_list_shows_them() {
     assert_eq!(saved(), before);
 }
 
-// PLAN.md 4.1 and 4.2: `profiles list` shows each profile's description as its last column, in
-// text, and `--search` keeps the profiles whose name or description contains the text, in any
+// plan-history.md 4.1 and 4.2: `profiles list` shows each profile's description as its last column,
+// in text, and `--search` keeps the profiles whose name or description contains the text, in any
 // case. A hostile description stays one field: its backslash is doubled and the rest, `-- `
 // included, stays inside the row. No match is an empty list, not an error. Windows-auth
 // profiles, so Credential Manager is never consulted.
@@ -3570,7 +3571,7 @@ fn profile_list_shows_descriptions_and_searches_them() {
     assert_eq!(fs::read_to_string(&config).unwrap(), saved);
 }
 
-// Owner decision 12 and PLAN.md 2.16 (agent trial 2): a new profile refuses writes unless
+// Owner decision 12 and plan-history.md 2.16 (agent trial 2): a new profile refuses writes unless
 // `--write-policy` says otherwise, and says so when saved; a refusal under a deny profile never
 // offers --allow-write, which that profile refuses. An existing profile keeps its policy.
 #[test]
@@ -3734,7 +3735,7 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     assert!(config.exists() && !elsewhere.join("sqlh").exists());
 }
 
-// docs/mcp-mode.md §2 and §3 (PLAN.md 5.3), through the real binary with no server: launch
+// docs/mcp-mode.md §2 and §3 (plan-history.md 5.3), through the real binary with no server: launch
 // errors are exit 3 on stderr with nothing on stdout; a scripted session gets one JSON-RPC
 // message per line, in both eras; a call to a server that isn't there is a tool error (the
 // run's own output, exit 2), never a protocol error; and the server ends when stdin closes.
@@ -6202,7 +6203,7 @@ mod live {
         );
     }
 
-    // F06 / PLAN.md 2.2: a loop's row counts are one line, not 300.
+    // F06 / plan-history.md 2.2: a loop's row counts are one line, not 300.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_loop_of_inserts_prints_one_row_count_line() {
@@ -6224,7 +6225,7 @@ mod live {
         );
     }
 
-    // F06 / PLAN.md 2.2: a run over the output budget ends with a valid status and a note,
+    // F06 / plan-history.md 2.2: a run over the output budget ends with a valid status and a note,
     // in text and in json, and stays within the budget.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -6268,7 +6269,7 @@ mod live {
         assert_eq!(doc["ok"], true);
     }
 
-    // F07 / PLAN.md 2.3: a reader that holds stdout open and never reads can't make sqlh
+    // F07 / plan-history.md 2.3: a reader that holds stdout open and never reads can't make sqlh
     // hang. With much output, the batch stops waiting after -t seconds. With output that
     // fits sqlh's queue (256 KiB) but not the pipe (64 KiB), the run finishes and the last
     // wait for delivery gives up instead. Either way: exit 7.
@@ -6311,8 +6312,8 @@ mod live {
         }
     }
 
-    // PLAN.md 2.7: a large value shown with --max-cell is cut as it arrives, so memory stays
-    // flat. The values are built on the server, 60 MB each; before the change a run held two
+    // plan-history.md 2.7: a large value shown with --max-cell is cut as it arrives, so memory
+    // stays flat. The values are built on the server, 60 MB each; before the change a run held two
     // copies of one (about 120 MB at the peak, and 2 GB for a value of 1 GB), and now it holds
     // the 500 characters it shows, plus the few buffers it reads through. The count of what was
     // cut stays exact: the text has a surrogate pair that chunk boundaries fall in, and a
@@ -6421,8 +6422,8 @@ mod live {
         assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
     }
 
-    // PLAN.md 2.7: rows past --max-rows are counted without decoding their values. The first
-    // row is small and shown; the five after it hold 40 MB each, and are skipped chunk by
+    // plan-history.md 2.7: rows past --max-rows are counted without decoding their values. The
+    // first row is small and shown; the five after it hold 40 MB each, and are skipped chunk by
     // chunk. Reading each into memory first took 40 MB or more at the peak.
     #[cfg(windows)]
     #[test]
@@ -6455,8 +6456,8 @@ mod live {
         assert!(peak < 25 << 20, "peak working set {} MB", peak >> 20);
     }
 
-    // PLAN.md 2.5 (docs/notes/harness-kill.md): a harness that kills sqlh outright, here with
-    // TerminateProcess, leaves no work running on the server. The session is gone within
+    // plan-history.md 2.5 (docs/notes/harness-kill.md): a harness that kills sqlh outright, here
+    // with TerminateProcess, leaves no work running on the server. The session is gone within
     // seconds, for a waiting query and for a CPU-bound one that sends nothing. The note measured
     // 46 runs of this kind, the slowest 0.14 s; the bound here is wide because the observer is
     // a fresh connection that takes a few hundred ms to log in. Sessions are matched on id and
@@ -6563,8 +6564,8 @@ mod live {
         }
     }
 
-    // PLAN.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that the
-    // connection stayed usable, and not that the server confirmed the cancel: the driver gives
+    // plan-history.md 2.4: Ctrl+Break cancels a running statement. The run says what sqlh saw, that
+    // the connection stayed usable, and not that the server confirmed the cancel: the driver gives
     // no receipt for its attention (see `Session::failure`).
     #[cfg(windows)]
     #[test]
@@ -6616,9 +6617,9 @@ mod live {
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
-    // PLAN.md 2.4: Ctrl+Break also ends a run that waits for a stalled reader, without waiting
-    // out -t. What was written can't be delivered, so the exit is 7, and stderr says that the
-    // run itself was cancelled.
+    // plan-history.md 2.4: Ctrl+Break also ends a run that waits for a stalled reader, without
+    // waiting out -t. What was written can't be delivered, so the exit is 7, and stderr says that
+    // the run itself was cancelled.
     #[cfg(windows)]
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -6722,8 +6723,8 @@ mod live {
         (head.to_owned(), server.into(), database.into(), ms)
     }
 
-    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.1 and §5.3: in text and csv the status line
-    // ends with the server, the database the run started in and the connect time, so the first
+    // plan-history.md 2.11, owner decision 10, DESIGN.md §5.1 and §5.3: in text and csv the status
+    // line ends with the server, the database the run started in and the connect time, so the first
     // response shows where it ran (agent trial 1 spent a call finding out it was in master).
     // The database is the profile's own, not the one a later USE moved the session to; csv has
     // the same tail on stderr and nothing of it on stdout; json agrees on the server and the
@@ -6840,7 +6841,7 @@ mod live {
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
-    // PLAN.md 2.1: --verbose says where the time to the first batch went; a build with
+    // plan-history.md 2.1: --verbose says where the time to the first batch went; a build with
     // `--features timing` also names the connect steps.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -6866,7 +6867,7 @@ mod live {
         }
     }
 
-    // PLAN.md 2.8, owner decision 7: what a connection looks like to the server. The lock
+    // plan-history.md 2.8, owner decision 7: what a connection looks like to the server. The lock
     // timeout and the deadlock priority are in every session, writes allowed or not;
     // READ UNCOMMITTED (isolation level 1, against the default READ COMMITTED, 2) only when
     // asked for, with its note once.
@@ -7025,7 +7026,7 @@ mod live {
         }
     }
 
-    // PLAN.md 2.8: a read that waits behind another session's open write gives up after
+    // plan-history.md 2.8: a read that waits behind another session's open write gives up after
     // --lock-timeout (default 10 s, here 2) with error 1222: an ordinary SQL error, exit 1,
     // on the line of the statement that waited. The same read with --read-uncommitted takes no
     // shared lock, so it doesn't wait: it returns at once, with the uncommitted row, and says
@@ -7164,7 +7165,7 @@ mod live {
         );
     }
 
-    // PLAN.md 2.8: DEADLOCK_PRIORITY LOW makes the agent's session the victim when it
+    // plan-history.md 2.8: DEADLOCK_PRIORITY LOW makes the agent's session the victim when it
     // deadlocks with ordinary work. The two sessions update the same two tables in opposite
     // order; the other one (NORMAL, the server's default) wins, and sqlh's run ends with
     // error 1205, an ordinary SQL error (exit 1) on the line of the statement that was chosen.
@@ -7209,8 +7210,8 @@ mod live {
         assert_eq!(production.code, 0, "{}", production.stdout);
     }
 
-    // PLAN.md 2.12 / DESIGN.md §5.1 and §5.2: where a message lands. No query was found that
-    // makes SQL Server send a message between two rows of a result: warnings raised per row
+    // plan-history.md 2.12 / DESIGN.md §5.1 and §5.2: where a message lands. No query was found
+    // that makes SQL Server send a message between two rows of a result: warnings raised per row
     // (an aggregate that drops a NULL, an arithmetic warning) are held until the end of the
     // statement, even in results of 50,000 and of 1.2 million rows (a parallel plan), and
     // PRINT and RAISERROR can't run inside a query. The nearest cases are what this pins: a
@@ -7359,7 +7360,7 @@ mod live {
         assert_eq!(&footers[2..], ["-- 1 row", "-- 1 row"], "{}", r.stdout);
     }
 
-    // PLAN.md 2.11: a JSON document starts with the contract version and says where the run
+    // plan-history.md 2.11: a JSON document starts with the contract version and says where the run
     // went: the connection, taken from the login so the first response shows the database;
     // how long connecting took; and how long each batch took. The database is the one the run
     // started in, not the one a later USE moved the session to.
@@ -7418,7 +7419,7 @@ mod live {
         );
     }
 
-    // PLAN.md 2.11: a run cut short by --max-output still has its connection, its times and
+    // plan-history.md 2.11: a run cut short by --max-output still has its connection, its times and
     // its outcome, and is valid JSON no longer than the cap.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -7442,11 +7443,11 @@ mod live {
         assert_eq!(doc["ok"], true);
     }
 
-    // PLAN.md 2.15 (decision 6, docs/notes/drain-experiment.md). The tests below need a result
-    // of millions of narrow rows, far more than a 250 ms count can read, whose full count takes
-    // seconds. They used to read StackOverflow2010's `dbo.Votes`; since PLAN.md 3.4 the server
-    // makes the rows up: a cross join of the catalog view `sys.all_columns` (thousands of rows
-    // on any server, so millions of pairs), which streams as fast as a table scan, stores
+    // plan-history.md 2.15 (decision 6, docs/notes/drain-experiment.md). The tests below need a
+    // result of millions of narrow rows, far more than a 250 ms count can read, whose full count
+    // takes seconds. They used to read StackOverflow2010's `dbo.Votes`; since plan-history.md 3.4
+    // the server makes the rows up: a cross join of the catalog view `sys.all_columns` (thousands
+    // of rows on any server, so millions of pairs), which streams as fast as a table scan, stores
     // nothing, and needs no database beyond the scratch one.
 
     const SO: &str = "sqlh_test";
@@ -8201,8 +8202,8 @@ mod live {
     // 2026-10-19, the connect counted against it: a server busy enough to take the whole 5 s
     // to acknowledge the cancel (eight runs at once, each building a 16 MB value) ended the
     // batch at `-t` plus 5 s, as designed, and the run still failed the bound by its connect,
-    // 200 to 450 ms under that load (PLAN.md, Phase 5.4, Still open). The outside clock keeps a
-    // looser bound, `OUTSIDE`, enforced while the run goes on (`run_bounded`, R43): a run
+    // 200 to 450 ms under that load (plan-history.md, Phase 5.4, Still open). The outside clock
+    // keeps a looser bound, `OUTSIDE`, enforced while the run goes on (`run_bounded`, R43): a run
     // still going past it is killed and fails with what it wrote, so a hang before or after
     // its batch, which sqlh's own clock can't show, fails too, and doesn't hold the suite up.
     // Until R43 it was checked only once the run had ended, which a hung run never does.
@@ -8488,10 +8489,10 @@ mod live {
         }
     }
 
-    // PLAN.md 3.4: tests/smoke.sql against the server, compared whole with the expected output
-    // in tests/golden/: every data type's rendering, escapes, cut values, the row limit, temp
-    // tables in read-only mode, `GO n`, messages, a result an error cut short, errors mapped to
-    // their lines and the status line. Only what changes from run to run is normalized: the
+    // plan-history.md 3.4: tests/smoke.sql against the server, compared whole with the expected
+    // output in tests/golden/: every data type's rendering, escapes, cut values, the row limit,
+    // temp tables in read-only mode, `GO n`, messages, a result an error cut short, errors mapped
+    // to their lines and the status line. Only what changes from run to run is normalized: the
     // times, the server's name and version, the database's name, and in JSON the script's
     // path, which is the checkout's. After a deliberate change to the output, rerun with
     // SQLH_BLESS=1 to rewrite the golden files, and review the diff.
@@ -8619,7 +8620,7 @@ mod live {
 
     /// Objects for one test, made after `Probe` has checked the scratch marker, each named with
     /// the probe's unique name as a prefix; dropped in reverse order, before the probe's table,
-    /// when this goes out of scope, whether the test passed or not (PLAN.md 3.4).
+    /// when this goes out of scope, whether the test passed or not (plan-history.md 3.4).
     struct Objects {
         probe: Probe,
     }
@@ -8875,7 +8876,7 @@ mod live {
         }
     }
 
-    // schema-commands.md and PLAN.md Phase 4, against SQL Server: `describe` reports every
+    // schema-commands.md and plan-history.md Phase 4, against SQL Server: `describe` reports every
     // section for a table, and what applies to views, procedures, functions and synonyms; `def`
     // prints a counted block; `find`, `find --text` and `tables` match names and bodies; a name
     // resolves case-insensitively but never outside an explicit schema; an ambiguous or unknown
@@ -9571,8 +9572,8 @@ mod live {
         );
     }
 
-    // F03 (PLAN.md 1.5), end to end: every shape the review got past the guard is refused by
-    // the real binary before anything runs, and a sequence it would have advanced is where it
+    // F03 (plan-history.md 1.5), end to end: every shape the review got past the guard is refused
+    // by the real binary before anything runs, and a sequence it would have advanced is where it
     // was. (Unit tests in src/guard.rs cover the classifier; this is the regression against a
     // server.)
     #[test]
@@ -9619,8 +9620,8 @@ mod live {
         );
     }
 
-    // PLAN.md 3.4: a write reaches a table with a filtered index (which refuses writes from a
-    // session whose SET options are wrong, error 1934) and fires its trigger; a foreign key's
+    // plan-history.md 3.4: a write reaches a table with a filtered index (which refuses writes from
+    // a session whose SET options are wrong, error 1934) and fires its trigger; a foreign key's
     // refusal is an ordinary SQL error mapped to its line; without --allow-write none of it
     // runs.
     #[test]
@@ -9765,8 +9766,8 @@ mod live {
         assert!(!r.stdout.contains("counting stopped"), "{}", r.stdout);
     }
 
-    /// A low-privilege login for one test (owner decision 5, PLAN.md 3.4): `db_datareader` in
-    /// the scratch database and `VIEW DEFINITION`, nothing else. It is made through the test
+    /// A low-privilege login for one test (owner decision 5, plan-history.md 3.4): `db_datareader`
+    /// in the scratch database and `VIEW DEFINITION`, nothing else. It is made through the test
     /// profile with a random password that never leaves this process and the sqlh processes it
     /// starts: the SQL that sets it reaches sqlh on stdin (never a command line or a file), and
     /// runs as the login get it from `SQLCMDPASSWORD` in their own environment (the test
@@ -10202,9 +10203,9 @@ mod live {
         format!("Aa1!{a:016x}{b:016x}")
     }
 
-    // Owner decision 5 (PLAN.md 3.4): the database's permissions are the boundary, as DESIGN.md
-    // §7 says. A login with only read rights reads; asked to write, with --allow-write getting
-    // past sqlh's guard, the server refuses (error 229) and nothing changes; without
+    // Owner decision 5 (plan-history.md 3.4): the database's permissions are the boundary, as
+    // DESIGN.md §7 says. A login with only read rights reads; asked to write, with --allow-write
+    // getting past sqlh's guard, the server refuses (error 229) and nothing changes; without
     // --allow-write, sqlh's guard refuses first.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -10502,8 +10503,8 @@ mod live {
         );
     }
 
-    /// PLAN.md 5.4: sqlh mcp's tools against the test server, through the real binary and the
-    /// test profile (docs/mcp-mode.md §9, Still to do). A test that compares calls runs them on
+    /// plan-history.md 5.4: sqlh mcp's tools against the test server, through the real binary and
+    /// the test profile (docs/mcp-mode.md §9, Still to do). A test that compares calls runs them on
     /// one connection (`--pool 1`) and asserts that they shared it: one `@@SPID` throughout,
     /// and no connect after the first call. A leak test across two connections proves nothing.
     mod mcp_tools {
@@ -11172,7 +11173,7 @@ mod live {
             assert_eq!(code, 0, "{stderr}");
         }
 
-        // The external review's question 3 (PLAN.md, Phase 5.2 and 5.3 external review), on
+        // The external review's question 3 (plan-history.md, Phase 5.2 and 5.3 external review), on
         // one connection: a fresh login's session against the next call's, after a call that
         // sets ROWCOUNT, TEXTSIZE, LANGUAGE, DATEFORMAT, DATEFIRST and CONTEXT_INFO and opens a
         // GLOBAL cursor, all of which the guard lets through. Values: DBCC USEROPTIONS (which

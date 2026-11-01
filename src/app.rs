@@ -1,6 +1,6 @@
 //! The command-line application: arguments, the output and its closing lines, `-o`, the
 //! panic net and the diagnostics of last resort (DESIGN.md §4–§6). The run itself is
-//! `run` (PLAN.md 3.1).
+//! `run` (plan-history.md 3.1).
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -83,7 +83,7 @@ fn version_line() -> String {
 }
 
 /// sqlh's version, set by `build.rs` (decision 44): the release's, given at build time by the
-/// release workflow (`SQLH_VERSION`, PLAN.md 3.6: `0.1.0` from the tag `v0.1.0`, or
+/// release workflow (`SQLH_VERSION`, plan-history.md 3.6: `0.1.0` from the tag `v0.1.0`, or
 /// `0.1.0-dev.<run>` for a build without a tag), else `Cargo.toml`'s with `-local`. The exe's
 /// Windows version resource carries the same.
 pub(crate) const VERSION: &str = env!("SQLH_BUILT_VERSION");
@@ -727,8 +727,8 @@ mod tests {
         )
     }
 
-    // PLAN.md 2.15: the status line says how many batches had a count stopped, in a run that
-    // succeeded and in one that failed (with a SQL error or any other failure), and says
+    // plan-history.md 2.15: the status line says how many batches had a count stopped, in a run
+    // that succeeded and in one that failed (with a SQL error or any other failure), and says
     // nothing otherwise. The counts are the run's own (`run::Accounting`, whose agreement
     // with the output's tally `run.rs` tests).
     #[test]
@@ -968,7 +968,7 @@ mod tests {
         drop(release);
     }
 
-    // PLAN.md 2.4: after a cancel the closing lines get one second, whatever -t says, and
+    // plan-history.md 2.4: after a cancel the closing lines get one second, whatever -t says, and
     // the delivery is detached once it gives up, so dropping the output doesn't wait.
     #[test]
     fn after_a_cancel_the_closing_lines_get_one_second() {
@@ -995,8 +995,8 @@ mod tests {
         assert_eq!(delivered, Exit::Undelivered);
     }
 
-    // PLAN.md 2.12: a sink that refuses an event out of order has found a bug in sqlh or its
-    // driver, so the run is an internal error (exit 10), not undeliverable output (exit 7);
+    // plan-history.md 2.12: a sink that refuses an event out of order has found a bug in sqlh or
+    // its driver, so the run is an internal error (exit 10), not undeliverable output (exit 7);
     // a failure to write stays exit 7.
     #[test]
     fn an_event_out_of_order_is_an_internal_error_and_a_broken_pipe_is_not() {

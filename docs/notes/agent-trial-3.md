@@ -1,6 +1,6 @@
 # Agent trial 3: OpenCode with MCP
 
-Run 2026-10-21 (PLAN.md 5.6) against the release build of `593a6e3`; the code is unchanged through `241c5fd`. OpenCode 2.0.26 (`opencode-cli`, bundled with OpenCode Desktop) drove `sqlh mcp --profile test` with the owner's local model, `ollama/qwen3.8:latest`, in the legacy era (`initialize`, `2025-11-25`; mcp-mode.md §9, Client interop). The profile's database is `StackOverflow2010`.
+Run 2026-10-21 (plan-history.md 5.6) against the release build of `593a6e3`; the code is unchanged through `241c5fd`. OpenCode 2.0.26 (`opencode-cli`, bundled with OpenCode Desktop) drove `sqlh mcp --profile test` with the owner's local model, `ollama/qwen3.8:latest`, in the legacy era (`initialize`, `2025-11-25`; mcp-mode.md §9, Client interop). The profile's database is `StackOverflow2010`.
 
 For the trial the owner had the `test` profile set to `write_policy = "deny"`; it was restored to `flag` afterwards, byte for byte. Each task ran in a fresh session (`opencode-cli run --standalone --auto --format json`) from an empty folder, with the configuration in a scratch file (`OPENCODE_CONFIG`). A `tee` on each side of the server recorded the traffic.
 
@@ -39,12 +39,12 @@ Every call ended with `-- ok` or with an `isError` result the model read correct
   - task 4's second run: a ranking that drops a row its query returned;
   - task 5: an invented cause for error 207.
 
-  sqlh's output was right in each case; the errors were the model's, in what it claimed and in how it passed the results on, as in trial 2's arithmetic. The dropped ranking row is itself an error of fidelity: not every figure the tools returned reached the answer. These are counts of what one reading found, not a score; a later evaluation should compare each row and claim of an answer with the results it came from (the completion review, PLAN.md, Phase 5.4–5.6).
+  sqlh's output was right in each case; the errors were the model's, in what it claimed and in how it passed the results on, as in trial 2's arithmetic. The dropped ranking row is itself an error of fidelity: not every figure the tools returned reached the answer. These are counts of what one reading found, not a score; a later evaluation should compare each row and claim of an answer with the results it came from (the completion review, plan-history.md, Phase 5.4–5.6).
 - **Schema discovery used the schema tools.** Every task opened with `info`, `databases`, `tables` or `describe` rather than catalog queries, and found its tables first time; task 5 sampled a system view (`max_rows: 2`) to find its columns after a wrong guess.
 
 ## Follow-ups
 
-Recorded in PLAN.md (5.6):
+Recorded in plan-history.md (5.6):
 - **Decisions 14 and 15:** the evidence above supports both as decided: keep the CLI's daemon and MCP sessions deferred.
 - **Output (DESIGN.md §5), built 2026-10-22 in `3915347` at the owner's request:**
   - A run that cut values ends with a note saying how to see one whole: `2 values were cut (--max-cell 500); read one in pieces with SUBSTRING, or raise --max-cell` (`max_cell` in MCP; only `raise ...` when the cut values are in a schema command's sections).

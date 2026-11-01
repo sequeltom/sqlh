@@ -1,4 +1,4 @@
-//! The console events that cancel a run (PLAN.md 2.4, review F08): Ctrl+C, Ctrl+Break, the
+//! The console events that cancel a run (plan-history.md 2.4, review F08): Ctrl+C, Ctrl+Break, the
 //! console window closing, logoff and shutdown.
 
 use std::io;

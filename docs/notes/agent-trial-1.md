@@ -27,4 +27,4 @@ Run 2026-10-10 against `fdefab9`. OpenCode drove `sqlh.exe` with a local model (
 
 ## Follow-ups
 
-Recorded in PLAN.md: task 2.9 (help tips), Phase 4 (evidence for `describe`), Phase 8 (skill guidance), and a second trial that exercises limits and refusals.
+Recorded in plan-history.md: task 2.9 (help tips), Phase 4 (evidence for `describe`) and a second trial that exercises limits and refusals (2.10); and in PLAN.md, Phase 8 (skill guidance).

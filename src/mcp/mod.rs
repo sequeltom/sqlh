@@ -1,4 +1,4 @@
-//! `sqlh mcp` (PLAN.md Phase 5.3; docs/mcp-mode.md): an MCP server on stdio, the reuse
+//! `sqlh mcp` (plan-history.md Phase 5.3; docs/mcp-mode.md): an MCP server on stdio, the reuse
 //! engine's first front end (owner decision 14). It serves the profiles listed at its launch
 //! (decision 18), with read-only tools (decision 16), each call stateless on a pooled,
 //! reset connection (decisions 15, 17, 19).

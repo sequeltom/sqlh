@@ -3,10 +3,10 @@
 //! blocks the batch unless its target is a temp table (#t) or table variable (@t).
 //! Layer 2, the rolled-back wrapper transaction, lives in main.rs.
 //!
-//! The tokens are read as a stream and none is kept (PLAN.md 2.14), so the guard's memory
+//! The tokens are read as a stream and none is kept (plan-history.md 2.14), so the guard's memory
 //! doesn't depend on what the input looks like: see `Guard` and `Lexer`.
 //!
-//! Its work is bounded as well (PLAN.md R18): see `Work`.
+//! Its work is bounded as well (plan-history.md R18): see `Work`.
 //!
 //! The guard reduces accidents. It is not a security boundary: database permissions are.
 
@@ -54,7 +54,7 @@ impl Blocked {
     /// The advice to print. Where writes are off for good (`off`), `--allow-write` can't help,
     /// so the advice never offers it: it says why writes are off, after what can be done
     /// instead. Under a profile whose `write_policy` is `deny`, `--allow-write` is a usage error
-    /// (PLAN.md 2.16, from agent trial 2); `sqlh mcp` is read-only (owner decision 16).
+    /// (plan-history.md 2.16, from agent trial 2); `sqlh mcp` is read-only (owner decision 16).
     pub fn advice_for(&self, off: Option<&WritesOff>) -> String {
         // The reason, as a clause after what to try instead, and as a sentence on its own (the
         // program's name keeps its lower case).
@@ -356,7 +356,7 @@ const STATEMENT_START: &[&str] = &[
     "WRITETEXT",
 ];
 
-/// The classifier's work budget (DESIGN.md §7, PLAN.md R18), the backstop under the linear
+/// The classifier's work budget (DESIGN.md §7, plan-history.md R18), the backstop under the linear
 /// scans below. Every token the classifier reads costs one unit, lookahead included, so
 /// reading the same suffix again is paid for again; a read also costs one unit for each 32
 /// bytes it went over, so a huge string or comment that a lookahead crosses over and over is
@@ -634,7 +634,7 @@ pub fn several_outputs(sql: &str) -> bool {
 
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
-/// therefore doesn't depend on how many tokens the input has (PLAN.md 2.14); only a
+/// therefore doesn't depend on how many tokens the input has (plan-history.md 2.14); only a
 /// refusal's message can be as long as the name it quotes, and the open `TOP ( ... )` clauses
 /// (at most `MAX_OPEN_TOP`, a few bytes each). Every read is paid for out of `work`.
 struct Guard<'a> {
@@ -1632,9 +1632,10 @@ mod tests {
         assert_eq!(blocked("SELECT NEXT VALUE FOR dbo.S").advice, WRITE_ADVICE);
     }
 
-    // PLAN.md 2.16 (agent trial 2): under a profile whose write_policy is deny, --allow-write is
-    // a usage error, so no refusal may offer it. The alternative short of writing stays, and the
-    // advice says the profile doesn't allow writes. Without a deny profile it is as before.
+    // plan-history.md 2.16 (agent trial 2): under a profile whose write_policy is deny,
+    // --allow-write is a usage error, so no refusal may offer it. The alternative short of writing
+    // stays, and the advice says the profile doesn't allow writes. Without a deny profile it is as
+    // before.
     #[test]
     fn refusals_under_a_deny_profile_never_offer_allow_write() {
         let denied = "profile p doesn't allow writes (write_policy = \"deny\")";
@@ -1982,7 +1983,7 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.15: input that says XACT_ABORT gets exact counting.
+    // plan-history.md 2.15: input that says XACT_ABORT gets exact counting.
     #[test]
     fn xact_abort_is_found_among_the_tokens() {
         for sql in [
@@ -2134,8 +2135,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.14: the guard reads the tokens as a stream and keeps none of them. The tests
-    // below pin the stream itself, the case-insensitive matching that replaced the uppercased
+    // plan-history.md 2.14: the guard reads the tokens as a stream and keeps none of them. The
+    // tests below pin the stream itself, the case-insensitive matching that replaced the uppercased
     // copy of every token, and inputs with millions of tokens.
     type Seen<'a> = (Kind, &'a str, &'a str, u32);
 
@@ -2386,8 +2387,8 @@ mod tests {
         );
     }
 
-    // The refusals' line numbers are the contract of PLAN.md 2.14's restructuring: the line of
-    // the keyword that makes the write, through comments and multi-line strings and names.
+    // The refusals' line numbers are the contract of plan-history.md 2.14's restructuring: the line
+    // of the keyword that makes the write, through comments and multi-line strings and names.
     #[test]
     fn refusals_name_the_line_of_their_keyword() {
         for (sql, line) in [

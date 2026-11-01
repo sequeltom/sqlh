@@ -100,7 +100,7 @@ pub struct ServerMessage {
 }
 
 /// Receives a batch's results, messages and errors in the order `Session::run` delivers them
-/// (DESIGN.md §5.1 and §5.2; the sinks refuse a call out of this order, PLAN.md 2.12):
+/// (DESIGN.md §5.1 and §5.2; the sinks refuse a call out of this order, plan-history.md 2.12):
 ///
 /// - **A result set** is `columns`, then its rows (`row`, or `skipped_row` while
 ///   `wants_values` is false), then `end_rows`. Between `columns` and `end_rows` the sink
@@ -255,7 +255,7 @@ impl Cancel {
     }
 }
 
-/// Output backpressure (PLAN.md 2.3): while too much output waits for a slow reader, `run`
+/// Output backpressure (plan-history.md 2.3): while too much output waits for a slow reader, `run`
 /// waits here instead of reading more rows. The wait doesn't block the runtime, so timers
 /// and Ctrl+C keep working.
 pub trait Backpressure {
@@ -762,8 +762,8 @@ impl Session {
 
     /// What the login says about the connection. Nothing is sent to the server; the driver
     /// already holds all of it. The database is the current one, since the driver applies the
-    /// server's environment-change token for a `USE` (PLAN.md 2.11); read it right after the
-    /// connect and it is the database the first batch starts in.
+    /// server's environment-change token for a `USE` (plan-history.md 2.11); read it right after
+    /// the connect and it is the database the first batch starts in.
     pub fn connection(&self) -> Connection {
         Connection {
             server: self.client.server_reported_name().map(str::to_owned),
@@ -1675,8 +1675,8 @@ mod tests {
             .unwrap()
     }
 
-    // PLAN.md 2.15: the budget starts with the first hidden row, a timer ends it while the server
-    // is still looking for the next row, and a result that ends first leaves nothing behind.
+    // plan-history.md 2.15: the budget starts with the first hidden row, a timer ends it while the
+    // server is still looking for the next row, and a result that ends first leaves nothing behind.
     #[test]
     fn the_count_budget_fires_from_the_first_hidden_row() {
         let run = CancelHandle::new();
@@ -1922,8 +1922,8 @@ mod tests {
         });
     }
 
-    // PLAN.md 2.15: what a cancel is called depends only on what sqlh observed. A count that
-    // sqlh itself stopped and the server never acknowledged (the driver marked the connection
+    // plan-history.md 2.15: what a cancel is called depends only on what sqlh observed. A count
+    // that sqlh itself stopped and the server never acknowledged (the driver marked the connection
     // dead) is its own error, which the run words (`run::db_failure`); the user's cancel, and
     // any other error, keep their words.
     #[test]
@@ -2571,8 +2571,8 @@ pub(crate) mod fake_server {
         format!("127.0.0.1,{port}")
     }
 
-    // A pooled session (PLAN.md 5.2, the engine's tests): `serve_pool` accepts any number of
-    // connections and answers request after request on each, the way SQL Server answers the
+    // A pooled session (plan-history.md 5.2, the engine's tests): `serve_pool` accepts any number
+    // of connections and answers request after request on each, the way SQL Server answers the
     // batches sqlh sends (`answer`), with the reset, the wrapper transaction and attentions
     // handled, and with the faults a pool has to survive played where a test asks (`Conn`).
 
@@ -3639,9 +3639,9 @@ pub(crate) mod fake_server {
     }
 }
 
-/// Spike 5.1 (PLAN.md Phase 5): what the connection reset clears, and what each kind of cancel
-/// leaves behind (docs/notes/mcp-reuse-spike.md). Live: every state after a reset must equal a fresh
-/// login's but for the isolation level, which the reset leaves as the last call set it (so
+/// Spike 5.1 (plan-history.md Phase 5): what the connection reset clears, and what each kind of
+/// cancel leaves behind (docs/notes/mcp-reuse-spike.md). Live: every state after a reset must equal
+/// a fresh login's but for the isolation level, which the reset leaves as the last call set it (so
 /// sqlh's session setup sets it, step 1), and no kind of cancel may lose the connection.
 /// `--nocapture` prints what it saw:
 /// `SQLH_TEST_PROFILE=test cargo test --lib spike_reset -- --ignored --nocapture`.

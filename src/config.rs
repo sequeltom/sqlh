@@ -84,7 +84,7 @@ impl AuthKind {
     }
 }
 
-/// The longest profile description, in characters (PLAN.md 4.1).
+/// The longest profile description, in characters (plan-history.md 4.1).
 pub const MAX_DESCRIPTION_CHARS: usize = 300;
 
 /// Unicode's Bidi_Control characters (UAX #9): marks, embeddings, overrides and isolates,
@@ -94,7 +94,7 @@ const BIDI_CONTROLS: [char; 12] = [
     '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
 ];
 
-/// Checks a profile description (PLAN.md 4.1, DESIGN.md §8): one line of at most
+/// Checks a profile description (plan-history.md 4.1, DESIGN.md §8): one line of at most
 /// `MAX_DESCRIPTION_CHARS` characters, with no control character (tab included) and no Unicode
 /// line or paragraph separator, so it reads as one line wherever it is shown, and no
 /// bidirectional control character, so it shows in the order it was written (right-to-left
@@ -129,8 +129,8 @@ pub fn check_description(text: &str) -> Result<(), String> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Profile {
     pub name: String,
-    /// One line on what the profile is for (PLAN.md 4.1), for picking a profile; `None` when
-    /// not set. Data, never instructions: whoever can run `profiles add` can set it.
+    /// One line on what the profile is for (plan-history.md 4.1), for picking a profile; `None`
+    /// when not set. Data, never instructions: whoever can run `profiles add` can set it.
     pub description: Option<String>,
     pub server: Option<String>,
     pub database: Option<String>,
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(config.find("a").unwrap().max_rows, Some(10));
     }
 
-    // PLAN.md 4.1: `description` is an optional string key, written first in its table; one
+    // plan-history.md 4.1: `description` is an optional string key, written first in its table; one
     // line of at most 300 characters. Its escapes decode, but an escape that makes it more than
     // one line (\n, \t) is refused like a control character typed into it; an empty one is no
     // description; a repeated one is an error, as for every key.
@@ -1097,7 +1097,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 4.1: what `profiles add --description` accepts, typed rather than escaped.
+    // plan-history.md 4.1: what `profiles add --description` accepts, typed rather than escaped.
     #[test]
     fn a_description_is_one_line() {
         assert!(check_description("").is_ok());
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(check_description("owner 👩\u{200D}💻").is_ok());
     }
 
-    // PLAN.md 2.15: `exact_count` is a boolean profile key; unset it is not written.
+    // plan-history.md 2.15: `exact_count` is a boolean profile key; unset it is not written.
     #[test]
     fn exact_count_key() {
         let config = parse(
@@ -1667,8 +1667,8 @@ mod tests {
                              [profiles.patient]\nserver = \"srv\"\nauth = \"windows\"\nlock_timeout = 30\n\
                              [profiles.forever]\nserver = \"srv\"\nauth = \"windows\"\nlock_timeout = 0\n";
 
-        // PLAN.md 2.8: 10 s by default, from a profile, and a flag beats the profile. 0 is a
-        // value ("no limit"), not "unset". There is no environment variable for it.
+        // plan-history.md 2.8: 10 s by default, from a profile, and a flag beats the profile. 0 is
+        // a value ("no limit"), not "unset". There is no environment variable for it.
         #[test]
         fn the_lock_timeout_defaults_to_ten_seconds_and_follows_the_usual_precedence() {
             let timeout = |opts: &Opts| resolve_in(opts, LOCKS, &[]).unwrap().lock_timeout;

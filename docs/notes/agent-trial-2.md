@@ -27,7 +27,7 @@ Run 2026-10-12 against the release build of `3161ea6` (`main` at `ea056fc` chang
 
 ## Follow-ups
 
-Recorded in PLAN.md (task 2.10 and the open items it raised):
+Recorded in plan-history.md (task 2.10 and the open items it raised):
 - A guard refusal under a `deny` profile says that writes are disabled for the profile instead of advising `--allow-write` (task 2.16).
 - For the owner: whether new profiles should default to `write_policy = "deny"`, and whether `profile list` should show the server and login to an agent (decision 12).
 - Agent guidance (Phase 8, the skill): never add `--allow-write` without the user's explicit go-ahead for that statement; narrow a query before raising `--max-rows`, `--max-cell`, `-t` or using `--exact-count`; compute derived figures in SQL or leave them out.

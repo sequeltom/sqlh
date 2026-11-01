@@ -1,5 +1,5 @@
-# cargo-about (PLAN.md 3.6): the release workflow builds THIRD-PARTY-NOTICES.html from this and
-# about.hbs, and fails if a dependency's licence isn't accepted here.
+# cargo-about (plan-history.md 3.6): the release workflow builds THIRD-PARTY-NOTICES.html from
+# this and about.hbs, and fails if a dependency's licence isn't accepted here.
 accepted = [
     "MIT",
     "Apache-2.0",

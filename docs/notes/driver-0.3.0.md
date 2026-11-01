@@ -1,6 +1,6 @@
 # mssql-tds 0.2.0 → 0.3.0: what changes for sqlh
 
-2026-10-27. Step 1 of PLAN.md's driver upgrade task: the analysis, before any code changes. Sources: the two crates as cargo unpacked them (`mssql-tds-0.2.0`, `mssql-tds-0.3.0`), compared file by file (58 files differ). Upstream's CHANGELOG is one cumulative "Unreleased" list, and the repository has no version tags, so it doesn't separate the versions: many entries it lists were already in 0.2.0, and the source is the evidence. Four passes, one per area, each claim with file and line in both versions; the claims that decide anything were re-read by hand (marked **checked**). A trial build on 0.3.0 ran in a throwaway worktree. Nothing here connected to a server; the live checks are step 2's (end of this note).
+2026-10-27. Step 1 of plan-history.md's driver upgrade task: the analysis, before any code changes. Sources: the two crates as cargo unpacked them (`mssql-tds-0.2.0`, `mssql-tds-0.3.0`), compared file by file (58 files differ). Upstream's CHANGELOG is one cumulative "Unreleased" list, and the repository has no version tags, so it doesn't separate the versions: many entries it lists were already in 0.2.0, and the source is the evidence. Four passes, one per area, each claim with file and line in both versions; the claims that decide anything were re-read by hand (marked **checked**). A trial build on 0.3.0 ran in a throwaway worktree. Nothing here connected to a server; the live checks are step 2's (end of this note).
 
 ## Summary
 
@@ -117,7 +117,7 @@
   - the per-command info buffer;
   - the narrow-encoding `?` (send side only; sqlh sends SQL as UTF-16).
 - **Memory:** the large-value cursor paths sqlh streams through (`try_read_row_plp_complete`, `read_row_column`, the PLP chunk reads) are unchanged apart from doc comments, so no new code buffers a whole value. `drain_rows`, which `close_query` uses, now skips columns without decoding them (`tds_client.rs` 0.3.0:5066-5126), so draining an unread result costs less. `text`, `ntext` and `image` are still read whole, up to 100 MB (U3).
-- **Messages:** where PRINT and low-severity RAISERROR land (PLAN.md 2.12) is unchanged. The info capture and `take_info_messages` are the same code, and the new drain still captures info.
+- **Messages:** where PRINT and low-severity RAISERROR land (plan-history.md 2.12) is unchanged. The info capture and `take_info_messages` are the same code, and the new drain still captures info.
 - **Data classification (token 0xA3):** never requested. The request is crate-private and set only under `test-util`, so the server never sends it. A server that sent it anyway gets a protocol error, as in 0.2.0.
 - **No compile break here:**
   - `Error` gains `EncodedValueTooLong`, and `Redirection` gains a `database` field. sqlh's matches have catch-alls and never take `Redirection` apart.
@@ -242,7 +242,7 @@ So connect bounds, exit codes, texts, latency and memory are 0.2.0's; `-M`'s row
 
 **Not settled:** whether on-prem SQL Server 2025 acknowledges DNS caching (decision 42). A one-off probe through the driver's `test-util` API, never committed, found the test profile's server named by an IP literal, which the driver never caches, so it couldn't tell; checking with a host name would mean sending the profile's stored password to a spelling other than its own, which R20's binding refuses, so it was not done. Still the likely answer: no, an Azure feature [inferred]. The external review (below) showed a way that needs no other spelling.
 
-**External review (2026-10-31, `048aa89..7b28076`; PLAN.md, Driver 0.3.0 external review):** accepted, no blocking code finding, one P3, R46; fixed on the branch:
+**External review (2026-10-31, `048aa89..7b28076`; plan-history.md, Driver 0.3.0 external review):** accepted, no blocking code finding, one P3, R46; fixed on the branch:
 - **R46, the certificate by negotiated mode.** Whether the certificate is checked depends on the encryption the connection negotiated, not on the flag alone (`handler_factory.rs:494-531`, `ssl_handler.rs:29-64`, unchanged from 0.2.0): strict checks it even with `-C`; mandatory unless `-C`; optional negotiates Mandatory, checked unless `-C`, when the server requires encryption, and otherwise LoginOnly (never checked) or none. DESIGN.md §8, mcp-mode.md §5, §1.2–§1.3 above and U7 now say so.
 - **Found while fixing R46, an output defect of the same rule:** under `-Ns`, a certificate failure's hint said to pass `-C` (or set `trust_server_certificate`), which strict ignores, so an agent following it failed again. It now says `strict encryption checks the server's certificate even with -C, and needs SQL Server 2022 or later: ...`, and offers `-Nm`, where `-C` applies (`db::tests::a_certificate_failure_under_strict_encryption_offers_no_trust`; DESIGN.md §6, mcp-mode.md §4).
 - **Judgment 4's positive case, promoted:** `db::fake_server::an_acknowledged_enhanced_route_takes_the_login_to_its_database`: a type-21 route with FEATUREEXTACK 0x0F = 1 is followed, the routed LOGIN7 asks for the route's database, and it asks for no session recovery.

@@ -1,5 +1,5 @@
 //! sqlh: a SQL Server query tool for AI agents and harnesses. The binary (`src/main.rs`) only
-//! calls `main`; everything else is here, so that other entry points (PLAN.md Phase 5) can
+//! calls `main`; everything else is here, so that other entry points (plan-history.md Phase 5) can
 //! share the execution core (`run`).
 
 mod app;

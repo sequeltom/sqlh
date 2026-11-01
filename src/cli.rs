@@ -251,8 +251,8 @@ fn parse_profile(args: Vec<OsString>) -> Result<Command, String> {
     Ok(Command::Profile(command))
 }
 
-/// `profiles list`'s one option, `--search TEXT` (PLAN.md 4.2). The list is text only (owner,
-/// 2026-10-13): it is setup an agent reads once, and text is the cheapest format to read.
+/// `profiles list`'s one option, `--search TEXT` (plan-history.md 4.2). The list is text only
+/// (owner, 2026-10-13): it is setup an agent reads once, and text is the cheapest format to read.
 fn parse_list(mut p: lexopt::Parser) -> Result<ProfileCommand, String> {
     use lexopt::prelude::*;
     let mut search = None;
@@ -568,7 +568,7 @@ mod tests {
         assert!(err(&["--lock-timeout"]).contains("lock-timeout"));
     }
 
-    // PLAN.md 2.15: `--exact-count` is a switch like the others.
+    // plan-history.md 2.15: `--exact-count` is a switch like the others.
     #[test]
     fn exact_count_is_a_switch() {
         assert_eq!(opts(&["x"]).exact_count, None);
@@ -730,8 +730,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 4.1 and 4.2: `profiles add` takes --description; `profiles list` takes --search,
-    // and nothing else.
+    // plan-history.md 4.1 and 4.2: `profiles add` takes --description; `profiles list` takes
+    // --search, and nothing else.
     #[test]
     fn profile_descriptions_and_search() {
         match parse_args(&[

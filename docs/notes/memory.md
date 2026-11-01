@@ -1,10 +1,10 @@
-# Memory (PLAN.md 2.7)
+# Memory (plan-history.md 2.7)
 
 Measured 2026-10-11 on the dev machine (Windows 11, 12 logical cores, 31 GB) against the owner's dev/test SQL Server 2025 over Wi-Fi, with release builds of two trees and mssql-tds 0.2.0: **before** is `f12b041`, **after** is the 2.7 change. Large values are built on the server and read-only, for example `REPLICATE(CAST('x' AS varchar(max)), 1073741824)`. Peak working set and peak commit come from the exited child's process handle (`GetProcessMemoryInfo`), CPU time from `GetProcessTimes`, so nothing is sampled. The wrapper that did this was a short program kept outside the repository; `run_measured` in `tests/cli.rs` does the same for the tests. A run of `sqlh --version` peaks at 7 MB; a run that connects peaks at 9.6 MB of working set and 1.9 MB of commit before it has read anything. The exe grew from 2,285,568 to 2,341,376 bytes (2.4%).
 
 ## Summary
 
-Peak memory for the value or rows below, with the default limits (`--max-cell 500`) unless the first column says otherwise. 1 GiB took about 20 s to read, so it is the size used (the acceptance in PLAN.md asks for 1 GB, or at least 200 MB if that is too slow).
+Peak memory for the value or rows below, with the default limits (`--max-cell 500`) unless the first column says otherwise. 1 GiB took about 20 s to read, so it is the size used (the acceptance in plan-history.md asks for 1 GB, or at least 200 MB if that is too slow).
 
 | Case | Before | After |
 |---|---|---|
@@ -27,7 +27,7 @@ One difference is known, found afterwards and left: in the text format a value i
 
 ## Why not a cutting `RowWriter`
 
-PLAN.md proposed `next_row_into` with a `RowWriter` that cuts at `--max-cell`. In 0.2.0 that cuts after the peak:
+plan-history.md proposed `next_row_into` with a `RowWriter` that cuts at `--max-cell`. In 0.2.0 that cuts after the peak:
 
 - `datatypes/decoder.rs`, macro `read_value_into!`: for a PLP value whose total length the server declares, the decoder asks the writer for a destination with `RowWriter::value_destination(col, kind, length)`. A writer that answers `None` gets `Vec::with_capacity(length)`, filled from the wire, then handed to `write_string` or `write_bytes`. A writer that answers `Some` must return a slice of exactly `length` bytes (the trait's contract). Either way a value of 1 GiB is in memory in one piece before any writer code sees a byte of it. `DiscardRowWriter` declines, so decoding a hidden row into it allocates the value too. A value without a declared total (`PLP_UNKNOWNLEN`) is accumulated chunk by chunk into a growing `Vec` instead (`read_plp_chunks_unknown_len`).
 - `ResultSet::next_row` is `next_row_into(DefaultRowWriter)`, so the old read path was this one: the driver's `Vec` of 1 GiB, then `SqlString::to_utf8_string` made a second copy, then the sink cut it.
@@ -94,15 +94,15 @@ Where rows are big (a text column of a kilobyte or more) or have no PLP column, 
 
 ## Found on the way
 
-- **The read-only guard is not bounded by the input limit.** `guard::tokenize` makes a `Token` of some 56 bytes (a `&str`, an uppercased `String`, a kind and a line) for each token of the input, in one `Vec` that grows by doubling, so a run's peak depends on what the input looks like, not on its size: 10 MB of `(` peaked at 795 MB working set (1.18 GB commit); 9.9 MB of `SELECT 1` lines, 233 MB; 10 MB of two-letter words, 250 MB; 9 MB of `$(v)` references to a 9-byte value, 30 MB. The 10 MB cap bounds accepted SQL, not what it costs. A fix was outside this task (`src/guard.rs`); it is PLAN.md 2.14, measured in the last section below.
-- **Abandoning a result set is not flat in the driver.** `drain_rows`, behind `advance` and `close_query`, reads the rest of a result set with `next_row_into(DiscardRowWriter)`, which allocates each PLP value whole. (`drain_result_set_rows`, which `drain_stream` uses after an error, skips with `ColumnPolicy::SkipAll` and doesn't.) sqlh's batch loop reads every result set to its end, so it doesn't reach `drain_rows` for rows; a future early cutoff (the drain policy, PLAN.md 2.6) would, and would need the cursor skip instead.
+- **The read-only guard is not bounded by the input limit.** `guard::tokenize` makes a `Token` of some 56 bytes (a `&str`, an uppercased `String`, a kind and a line) for each token of the input, in one `Vec` that grows by doubling, so a run's peak depends on what the input looks like, not on its size: 10 MB of `(` peaked at 795 MB working set (1.18 GB commit); 9.9 MB of `SELECT 1` lines, 233 MB; 10 MB of two-letter words, 250 MB; 9 MB of `$(v)` references to a 9-byte value, 30 MB. The 10 MB cap bounds accepted SQL, not what it costs. A fix was outside this task (`src/guard.rs`); it is plan-history.md 2.14, measured in the last section below.
+- **Abandoning a result set is not flat in the driver.** `drain_rows`, behind `advance` and `close_query`, reads the rest of a result set with `next_row_into(DiscardRowWriter)`, which allocates each PLP value whole. (`drain_result_set_rows`, which `drain_stream` uses after an error, skips with `ColumnPolicy::SkipAll` and doesn't.) sqlh's batch loop reads every result set to its end, so it doesn't reach `drain_rows` for rows; a future early cutoff (the drain policy, plan-history.md 2.6) would, and would need the cursor skip instead.
 - **A cancel during the new read** ends the run like any other: Ctrl+Break while a 1 GiB value was streaming, and while rows of 400 MB were being skipped, gave exit 6 within 0.2 to 0.5 s with "the statement was cancelled; the connection stayed usable". The query timeout does too (`-t 12` on the 1 GiB value: exit 4; the driver then took 5 s to settle the attention, in the old build as well).
 
 ## Upstream issues worth filing
 
 Moved to [upstream-issues.md](upstream-issues.md) (2026-10-17), the one list the owner files from: `DiscardRowWriter` is U2, `text`/`ntext`/`image` U3, and the UTF-8 panic U6 (upstream's own #310).
 
-## The read-only guard (PLAN.md 2.14)
+## The read-only guard (plan-history.md 2.14)
 
 Measured 2026-10-11 on the same machine, with release builds of `2badb88` (before) and the 2.14 change (after), by the same method as above (peak working set and peak commit of the exited child). Every run is `-S 127.0.0.1,1 -l 1 -i file`, so a run that passes the guard ends at the connect (about 1 s of timeout in its wall time); a refused run ends before any connect. The inputs are at the 10 MB limit.
 

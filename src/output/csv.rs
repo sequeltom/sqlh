@@ -424,7 +424,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 2.12, DESIGN.md §5.1 and §5.3: nothing but rows arrives inside a result set.
+    // plan-history.md 2.12, DESIGN.md §5.1 and §5.3: nothing but rows arrives inside a result set.
     // The data stream holds the rows only; a message the server sent during the result is on
     // the metadata stream after its footer.
     #[test]
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(data.text(), "x\na\n\nx\nb\n");
     }
 
-    // PLAN.md 2.15, exact output: the stopped count's footer, note and status are metadata
+    // plan-history.md 2.15, exact output: the stopped count's footer, note and status are metadata
     // lines; the data stream is rows only.
     #[test]
     fn a_stopped_count_is_a_lower_bound_in_the_footer_note_and_status() {
@@ -646,8 +646,8 @@ mod tests {
         );
     }
 
-    // PLAN.md 2.15 (review), exact output: as in the text format, a stopped count never says
-    // that nothing was hidden (`≥11` with ten shown), one that `-t` stopped before any hidden
+    // plan-history.md 2.15 (review), exact output: as in the text format, a stopped count never
+    // says that nothing was hidden (`≥11` with ten shown), one that `-t` stopped before any hidden
     // row arrived reads `≥10`, and the note advises each kind of stop on its own.
     #[test]
     fn a_stopped_count_never_says_that_nothing_was_hidden() {
@@ -880,7 +880,7 @@ mod tests {
         assert!(total(&data, &meta) <= 4096);
     }
 
-    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.3: the status line, on the metadata
+    // plan-history.md 2.11, owner decision 10, DESIGN.md §5.3: the status line, on the metadata
     // stream, ends with the server, the database the run started in and the connect time, as in
     // the text format. The data stream holds data only, and is the same with and without it.
     #[test]

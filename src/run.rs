@@ -1,7 +1,7 @@
-//! The execution core (PLAN.md 3.1): from the input to the batches' results. A `Request` says
-//! what to run, `RunPolicy` what applies to it (the guard, the wrapper transaction, `--check`),
-//! `QueryOrigin` whether the SQL is the user's or sqlh's own, and `RunOutcome` how it ended.
-//! Nothing here depends on the command line or on how output is delivered: the CLI (`app`)
+//! The execution core (plan-history.md 3.1): from the input to the batches' results. A `Request`
+//! says what to run, `RunPolicy` what applies to it (the guard, the wrapper transaction,
+//! `--check`), `QueryOrigin` whether the SQL is the user's or sqlh's own, and `RunOutcome` how it
+//! ended. Nothing here depends on the command line or on how output is delivered: the CLI (`app`)
 //! builds the `Request`, and the run writes to any `Output`, waits on any `Backpressure`, and
 //! counts its errors itself (`Accounting`), so other callers (Phase 4's schema commands, Phase
 //! 5's connection reuse) can drive it the same way.
@@ -117,7 +117,7 @@ fn wrapper_lost_unreported(
     })
 }
 
-/// Agent defaults on every connection, writes allowed or not (PLAN.md 2.8, owner decision
+/// Agent defaults on every connection, writes allowed or not (plan-history.md 2.8, owner decision
 /// 7): sqlh's session is the one that loses a deadlock (error 1205) and gives up on a lock
 /// after `--lock-timeout` (error 1222), so it gives way to production work.
 const AGENT_DEFAULTS: &str = "SET DEADLOCK_PRIORITY LOW;";
@@ -874,7 +874,8 @@ async fn run_session(
     started: Instant,
 ) -> Result<Stats, Failure> {
     let timeout = settings.query_timeout;
-    // --verbose and `profiles test` say where the time to the first batch went (PLAN.md 2.1).
+    // --verbose and `profiles test` say where the time to the first batch went
+    // (plan-history.md 2.1).
     let report = prepared.report != Report::Off;
     let connect_started = Instant::now();
     if report {
@@ -1503,7 +1504,7 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.8: the session setup, exactly. The agent defaults are in every connection,
+    // plan-history.md 2.8: the session setup, exactly. The agent defaults are in every connection,
     // writes allowed or not; READ UNCOMMITTED only when asked for, and READ COMMITTED
     // otherwise, always before the wrapper transaction begins.
     #[test]
@@ -1579,8 +1580,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.15, decision 6 (DESIGN.md §4.4): which runs stop their count, and which let `-t`
-    // end it. Writes allowed, and `XACT_ABORT` in the input, count exactly and keep `-t` a
+    // plan-history.md 2.15, decision 6 (DESIGN.md §4.4): which runs stop their count, and which let
+    // `-t` end it. Writes allowed, and `XACT_ABORT` in the input, count exactly and keep `-t` a
     // failure, because both would lose something to a stop (a skipped COMMIT, a rolled-back
     // wrapper); a request for exact counting changes the count only.
     #[test]
@@ -1631,8 +1632,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 3.1: the policy is decided once. The guard checks writes unless they are allowed,
-    // and NOEXEC under --check; the wrapper is there unless writes are allowed, and always
+    // plan-history.md 3.1: the policy is decided once. The guard checks writes unless they are
+    // allowed, and NOEXEC under --check; the wrapper is there unless writes are allowed, and always
     // under --check.
     #[test]
     fn the_run_policy_decides_the_guard_and_the_wrapper() {
@@ -1671,7 +1672,7 @@ mod tests {
         assert!(!generated.allow_write && generated.wrap(), "{generated:?}");
     }
 
-    // PLAN.md 3.1: the user's SQL gets $(var) and the guard; sqlh's own SQL (QueryOrigin::
+    // plan-history.md 3.1: the user's SQL gets $(var) and the guard; sqlh's own SQL (QueryOrigin::
     // Generated) is taken as it is, and always runs in the wrapper, even where the profile
     // allows writes.
     #[test]
@@ -1826,7 +1827,7 @@ mod tests {
         );
     }
 
-    // PLAN.md 3.1: the exit code comes from the outcome alone: the failure's, else 1 when a
+    // plan-history.md 3.1: the exit code comes from the outcome alone: the failure's, else 1 when a
     // batch reported a SQL error, else 0.
     #[test]
     fn the_outcome_gives_the_exit_code() {

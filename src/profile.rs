@@ -345,7 +345,7 @@ fn add(name: &str, opts: &Opts, out: &mut Out, store: &dyn Store) -> Result<(), 
 }
 
 /// Lists the profiles, or with `search` those whose name or description contains it, in any
-/// case (PLAN.md 4.2). Returns how many were listed, and how many there are. Never reads a
+/// case (plan-history.md 4.2). Returns how many were listed, and how many there are. Never reads a
 /// password: a credential's existence is all it checks.
 fn list(out: &mut Out, search: Option<&str>) -> Result<(usize, usize), Failure> {
     let config = config::load().map_err(Failure::usage)?;
@@ -491,7 +491,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
-    /// A store in memory whose steps can be made to fail (F12, PLAN.md 3.2).
+    /// A store in memory whose steps can be made to fail (F12, plan-history.md 3.2).
     #[derive(Default)]
     struct Fake {
         config: RefCell<Config>,
@@ -953,9 +953,9 @@ mod tests {
         assert_eq!(run(&fake, true), pair("srv", "old"));
     }
 
-    // PLAN.md 4.1: --description replaces the saved description, an edit without it keeps it,
-    // and an empty one removes it. One that isn't a single line, or is too long, is refused
-    // before anything is read or written.
+    // plan-history.md 4.1: --description replaces the saved description, an edit without it
+    // keeps it, and an empty one removes it. One that isn't a single line, or is too long, is
+    // refused before anything is read or written.
     #[test]
     fn add_keeps_replaces_and_removes_the_description() {
         let fake = with_dev("");

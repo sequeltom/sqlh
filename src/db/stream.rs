@@ -1,4 +1,4 @@
-//! Large values, read in pieces (PLAN.md 2.7, DESIGN.md §11). The columns that can hold
+//! Large values, read in pieces (plan-history.md 2.7, DESIGN.md §11). The columns that can hold
 //! megabytes or gigabytes are the partially length-prefixed ones (PLP): `varchar(max)`,
 //! `nvarchar(max)`, `varbinary(max)`, `xml`, `json` and CLR types. The driver's row readers
 //! (`next_row`, `next_row_into` with a `RowWriter`) allocate the whole declared length of such a
@@ -586,7 +586,7 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.7: what a cutter holds depends on the limit, not on the value. A value of
+    // plan-history.md 2.7: what a cutter holds depends on the limit, not on the value. A value of
     // 16 MB (and nothing stops it being 16 GB) goes through chunk by chunk with the same few
     // kilobytes held, and still counts every character.
     #[test]

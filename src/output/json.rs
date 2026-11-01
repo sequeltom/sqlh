@@ -27,7 +27,7 @@ use crate::db::{BatchSink, Column, Connection, ServerMessage, Stop, Value};
 /// version has to ignore what it doesn't know. 1.0 is the document with `contract_version`,
 /// `connection`, `connect_ms` and the batches' `elapsed_ms`. 1.1 added `row_count_exact` to
 /// every result and `counting_stopped` to every batch (the bounded count of hidden rows,
-/// PLAN.md 2.15) but was never released as a stable contract. 2.0 is the major bump it
+/// plan-history.md 2.15) but was never released as a stable contract. 2.0 is the major bump it
 /// needed: a result's `row_count` may now be a lower bound, which a reader of 1.x would take
 /// for the exact total, so that reader must reject the document at its major version (code
 /// review R16). 2.0 keeps 1.1's fields. 2.1 adds `label` to the result events of a schema
@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(events[1]["line"], json!(7));
     }
 
-    // PLAN.md 2.15, exact output: a stopped count says so in the result (`row_count` is the
+    // plan-history.md 2.15, exact output: a stopped count says so in the result (`row_count` is the
     // floored lower bound and `row_count_exact` false) and in its batch (`counting_stopped`);
     // the batch after it is exact. The note and the status say it in words.
     #[test]
@@ -1054,8 +1054,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.15 (review), exact output: a stopped count is `truncated` whenever a hidden row
-    // was counted, even when flooring to one digit leaves the bound no higher than the rows
+    // plan-history.md 2.15 (review), exact output: a stopped count is `truncated` whenever a hidden
+    // row was counted, even when flooring to one digit leaves the bound no higher than the rows
     // shown: eleven rows counted with ten shown are `row_count` 11 and `truncated`, not 10 and
     // not truncated. A count `-t` stopped before any hidden row arrived has none to report: the
     // rows shown are the bound, `truncated` is false, and `row_count_exact` still says that
@@ -1201,8 +1201,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.15 (review): a result a failure cut short has only the rows that arrived, so
-    // its count is never exact, whether or not anything was hidden. A reader that looks only at
+    // plan-history.md 2.15 (review): a result a failure cut short has only the rows that arrived,
+    // so its count is never exact, whether or not anything was hidden. A reader that looks only at
     // `row_count_exact` is not told that a partial count is the total.
     #[test]
     fn an_interrupted_result_never_claims_an_exact_count() {
@@ -1324,7 +1324,7 @@ mod tests {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
     }
 
-    // PLAN.md 2.11: the contract version, the description of the connection and the times.
+    // plan-history.md 2.11: the contract version, the description of the connection and the times.
 
     fn connection() -> Connection {
         Connection {
@@ -1740,8 +1740,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.12, DESIGN.md §5.2: nothing but rows arrives inside a result set. What did is
-    // refused and changes nothing, and a message the server sent during the result is an
+    // plan-history.md 2.12, DESIGN.md §5.2: nothing but rows arrives inside a result set. What did
+    // is refused and changes nothing, and a message the server sent during the result is an
     // event after it in the batch's events, never one of its rows.
     #[test]
     fn nothing_but_rows_arrives_inside_a_result_set() {

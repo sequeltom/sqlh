@@ -1,4 +1,4 @@
-# Connect failures and cancellation (PLAN.md 2.4)
+# Connect failures and cancellation (plan-history.md 2.4)
 
 Measured 2026-10-10 on the dev machine (Windows 11) with mssql-tds 0.2.0, using addresses that refuse (`127.0.0.1,1`), addresses that don't answer (the documentation ranges `192.0.2.0/24` and `198.51.100.0/24`), and a local listener that accepts and never answers.
 

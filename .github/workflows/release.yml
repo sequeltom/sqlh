@@ -1,5 +1,6 @@
-# Release (PLAN.md 3.6): a signed sqlh.exe, its SHA-256 and a zip with the licence and the
-# third-party notices, published as a draft GitHub release for the owner to review and publish.
+# Release (plan-history.md 3.6): a signed sqlh.exe, its SHA-256 and a zip with the licence and
+# the third-party notices, published as a draft GitHub release for the owner to review and
+# publish.
 #
 #   push a tag v<x.y.z>   a release build; the tag must match Cargo.toml's version
 #   run it by hand        a pre-release build, v<x.y.z>-dev.<run number>

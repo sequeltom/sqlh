@@ -1,4 +1,4 @@
-# Connect latency (PLAN.md 2.1)
+# Connect latency (plan-history.md 2.1)
 
 Measured 2026-10-10, on a working tree based on `061ef26`. This was a time-boxed investigation: where the time before the first batch goes, and whether sqlh or the driver can win it back.
 

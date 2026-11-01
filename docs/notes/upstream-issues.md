@@ -10,14 +10,14 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 ### U1. The first open of a remote Named Pipe blocks the async runtime
 
-- **Seen in:** 0.2.0, reading the source (docs/notes/connect-failures.md, PLAN.md 2.4); still in 0.3.0 (`named_pipes.rs:89`; docs/notes/driver-0.3.0.md §5).
+- **Seen in:** 0.2.0, reading the source (docs/notes/connect-failures.md, plan-history.md 2.4); still in 0.3.0 (`named_pipes.rs:89`; docs/notes/driver-0.3.0.md §5).
 - **What:** `open_named_pipe_with_retry` calls tokio's `ClientOptions::open`, a synchronous `CreateFileW`, inside the async fn, whether the pipe came from the protocol waterfall, an `np:` prefix or a UNC path. For an unreachable host that stalls every timer, cancellation and task for about 21 s (SMB's own timeout), and the error that comes back is the pipe's instead of the TCP timeout. The retry after `ERROR_PIPE_BUSY` is not part of this: its `WaitNamedPipeW` already runs on `spawn_blocking`. Related: an IPv6 address can't take a `tcp:` prefix, so without a port it gets the waterfall and the same freeze.
 - **sqlh's workaround:** remote Named Pipes are refused before connecting (exit 3, with the TCP spelling), and an IPv6 address without a port is sent with port 1433, so the driver uses TCP (DESIGN.md §4, `-S`).
 - **Possible fix:** run the first open on a blocking thread too and bound it by the connect timeout (the open itself can't be cancelled, but the runtime and its timers stay free), or leave remote names on TCP unless Named Pipes are asked for.
 
 ### U2. A `RowWriter` can't decline a large value
 
-- **Seen in:** 0.2.0, measuring memory (docs/notes/memory.md, PLAN.md 2.7); half fixed in 0.3.0: `drain_rows` now skips (`ColumnPolicy::SkipAll`), but the `RowWriter` contract still can't decline a value, so the workaround stays (driver-0.3.0.md §5).
+- **Seen in:** 0.2.0, measuring memory (docs/notes/memory.md, plan-history.md 2.7); half fixed in 0.3.0: `drain_rows` now skips (`ColumnPolicy::SkipAll`), but the `RowWriter` contract still can't decline a value, so the workaround stays (driver-0.3.0.md §5).
 - **What:** a `RowWriter` offered a PLP value can only return a destination or `None`, and `None` makes the decoder allocate the value's declared length (`value_destination` has no way to say "skip"), so `DiscardRowWriter` and every consumer that wants a prefix of a large value pay for all of it. In 0.3.0 `drain_rows` no longer does: it reads with `ColumnPolicy::SkipAll` (rewritten for 0.3.0 in review, 2026-10-31).
 - **sqlh's workaround:** large values are read through the column cursor and cut as they arrive (`src/db/stream.rs`); hidden rows use the cursor's skip.
 - **Possible fix:** a skip or a limit in `value_destination`'s contract.
@@ -39,7 +39,7 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 ### U5. Withdrawing a half-sent request waits up to 120 s, without the cancel
 
-- **Seen in:** 0.2.0 (PLAN.md, Phase 2 follow-up, R15 B); fixed in 0.3.0 for callers that opt in (`CancelHandle::set_cancel_timeout_secs`), which sqlh doesn't yet; `settle_within` stays either way (driver-0.3.0.md §2).
+- **Seen in:** 0.2.0 (plan-history.md, Phase 2 follow-up, R15 B); fixed in 0.3.0 for callers that opt in (`CancelHandle::set_cancel_timeout_secs`), which sqlh doesn't yet; `settle_within` stays either way (driver-0.3.0.md §2).
 - **What:** a request cancelled between two of its packets is withdrawn (EOM|IGNORE) and its DONE awaited in `withdraw_sent_message` for up to 120 s, with the cancel removed and no bound from the caller's timeout; an attention, by contrast, gets 5 s.
 - **sqlh's workaround:** `settle_within`: a batch's work races `-t` plus a 5 s grace; past it the work is dropped where it stands and the session retired (exit 4).
 - **Possible fix:** bound the withdrawal by the operation's timeout or the attention's 5 s, and keep the cancel honored while it waits.

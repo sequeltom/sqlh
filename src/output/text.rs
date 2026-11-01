@@ -1137,8 +1137,9 @@ pub(super) mod tests {
         .unwrap();
     }
 
-    /// PLAN.md 2.15: two batches, the first with a result whose count was stopped after 1,003
-    /// rows (`--max-rows 3`), and a status line that says so. The same calls for every format.
+    /// plan-history.md 2.15: two batches, the first with a result whose count was stopped after
+    /// 1,003 rows (`--max-rows 3`), and a status line that says so. The same calls for every
+    /// format.
     pub fn stopped_run(out: &mut dyn Output) {
         let first = BatchInfo {
             total: 2,
@@ -1196,7 +1197,7 @@ pub(super) mod tests {
         }
     }
 
-    /// PLAN.md 2.15 (review), with `short_limits()`: the two stopped counts whose bound one
+    /// plan-history.md 2.15 (review), with `short_limits()`: the two stopped counts whose bound one
     /// significant digit would flatten to "nothing was hidden". Batch 1 was stopped by the budget
     /// after one hidden row: 11 rows counted floor to 10, which is the rows shown, so the bound
     /// is one more, 11. Batch 2 was stopped by `-t` before any hidden row arrived: the bound is
@@ -1237,8 +1238,8 @@ pub(super) mod tests {
         18446744073709551615; 18446744073709551615 later batches not run (--continue-on-error \
         runs them), counting stopped in 18446744073709551615, 340282366920938463463374607431768211455 ms";
 
-    /// PLAN.md 2.12, the same calls for every format (with `limits()`: one result set and one
-    /// message shown). A message, an error and a row count that arrive between a result set's
+    /// plan-history.md 2.12, the same calls for every format (with `limits()`: one result set and
+    /// one message shown). A message, an error and a row count that arrive between a result set's
     /// `columns` and its `end_rows` are refused with an error, in a shown result set and in a
     /// hidden one, and change nothing: not the counts, and not what the limits still allow.
     /// Once the result set is closed the same calls are taken, so a message the server sent
@@ -1356,7 +1357,7 @@ pub(super) mod tests {
         );
     }
 
-    // PLAN.md 2.15, exact output: a stopped count reads `≥` with the total floored to one
+    // plan-history.md 2.15, exact output: a stopped count reads `≥` with the total floored to one
     // digit, says what stopped it inside the parentheses, and the closing note and the status
     // line say that the rest of the batch was cancelled. The batch after it runs as usual.
     #[test]
@@ -1443,8 +1444,8 @@ pub(super) mod tests {
         );
     }
 
-    // PLAN.md 2.15 (review), exact output: flooring to one digit never makes a stopped count
-    // say that nothing was hidden. Eleven rows counted with ten shown read `≥11`, not `≥10`;
+    // plan-history.md 2.15 (review), exact output: flooring to one digit never makes a stopped
+    // count say that nothing was hidden. Eleven rows counted with ten shown read `≥11`, not `≥10`;
     // a count that `-t` stopped before any hidden row arrived reads `≥10`, the rows shown. The
     // note gives each kind of stop its own advice, and the status counts both batches.
     #[test]
@@ -1642,7 +1643,7 @@ pub(super) mod tests {
         );
     }
 
-    // PLAN.md 2.11, owner decision 10, DESIGN.md §5.1: a run that connected ends its status
+    // plan-history.md 2.11, owner decision 10, DESIGN.md §5.1: a run that connected ends its status
     // line with the server, the database it started in and the connect time. The elapsed time
     // before the tail is the run's own and includes the connect.
     #[test]
@@ -2009,9 +2010,9 @@ pub(super) mod tests {
         );
     }
 
-    // PLAN.md 2.12, DESIGN.md §5.1: nothing but rows arrives inside a result set. A message,
-    // an error or a row count that did is refused and changes nothing; a message the server
-    // sent during the result is written after its footer.
+    // plan-history.md 2.12, DESIGN.md §5.1: nothing but rows arrives inside a result set. A
+    // message, an error or a row count that did is refused and changes nothing; a message the
+    // server sent during the result is written after its footer.
     #[test]
     fn nothing_but_rows_arrives_inside_a_result_set() {
         let (mut s, main, meta) = sink(limits());
@@ -2302,9 +2303,9 @@ pub(super) mod tests {
         );
     }
 
-    // PLAN.md 2.15's stopped counts in sqlh mcp, exact output: the footer names max_rows, and the
-    // note offers the call's exact_count for a count the budget stopped and a larger timeout
-    // for one -t stopped, but no larger timeout to a call that has the server's limit
+    // plan-history.md 2.15's stopped counts in sqlh mcp, exact output: the footer names max_rows,
+    // and the note offers the call's exact_count for a count the budget stopped and a larger
+    // timeout for one -t stopped, but no larger timeout to a call that has the server's limit
     // (`Limits::timeout_at_limit`), so a count only -t stopped gets no advice at all.
     #[test]
     fn in_mcp_a_stopped_count_offers_what_the_call_can_change() {

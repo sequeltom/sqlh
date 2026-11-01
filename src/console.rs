@@ -30,9 +30,9 @@ pub fn git_bash_path(path: &str) -> Option<String> {
 }
 
 /// What to add to the message for a path that wasn't found when it is written like a Git Bash
-/// path, so the caller can name the spellings that work (PLAN.md 2.13). The forward-slash one
-/// is there because the text format doubles a backslash (DESIGN.md §5.1), and `C:/code/x.sql`
-/// reads the same in every format.
+/// path, so the caller can name the spellings that work (plan-history.md 2.13). The
+/// forward-slash one is there because the text format doubles a backslash (DESIGN.md §5.1), and
+/// `C:/code/x.sql` reads the same in every format.
 pub fn git_bash_hint(path: &str) -> Option<String> {
     git_bash_path(path).map(|windows| {
         format!(
@@ -241,7 +241,8 @@ unsafe extern "system" fn restore_on_signal(_event: u32) -> windows_sys::Win32::
 mod tests {
     use super::*;
 
-    // PLAN.md 2.13: only `/<drive letter>` followed by `/` or the end is a Git Bash drive path.
+    // plan-history.md 2.13: only `/<drive letter>` followed by `/` or the end is a Git Bash
+    // drive path.
     #[test]
     fn git_bash_drive_paths_have_a_windows_spelling() {
         let cases = [

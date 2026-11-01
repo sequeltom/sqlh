@@ -23,9 +23,9 @@ zeroize = "1"
 log = { version = "0.4", optional = true }
 
 [features]
-# Developer builds (PLAN.md 2.1): --verbose and `profile test` also time each connect step
-# (tcp, prelogin, tls, login) from the driver's log events. Off by default: listening to the
-# driver's logging keeps all of its log formatting in the exe (+270 KB, about 12%).
+# Developer builds (plan-history.md 2.1): --verbose and `profile test` also time each connect
+# step (tcp, prelogin, tls, login) from the driver's log events. Off by default: listening to
+# the driver's logging keeps all of its log formatting in the exe (+270 KB, about 12%).
 timing = ["dep:log"]
 
 [target.'cfg(windows)'.dependencies]

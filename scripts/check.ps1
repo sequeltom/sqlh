@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    The local release check (PLAN.md 3.3): everything a change must pass, in one command.
+    The local release check (plan-history.md 3.3): everything a change must pass, in one
+    command.
 
 .DESCRIPTION
     Runs, in order, and stops at the first failure with a non-zero exit code:
@@ -16,7 +17,8 @@
     update a stale Cargo.lock and let a later step pass on it (R23): a stale lockfile fails
     step 1 and is left as it was.
     With -Live it then runs the live tests (debug and release) through the profile named in
-    $env:SQLH_TEST_PROFILE, or "test". CI (PLAN.md 3.5) runs it without -Live: no server there.
+    $env:SQLH_TEST_PROFILE, or "test". CI (plan-history.md 3.5) runs it without -Live: no
+    server there.
 
 .PARAMETER Live
     Also run the live tests against the test server (scratch database sqlh_test).

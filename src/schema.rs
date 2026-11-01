@@ -1,4 +1,4 @@
-//! Schema commands (docs/schema-commands.md, PLAN.md Phase 4): `info`, `dbs`, `tables`,
+//! Schema commands (docs/schema-commands.md, plan-history.md Phase 4): `info`, `dbs`, `tables`,
 //! `describe`, `find` and `def`. Each is canned T-SQL run as sqlh's own SQL
 //! (`QueryOrigin::Generated`): read-only, in the wrapper transaction, no guard and no `$(var)`.
 //! Arguments reach the SQL only as `N'...'` literals (`literal`), never as identifiers. Each
@@ -813,7 +813,7 @@ fn object_sql(kind: &str) -> String {
 
 /// Columns of a table, view or table-valued function, system ones included. A default or a
 /// computed column whose definition the login can't see shows `(hidden)`, not NULL, so it
-/// isn't taken for having none (PLAN.md Phase 4).
+/// isn't taken for having none (plan-history.md Phase 4).
 fn columns_sql() -> String {
     format!(
         "SELECT c.name AS [column], {ty} AS type, c.is_nullable AS [null], \

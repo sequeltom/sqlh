@@ -1,4 +1,4 @@
-//! The connection-reuse engine (PLAN.md Phase 5.2; docs/mcp-mode.md §5; owner decisions 14,
+//! The connection-reuse engine (plan-history.md Phase 5.2; docs/mcp-mode.md §5; owner decisions 14,
 //! 15, 17 and 19). It keeps a small pool of open connections per profile and runs each call
 //! through the execution core (`run`), exactly as a CLI run does, on a connection that is
 //! reset first, so a call behaves like one CLI run without the connect. It has no MCP in it:
@@ -1529,9 +1529,9 @@ mod tests {
     }
 
     // Decision 19 as built: the regressions the external review of Phase 5.2 and 5.3 asked to
-    // keep (PLAN.md): the probe's two sides, the idle peers a retry drops, a replacement that
-    // can't log in, a cancel in the probe's attention wait, and a connection that dies at the
-    // call's USE.
+    // keep (plan-history.md): the probe's two sides, the idle peers a retry drops, a
+    // replacement that can't log in, a cancel in the probe's attention wait, and a connection
+    // that dies at the call's USE.
 
     /// A connection of the pooled fake that holds its first call's SELECT 50 ms, and answers the
     /// next call's setup, a reused connection's probe, after `setup`.

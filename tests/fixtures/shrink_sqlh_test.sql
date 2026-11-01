@@ -1,6 +1,7 @@
--- Gives the scratch database's space back after experiments that grew it (PLAN.md 3.4).
--- The live tests drop what they create, but a large write that is rolled back (the 2.5
--- harness-kill measurements) leaves the log at its peak size. Safe to rerun. Run with:
+-- Gives the scratch database's space back after experiments that grew it
+-- (plan-history.md 3.4). The live tests drop what they create, but a large write that
+-- is rolled back (the 2.5 harness-kill measurements) leaves the log at its peak size.
+-- Safe to rerun. Run with:
 --   sqlh --profile test --allow-write -i tests/fixtures/shrink_sqlh_test.sql
 USE sqlh_test;
 GO

@@ -538,7 +538,7 @@ mod tests {
         assert!(err.contains("over the 10 MB limit"), "{err}");
     }
 
-    // PLAN.md 2.7: the limit is checked as the text is built, not after. This input would
+    // plan-history.md 2.7: the limit is checked as the text is built, not after. This input would
     // expand to 32 GB ("$(v)" a million times, 32 KB each); it is refused when it reaches the
     // limit, which is the only reason this test finishes at all, and the message is the
     // existing one.
@@ -559,8 +559,8 @@ mod tests {
         );
     }
 
-    // PLAN.md 2.7: the room is exact. Original text before and after a reference, a value, a
-    // `$(` kept literal and text without any reference all count, byte for byte.
+    // plan-history.md 2.7: the room is exact. Original text before and after a reference, a value,
+    // a `$(` kept literal and text without any reference all count, byte for byte.
     #[test]
     fn the_room_is_exact() {
         let vars = [
@@ -595,8 +595,8 @@ mod tests {
         }
     }
 
-    // PLAN.md 2.7: the limit is shared by a run's batches, so each gets what the earlier ones
-    // left.
+    // plan-history.md 2.7: the limit is shared by a run's batches, so each gets what the earlier
+    // ones left.
     #[test]
     fn the_room_shrinks_across_batches() {
         // `SELECT '$(v)'` twice (14 and 13 bytes, 4 of them the reference), then a comment of
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(limit(run(4_999_989, 0).unwrap()), MAX_INPUT_BYTES);
     }
 
-    /// `substitute` as it was before PLAN.md 2.7: no room, and the line map made eagerly.
+    /// `substitute` as it was before plan-history.md 2.7: no room, and the line map made eagerly.
     fn reference(
         text: &str,
         vars: &[(String, String)],
@@ -681,7 +681,7 @@ mod tests {
         Ok((out, if multi_line { map } else { Vec::new() }))
     }
 
-    // PLAN.md 2.7: building within a room, and making the line map only when a value adds
+    // plan-history.md 2.7: building within a room, and making the line map only when a value adds
     // lines, change nothing about the result. Against the old algorithm, for any room: the
     // same text and line map when it fits, TooLarge when it doesn't, and for an undefined name
     // the same error unless the room ran out before the name was reached.
