@@ -1267,6 +1267,11 @@ Decided 2026-10-11, except where an item gives a later date:
     6. linked-server reads (decision 25): last, since live check 1, the MSDTC question, is blocked.
 
     Each slice ships in a `0.1.x` release (decision 50) and gets real use before the next starts. **Part 2** (decisions 22, 31–36: the kinds, the deny tier, `kill`, per-database runs, trusted entries; no `execute` tool) is built once the colleagues' use of `0.1.x` shows which changes agents need to make. **Why:** the decisions were all taken on one day, before any code, and the rules are lexical, so each family is better found in use than in review (R48 was such a gap); small models gain most from slices 1 and 2 (decision 48), which need the least.
+52. **External review goes by risk; small follow-ups fold into the next round (owner decision, 2026-11-01).**
+    - **Reviewed externally, before it is built on:** the guard and run policy (the classifier, allowlists, the wrapper, write policy); the output contract (DESIGN.md §5's formats, exit codes, status lines); credentials and secrets (Credential Manager, `Secret`, profiles, connect hints); the engine, cancellation and the MCP protocol; driver upgrades; the release and signing workflows.
+    - **Self-verified, then covered by the next external review's range, with no round of its own:** a P3 fix that touches only tests or docs, a docs-only change, a test-only change. Each is checked with `scripts/check.ps1` (and `-Live` where it touches a live test) and recorded in this plan with what it fixes and how it was checked; the next brief lists them so the reviewer sees every line, later and batched.
+    - **Before any release** (`0.1.0`, each `0.1.x`): every change since the last external review is covered by one.
+    - **Why:** the reviews find real defects (R35–R39, R42, R48, R49), but R50, a one-line test fix, took a full brief, review and verification round, as R46's and R47's verifications did for little.
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
 
