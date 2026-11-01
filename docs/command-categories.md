@@ -6,6 +6,8 @@ Status: a design for owner decisions, 2026-10-23; built on HEAD `f905385` (exe 2
 
 ## 1. For the owner: summary
 
+**Build order (owner decision 51, 2026-11-01; PLAN.md §6):** Part 1 (§6) in six thin slices, each released and used before the next: (1) refusal wording (§6.9) and the small items (§6.10); (2) `activity`, `errorlog` and `info` (§6.7); (3) read list round 2 and the exact-shape reads (§6.1, §6.2); (4) contention (§6.4); (5) the pause and showplan hygiene (§6.6, §6.8); (6) remote reach (§6.5), last, since its MSDTC check is blocked. Part 2 (§7) waits until real use shows which changes agents need. The decisions below (§9) stand.
+
 **The model**
 - **Permissions are the boundary; sqlh's checks are an accident guard** for a login granted more than the agent needs (VISION.md, Safety). Every rule is lexical. Synonyms, renamed objects, CLR functions and mapped drives get past the classifier in every mode. Dynamic SQL and `EXEC @var`, which read-only runs and MCP refuse, get past the deny tier under `--allow-write` or `--allow unvetted` (§2).
 - **Read-only runs and every `sqlh mcp` read tool keep today's shape:** the classifier, then the rolled-back wrapper transaction. Part 1 makes them fit DBA work better: a longer read list, a few exact-shape reads that run alone outside the wrapper, lock-holding SQL refused, agent-chosen remote paths refused, a client-side pause for deltas, and sqlh's own `activity` and `errorlog` reads.

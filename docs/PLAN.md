@@ -1082,6 +1082,8 @@ The second-result, exit-code and no-stopped-count assertions remain unchanged fo
 
 ### Phase 6: command categorization (VISION priority 4)
 
+**Build order (decision 51, 2026-11-01):** Part 1 in six thin slices, each released and used before the next, starting with refusal wording and the five small items; Part 2 waits for real use. §6, decision 51, lists the slices and the live checks each needs.
+
 This is design work with the owner before any code:
 1. List concrete DBA investigation workflows: blocking chains, wait stats, Query Store, plan cache and showplans, index usage, statistics, `sp_who2`, and common community procedures.
 2. List their risks.
@@ -1256,6 +1258,15 @@ Decided 2026-10-11, except where an item gives a later date:
     - **Not changed:** a Windows 10 / Windows Server 2016 floor for the machine sqlh runs on stays a candidate (VISION.md); Managed Instance and Azure SQL follow their own plan; SQL Server 2012 and 2014 are not targets.
 50. **The first release is a private `0.1.0` for the owner and a few colleagues, with Windows authentication in scope (owner decision, 2026-11-01).** The repository stays private; colleagues get the signed exe from the GitHub release (with access to the repository) or as the release zip passed on. It ships what is built: the CLI, the schema commands and the local `sqlh mcp`. It doesn't wait for Phase 6, whose Part 1 then gets real use; nor for hosted MCP (decision 47). Its gates are §7's checklist, which this decision completes: Windows authentication checked live, the SQL Server 2016 run (decision 49), a clean workstation, and SmartScreen and antivirus on a locked-down one. A public release (`0.2` or `1.0`) comes later, after Phase 6 Part 1 is in use and the README is reviewed for strangers; making the repository public stays the owner's separate decision.
     - **The Windows authentication check (owner's suggestion):** a local Windows user on the test server, with a SQL Server login for it (`CREATE LOGIN [SERVER\user] FROM WINDOWS`, the owner's to make). The workstation isn't in a domain with the server, so its SSPI logs in by NTLM with that user's credentials: the owner starts a shell with them (`runas /netonly /user:SERVER\user`, which asks for the password itself), and sqlh runs there with a Windows-auth profile. Nothing stores or passes the password but Windows. It checks sqlh's SSPI path end to end (`SUSER_SNAME()` and `auth_scheme` in `sys.dm_exec_connections` show who and how) and its errors (a refused login, a user without a SQL login). Kerberos (an SPN, a domain) stays unchecked until a domain environment is at hand, the owner's real one say; that gap is recorded with the result.
+51. **Phase 6 Part 1 is built in thin slices, each released and used before the next; Part 2 waits for real use (owner decision, 2026-11-01).** Decisions 22–36 stand; this sets their order. Part 1's slices, in order (command-categories.md §6; its §10 numbers the live checks):
+    1. refusal wording and the five small items (decisions 23, 30): no live check needed;
+    2. `activity`, `errorlog` and `info`'s view permissions (decision 28): after live check 10;
+    3. read list round 2 and the exact-shape reads (decision 26): after live checks 2 and 4;
+    4. lock-holding SQL and SNAPSHOT as a run setting (decision 24): after the owner approves live check 3;
+    5. the client-side pause and showplan hygiene (decisions 27, 29): after live checks 5 and 6;
+    6. linked-server reads (decision 25): last, since live check 1, the MSDTC question, is blocked.
+
+    Each slice ships in a `0.1.x` release (decision 50) and gets real use before the next starts. **Part 2** (decisions 22, 31–36: the kinds, the deny tier, `kill`, per-database runs, trusted entries; no `execute` tool) is built once the colleagues' use of `0.1.x` shows which changes agents need to make. **Why:** the decisions were all taken on one day, before any code, and the rules are lexical, so each family is better found in use than in review (R48 was such a gap); small models gain most from slices 1 and 2 (decision 48), which need the least.
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
 
