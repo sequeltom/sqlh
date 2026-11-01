@@ -22,7 +22,7 @@ What the finished records left open and is still open (checked 2026-11-01 agains
 - **MCP's memory with requests held back:** 64 requests or 16 MiB plus one message are bounds, not a measured peak; keep the caps until the combined memory is measured (plan-history.md, Phase 5.2 and 5.3 fix verification).
 - **A code comment to correct:** `src/mcp/protocol.rs`'s "a call costs at most three scans" should say the scans come on top of `serde_json`'s parse, bounded but not linear in the message (mcp-mode.md §4, Parser work); left for the next code change there (plan-history.md, Phase 5.4, built 2026-10-18).
 - **A stored password that isn't UTF-8** is refused, but its bytes, copied out of Credential Manager, are dropped unwiped with `from_utf8`'s error (`credman.rs`; F14's wiping) (plan-history.md, Follow-ups and Phase 4.1-4.3 initial review).
-- **The M0 spike's two unverified items,** Windows auth (SSPI) and Ctrl+C mid-query (m0-driver-spike.md, Still to verify): §7's Windows-auth and cancellation lines (decision 50) (plan-history.md, 2. Docs re-review). Windows auth's success path passed on 2026-11-01 on the test server (Standard Developer), NTLM, with a same-named local user on each side, so no `runas /netonly`: a query, `profiles add` and `test`, schema commands, the guard's refusal and `sqlh mcp` with a pooled connection. Still unchecked: its errors (a user without a SQL login, a refused login), Standard edition, and Kerberos.
+- **The M0 spike's two unverified items,** Windows auth (SSPI) and Ctrl+C mid-query (m0-driver-spike.md, Still to verify): §7's Windows-auth and cancellation lines (decision 50) (plan-history.md, 2. Docs re-review). Windows auth's success path passed on 2026-11-01 on the test server (Standard Developer), NTLM, with a same-named local user on each side, so no `runas /netonly`: a query, `profiles add` and `test`, schema commands, the guard's refusal and `sqlh mcp` with a pooled connection. A refused login's error was seen on the 2016 instance (error 18452, exit 2, "the server rejected Windows auth for this login; use -U with a SQL login"). Still unchecked: a user without a SQL login, Standard edition, and Kerberos.
 
 ### MCP client feedback (October 31, 2026)
 
@@ -50,6 +50,12 @@ The owner ran `sqlh mcp` from Claude Desktop (chat and Cowork) against a real SQ
    - (a) paging for `definition` (a line range), since a 63,000-character procedure only reached the model through the client's fallback file;
    - (b) `info`: the name the connection dialed, the availability group role (`sys.dm_hadr_availability_replica_states`, which needs `VIEW SERVER STATE`), and the time zone name where the server has `CURRENT_TIMEZONE()` (2019 and later). Its catalog SQL must still run on 2016, which the client used.
 4. **Declined:** a key=value status line (`format: json` is that), cut markers moved to a footer, and the `definition` line count (correct). The reasons are in the note.
+
+### The profiles file under a packaged app (found 2026-11-01; open, an owner decision)
+
+The Claude desktop app is a packaged (MSIX) Windows app, and Windows redirects `%APPDATA%` for what it starts, so sqlh there can read a different `profiles.toml` from the one a user's shell writes. Measured from a Code-tab shell: `C:\Users\<user>\AppData\Roaming\sqlh\profiles.toml` is served from `...\AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\sqlh\profiles.toml`, where it was first written from inside the package; a profile added in the user's shell, or in the app's Terminal panel, wrote the real Roaming file and never appeared there. The run fails with `no profile named "..."` and nothing says why. Credential Manager isn't split: both sides find the same stored password. Not measured: `sqlh mcp` launched by the app (the owner's earlier Cowork and Desktop runs worked, with their profiles not traced to a file), and a machine with no copy in the package's cache, where a read should fall through to the real file. The workaround is `SQLH_CONFIG`, a path outside `AppData`.
+
+Options: keep the profiles file outside `AppData` (`%USERPROFILE%\.sqlh`, with a one-time move from today's path, as the move from `sqlharness` did, DESIGN.md §8); or keep the path and have the error name the file it read and the cause.
 
 ### Setting the default profile (owner, 2026-10-26, from manual testing; planned, not started)
 
@@ -141,13 +147,22 @@ A colleague of the owner asked for Cowork-style access: claude.ai's remote conne
   - **Backup, open for reconsideration (decision 47):** (a) a shared read-only login per profile on the host (a group-managed service account with Windows auth, or a SQL login whose password comes from the host's secrets; sqlh maps callers to the profiles they may use and records who ran what). It works on any version, SQL Server 2016 included, but every caller has that login's permissions, which are then the boundary. Not built; revisit if a server without Entra needs hosting.
   - **Not planned:** (b) a SQL login per caller stored on the host (every password entered and rotated on a shared server), and (d) Kerberos delegation from the token's user to an Active Directory account (domain-administrator delegation settings).
 
-### SQL Server 2016 support (decision 49, owner, 2026-11-01; planned, waiting on the owner's 2016 instance)
+### SQL Server 2016 support (decision 49, owner, 2026-11-01; first run passed 2026-11-01)
+
+**The first run:** on 2016 SP3 (13.0.6300) Developer, with a sysadmin SQL login: `tests/fixtures/sqlh_test.sql` ran as written, the smoke script matched its golden files, and the live suite's two failures were both tests that assumed 2025, now fixed; 61 live tests pass on debug and 55 on release, and the full `scripts/check.ps1 -Live` still passes on 2025. No catalog SQL needed a change. The two:
+
+- `the_error_log_and_server_reads_...`: `VIEW ANY ERROR LOG` is SQL Server 2022's, so the grant doesn't parse on 2016 (error 102). The rest of DESIGN.md §7's permissions table holds there, error numbers included.
+- `describe_shows_any_name_from_compatibility_level_110`: 2016 has no `STRING_AGG`, so a column name XML can't carry (U+001B) makes `describe` fail after its columns, with the server's error 6841. It's a known version difference, documented in schema-commands.md §3, not fixed: such a name is rare, and any fix needs a third way to aggregate on 2016. An ordinary name is described in full.
+
+By hand on `StackOverflow2013`, read-only: `info`, `tables`, `describe` (table and DMV, text and JSON), `find`, `def`, `deps`, capped and aggregate queries, csv, `--check`, the guard, `--read-uncommitted`, `--exact-count`, a DMV read, the error log, and `sqlh mcp`'s `query`, `describe` and `info`. A `STRING_AGG` query gets the server's error 195. `-Ns` fails with a message that says strict encryption needs SQL Server 2022 or later. A first read of `dbo.Posts` (37 GB) hit the 60 s timeout, exit 4, then took about 200 ms: consistent with a cold cache, not diagnosed further.
+
+Not checked on 2016: Windows authentication (the instance refuses this workstation's login, error 18452), a login short of sysadmin beyond the `Reader` tests, and an availability group here (the owner's benchmark ran on one, notes/mcp-client-feedback.md).
 
 1. **The instance, the owner's:** SQL Server 2016 SP3 (Developer edition is free) on a machine the workstation reaches, with mixed-mode authentication (the `Reader` tests make SQL logins) and a login with the rights the 2025 `test` profile has. The owner makes its profile with `sqlh profiles add` (a name such as `test2016`); its server name and credentials stay out of the repo, as for `test`.
 2. **The scratch database:** `tests/fixtures/sqlh_test.sql` creates `sqlh_test` there; check that the script itself runs on 2016.
 3. **First run:** the smoke script and the live suite with `SQLH_TEST_PROFILE` naming the 2016 profile, debug and release. Classify each failure: a sqlh defect (catalog SQL that needs a later version), a test that assumes 2025 (strict encryption needs 2022 or later; 2016's highest compatibility level is 130, which decision 21's level test must use; error text or catalog columns that differ), or a known version difference to document.
 4. **Fixes:** defects fixed in sqlh with tests; a test that depends on the version asks the server (`SERVERPROPERTY('ProductMajorVersion')`) and states its 2016 expectation, never skips silently; the smoke golden files normalize the server's version already, so a difference in them is a finding.
-5. **Running it:** `scripts/check.ps1 -Live` takes one profile; decide then whether it runs the suite once per listed profile or the 2016 run stays a separate step before a release. CI can't reach either server, so both stay the owner's live runs.
+5. **Running it:** the 2016 run stays a separate step before a release, with no change to the script: `$env:SQLH_TEST_PROFILE='test2016'; pwsh scripts/check.ps1 -Live`. CI can't reach either server, so both stay the owner's live runs.
 
 ## 5. Sequencing rationale
 
@@ -258,7 +273,8 @@ Decided 2026-10-11, except where an item gives a later date:
 
 ## 7. First-release checklist (replaces the spike's "still to verify")
 
-- [ ] SQL Server 2016 SP3 (decision 49): the smoke script and the live tests pass against the owner's 2016 instance, version-specific tests with their 2016 expectations
+- [x] SQL Server 2016 SP3 (decision 49): the smoke script and the live tests pass against the owner's 2016 instance, version-specific tests with their 2016 expectations (2026-11-01; rerun before the release, §4, SQL Server 2016 support)
+- [ ] The profiles file under a packaged client: a profile added in the user's own shell reaches sqlh started by the Claude desktop app (§4, The profiles file under a packaged app)
 - [ ] Clean Windows 11 x64 workstation (§6.1): runs with no installs, `dumpbin` imports are in-box only, and the size is within budget
 - [ ] Against a remote SQL Server 2025 over a real network: connect latency measured (plan-history.md 2.1 measured the dev LAN; the release environment is still to do), encryption modes mandatory and strict
 - [ ] SQL Server 2025 **Standard** (not only Standard Developer): SQL auth, and Windows auth (decision 50: NTLM through a local Windows user on the test server; Kerberos recorded as unchecked unless a domain is at hand)

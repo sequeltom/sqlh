@@ -4,7 +4,7 @@
 
 What makes it agent-friendly, in brief: compact typed output with hard limits, errors that point at the input line, documented exit codes, no prompts, and read-only by default. The full running list is [Built for agents](#built-for-agents).
 
-Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
+Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025, and against SQL Server 2016 SP3 for reading. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
 
 ## Safety: read this first
 

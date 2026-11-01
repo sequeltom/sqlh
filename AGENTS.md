@@ -130,7 +130,7 @@ cargo fmt
 target\release\sqlh.exe --profile test -i tests\smoke.sql --continue-on-error   # end-to-end; expect exit 1
 ```
 
-The test server is the owner's, reached through a profile named `test`. The owner creates it with `sqlh profiles add test ...`, which prompts for the password. Never ask for the password, and never put it in a command, file or environment variable. To try profile commands without touching the real profiles, set `SQLH_CONFIG` to a scratch file.
+The test server is the owner's, reached through a profile named `test`. The owner creates it with `sqlh profiles add test ...`, which prompts for the password. Never ask for the password, and never put it in a command, file or environment variable. To try profile commands without touching the real profiles, set `SQLH_CONFIG` to a scratch file. The 2016 instance is the owner's profile `test2016`; run the suite on it with `$env:SQLH_TEST_PROFILE='test2016'; pwsh scripts/check.ps1 -Live` (PLAN.md, SQL Server 2016 support). A shell started by the packaged Claude desktop app reads a redirected `%APPDATA%`, so a profile the owner adds may not appear there: point `SQLH_CONFIG` at a copy of it outside `AppData` (PLAN.md, The profiles file under a packaged app).
 
 `dumpbin` isn't on PATH. Find it under `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64\`. `dumpbin /dependents target\release\sqlh.exe` must list only in-box Windows DLLs.
 

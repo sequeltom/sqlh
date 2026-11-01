@@ -9354,6 +9354,13 @@ mod live {
             .to_owned()
     }
 
+    /// 13 is SQL Server 2016, 16 is 2022. A test whose expectation depends on the version states
+    /// each one rather than skipping (PLAN.md, SQL Server 2016 support).
+    fn server_major(server: &dyn Server) -> u32 {
+        let sql = "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major";
+        value(server, sql).parse().unwrap()
+    }
+
     /// Puts back the level `SAVED_LEVEL` holds, then drops the table, which it keeps if the
     /// level can't be set, so the level is tried again later; nothing without the table. The
     /// level test's cleanup (`save_level`) and the start-of-run step (`put_back_left_level`).
@@ -9531,13 +9538,24 @@ mod live {
             );
         };
 
+        // SQL Server 2016 has no STRING_AGG, so FOR XML has to carry this name there and can't:
+        // the columns are shown, then the server's error (schema-commands.md §3).
+        let major = server_major(&*server);
         for level in [110, 120] {
-            let out = described(&odd, level);
-            has(&out, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
-            has(
-                &out,
-                &format!("{odd_ix}\tNONCLUSTERED\t0\t0\tid, [a\\x1Bb] DESC\tnote\tNULL\t0"),
-            );
+            if major >= 14 {
+                let out = described(&odd, level);
+                has(&out, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
+                has(
+                    &out,
+                    &format!("{odd_ix}\tNONCLUSTERED\t0\t0\tid, [a\\x1Bb] DESC\tnote\tNULL\t0"),
+                );
+            } else {
+                set_level(&objects, level);
+                let r = live(&p, &db, &["describe", &odd]);
+                assert_eq!(r.code, 1, "describe {odd} at level {level}:\n{}", r.stdout);
+                has(&r.stdout, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
+                assert!(r.stdout.contains("-- error 6841 "), "{}", r.stdout);
+            }
         }
 
         let out = described(&plain, 100);
@@ -10278,7 +10296,7 @@ mod live {
     // refusal and xp_fixeddrives no rows, while xp_instance_regread, xp_msver and the
     // sp_configure listing run; VIEW SERVER STATE or VIEW ANY ERROR LOG opens the sp_ log
     // procedures, neither opens xp_readerrorlog or xp_fixeddrives, and an EXECUTE grant in
-    // master opens xp_readerrorlog.
+    // master opens xp_readerrorlog. SQL Server 2016 gives the same, without VIEW ANY ERROR LOG.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_error_log_and_server_reads_run_read_only_and_the_server_decides_who_may() {
@@ -10392,14 +10410,20 @@ mod live {
         };
         server(&format!("GRANT VIEW SERVER STATE TO [{login}];"));
         sp_procedures_only("VIEW SERVER STATE");
-        // VIEW ANY ERROR LOG is SQL Server 2022's.
-        server(&format!(
-            "REVOKE VIEW SERVER STATE FROM [{login}]; GRANT VIEW ANY ERROR LOG TO [{login}];"
-        ));
-        sp_procedures_only("VIEW ANY ERROR LOG");
+        server(&format!("REVOKE VIEW SERVER STATE FROM [{login}];"));
+        // VIEW ANY ERROR LOG is SQL Server 2022's: before that, the grant doesn't parse.
+        let grant = format!("GRANT VIEW ANY ERROR LOG TO [{login}];");
+        if server_major(&*reader.probe.server) >= 16 {
+            server(&grant);
+            sp_procedures_only("VIEW ANY ERROR LOG");
+            server(&format!("REVOKE VIEW ANY ERROR LOG FROM [{login}];"));
+        } else {
+            let r = reader.probe.server.write(&format!("USE master; {grant}"));
+            assert_eq!(r.code, 1, "{grant}\n{}", r.stdout);
+            assert!(r.stdout.contains("-- error 102 "), "{}", r.stdout);
+        }
 
         // EXECUTE on the procedure, through a user in master (its drop was armed above).
-        server(&format!("REVOKE VIEW ANY ERROR LOG FROM [{login}];"));
         server(&format!(
             "CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT EXECUTE ON sys.xp_readerrorlog TO [{login}];"
