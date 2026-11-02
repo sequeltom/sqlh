@@ -2118,6 +2118,130 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
+// DESIGN.md §7: the lexer ends a token where the servers do, so what they would run is refused.
+// A file with these bytes reached SQL Server before: `COMMIT` of the wrapper, on both versions.
+#[test]
+fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
+    const COMMIT: &str = "-- blocked: line 1: COMMIT is not allowed in read-only mode (if it is a \
+                          column name, write it as [COMMIT]); nothing was run. Rerun with \
+                          --allow-write if the write is intended";
+    let dir = scratch("guard_tokens");
+    let file = dir.join("input.sql");
+    let bytes = |sql: &str| sql.as_bytes().to_vec();
+    let mut refused = vec![
+        b"SELECT 1 --c\rCOMMIT\rSELECT @@TRANCOUNT AS tc".to_vec(),
+        b"SELECT 1COMMIT SELECT @@TRANCOUNT AS tc".to_vec(),
+        b"SELECT 1.COMMIT".to_vec(),
+        b"SELECT 1e5COMMIT".to_vec(),
+        b"SELECT 1e+5COMMIT".to_vec(),
+        b"SELECT .5COMMIT".to_vec(),
+        b"SELECT $1COMMIT".to_vec(),
+        b"SELECT $ 1COMMIT".to_vec(),
+        b"SELECT 1\x0bCOMMIT".to_vec(),
+        bytes("SELECT £1COMMIT"),
+        bytes("SELECT 1 AS a\u{A0}COMMIT"),
+        bytes("SELECT 1 AS a\u{3000}COMMIT"),
+        bytes("SELECT 1 AS a\u{2003}COMMIT"),
+        bytes("SELECT 1 AS a\u{85}COMMIT"),
+        bytes("SELECT 1 AS a\u{200B}COMMIT"),
+    ];
+    // The same text as UTF-16, the input's other encoding.
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(
+            "SELECT 1 AS a\u{A0}COMMIT"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        )
+        .collect();
+    refused.push(utf16);
+    for input in &refused {
+        fs::write(&file, input).unwrap();
+        let r = sqlh_args(&[DEAD, &["-i", file.to_str().unwrap()]].concat());
+        assert_eq!(r.code, 5, "{input:?}: {}", r.stdout);
+        assert_eq!(r.stdout.lines().next(), Some(COMMIT), "{input:?}");
+    }
+    // Refused in --check too, and NOEXEC there can't be hidden the same way.
+    let r = sqlh_args(&[DEAD, &["--check", "-Q", "SELECT 1 --c\rSET NOEXEC OFF"]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("SET NOEXEC can't be used"),
+        "{}",
+        r.stdout
+    );
+
+    // Reads with the same characters get past the guard, to the closed port.
+    for sql in [
+        "SELECT 1 --c\rSELECT 2",
+        "SELECT 1\u{A0}AS\u{3000}x",
+        "SELECT 1e5, 0xFF, $1.50, $ 1, £1 --COMMIT\n",
+        "SELECT 0xDELETE FROM t",
+        "SELECT 1EXEC",
+    ] {
+        assert_reached_connect(&sqlh_args(&[DEAD, &["-Q", sql]].concat()), sql);
+    }
+}
+
+// An unknown statement's advice says what the flag does: under --check it only compiles.
+#[test]
+fn under_check_a_refusal_does_not_promise_that_the_flag_runs_it() {
+    let dir = scratch("refusal_under_check");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.flagged]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"flag\"\n",
+    )
+    .unwrap();
+    let with = |sql: &str, extra: &[&str]| {
+        run(sqlh()
+            .args(["--profile", "flagged", "-Q", sql])
+            .args(extra)
+            .env("SQLH_CONFIG", &config))
+    };
+    for (sql, refused) in [
+        (
+            "EXEC sp_WhoIsActive",
+            "EXEC sp_WhoIsActive isn't on sqlh's list of read-only procedures, so sqlh can't tell \
+             what it does; nothing was run. Rerun with --allow-write to compile it as written",
+        ),
+        (
+            "sp_WhoIsActive",
+            "sp_WhoIsActive starts the batch, so SQL Server would run it as a stored procedure (a \
+             typo?); it isn't on sqlh's list of read-only procedures; nothing was run. Fix it if \
+             it's a typo, or rerun with --allow-write to compile it as written",
+        ),
+        (
+            "DBCC FREEPROCCACHE",
+            "DBCC FREEPROCCACHE isn't on sqlh's list of read-only DBCC commands; nothing was run. \
+             Rerun with --allow-write to compile it as written",
+        ),
+        (
+            "EXEC dbo.sp_who",
+            "EXEC dbo.sp_who: only a bare, sys. or master. name is taken as the system procedure \
+             (another schema, database or linked server can name a different one); nothing was \
+             run. Call it as sys.sp_who, or rerun with --allow-write to compile it as written",
+        ),
+    ] {
+        let r = with(sql, &["--check"]);
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert_eq!(
+            r.stdout.lines().next().unwrap_or(""),
+            format!("-- blocked: line 1: {refused}"),
+            "{sql}"
+        );
+        assert_reached_connect(&with(sql, &["--check", "--allow-write"]), sql);
+    }
+}
+
+// Exit 5 is more than writes now: a read that costs too much, and what sqlh doesn't know.
+#[test]
+fn help_names_exit_5_for_what_it_is() {
+    let help = sqlh_args(&["--help"]).stdout;
+    assert!(help.contains(" 5 blocked  6 cancelled"), "{help}");
+    assert!(!help.contains("write blocked"), "{help}");
+}
+
 // Decision 23 (command-categories.md §6.9): a refusal says what sqlh knows about the statement and
 // what lifts it, whatever the profile allows. Agents act on these words, so they are held whole.
 #[test]
@@ -4400,6 +4524,54 @@ mod mcp {
                     }
                 }
             }
+        }
+    }
+
+    // DESIGN.md §7: what the reset isn't known to clear, and a wait, reached the server through
+    // these spellings, because the lexer ended a token elsewhere than the servers do.
+    #[test]
+    fn a_call_cannot_hide_a_statement_from_the_guard() {
+        let config = profiles("mcp_hidden_statements");
+        const AUTOPILOT: &str = "-- blocked: line 1: SET AUTOPILOT leaves session state sqlh \
+                                 mcp's reset isn't known to clear; nothing was run. Run it with \
+                                 the sqlh CLI, whose session ends with the run";
+        const IDENTITY: &str = "-- blocked: line 1: SET IDENTITY_INSERT leaves session state sqlh \
+                                mcp's reset isn't known to clear; nothing was run. Run it with \
+                                the sqlh CLI, whose session ends with the run";
+        const KEY: &str = "-- blocked: line 1: OPEN SYMMETRIC KEY leaves session state sqlh \
+                           mcp's reset isn't known to clear; nothing was run. Run it with the \
+                           sqlh CLI, whose session ends with the run";
+        const WAITFOR: &str = "-- blocked: line 1: WAITFOR is not allowed in read-only mode (if \
+                               it is a column name, write it as [WAITFOR]); nothing was run. \
+                               sqlh mcp is read-only";
+        let cases = [
+            ("SET\u{A0}AUTOPILOT ON", AUTOPILOT),
+            ("SET\u{B}AUTOPILOT ON", AUTOPILOT),
+            ("SET AUTOPILOT\u{B}ON", AUTOPILOT),
+            ("SELECT 1 --c\rSET AUTOPILOT ON", AUTOPILOT),
+            ("SELECT 1SET AUTOPILOT ON", AUTOPILOT),
+            ("SET\u{3000}IDENTITY_INSERT #i ON", IDENTITY),
+            ("OPEN SYMMETRIC\u{B}KEY k DECRYPTION BY PASSWORD = 'x'", KEY),
+            ("SELECT 1 --c\rWAITFOR DELAY '00:00:01'", WAITFOR),
+            ("SELECT 1WAITFOR DELAY '00:00:01'", WAITFOR),
+            ("SELECT 1 AS a\u{A0}WAITFOR DELAY '00:00:01'", WAITFOR),
+        ];
+        let lines: Vec<String> = (1..)
+            .zip(&cases)
+            .map(|(id, (sql, _))| {
+                let sql = serde_json::Value::from(*sql);
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":{sql}}}}}}}"#
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (id, (sql, refused)) in (1..).zip(&cases) {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{sql:?}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text.lines().next(), Some(*refused), "{sql:?}");
         }
     }
 
@@ -7870,6 +8042,116 @@ mod live {
         let r = live(&p, &db, &["--check", "-Q", &sql]);
         assert_eq!(r.code, 0, "{}", r.stdout);
         assert!(!r.stdout.contains("uncommitted"), "{}", r.stdout);
+    }
+
+    // The hints the servers take that the note used to miss, and a FROM that isn't a table list's.
+    // `TRIM` is SQL Server 2017's: on 2016 the second case is the server's error, with no note.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_note_goes_by_what_the_servers_take_as_a_hint() {
+        let (p, db) = target();
+        const NOTE: &str = "-- note: some reads were uncommitted";
+        for sql in [
+            "SELECT 1 AS x FROM sys.objects ([NOLOCK ]) WHERE 1 = 0",
+            "CREATE TABLE #t (a int); SELECT a FROM tempdb..#t (NOLOCK)",
+            "CREATE TABLE #t (a int); SELECT a FROM tempdb.dbo.#t x (NOLOCK)",
+            "CREATE TABLE #t (a int); SELECT a FROM #t (NOLOCK\u{A0})",
+            "SELECT 1FROM sys.objects (NOLOCK) WHERE 1 = 0",
+        ] {
+            let r = live(&p, &db, &["-Q", sql]);
+            assert_eq!(r.code, 0, "{sql}\n{}{}", r.stdout, r.stderr);
+            assert!(r.stdout.starts_with(NOTE), "{sql}\n{}", r.stdout);
+        }
+        for sql in [
+            "CREATE TABLE #t (a int, nolock int); SELECT a FROM #t",
+            "CREATE TABLE #t (a int, nolock int); SELECT TRIM(CHAR(32) FROM UPPER(nolock)) FROM #t",
+        ] {
+            let r = live(&p, &db, &["-Q", sql]);
+            assert!(!r.stdout.contains(NOTE), "{sql}\n{}", r.stdout);
+        }
+    }
+
+    // The guard's lexer against the servers, the same check that gave its tables (DESIGN.md §7,
+    // `guard::is_space`, `guard::is_currency`), on the characters in the tables and their
+    // neighbours. Only `sys.dm_exec_describe_first_result_set` parses these, so nothing runs.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_read_the_guards_characters_as_it_does() {
+        let (p, db) = target();
+        let spaces: Vec<u32> = (0..=0x20)
+            .chain([0x85, 0xA0, 0x1680])
+            .chain(0x2000..=0x200B)
+            .chain([0x2028, 0x2029, 0x202F, 0x205F, 0x3000])
+            .collect();
+        let currency: Vec<u32> = [0x5C, 0xA2, 0xA3, 0xA4, 0xA5, 0x9F2, 0x9F3, 0xE3F, 0x17DB]
+            .into_iter()
+            .chain(0x20A0..=0x20B1)
+            .chain([0xFDFC, 0xFE69, 0xFF04, 0xFFE0, 0xFFE1, 0xFFE5, 0xFFE6])
+            .collect();
+        let others = [
+            0x7F, 0x80, 0x84, 0x86, 0x9F, 0xA1, 0xA6, 0xAD, 0x167F, 0x1681, 0x17DA, 0x17DC, 0x180E,
+            0x1FFF, 0x200C, 0x200D, 0x200E, 0x2027, 0x202A, 0x202E, 0x2030, 0x205E, 0x2060, 0x209F,
+            0x20B2, 0x20BF, 0x2FFF, 0x3001, 0xFDFB, 0xFE68, 0xFEFF, 0xFF03, 0xFF05, 0xFFE2, 0xFFE4,
+        ];
+        let probed: Vec<String> = spaces
+            .iter()
+            .chain(&currency)
+            .chain(&others)
+            .map(u32::to_string)
+            .collect();
+        let hits = |shape: &str, wanted: &str| -> Vec<u32> {
+            let sql = format!(
+                "SELECT i FROM (VALUES ({})) AS p (i) CROSS APPLY (SELECT TOP (1) \
+                 system_type_name AS t FROM sys.dm_exec_describe_first_result_set({shape}, NULL, \
+                 0)) AS d WHERE d.t = '{wanted}' ORDER BY i",
+                probed.join("),(")
+            );
+            let r = live(&p, &db, &["--format", "csv", "--max-rows", "0", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            r.stdout
+                .lines()
+                .skip(1)
+                .map(|line| line.parse().expect("a number"))
+                .collect()
+        };
+        assert_eq!(hits("N'SELECT 1' + NCHAR(i) + N'AS x'", "int"), spaces);
+        assert_eq!(hits("N'SELECT ' + NCHAR(i) + N'1 AS x'", "money"), currency);
+
+        // What makes a statement of the keyword after a number (no error from the parse), and what
+        // the number takes for itself: an `E` for its exponent, a `.`, what is hex.
+        for (shape, parses) in [
+            ("SELECT 1 --c\rDELETE #t", true),
+            ("SELECT 1 --c\u{2028}DELETE #t", true),
+            ("SELECT 1DELETE #t", true),
+            ("SELECT 1.DELETE #t", true),
+            ("SELECT 1eDELETE #t", true),
+            ("SELECT 1e5DELETE #t", true),
+            ("SELECT 1E+5DELETE #t", true),
+            ("SELECT .5DELETE #t", true),
+            ("SELECT 0xINSERT #t VALUES (1)", true),
+            ("SELECT $1DELETE #t", true),
+            ("SELECT $.5DELETE #t", true),
+            ("SELECT $-1.5DELETE #t", true),
+            ("SELECT $ 1DELETE #t", true),
+            ("SELECT $  +1DELETE #t", true),
+            ("SELECT $ DELETE #t", true),
+            ("SELECT \\1DELETE #t", true),
+            ("SELECT $1EXEC sp_who", true),
+            ("SELECT 1EXEC sp_who", false),
+            ("SELECT 0x1EXEC sp_who", false),
+            ("SELECT $+\t1EXEC sp_who", false),
+            ("SELECT $\t1EXEC sp_who", false),
+        ] {
+            let sql = format!(
+                "SELECT COUNT(*) AS syntax_errors FROM \
+                 sys.dm_exec_describe_first_result_set(N'{shape}', NULL, 0) WHERE error_number \
+                 IN (102, 156)"
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{shape:?}: {}{}", r.stdout, r.stderr);
+            let expected = if parses { "0" } else { "1" };
+            assert_eq!(r.stdout.lines().nth(1), Some(expected), "{shape:?}");
+        }
     }
 
     // The note counts against --max-output like any note; how many rows it costs is held

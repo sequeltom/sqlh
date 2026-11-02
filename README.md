@@ -120,7 +120,7 @@ Without `--allow-write`, a write is refused before anything runs (exit 5), with 
 
 | Tool | What it does |
 |---|---|
-| `query` | Runs T-SQL under the read-only guard, as the command line does |
+| `query` | Runs T-SQL under the read-only guard, as the command line does; it also refuses what could outlast the call on a reused connection |
 | `check` | Compiles T-SQL without running it |
 | `info`, `databases`, `tables`, `describe`, `find`, `definition`, `deps` | The schema commands above |
 
@@ -130,7 +130,7 @@ Each tool also takes `profile` (needed when several are listed), `database`, `ma
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md) and [docs/history/plan-history.md](docs/history/plan-history.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 47 built, 2 planned.**
+**Tally: 48 built, 2 planned.**
 
 ### Built
 
@@ -156,6 +156,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 **Safe to hand to a model**
 - **Read-only by default.** A guard refuses SQL that writes before anything runs, and everything runs in a transaction that is rolled back. This guards against accidents; the database's permissions are the real boundary. *(MVP)*
+- **A statement can't hide in how the text is typed.** The guard ends a word where SQL Server does, measured against the server for every character, so a no-break space pasted from a web page, a line comment ended by a lone carriage return, or a keyword glued to a number (`1DELETE`) doesn't slip a statement past it. *(Phase 6, slice 1)*
 - **`--check`.** Compile only: syntax errors and unknown columns, with nothing executed, and the input can't switch the check off. *(MVP; hardened in Phase 1)*
 - **A write policy per profile, and new profiles refuse writes.** `deny` (never), `flag` (needs `--allow-write`) or `allow`; `profiles add` makes new profiles `deny`, because an agent in trial 2 added `--allow-write` on its own. Under `deny`, a refusal says the profile doesn't allow writes rather than suggesting a flag that would fail. *(MVP; deny by default and its refusals since Phase 2.16)*
 - **No secrets in the transcript.** `-P` is rejected. Passwords live in Windows Credential Manager (or `SQLCMDPASSWORD`), and a stored password is only ever sent to its own server and login (or to a server that server hands the login to, as Always On read-only routing does), so a profile can't be repointed to harvest it. Each stored password remembers the server, login and encryption it was saved for, so a run that meets a profile mid-edit, or one an interrupted edit left behind, refuses rather than send it elsewhere. *(MVP; bound to its profile since Phase 3)*

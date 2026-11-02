@@ -248,7 +248,12 @@ impl Lexer {
                 continue;
             }
             match (c, next) {
-                (b'-', Some(b'-')) => return,
+                // The servers end this comment at a lone CR too (`guard::Lexer`), and a line here
+                // ends only at LF.
+                (b'-', Some(b'-')) => match bytes[i..].iter().position(|&b| b == b'\r') {
+                    Some(cr) => i += cr,
+                    None => return,
+                },
                 (b'/', Some(b'*')) => {
                     self.comment_depth = 1;
                     i += 2;
@@ -399,6 +404,21 @@ mod tests {
             .into_iter()
             .map(|b| (b.text, b.line, b.repeat))
             .collect()
+    }
+
+    // The servers end a line comment at a lone CR, so what follows one on the line opens a string.
+    #[test]
+    fn a_lone_cr_ends_a_line_comment_when_finding_terminators() {
+        let sql = "SELECT 1 --c\r, 'a\nGO\nb' AS x";
+        assert_eq!(batches(sql), vec![(sql.into(), 1, 1)]);
+        let ended = "SELECT 1 --it's\r\nGO\nSELECT 2 --'\n";
+        assert_eq!(
+            batches(ended),
+            vec![
+                ("SELECT 1 --it's\r\n".into(), 1, 1),
+                ("SELECT 2 --'\n".into(), 3, 1)
+            ]
+        );
     }
 
     #[test]

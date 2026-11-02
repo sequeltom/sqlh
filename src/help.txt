@@ -58,5 +58,5 @@ FORMAT
   Last line: "-- ok: ...", "-- partial: ..." (exit 0; a stopped count cut statements) or "-- failed (exit N): ...".
 
 EXIT CODES
-  0 ok or partial  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 write blocked  6 cancelled
+  0 ok or partial  1 SQL error  2 connect/login failed  3 usage  4 timeout  5 blocked  6 cancelled
   7 output not delivered (reader gone or stalled, or -o failed)  10 internal error (both may lose the last line)

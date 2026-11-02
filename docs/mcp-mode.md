@@ -209,6 +209,7 @@ Short names are used, because clients prefix them with the server name (Claude C
 | Where | CLI | sqlh mcp |
 |---|---|---|
 | A refused write | `Rerun with --allow-write if the write is intended`; `<instead>, or rerun with --allow-write` | `sqlh mcp is read-only`; `<instead>; sqlh mcp is read-only` (`Use a #temp table; sqlh mcp is read-only`) (`guard::WritesOff::Mcp`, as 2.16 did for `deny` profiles) |
+| A procedure or DBCC command sqlh doesn't know (decision 23, DESIGN.md §7) | `Rerun with --allow-write to run it as written`; an implicit call's `Fix it if it's a typo, or rerun with --allow-write to run it as written`; under `--check`, `to compile it as written` | `sqlh mcp is read-only`; `Fix it if it's a typo; sqlh mcp is read-only` |
 | `check` with `NOEXEC` in its SQL | `Remove SET NOEXEC (--check sets it already); write a column named NOEXEC as [NOEXEC]. --allow-write doesn't lift this` | `Remove SET NOEXEC (the check tool sets it already); write a column named NOEXEC as [NOEXEC]` |
 | `sys.dm_db_index_physical_stats` over every database in a mode that scans (decision 30(d)) | `Name the database and object, or use 'LIMITED'` | the same: it names no flag, and read-only is not why it is refused |
 | `SET AUTOPILOT`, `SET IDENTITY_INSERT`, `OPEN SYMMETRIC KEY`, `OPEN MASTER KEY` (decision 30(e)) | not refused: the CLI's session ends with the run | `... leaves session state sqlh mcp's reset isn't known to clear; nothing was run. Run it with the sqlh CLI, whose session ends with the run` (§5) |

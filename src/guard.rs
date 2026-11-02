@@ -42,12 +42,13 @@ impl Blocked {
         }
     }
 
-    /// A refusal of what sqlh doesn't know, so it doesn't call it a write (decision 23).
-    fn unknown(line: u32, reason: String) -> Blocked {
+    /// A refusal of what sqlh doesn't know, so it doesn't call it a write (decision 23). `tail`
+    /// is the run's `Guard::as_written`.
+    fn unknown(line: u32, reason: String, tail: &str) -> Blocked {
         Blocked {
             line,
             reason,
-            advice: "Rerun with --allow-write to run it as written".into(),
+            advice: format!("Rerun with --allow-write{tail}"),
             lifted_by_write: true,
             instead: None,
         }
@@ -161,12 +162,47 @@ impl Token<'_> {
         self.kind == Kind::Word && self.name.eq_ignore_ascii_case(keyword)
     }
 
-    /// True for a name spelled `name` in any case, bare or quoted; `name` is upper case. The
-    /// server ignores trailing spaces in a quoted name (`[sys ]` is `sys`).
-    fn names(&self, name: &str) -> bool {
-        matches!(self.kind, Kind::Word | Kind::Quoted)
-            && self.name.trim_end_matches(' ').eq_ignore_ascii_case(name)
+    /// True for a bare word that `spells` the word `keyword`, where the servers don't reserve the
+    /// word and so compare it by collation (DESIGN.md §7).
+    fn spells_word(&self, keyword: &str) -> bool {
+        self.kind == Kind::Word && spells(self.name, keyword)
     }
+
+    /// True for a name, bare or quoted, that `spells` `name`, as any object's name is compared.
+    fn spells_name(&self, name: &str) -> bool {
+        matches!(self.kind, Kind::Word | Kind::Quoted) && spells(self.name, name)
+    }
+}
+
+/// What a comparison by collation makes of a character, as near as sqlh can tell without the
+/// collation (DESIGN.md §7): a full-width form is its ASCII letter, and what is neither a letter
+/// nor a number beyond ASCII (a joiner, U+FEFF) is nothing.
+fn folded(c: char) -> Option<char> {
+    match c {
+        c if c.is_ascii() => Some(c),
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0),
+        c if c.is_alphanumeric() => Some(c),
+        _ => None,
+    }
+}
+
+/// Whether the servers could read `name` as `keyword` (upper case), comparing by collation: in any
+/// case, with trailing spaces (`[sys ]` is `sys`), and `folded`. Only for what a match refuses, or
+/// reports: a match that lets something through would make a new way past the guard.
+fn spells(name: &str, keyword: &str) -> bool {
+    let name = name.trim_end_matches(' ');
+    if name.eq_ignore_ascii_case(keyword) {
+        return true;
+    }
+    // Folding only ever shortens, so a word this short costs no second look.
+    if name.len() <= keyword.len() || name.is_ascii() {
+        return false;
+    }
+    let mut letters = name.chars().filter_map(folded);
+    keyword
+        .chars()
+        .all(|k| letters.next().is_some_and(|c| c.eq_ignore_ascii_case(&k)))
+        && letters.all(|c| c == ' ')
 }
 
 /// The entry of `list` (upper case) that `name` spells in any case.
@@ -183,13 +219,30 @@ fn in_list(list: &[&str], name: &str) -> bool {
 /// The longest word the main loop acts on: OPENDATASOURCE, with 14 letters.
 const KEYWORD_MAX: usize = 16;
 
-/// `name` in ASCII upper case, for a `match` on keywords. A word too long to be one gives "",
-/// which no arm matches, so a long word costs nothing.
+/// `name` in ASCII upper case, `folded`, for a `match` on keywords whose arms can only refuse. A
+/// word too long to be one gives "", which no arm matches, so a long word costs nothing, and so
+/// does a word with a letter beyond ASCII in it, which no keyword has (`UPDATE时间`).
 fn keyword<'b>(name: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> &'b str {
-    let Some(room) = buf.get_mut(..name.len()) else {
+    let len = if name.is_ascii() {
+        let Some(room) = buf.get_mut(..name.len()) else {
+            return "";
+        };
+        room.copy_from_slice(name.as_bytes());
+        name.len()
+    } else {
+        let mut len = 0;
+        for c in name.chars().filter_map(folded) {
+            let (true, Some(slot)) = (c.is_ascii(), buf.get_mut(len)) else {
+                return "";
+            };
+            *slot = c as u8;
+            len += 1;
+        }
+        len
+    };
+    let Some(room) = buf.get_mut(..len) else {
         return "";
     };
-    room.copy_from_slice(name.as_bytes());
     room.make_ascii_uppercase();
     // Upper-casing ASCII letters keeps valid UTF-8 valid, so this does not fail.
     std::str::from_utf8(room).unwrap_or("")
@@ -356,7 +409,7 @@ fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
                 literal_read = false;
             }
             _ if (1..=3).contains(&argument) => {
-                if t.names(PHYSICAL_STATS) {
+                if t.spells_name(PHYSICAL_STATS) {
                     named += 1;
                     if named > MAX_STATS_NAMED {
                         return StatsCall::TooNested;
@@ -405,10 +458,11 @@ fn stats_mode(token: &Token<'_>) -> Option<&'static str> {
     } else {
         value
     };
-    let value = value.trim_end_matches(' ');
+    // The function reads its mode up to a NUL: `N'DETAILED' + NCHAR(0) + N'zz'` scans.
+    let value = value.split('\0').next().unwrap_or(value);
     ["DETAILED", "SAMPLED"]
         .into_iter()
-        .find(|mode| value.eq_ignore_ascii_case(mode))
+        .find(|mode| spells(value, mode))
 }
 
 /// The refusal of `sys.dm_db_index_physical_stats` over every database in a mode that scans
@@ -442,7 +496,7 @@ fn set_of_unknown_state(after: &Lexer<'_>) -> Option<&'static str> {
     if after.word_is(0, "IDENTITY_INSERT") {
         return Some("SET IDENTITY_INSERT");
     }
-    if !after.word_is(0, "AUTOPILOT") {
+    if !after.spells(0, "AUTOPILOT") {
         return None;
     }
     // Not reserved, so `UPDATE #t SET autopilot = 1`, `+=` and `.modify(...)` are a column's. A
@@ -457,12 +511,12 @@ fn set_of_unknown_state(after: &Lexer<'_>) -> Option<&'static str> {
 /// The key `OPEN`, at `after`, would leave open, if it opens one. The servers take these bare
 /// words only (`OPEN [MASTER] KEY` is a syntax error), and `OPEN [master]` is a cursor's.
 fn open_of_key(after: &Lexer<'_>) -> Option<&'static str> {
-    if !after.word_is(1, "KEY") {
+    if !after.spells(1, "KEY") {
         return None;
     }
-    if after.word_is(0, "SYMMETRIC") {
+    if after.spells(0, "SYMMETRIC") {
         Some("OPEN SYMMETRIC KEY")
-    } else if after.word_is(0, "MASTER") {
+    } else if after.spells(0, "MASTER") {
         Some("OPEN MASTER KEY")
     } else {
         None
@@ -786,6 +840,7 @@ fn metered(
     let result = pass(&Guard {
         sql,
         work: &work,
+        compile_only: policy.compile_only,
         reused_session: policy.reused_session,
     });
     if work.exceeded() {
@@ -801,7 +856,7 @@ fn metered(
 /// wrapper transaction gone. Dynamic SQL in a string is not seen; that run is cut like any
 /// other. One pass over the text, so it needs no budget.
 pub fn mentions_xact_abort(sql: &str) -> bool {
-    Lexer::new(sql).any(|t| t.is_word("XACT_ABORT"))
+    Lexer::new(sql).any(|t| t.spells_word("XACT_ABORT"))
 }
 
 /// The words of `STATEMENT_START` whose statements return nothing a reader would miss: no rows,
@@ -974,11 +1029,11 @@ impl UncommittedReads {
         self.isolation |= other.isolation;
     }
 
-    /// Records the hint `name` spells, if it does.
+    /// Records the hint `name` spells, if it does (`[NOLOCK ]`, as the server reads it).
     fn hint(&mut self, name: &str) {
-        if name.eq_ignore_ascii_case("NOLOCK") {
+        if spells(name, "NOLOCK") {
             self.nolock = true;
-        } else if name.eq_ignore_ascii_case("READUNCOMMITTED") {
+        } else if spells(name, "READUNCOMMITTED") {
             self.readuncommitted = true;
         }
     }
@@ -1079,7 +1134,8 @@ impl TableSource {
         use TableSource::*;
         match (self, token.kind) {
             (Off, _) => Off,
-            (Dot, Kind::Word | Kind::Quoted) => Name,
+            // `tempdb..#t` and `dbo.#t` name the session's table too.
+            (Dot, Kind::Word | Kind::Quoted | Kind::Temp) => Name,
             (Expected, Kind::Word) if is_reserved(token.name) => Off,
             (Expected, Kind::Word | Kind::Quoted | Kind::Temp) => Name,
             // `FROM @t (NOLOCK)` is a syntax error (1018), so it never reads.
@@ -1124,6 +1180,9 @@ fn defines_a_module(start: &Lexer<'_>) -> bool {
 ///   a function given a column, so that form isn't looked for there.
 /// - `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` (or `TRAN`).
 ///
+/// A `FROM` that is part of an expression starts no table list: `TRIM(x FROM y)` and `a IS
+/// DISTINCT FROM b`.
+///
 /// The text is all it has: `FROM f(nolock)` with a column of an outer query as the argument
 /// counts, a table list that goes on past a derived table or an `ON` doesn't, and neither does
 /// dynamic SQL or a module's own hints. One pass over the text, with lookahead of a few tokens
@@ -1141,13 +1200,26 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
     let mut hints: Option<usize> = None;
     let mut after_with = false;
     let mut after_equals = false;
+    let mut after_trim = false;
+    let mut after_distinct = false;
+    // A bit per depth, set when the parenthesis that opened that depth is a `TRIM(`. Past 64 deep
+    // a `TRIM(x FROM y)` reads as a table list, which at worst says too much (DESIGN.md §4.3).
+    let mut trims = 0u64;
+    let depth_bit = |depth: usize| 1u64.checked_shl(depth as u32).unwrap_or(0);
     while let Some(token) = lex.next() {
         let with = std::mem::take(&mut after_with);
+        let trim = std::mem::take(&mut after_trim);
+        let distinct = std::mem::take(&mut after_distinct);
         let equals = std::mem::replace(&mut after_equals, token.kind == Kind::Punct('='));
         let in_table_list = depth == source_depth;
         match token.kind {
             Kind::Punct('(') => {
                 depth += 1;
+                if trim {
+                    trims |= depth_bit(depth);
+                } else {
+                    trims &= !depth_bit(depth);
+                }
                 if with && hints.is_none() {
                     hints = Some(depth);
                 }
@@ -1181,11 +1253,14 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
             Kind::Word => {
                 let mut buf = [0; KEYWORD_MAX];
                 match keyword(token.name, &mut buf) {
+                    "FROM" if distinct || trims & depth_bit(depth) != 0 => {}
                     "FROM" | "JOIN" | "USING" => {
                         source = TableSource::Expected;
                         source_depth = depth;
                         continue;
                     }
+                    "TRIM" => after_trim = true,
+                    "DISTINCT" => after_distinct = true,
                     "WITH" => {
                         after_with = true;
                         if in_table_list {
@@ -1212,10 +1287,10 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
                         if lex
                             .word(0)
                             .is_some_and(|w| in_list(&["TRAN", "TRANSACTION"], w))
-                            && lex.word_is(1, "ISOLATION")
-                            && lex.word_is(2, "LEVEL")
-                            && lex.word_is(3, "READ")
-                            && lex.word_is(4, "UNCOMMITTED") =>
+                            && lex.spells(1, "ISOLATION")
+                            && lex.spells(2, "LEVEL")
+                            && lex.spells(3, "READ")
+                            && lex.spells(4, "UNCOMMITTED") =>
                     {
                         found.isolation = true;
                     }
@@ -1243,6 +1318,8 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
 struct Guard<'a> {
     sql: &'a str,
     work: &'a Work,
+    /// `Policy::compile_only`.
+    compile_only: bool,
     /// `Policy::reused_session`.
     reused_session: bool,
 }
@@ -1278,10 +1355,20 @@ impl<'a> Guard<'a> {
         Lexer::metered(self.sql, self.work)
     }
 
+    /// What `--allow-write` would do with SQL sqlh doesn't know. `--check --allow-write` still
+    /// only compiles (`RunPolicy::wrap`), so under `--check` the advice can't promise a run.
+    fn as_written(&self) -> &'static str {
+        if self.compile_only {
+            " to compile it as written"
+        } else {
+            " to run it as written"
+        }
+    }
+
     /// Under `--check`, input must not touch NOEXEC: `SET NOEXEC OFF` would let the rest of
     /// the batch, and every later batch, run for real.
     fn check_compile_only(&self) -> Result<(), Blocked> {
-        match self.lexer().find(|t| t.is_word("NOEXEC")) {
+        match self.lexer().find(|t| t.spells_word("NOEXEC")) {
             Some(token) => Err(Blocked {
                 line: token.line,
                 reason: "SET NOEXEC can't be used with --check: switching it off would run the \
@@ -1452,7 +1539,8 @@ impl<'a> Guard<'a> {
             }
             "BEGIN" => {
                 let kinds = ["TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG"];
-                if let Some(w) = lex.word(0).and_then(|w| find_entry(&kinds, w)) {
+                let next = lex.word(0).unwrap_or("");
+                if let Some(w) = kinds.iter().find(|kind| spells(next, kind)) {
                     return Err(self.blocked(line, &format!("BEGIN {w}")));
                 }
             }
@@ -1463,7 +1551,7 @@ impl<'a> Guard<'a> {
                 }
             }
             // Sequence allocation survives a rollback, so the wrapper can't undo it.
-            "NEXT" if lex.word_is(0, "VALUE") && lex.word_is(1, "FOR") => {
+            "NEXT" if lex.spells(0, "VALUE") && lex.word_is(1, "FOR") => {
                 return Err(Blocked::write(
                     line,
                     format!(
@@ -1490,12 +1578,12 @@ impl<'a> Guard<'a> {
     /// found from its `sys`: the server answers a bare, `dbo.` or `master..` name with error 208,
     /// so `sys.` is the only way to the function, with a database in front or not.
     fn check_physical_stats(&self, token: &Token<'a>, lex: &Lexer<'a>) -> Result<(), Blocked> {
-        if !token.names("SYS") {
+        if !token.spells_name("SYS") {
             return Ok(());
         }
         let mut call = lex.clone();
         let is_call = call.next().is_some_and(|t| t.kind == Kind::Punct('.'))
-            && call.next().is_some_and(|t| t.names(PHYSICAL_STATS))
+            && call.next().is_some_and(|t| t.spells_name(PHYSICAL_STATS))
             && call.next().is_some_and(|t| t.kind == Kind::Punct('('));
         if !is_call {
             return Ok(());
@@ -1658,7 +1746,7 @@ impl<'a> Guard<'a> {
                          procedure (a typo?); it isn't on sqlh's list of read-only procedures"
                     ),
                     "Fix it if it's a typo".into(),
-                    " to run it as written",
+                    self.as_written(),
                 ));
             }
             return Err(Blocked::unknown(
@@ -1667,6 +1755,7 @@ impl<'a> Guard<'a> {
                     "{what} {shown} isn't on sqlh's list of read-only procedures, so sqlh can't \
                      tell what it does"
                 ),
+                self.as_written(),
             ));
         }
         if !self.local_system_qualifier(start) {
@@ -1681,7 +1770,7 @@ impl<'a> Guard<'a> {
                     self.name_at(start)
                 ),
                 format!("Call it as sys.{}", last.map_or("", |t| t.text)),
-                " to run it as written",
+                self.as_written(),
             ));
         }
         if let Some(arg) = ARG_CHECKS
@@ -1798,7 +1887,11 @@ impl<'a> Guard<'a> {
             if arg_start {
                 arg_start = false;
                 let named = t.kind == Kind::Var && scan.kind(0) == Some(Kind::Punct('='));
-                if named && t.name.eq_ignore_ascii_case(param) {
+                // The server finds a parameter by its collation, under which an ignored or
+                // folded character (`@updateusage` with a joiner in it, a full-width letter)
+                // still names this one. Neither procedure has a parameter that needs one, so any
+                // other is the server's error 8145 and refusing it costs nothing.
+                if named && (t.name.eq_ignore_ascii_case(param) || !t.name.is_ascii()) {
                     return Some(true);
                 }
                 if !named {
@@ -1842,7 +1935,7 @@ impl<'a> Guard<'a> {
             .find(|(known, _)| known.eq_ignore_ascii_case(command))
         {
             Some((_, read)) => Blocked::write_or(line, reason, format!("Read {read} instead"), ""),
-            None => Blocked::unknown(line, reason),
+            None => Blocked::unknown(line, reason, self.as_written()),
         }
     }
 }
@@ -1949,10 +2042,129 @@ impl<'a> Lexer<'a> {
     fn word_is(&self, n: usize, keyword: &str) -> bool {
         self.ahead(n).is_some_and(|t| t.is_word(keyword))
     }
+
+    /// `Token::spells_word`, of the token `n` places on.
+    fn spells(&self, n: usize, keyword: &str) -> bool {
+        self.ahead(n).is_some_and(|t| t.spells_word(keyword))
+    }
 }
 
+/// An ASCII byte that continues a name. Beyond ASCII, `ends_a_word` decides.
 fn word_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'@' || c == b'#' || c == b'$' || c >= 0x80
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'@' || c == b'#' || c == b'$'
+}
+
+/// What the servers read as whitespace beyond ASCII, where they also read every control character
+/// and the NUL as whitespace: a keyword next to one of these is that keyword. From parsing every
+/// code point with `sys.dm_exec_describe_first_result_set` (SQL Server 2016 SP3 and 2025 gave the
+/// same set, DESIGN.md §7). U+200B and U+0085 are here, U+200C, U+200D, U+180E and U+FEFF aren't.
+fn is_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{85}' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200B}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+/// What the servers take as a currency sign beyond ASCII, from the same parse. Each is a `money`
+/// literal by itself or with a number after it, whatever comes next, unlike `$`, which starts a
+/// pseudocolumn's name unless a number follows (`$action`, `$DELETE`: error 126).
+fn is_currency(c: char) -> bool {
+    matches!(
+        c,
+        '\u{A2}'..='\u{A5}'
+            | '\u{9F2}'
+            | '\u{9F3}'
+            | '\u{E3F}'
+            | '\u{17DB}'
+            | '\u{20A0}'..='\u{20B1}'
+            | '\u{FDFC}'
+            | '\u{FE69}'
+            | '\u{FF04}'
+            | '\u{FFE0}'
+            | '\u{FFE1}'
+            | '\u{FFE5}'
+            | '\u{FFE6}'
+    )
+}
+
+/// Where the name that goes on from `i` ends. Every other character the servers don't take in a
+/// name is a syntax error there, so calling it part of the word hides nothing that would run.
+fn word_end(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while let Some(&b) = bytes.get(i) {
+        if b < 0x80 {
+            if !word_char(b) {
+                break;
+            }
+            i += 1;
+        } else {
+            match sql.get(i..).and_then(|rest| rest.chars().next()) {
+                Some(c) if !is_space(c) && !is_currency(c) => i += c.len_utf8(),
+                _ => break,
+            }
+        }
+    }
+    i
+}
+
+fn digits_end(bytes: &[u8], mut i: usize) -> usize {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    i
+}
+
+/// Where the digits and decimal point of a number from `i` end.
+fn decimal_end(bytes: &[u8], i: usize) -> usize {
+    let i = digits_end(bytes, i);
+    if bytes.get(i) == Some(&b'.') {
+        digits_end(bytes, i + 1)
+    } else {
+        i
+    }
+}
+
+/// Where a `money` literal ends, from just past its sign. The servers take spaces (U+0020 only)
+/// after the sign, then a `+` or `-`, then a number with no exponent: `$ -1.5EXEC` is a literal
+/// and a keyword, and `$1eDELETE` is `$1` with an alias. With no number, the sign is the whole
+/// literal.
+fn money_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while bytes.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let end = decimal_end(bytes, i);
+    if end == i { from } else { end }
+}
+
+/// Where the number from `i` ends. The servers end one at the first byte that can't continue it,
+/// so what comes next is a token of its own however close it is: `1DELETE` and `0xINSERT` are a
+/// number and a keyword, and `1e` and `1e+5` are whole numbers.
+fn number_end(bytes: &[u8], i: usize) -> usize {
+    if matches!(bytes.get(i..i + 2), Some(b"0x" | b"0X")) {
+        let mut i = i + 2;
+        while bytes.get(i).is_some_and(u8::is_ascii_hexdigit) {
+            i += 1;
+        }
+        return i;
+    }
+    let mut i = decimal_end(bytes, i);
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        let digits = if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i + 1
+        } else {
+            i
+        };
+        if bytes.get(digits).is_some_and(u8::is_ascii_digit) {
+            i = digits_end(bytes, digits);
+        }
+    }
+    i
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -1994,12 +2206,15 @@ impl<'a> Lexer<'a> {
                     i += 1;
                     continue;
                 }
-                c if c.is_ascii_whitespace() => {
+                // Control characters too, VT and NUL among them (`is_space`).
+                c if c <= b' ' => {
                     i += 1;
                     continue;
                 }
+                // A lone CR ends the comment on the servers as well, though it starts no new
+                // line in their numbering, so the count above stays with LF.
                 b'-' if next == Some(b'-') => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
+                    while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
                         i += 1;
                     }
                     continue;
@@ -2043,28 +2258,45 @@ impl<'a> Lexer<'a> {
                     Kind::Quoted
                 }
                 b'@' | b'#' => {
-                    i += 1;
-                    while i < bytes.len() && word_char(bytes[i]) {
-                        i += 1;
-                    }
+                    i = word_end(sql, i + 1);
                     if c == b'@' { Kind::Var } else { Kind::Temp }
                 }
                 c if c.is_ascii_digit() => {
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.')
-                    {
-                        i += 1;
-                    }
+                    i = number_end(bytes, i);
+                    Kind::Num
+                }
+                // `$action`, `$DELETE` and the like go on as a name (error 126 if it is none). `\`
+                // is a currency sign to the servers, the yen's in some code pages.
+                b'\\' => {
+                    i = money_end(bytes, i + 1);
+                    Kind::Num
+                }
+                b'$' if !next.is_some_and(|n| word_char(n) && !n.is_ascii_digit()) => {
+                    i = money_end(bytes, i + 1);
                     Kind::Num
                 }
                 c if word_char(c) => {
-                    while i < bytes.len() && word_char(bytes[i]) {
-                        i += 1;
-                    }
+                    i = word_end(sql, i + 1);
                     Kind::Word
                 }
+                c if c >= 0x80 => {
+                    let Some(ch) = sql.get(i..).and_then(|rest| rest.chars().next()) else {
+                        break;
+                    };
+                    i += ch.len_utf8();
+                    if is_space(ch) {
+                        continue;
+                    }
+                    if is_currency(ch) {
+                        i = money_end(bytes, i);
+                        Kind::Num
+                    } else {
+                        i = word_end(sql, i);
+                        Kind::Word
+                    }
+                }
                 _ => {
-                    // Multi-byte characters only appear inside words, which start with a letter or
-                    // a byte >= 0x80, so `c` is ASCII here.
+                    // Every byte >= 0x80 went to the arm above, so `c` is ASCII here.
                     i += 1;
                     Kind::Punct(c as char)
                 }
@@ -3280,6 +3512,7 @@ mod tests {
             let result = Guard {
                 sql,
                 work: &work,
+                compile_only: false,
                 reused_session: true,
             }
             .check_writes();
@@ -4286,7 +4519,8 @@ mod tests {
         let mut buf = [0; KEYWORD_MAX];
         assert_eq!(keyword("insert", &mut buf), "INSERT");
         assert_eq!(keyword("InSeRt", &mut buf), "INSERT");
-        assert_eq!(keyword("é_x", &mut buf), "é_X");
+        // No keyword has a letter beyond ASCII, so a word with one is no keyword.
+        assert_eq!(keyword("é_x", &mut buf), "");
         assert_eq!(keyword("", &mut buf), "");
         let longest = "a".repeat(KEYWORD_MAX);
         assert_eq!(keyword(&longest, &mut buf), longest.to_ascii_uppercase());
@@ -4588,6 +4822,7 @@ mod tests {
         let _ = Guard {
             sql,
             work: &work,
+            compile_only: false,
             reused_session: false,
         }
         .check_writes();
@@ -4818,5 +5053,609 @@ mod tests {
                 .contains("UPDATEUSAGE")
         );
         allowed(&format!("EXEC sp_spaceused N'a'; SELECT 1{args}"));
+    }
+
+    fn tokens(sql: &str) -> Vec<&str> {
+        Lexer::new(sql).map(|t| t.text).collect()
+    }
+
+    fn spaces() -> Vec<char> {
+        let beyond_ascii = [
+            ('\u{85}', '\u{85}'),
+            ('\u{A0}', '\u{A0}'),
+            ('\u{1680}', '\u{1680}'),
+            ('\u{2000}', '\u{200B}'),
+            ('\u{2028}', '\u{2029}'),
+            ('\u{202F}', '\u{202F}'),
+            ('\u{205F}', '\u{205F}'),
+            ('\u{3000}', '\u{3000}'),
+        ];
+        ('\0'..=' ')
+            .chain(beyond_ascii.iter().flat_map(|&(from, to)| from..=to))
+            .collect()
+    }
+
+    // The sets as `sys.dm_exec_describe_first_result_set` gave them for every code point on SQL
+    // Server 2016 SP3 and 2025; the live test `the_servers_read_the_guards_characters_as_it_does`
+    // checks the same lists against a real server.
+    #[test]
+    fn the_guards_spaces_and_currency_signs_are_exactly_the_servers() {
+        let spaces = spaces();
+        let currency = [
+            ('\u{A2}', '\u{A5}'),
+            ('\u{9F2}', '\u{9F3}'),
+            ('\u{E3F}', '\u{E3F}'),
+            ('\u{17DB}', '\u{17DB}'),
+            ('\u{20A0}', '\u{20B1}'),
+            ('\u{FDFC}', '\u{FDFC}'),
+            ('\u{FE69}', '\u{FE69}'),
+            ('\u{FF04}', '\u{FF04}'),
+            ('\u{FFE0}', '\u{FFE1}'),
+            ('\u{FFE5}', '\u{FFE6}'),
+        ];
+        for c in '\u{80}'..=char::MAX {
+            assert_eq!(is_space(c), spaces.contains(&c), "U+{:04X}", c as u32);
+            assert_eq!(
+                is_currency(c),
+                currency.iter().any(|&(from, to)| (from..=to).contains(&c)),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_end_where_the_servers_end_them() {
+        let cases: &[(&str, &[&str])] = &[
+            ("1DELETE t", &["1", "DELETE", "t"]),
+            ("1.DELETE", &["1.", "DELETE"]),
+            ("1.5DELETE", &["1.5", "DELETE"]),
+            ("1.2.3DELETE", &["1.2", ".", "3", "DELETE"]),
+            (".5DELETE", &[".", "5", "DELETE"]),
+            ("1eDELETE", &["1e", "DELETE"]),
+            ("1e5DELETE", &["1e5", "DELETE"]),
+            ("1E+5DELETE", &["1E+5", "DELETE"]),
+            ("1e-5DELETE", &["1e-5", "DELETE"]),
+            ("1.5e5DELETE", &["1.5e5", "DELETE"]),
+            ("1e+DELETE", &["1e", "+", "DELETE"]),
+            ("1,000DELETE", &["1", ",", "000", "DELETE"]),
+            ("0xINSERT", &["0x", "INSERT"]),
+            ("0XINSERT", &["0X", "INSERT"]),
+            ("0xDELETE", &["0xDE", "LETE"]),
+            ("0x1FKILL", &["0x1F", "KILL"]),
+            ("1N'a'", &["1", "N'a'"]),
+            // A money literal takes no exponent: `$1eDELETE` is `$1` with an alias.
+            ("$1DELETE", &["$1", "DELETE"]),
+            ("$1.5DELETE", &["$1.5", "DELETE"]),
+            ("$.5DELETE", &["$.5", "DELETE"]),
+            ("$1,000DELETE", &["$1", ",", "000", "DELETE"]),
+            ("$-1DELETE", &["$-1", "DELETE"]),
+            ("$+.5EXEC", &["$+.5", "EXEC"]),
+            ("$ 1EXEC", &["$ 1", "EXEC"]),
+            ("$  -1.5EXEC", &["$  -1.5", "EXEC"]),
+            ("$ .5EXEC", &["$ .5", "EXEC"]),
+            ("$+ 1EXEC", &["$", "+", "1E", "XEC"]),
+            ("$\t1EXEC", &["$", "1E", "XEC"]),
+            ("$ a", &["$", "a"]),
+            ("$ EXEC", &["$", "EXEC"]),
+            ("$,1", &["$", ",", "1"]),
+            ("1EXEC", &["1E", "XEC"]),
+            ("1e5EXEC", &["1e5", "EXEC"]),
+            ("$1eDELETE", &["$1", "eDELETE"]),
+            ("£1DELETE", &["£1", "DELETE"]),
+            ("£.5DELETE", &["£.5", "DELETE"]),
+            ("£DELETE", &["£", "DELETE"]),
+            ("£1EXEC", &["£1", "EXEC"]),
+            ("£ -1EXEC", &["£ -1", "EXEC"]),
+            ("£e5", &["£", "e5"]),
+            ("€1 ¥2", &["€1", "¥2"]),
+            ("a£DELETE", &["a", "£", "DELETE"]),
+            ("\\1EXEC", &["\\1", "EXEC"]),
+            ("\\ -1EXEC", &["\\ -1", "EXEC"]),
+            ("\\DELETE", &["\\", "DELETE"]),
+            // Not a number: the pseudocolumns, and a name that goes on.
+            ("$action $DELETE", &["$action", "$DELETE"]),
+            ("a$1DELETE a1DELETE", &["a$1DELETE", "a1DELETE"]),
+            ("@a1DELETE #b1DELETE", &["@a1DELETE", "#b1DELETE"]),
+            // Beyond ASCII: a name goes on, and a server's space ends it.
+            ("é1è ñ", &["é1è", "ñ"]),
+            ("a\u{200D}b", &["a\u{200D}b"]),
+            ("a\u{FEFF}b", &["a\u{FEFF}b"]),
+            ("a\u{A0}b", &["a", "b"]),
+            ("\u{3000}a\u{200B}b\u{85}", &["a", "b"]),
+            ("@a\u{A0}#b\u{2003}c", &["@a", "#b", "c"]),
+            // A comment ends at LF or at a lone CR, and at nothing else.
+            ("a --b\nc", &["a", "c"]),
+            ("a --b\rc", &["a", "c"]),
+            ("a --b\r\nc", &["a", "c"]),
+            ("a --b\u{2028}c\u{85}d", &["a"]),
+            ("a /* b\rc */ d", &["a", "d"]),
+            ("'a--b\rc'd", &["'a--b\rc'", "d"]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(tokens(sql), *expected, "{sql:?}");
+        }
+    }
+
+    // The servers don't start a new line at a lone CR (`SELECT 1/0` after two of them is their
+    // line 1), so a refusal's line doesn't either.
+    #[test]
+    fn a_lone_cr_ends_a_comment_but_starts_no_line() {
+        assert_eq!(blocked("SELECT 1 --c\rDELETE t").line, 1);
+        assert_eq!(blocked("SELECT 1\r\rDELETE t").line, 1);
+        assert_eq!(blocked("SELECT 1 --c\r\nDELETE t").line, 2);
+        assert_eq!(blocked("SELECT 1 --c\nDELETE t").line, 2);
+    }
+
+    // What these spellings hid from every pass: each was run on the servers, and reached them.
+    #[test]
+    fn nothing_is_hidden_by_a_comment_a_number_or_a_space() {
+        let statements = [
+            ("COMMIT", "COMMIT is not allowed"),
+            ("KILL 99999", "KILL is not allowed"),
+            ("WAITFOR DELAY '00:00:01'", "WAITFOR is not allowed"),
+            ("DELETE dbo.T", "DELETE dbo.T would"),
+            ("INSERT t VALUES (1)", "INSERT t would"),
+            ("UPDATE t SET a = 1", "UPDATE t would"),
+            ("DROP TABLE t", "DROP TABLE t would"),
+            ("EXEC sp_no_such_proc", "EXEC sp_no_such_proc isn't on"),
+            ("DBCC NOSUCHCOMMAND", "DBCC NOSUCHCOMMAND isn't on"),
+        ];
+        let mut before: Vec<String> = [
+            "SELECT 1 --c\r",
+            "SELECT 1 --c\r\r",
+            "SELECT 1e",
+            "SELECT 1e5",
+            "SELECT 1e+5",
+            "SELECT $1",
+            "SELECT $.5",
+            "SELECT $ 1",
+            "SELECT $-1",
+            "SELECT $ +1.5",
+            "SELECT £1",
+            "SELECT £ 1",
+            "SELECT £",
+            "SELECT \\1",
+            "SELECT \\ 1",
+            "SELECT \\",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for space in spaces() {
+            before.push(format!("SELECT 1 {space}"));
+            before.push(format!("SELECT 1{space}"));
+            before.push(format!("SELECT 1 AS a{space}"));
+            before.push(format!("DECLARE @x int SELECT @x{space}"));
+        }
+        for start in &before {
+            for (statement, reason) in statements {
+                let sql = format!("{start}{statement}");
+                let b = blocked(&sql);
+                assert!(b.reason.starts_with(reason), "{sql:?}: {}", b.reason);
+            }
+        }
+        // A plain number takes the `E` of `EXEC` for its exponent (the servers read `1E` and an
+        // alias `XEC`, and a name after that is their syntax error), and hex what is hex.
+        for (start, keyword) in [
+            ("SELECT 1", "DELETE t"),
+            ("SELECT 1", "COMMIT"),
+            ("SELECT 1.", "DELETE t"),
+            ("SELECT .5", "DELETE t"),
+            ("SELECT 1.5", "WAITFOR DELAY '00:00:01'"),
+            ("SELECT 0x", "INSERT t VALUES (1)"),
+            ("SELECT 0x", "KILL 1"),
+            ("SELECT 0X1F", "KILL 1"),
+        ] {
+            blocked(&format!("{start}{keyword}"));
+        }
+        // Between the words of a statement as well.
+        for space in spaces() {
+            let b = blocked(&format!("DELETE{space}dbo.T"));
+            assert_eq!(b.reason, "DELETE dbo.T would write", "{space:?}");
+            let b = blocked(&format!("DROP{space}TABLE{space}dbo.T"));
+            assert_eq!(b.reason, "DROP TABLE dbo.T would write", "{space:?}");
+            allowed(&format!("DROP{space}TABLE{space}#t"));
+        }
+        // And at a batch's start, where a word is a procedure's name.
+        allowed("\u{A0}SELECT 1");
+        allowed("--c\rSELECT 1");
+        allowed("\u{0}SELECT\u{B}1");
+        assert!(
+            blocked("\u{A0}sp_x")
+                .reason
+                .starts_with("sp_x starts the batch")
+        );
+    }
+
+    #[test]
+    fn noexec_under_check_is_seen_past_a_comment_a_number_or_a_space() {
+        let compile_only = Policy {
+            writes: true,
+            compile_only: true,
+            reused_session: false,
+        };
+        for sql in [
+            "SELECT 1 --c\rSET NOEXEC OFF SELECT 2",
+            "SET NOEXEC\u{A0}OFF SELECT 1",
+            "SET\u{A0}NOEXEC OFF SELECT 1",
+            "SET\u{B}NOEXEC\u{B}OFF SELECT 1",
+            "SELECT 1NOEXEC",
+        ] {
+            let b = check(sql, compile_only).expect_err(sql);
+            assert!(b.reason.starts_with("SET NOEXEC can't"), "{sql:?}");
+        }
+    }
+
+    // A read that only looks like the shapes above still passes: a false refusal is a defect too.
+    #[test]
+    fn numbers_and_spaces_keep_what_was_legal() {
+        for sql in [
+            "SELECT 1e5, 1E+5, 1.5e-5, 0xFF, 0XAB, 0x, $1.50, $.5, £1, 1., .5",
+            "SELECT 0xDELETE FROM t",
+            "SELECT $1eDELETE",
+            "SELECT 1EXEC",
+            "SELECT $ a, £ b, \\ c, $ 1 AS d",
+            "SELECT a$DELETE, b1DELETE, _DELETE FROM t",
+            "SELECT 1 AS é, [a\u{A0}DELETE b], 'c\u{A0}DELETE d' FROM t",
+            "SELECT $action, $partition.f(1)",
+            "SELECT TOP 1PERCENT a FROM t WHERE a=1AND b=2OR c=3",
+            "SELECT a FROM t\r\nWHERE b = 1 -- DELETE x\r\nAND c = 2",
+            "SELECT\u{A0}1\u{3000}AS\u{2003}x",
+            "CREATE TABLE #t(a int)\u{A0}INSERT\u{A0}#t\u{A0}VALUES(1)\u{85}DELETE\u{200B}#t",
+        ] {
+            allowed(sql);
+        }
+    }
+
+    #[test]
+    fn the_cost_and_session_rules_read_past_every_space() {
+        const F: &str = "dm_db_index_physical_stats";
+        for space in spaces() {
+            for sql in [
+                format!("SELECT * FROM sys{space}.{F}(NULL,NULL,NULL,NULL,'DETAILED')"),
+                format!("SELECT * FROM sys.{space}{F}(NULL,NULL,NULL,NULL,'DETAILED')"),
+                format!("SELECT * FROM sys.{F}{space}(NULL,NULL,NULL,NULL,'DETAILED')"),
+                format!("SELECT * FROM sys.{F}({space}NULL,NULL,NULL,NULL,'DETAILED')"),
+                format!("SELECT * FROM sys.{F}(NULL{space},NULL,NULL,NULL,'DETAILED')"),
+                format!("SELECT * FROM sys.{F}(NULL,NULL,NULL,NULL,{space}'DETAILED')"),
+                format!("SELECT * FROM sys.{F}(NULL,NULL,NULL,NULL,'DETAILED'{space})"),
+                format!("SELECT{space}*{space}FROM sys.{F}(NULL,NULL,NULL,NULL,'DETAILED')"),
+            ] {
+                let b = blocked(&sql);
+                assert!(b.reason.ends_with("in every database"), "{sql:?}");
+            }
+            for (sql, what) in [
+                (format!("SET{space}AUTOPILOT ON"), "SET AUTOPILOT"),
+                (format!("SET AUTOPILOT{space}ON"), "SET AUTOPILOT"),
+                (
+                    format!("SET{space}IDENTITY_INSERT #t ON"),
+                    "SET IDENTITY_INSERT",
+                ),
+                (format!("OPEN{space}SYMMETRIC KEY k"), "OPEN SYMMETRIC KEY"),
+                (format!("OPEN SYMMETRIC{space}KEY k"), "OPEN SYMMETRIC KEY"),
+                (format!("OPEN{space}MASTER{space}KEY"), "OPEN MASTER KEY"),
+            ] {
+                let b = check(&sql, MCP).expect_err(&sql);
+                assert_eq!(b.reason, state_reason(what), "{sql:?}");
+            }
+        }
+        for sql in [
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, --x\rNULL,NULL,NULL,'DETAILED')",
+            "SELECT * --x\rFROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+        ] {
+            let b = blocked(sql);
+            assert!(b.reason.ends_with("in every database"), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 1 --c\rSET AUTOPILOT ON",
+            "SELECT 1SET AUTOPILOT ON",
+            "SELECT 1\u{A0}SET AUTOPILOT ON",
+        ] {
+            let b = check(sql, MCP).expect_err(sql);
+            assert_eq!(b.reason, state_reason("SET AUTOPILOT"), "{sql:?}");
+        }
+    }
+
+    // The servers compare a name, this mode and every word they don't reserve by a collation, which
+    // ignores or folds these. All of them were run: each took the name, the mode or the statement.
+    #[test]
+    fn what_a_collation_ignores_is_seen_where_a_rule_goes_by_a_name() {
+        for sql in [
+            "SELECT * FROM sys.dm_db_index_physical_stats\u{200D}(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.[dm_db_index_physical_stats\u{200D}](NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM [sys\u{200D}].dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys\u{200D}.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM \u{FF53}ys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,N'DE\u{200D}TAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,N'DETAILED\u{FEFF}')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED\u{0}')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,N'DETAILED\u{0}zz')",
+        ] {
+            let b = blocked(sql);
+            assert!(b.reason.contains("'DETAILED'"), "{sql:?}: {}", b.reason);
+        }
+        let b = blocked(
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,N'SAMP\u{200D}LED')",
+        );
+        assert!(b.reason.contains("'SAMPLED'"), "{}", b.reason);
+
+        for (sql, what) in [
+            ("SET AUTOPILOT\u{200D} ON", "SET AUTOPILOT"),
+            ("SET AUTO\u{200D}PILOT ON", "SET AUTOPILOT"),
+            ("OPEN SYMMETRIC\u{200D} KEY k", "OPEN SYMMETRIC KEY"),
+            ("OPEN SYMMETRIC KEY\u{FEFF} k", "OPEN SYMMETRIC KEY"),
+            ("OPEN MASTER\u{200D} KEY", "OPEN MASTER KEY"),
+        ] {
+            let b = check(sql, MCP).expect_err(sql);
+            assert_eq!(b.reason, state_reason(what), "{sql:?}");
+            assert_eq!(check(sql, READ_ONLY), Ok(()), "{sql:?}");
+        }
+
+        let compile_only = Policy {
+            writes: true,
+            compile_only: true,
+            reused_session: false,
+        };
+        for sql in [
+            "SET NOEXEC\u{200D} OFF SELECT 1",
+            "SET NO\u{200D}EXEC OFF SELECT 1",
+            "SET \u{FF2E}\u{FF2F}\u{FF25}\u{FF38}\u{FF25}\u{FF23} OFF SELECT 1",
+        ] {
+            let b = check(sql, compile_only).expect_err(sql);
+            assert!(b.reason.starts_with("SET NOEXEC can't"), "{sql:?}");
+        }
+
+        // Words the servers don't reserve, each of which they took as the statement.
+        for (sql, reason) in [
+            ("SELECT 1 SEND\u{200D} ON CONVERSATION @x", "SEND is not"),
+            (
+                "SELECT NEXT\u{200D} VALUE FOR s",
+                "NEXT VALUE FOR s advances",
+            ),
+            (
+                "SELECT NEXT VALUE\u{200D} FOR s",
+                "NEXT VALUE FOR s advances",
+            ),
+            ("SELECT 1 BEGIN DIALOG\u{200D} @x", "BEGIN DIALOG would"),
+        ] {
+            let b = blocked(sql);
+            assert!(b.reason.starts_with(reason), "{sql:?}: {}", b.reason);
+        }
+    }
+
+    // A false refusal is a defect, and folding must take none away either: only what a match
+    // refuses goes by the fold. A batch that starts with a word the fold reads as a statement's is
+    // still a procedure call to the server, so it stays refused as one.
+    #[test]
+    fn the_fold_leaves_real_names_alone_and_weakens_nothing() {
+        for sql in [
+            "SELECT UPDATE\u{65F6}\u{95F4}, DELETE\u{00E9}, \u{00E9}COMMIT FROM t",
+            "SELECT * FROM sys\u{00E9}.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAIL\u{00E9}D')",
+        ] {
+            allowed(sql);
+        }
+        for (first, shown) in [("SELECT", "SELECT\u{200D}"), ("PRINT", "PRINT\u{200D}")] {
+            let sql = format!("{first}\u{200D} 1");
+            let b = blocked(&sql);
+            assert!(
+                b.reason.starts_with(&format!("{shown} starts the batch")),
+                "{sql:?}: {}",
+                b.reason
+            );
+        }
+        // The list goes by exact spelling, so a name the fold would read as listed isn't listed.
+        assert!(
+            blocked("EXEC sp_who\u{200D}")
+                .reason
+                .contains("isn't on sqlh's list")
+        );
+        // Nor does a word the fold reads as a statement's end the argument check's scan.
+        blocked("EXEC sp_configure SELECT\u{200D}, 1");
+        blocked("EXEC sp_spaceused N'a', SELECT\u{200D}");
+        // Nor does a scratch target count where the word before it only folds to the keyword.
+        blocked("ALTER TABLE\u{200D} #t ADD a int");
+        blocked("DROP TABLE\u{200D} #t");
+    }
+
+    #[test]
+    fn spelling_goes_by_the_fold() {
+        for (name, keyword, expected) in [
+            ("NOEXEC", "NOEXEC", true),
+            ("noexec", "NOEXEC", true),
+            ("NOEXEC  ", "NOEXEC", true),
+            ("NOEXEC\u{200D}", "NOEXEC", true),
+            ("\u{FEFF}NO\u{200D}EXEC\u{200C} ", "NOEXEC", true),
+            ("\u{FF2E}\u{FF4F}EXEC", "NOEXEC", true),
+            ("NOEXE", "NOEXEC", false),
+            ("NOEXECS", "NOEXEC", false),
+            ("NOEXEC\u{00E9}", "NOEXEC", false),
+            ("\u{65F6}NOEXEC", "NOEXEC", false),
+            ("", "NOEXEC", false),
+            ("\u{200D}", "NOEXEC", false),
+        ] {
+            assert_eq!(spells(name, keyword), expected, "{name:?}");
+        }
+        let mut buf = [0; KEYWORD_MAX];
+        assert_eq!(keyword("delete", &mut buf), "DELETE");
+        assert_eq!(keyword("del\u{200D}ete", &mut buf), "DELETE");
+        assert_eq!(keyword("\u{FF44}elete", &mut buf), "DELETE");
+        assert_eq!(keyword("DELETE\u{65F6}", &mut buf), "");
+        assert_eq!(keyword("OPENDATASOURCEXYZ", &mut buf), "");
+        assert_eq!(keyword(&"a\u{200D}".repeat(17), &mut buf), "");
+    }
+
+    // sp_spaceused's and sp_configure's parameters are found by collation too, and there sqlh does
+    // refuse: `@updateusage` with a joiner in it got the parameter's own error 15143 from the
+    // server. Neither procedure has a parameter whose name needs a character beyond ASCII.
+    #[test]
+    fn an_argument_check_reads_through_what_a_collation_ignores() {
+        for (sql, advice) in [
+            (
+                "EXEC sp_spaceused @objname = 'a', @updateusage\u{200D} = 'true'",
+                "Leave @updateusage out",
+            ),
+            (
+                "EXEC sp_spaceused @\u{FF55}pdateusage = 'true'",
+                "Leave @updateusage out",
+            ),
+            (
+                "EXEC sp_spaceused @updateusage\u{FEFF}='true'",
+                "Leave @updateusage out",
+            ),
+            (
+                "EXEC sp_configure 'a', @configvalue\u{200D} = 1",
+                "Read sys.configurations",
+            ),
+            (
+                "sp_configure @configname = 'a', @\u{FF43}onfigvalue = 1",
+                "Read sys.configurations",
+            ),
+        ] {
+            let b = blocked(sql);
+            assert!(b.advice.starts_with(advice), "{sql:?}: {}", b.advice);
+        }
+        allowed("EXEC sp_spaceused @objname = N'é'");
+        allowed("EXEC sp_configure @configname = N'é'");
+    }
+
+    #[test]
+    fn under_check_the_advice_does_not_promise_a_run() {
+        let compile_only = Policy {
+            writes: false,
+            compile_only: true,
+            reused_session: false,
+        };
+        for (sql, advice) in [
+            (
+                "EXEC sp_WhoIsActive",
+                "Rerun with --allow-write to compile it as written",
+            ),
+            (
+                "DBCC FREEPROCCACHE",
+                "Rerun with --allow-write to compile it as written",
+            ),
+            (
+                "sp_WhoIsActive",
+                "Fix it if it's a typo, or rerun with --allow-write to compile it as written",
+            ),
+            (
+                "EXEC dbo.sp_who",
+                "Call it as sys.sp_who, or rerun with --allow-write to compile it as written",
+            ),
+            // These never said it would run.
+            (
+                "DBCC LOGINFO",
+                "Read sys.dm_db_log_info instead, or rerun with --allow-write",
+            ),
+            ("DELETE dbo.T", WRITE_ADVICE),
+        ] {
+            let b = check(sql, compile_only).expect_err(sql);
+            assert_eq!(b.advice, advice, "{sql}");
+            // Where the flag doesn't work, none of this shows.
+            let off = b.advice_for(Some(&WritesOff::Mcp));
+            assert!(!off.contains("--allow-write"), "{sql}: {off}");
+        }
+        assert_eq!(
+            blocked("EXEC sp_WhoIsActive").advice,
+            "Rerun with --allow-write to run it as written"
+        );
+    }
+
+    #[test]
+    fn a_from_inside_an_expression_opens_no_table_list() {
+        let none = UncommittedReads::default();
+        let nolock = UncommittedReads {
+            nolock: true,
+            ..none
+        };
+        for (sql, expected) in [
+            ("SELECT TRIM(CHAR(32) FROM UPPER(nolock)) FROM #t", none),
+            ("SELECT trim(N' ' FROM LTRIM(readuncommitted)) FROM t", none),
+            (
+                "SELECT TRIM(TRIM(a FROM b) FROM UPPER(nolock)) FROM t",
+                none,
+            ),
+            (
+                "SELECT TRIM(a FROM TRIM(b FROM UPPER(nolock))) FROM t",
+                none,
+            ),
+            ("SELECT TRIM(LEADING a FROM UPPER(nolock)) FROM t", none),
+            ("SELECT 1 FROM t WHERE a IS DISTINCT FROM ABS(nolock)", none),
+            (
+                "SELECT 1 FROM t WHERE a IS NOT DISTINCT FROM ABS(nolock)",
+                none,
+            ),
+            // The real ones next to them still count.
+            ("SELECT TRIM(a FROM b) FROM t (NOLOCK)", nolock),
+            ("SELECT TRIM(a FROM b) FROM t WITH (NOLOCK)", nolock),
+            (
+                "SELECT TRIM((SELECT TOP 1 c FROM u (NOLOCK)) FROM b) FROM t",
+                nolock,
+            ),
+            (
+                "SELECT TRIM(a FROM (SELECT TOP 1 c FROM u (NOLOCK))) FROM t",
+                nolock,
+            ),
+            ("SELECT DISTINCT a FROM t (NOLOCK)", nolock),
+            // A `(` at the depth of an earlier `TRIM(` is another parenthesis.
+            (
+                "SELECT TRIM(a FROM b), (SELECT 1 FROM u (NOLOCK)) FROM t",
+                nolock,
+            ),
+        ] {
+            assert_eq!(uncommitted_reads(sql), expected, "{sql}");
+        }
+    }
+
+    // The spellings of decision 30(a)'s hints that DESIGN.md §4.3 didn't list as limits. The
+    // servers ran each, and `#t ([NOLOCKX])` is their error 207, so these are taken as hints.
+    #[test]
+    fn hints_are_found_in_every_spelling_the_lexer_can_see() {
+        let none = UncommittedReads::default();
+        let nolock = UncommittedReads {
+            nolock: true,
+            ..none
+        };
+        let hint = UncommittedReads {
+            readuncommitted: true,
+            ..none
+        };
+        let level = UncommittedReads {
+            isolation: true,
+            ..none
+        };
+        for (sql, expected) in [
+            ("SELECT * FROM sys.objects ([NOLOCK ]) WHERE 1 = 0", nolock),
+            ("SELECT * FROM #t ([NOLOCK  ])", nolock),
+            ("SELECT * FROM #t (\"READUNCOMMITTED \")", hint),
+            ("SELECT * FROM tempdb..#t (NOLOCK)", nolock),
+            ("SELECT * FROM tempdb.dbo.#t x (NOLOCK)", nolock),
+            ("SELECT * FROM dbo.#t (READUNCOMMITTED)", hint),
+            ("SELECT 1 FROM #t (NOLOCK\u{A0})", nolock),
+            ("SELECT 1 FROM #t\u{B}WITH(\u{B}NOLOCK\u{B})", nolock),
+            ("SELECT 1 FROM #t (\u{B}NOLOCK)", nolock),
+            ("SELECT 1 --x\rFROM #t (NOLOCK)", nolock),
+            ("SELECT 1FROM #t (NOLOCK)", nolock),
+            (
+                "SET\u{A0}TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+                level,
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ\u{3000}UNCOMMITTED",
+                level,
+            ),
+            ("SELECT * FROM #t (NOLOCK\u{200D})", nolock),
+            ("SELECT * FROM #t ([NOLOCK\u{200D}])", nolock),
+            ("SELECT * FROM #t WITH (NOLOCK\u{200D})", nolock),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED\u{200D}",
+                level,
+            ),
+            // Not a hint: a name of its own (error 207).
+            ("SELECT * FROM #t ([NOLOCKX])", none),
+        ] {
+            assert_eq!(uncommitted_reads(sql), expected, "{sql:?}");
+        }
     }
 }
