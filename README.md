@@ -4,7 +4,7 @@
 
 What makes it agent-friendly, in brief: compact typed output with hard limits, errors that point at the input line, documented exit codes, no prompts, and read-only by default. The full running list is [Built for agents](#built-for-agents).
 
-Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
+Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025, and against SQL Server 2016 SP3 for reading. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
 
 ## Safety: read this first
 
@@ -69,7 +69,7 @@ The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mc
 
 ### Profiles
 
-A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line.
+A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line. Profiles are saved in `%USERPROFILE%\.sqlh\profiles.toml`, where your shell and any agent read the same file; profiles from an older sqlh, under `%APPDATA%`, move there by themselves.
 
 ```powershell
 sqlh profiles add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"

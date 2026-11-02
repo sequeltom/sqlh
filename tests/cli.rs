@@ -3673,15 +3673,17 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
     assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
 }
 
-// The rename to sqlh (DESIGN.md §8): profiles saved under %APPDATA%\sqlharness move to
-// %APPDATA%\sqlh the first time sqlh reads them, comments and all, and the old file goes. A
-// file already at the new place is never overwritten, and an SQLH_CONFIG file is never
-// moved. Windows-auth profiles only, so no password is involved; the move of stored passwords
-// has its own test against the real Credential Manager (`credman_moves_a_legacy_credential`).
+// The earlier places (DESIGN.md §8): profiles saved under %APPDATA%\sqlharness or
+// %APPDATA%\sqlh move to %USERPROFILE%\.sqlh the first time sqlh reads them, comments and all,
+// and the old file goes. A file already at the new place is never overwritten, and an
+// SQLH_CONFIG file is never moved. Windows-auth profiles only, so no password is involved; the
+// move of stored passwords has its own test against the real Credential Manager
+// (`credman_moves_a_legacy_credential`).
 #[test]
-fn profiles_from_before_the_rename_move_to_the_new_folder() {
+fn profiles_from_earlier_places_move_to_the_new_folder() {
     let appdata = scratch("rename_migration");
-    let (old_dir, new_dir) = (appdata.join("sqlharness"), appdata.join("sqlh"));
+    let home = scratch("rename_migration_home");
+    let (old_dir, new_dir) = (appdata.join("sqlharness"), home.join(".sqlh"));
     let old_text = "# saved by an earlier sqlh\ndefault = \"dev\"\n\n[profiles.dev]\n\
                     server = \"127.0.0.1,1\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n";
     let list = || {
@@ -3689,6 +3691,7 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
         command
             .env_remove("SQLH_CONFIG")
             .env("APPDATA", &appdata)
+            .env("USERPROFILE", &home)
             .args(["profiles", "list"]);
         run(&mut command)
     };
@@ -3721,6 +3724,21 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     assert!(!r.stdout.contains("stale"), "{}", r.stdout);
     assert!(old_dir.join("profiles.toml").exists());
 
+    // A copy under %APPDATA%\sqlh, as a packaged app's shell or an earlier sqlh left it, adds
+    // what the new file lacks, and goes.
+    let appdata_dir = appdata.join("sqlh");
+    fs::create_dir_all(&appdata_dir).unwrap();
+    fs::write(
+        appdata_dir.join("profiles.toml"),
+        "[profiles.qa]\nserver = \"qa\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n",
+    )
+    .unwrap();
+    let r = list();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("\ndev\t1\t127.0.0.1,1\t"), "{}", r.stdout);
+    assert!(r.stdout.contains("\nqa\t0\tqa\t"), "{}", r.stdout);
+    assert!(!appdata_dir.exists(), "the copy under APPDATA is gone");
+
     // An SQLH_CONFIG file is used where it is, with no move.
     let elsewhere = scratch("rename_migration_config");
     let config = elsewhere.join("profiles.toml");
@@ -3729,10 +3747,11 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     command
         .env("SQLH_CONFIG", &config)
         .env("APPDATA", &elsewhere)
+        .env("USERPROFILE", &elsewhere)
         .args(["profiles", "list"]);
     let r = run(&mut command);
     assert_eq!(r.code, 0, "{}", r.stdout);
-    assert!(config.exists() && !elsewhere.join("sqlh").exists());
+    assert!(config.exists() && !elsewhere.join(".sqlh").exists());
 }
 
 // docs/mcp-mode.md §2 and §3 (plan-history.md 5.3), through the real binary with no server: launch
@@ -5940,7 +5959,8 @@ mod live {
         (profile, database)
     }
 
-    /// `target()` for the test that changes the scratch database's compatibility level: it
+    /// `target()` for a test that can't share the scratch database: one that changes its
+    /// compatibility level, or reads its whole catalog while others make and drop objects. It
     /// waits until no other live test holds the scratch lock, here or in another process, and
     /// none starts until the lock it returns is dropped.
     fn target_alone() -> (fs::File, String, String) {
@@ -6118,7 +6138,11 @@ mod live {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let name = format!("dbo.probe_{}_{nanos}", std::process::id());
+            // The clock alone isn't enough: two tests released together by `target_alone`'s
+            // lock read the same tick and made the same table (2026-11-01).
+            static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("dbo.probe_{}_{nanos}_{n}", std::process::id());
             let mut cleanup = Cleanup::new(server.clone());
             cleanup.arm(format!("DROP TABLE IF EXISTS {name}"));
             let r = server.write(&format!("CREATE TABLE {name} (id int NOT NULL)"));
@@ -8880,11 +8904,13 @@ mod live {
     // section for a table, and what applies to views, procedures, functions and synonyms; `def`
     // prints a counted block; `find`, `find --text` and `tables` match names and bodies; a name
     // resolves case-insensitively but never outside an explicit schema; an ambiguous or unknown
-    // name, and another database, are refused with what to do. All read-only.
+    // name, and another database, are refused with what to do. All read-only. It runs alone:
+    // `find --text` reads the whole catalog at low deadlock priority, so other tests' DDL made
+    // it the victim (error 1205, 2026-11-01, PLAN.md, Carried over from finished work).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn schema_commands_describe_what_the_catalog_holds() {
-        let (p, db) = target();
+        let (_alone, p, db) = target_alone();
         let schema = Schema::create(&p, &db);
         let run = |args: &[&str]| live(&p, &db, args);
         let ok = |args: &[&str]| {
@@ -9354,6 +9380,13 @@ mod live {
             .to_owned()
     }
 
+    /// 13 is SQL Server 2016, 16 is 2022. A test whose expectation depends on the version states
+    /// each one rather than skipping (PLAN.md, SQL Server 2016 support).
+    fn server_major(server: &dyn Server) -> u32 {
+        let sql = "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major";
+        value(server, sql).parse().unwrap()
+    }
+
     /// Puts back the level `SAVED_LEVEL` holds, then drops the table, which it keeps if the
     /// level can't be set, so the level is tried again later; nothing without the table. The
     /// level test's cleanup (`save_level`) and the start-of-run step (`put_back_left_level`).
@@ -9531,13 +9564,24 @@ mod live {
             );
         };
 
+        // SQL Server 2016 has no STRING_AGG, so FOR XML has to carry this name there and can't:
+        // the columns are shown, then the server's error (schema-commands.md §3).
+        let major = server_major(&*server);
         for level in [110, 120] {
-            let out = described(&odd, level);
-            has(&out, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
-            has(
-                &out,
-                &format!("{odd_ix}\tNONCLUSTERED\t0\t0\tid, [a\\x1Bb] DESC\tnote\tNULL\t0"),
-            );
+            if major >= 14 {
+                let out = described(&odd, level);
+                has(&out, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
+                has(
+                    &out,
+                    &format!("{odd_ix}\tNONCLUSTERED\t0\t0\tid, [a\\x1Bb] DESC\tnote\tNULL\t0"),
+                );
+            } else {
+                set_level(&objects, level);
+                let r = live(&p, &db, &["describe", &odd]);
+                assert_eq!(r.code, 1, "describe {odd} at level {level}:\n{}", r.stdout);
+                has(&r.stdout, "a\\x1Bb\tint\t0\t0\tNULL\tNULL\tNULL");
+                assert!(r.stdout.contains("-- error 6841 "), "{}", r.stdout);
+            }
         }
 
         let out = described(&plain, 100);
@@ -10278,7 +10322,7 @@ mod live {
     // refusal and xp_fixeddrives no rows, while xp_instance_regread, xp_msver and the
     // sp_configure listing run; VIEW SERVER STATE or VIEW ANY ERROR LOG opens the sp_ log
     // procedures, neither opens xp_readerrorlog or xp_fixeddrives, and an EXECUTE grant in
-    // master opens xp_readerrorlog.
+    // master opens xp_readerrorlog. SQL Server 2016 gives the same, without VIEW ANY ERROR LOG.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_error_log_and_server_reads_run_read_only_and_the_server_decides_who_may() {
@@ -10392,14 +10436,20 @@ mod live {
         };
         server(&format!("GRANT VIEW SERVER STATE TO [{login}];"));
         sp_procedures_only("VIEW SERVER STATE");
-        // VIEW ANY ERROR LOG is SQL Server 2022's.
-        server(&format!(
-            "REVOKE VIEW SERVER STATE FROM [{login}]; GRANT VIEW ANY ERROR LOG TO [{login}];"
-        ));
-        sp_procedures_only("VIEW ANY ERROR LOG");
+        server(&format!("REVOKE VIEW SERVER STATE FROM [{login}];"));
+        // VIEW ANY ERROR LOG is SQL Server 2022's: before that, the grant doesn't parse.
+        let grant = format!("GRANT VIEW ANY ERROR LOG TO [{login}];");
+        if server_major(&*reader.probe.server) >= 16 {
+            server(&grant);
+            sp_procedures_only("VIEW ANY ERROR LOG");
+            server(&format!("REVOKE VIEW ANY ERROR LOG FROM [{login}];"));
+        } else {
+            let r = reader.probe.server.write(&format!("USE master; {grant}"));
+            assert_eq!(r.code, 1, "{grant}\n{}", r.stdout);
+            assert!(r.stdout.contains("-- error 102 "), "{}", r.stdout);
+        }
 
         // EXECUTE on the procedure, through a user in master (its drop was armed above).
-        server(&format!("REVOKE VIEW ANY ERROR LOG FROM [{login}];"));
         server(&format!(
             "CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT EXECUTE ON sys.xp_readerrorlog TO [{login}];"
@@ -11406,8 +11456,8 @@ mod live {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA is set"))
-                        .join("sqlh")
+                    PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE is set"))
+                        .join(".sqlh")
                         .join("profiles.toml")
                 });
             let text = fs::read_to_string(&path)
