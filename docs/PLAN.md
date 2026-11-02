@@ -85,7 +85,7 @@ Not measured: `sqlh mcp` launched by the desktop app itself, as its configured s
 
 **Build order (decision 51, 2026-11-01):** Part 1 in six thin slices, each released and used before the next, starting with refusal wording and the five small items; Part 2 waits for real use. §6, decision 51, lists the slices and the live checks each needs.
 
-**Slice 1, as built:** decision 30(a), the note when the SQL itself reads uncommitted (DESIGN.md §4.3); decision 30(b), documented (DESIGN.md §7; docs only, decision 52); decision 30(c), the login's application name per run kind (DESIGN.md §4.3); decision 23's refusal wording, the "Now" list of command-categories.md §6.9 (DESIGN.md §7).
+**Slice 1, as built:** decision 30(a), the note when the SQL itself reads uncommitted (DESIGN.md §4.3); decision 30(b), documented (DESIGN.md §7; docs only, decision 52); decision 30(c), the login's application name per run kind (DESIGN.md §4.3); decision 30(d), the refusal of `sys.dm_db_index_physical_stats` over every database in a mode that scans (DESIGN.md §7); decision 23's refusal wording, the "Now" list of command-categories.md §6.9 (DESIGN.md §7).
 
 This is design work with the owner before any code:
 1. List concrete DBA investigation workflows: blocking chains, wait stats, Query Store, plan cache and showplans, index usage, statistics, `sp_who2`, and common community procedures.

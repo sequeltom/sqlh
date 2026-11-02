@@ -2138,6 +2138,7 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
     const FLUSH: &str = "Read sys.query_store_runtime_stats instead: it has the rows not yet \
                          flushed too; aggregate by plan_id, execution_type and \
                          runtime_stats_interval_id";
+    const STATS_REWRITE: &str = "Name the database and object, or use 'LIMITED'";
     let cases: Vec<(&str, &str, String, String)> = vec![
         (
             "EXEC sp_WhoIsActive",
@@ -2186,6 +2187,21 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             "Rerun with --allow-write if the write is intended".into(),
             DENIED_ALONE.into(),
         ),
+        // Decision 30(d): no write, so the rewrite alone, under any policy.
+        (
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would read every page of \
+             every index in every database",
+            STATS_REWRITE.into(),
+            STATS_REWRITE.into(),
+        ),
+        (
+            "SELECT * FROM sys.dm_db_index_physical_stats(DEFAULT, 1, 1, 1, N'sampled')",
+            "sys.dm_db_index_physical_stats(NULL, ..., 'SAMPLED') would read at least 1% of the \
+             pages of every index in every database",
+            STATS_REWRITE.into(),
+            STATS_REWRITE.into(),
+        ),
     ];
     let with = |profile: &str, sql: &str, extra: &[&str]| {
         run(sqlh()
@@ -2231,6 +2247,57 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
          sqlh can't tell what it does; nothing was run. Rerun with --allow-write to run it as \
          written"
     );
+}
+
+// Decision 30(d) from the command line: refused before anything connects, wherever the guard
+// runs, and passed by a run with writes on, where it doesn't, and by what the advice offers.
+#[test]
+fn the_wildcard_stats_call_is_refused_before_connecting() {
+    let dir = scratch("wildcard_stats");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.flagged]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"flag\"\n\n\
+         [profiles.allowed]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"allow\"\n",
+    )
+    .unwrap();
+    const CALL: &str = "SELECT 1\n\nSELECT * FROM [sys].[DM_DB_INDEX_PHYSICAL_STATS](NULL, NULL, NULL, NULL, N'detailed')";
+    const REFUSED: &str = "-- blocked: line 3: sys.dm_db_index_physical_stats(NULL, ..., \
+                           'DETAILED') would read every page of every index in every database; \
+                           nothing was run. Name the database and object, or use 'LIMITED'";
+    let with = |profile: &str, sql: &str, extra: &[&str]| {
+        run(sqlh()
+            .args(["--profile", profile, "-Q", sql])
+            .args(extra)
+            .env("SQLH_CONFIG", &config))
+    };
+    for extra in [&[][..], &["--check"][..], &["--read-uncommitted"][..]] {
+        let r = with("flagged", CALL, extra);
+        assert_eq!(r.code, 5, "{extra:?}: {}", r.stdout);
+        assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSED, "{extra:?}");
+    }
+    // A later batch's call stops the batches before it too: the guard reads the whole input.
+    let r = with("flagged", &format!("SELECT 1\nGO\n{CALL}"), &[]);
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(r.stdout.contains("would read every page"), "{}", r.stdout);
+
+    // The classifier doesn't run in a run with writes on, so neither does this check.
+    assert_reached_connect(&with("flagged", CALL, &["--allow-write"]), "--allow-write");
+    assert_reached_connect(&with("allowed", CALL, &[]), "write_policy = allow");
+
+    for sql in [
+        "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'LIMITED')",
+        "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, NULL)",
+        "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'DETAILED')",
+        "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(N'Sales'), NULL, NULL, NULL, 'SAMPLED')",
+        "DECLARE @m sysname = N'DETAILED'; \
+         SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, @m)",
+        "DECLARE @d int; SELECT * FROM sys.dm_db_index_physical_stats(@d, NULL, NULL, NULL, 'DETAILED')",
+    ] {
+        assert_reached_connect(&with("flagged", sql, &[]), sql);
+    }
 }
 
 // plan-history.md 2.14: the read-only guard takes memory in proportion to the size of the input,
@@ -4165,6 +4232,14 @@ mod mcp {
                      too; aggregate by plan_id, execution_type and runtime_stats_interval_id; \
                      {READ_ONLY}"
                 ),
+            ),
+            // Decision 30(d): the rewrite alone, since read-only is not why it is refused.
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+                "sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would read every page of \
+                 every index in every database"
+                    .to_owned(),
+                "Name the database and object, or use 'LIMITED'".to_owned(),
             ),
         ];
         let lines: Vec<String> = (1..)
@@ -10775,6 +10850,36 @@ mod live {
             let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
             assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
             assert!(r.stdout.starts_with(csv), "{}", r.stdout);
+        }
+    }
+
+    // Decision 30(d): what the refusal offers runs. TOP (1) reads the first index it reaches and
+    // stops, so the call over every database costs the test server next to nothing, where the
+    // same call counted in full took over 45 s on a cold 2016 instance.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn what_the_wildcard_stats_refusal_offers_runs() {
+        let (p, db) = target();
+        for (sql, shape) in [
+            (
+                "SELECT TOP (1) database_id FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, \
+                 NULL, 'LIMITED')",
+                "database_id:smallint\n",
+            ),
+            (
+                "SELECT TOP (1) database_id FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, \
+                 NULL, NULL)",
+                "database_id:smallint\n",
+            ),
+            (
+                "SELECT COUNT_BIG(*) AS levels FROM sys.dm_db_index_physical_stats(DB_ID(), \
+                 OBJECT_ID(N'dbo.sqlh_scratch'), NULL, NULL, 'DETAILED')",
+                "levels:bigint\n",
+            ),
+        ] {
+            let r = live(&p, &db, &["-Q", sql]);
+            assert_eq!(r.code, 0, "{sql}\n{}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(shape), "{sql}\n{}", r.stdout);
         }
     }
 

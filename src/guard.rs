@@ -21,7 +21,8 @@ pub struct Blocked {
     pub advice: String,
     /// Whether `--allow-write` lifts the refusal (it skips the classifier). `advice` then
     /// offers it, except for `FLUSH_PROC`, which is no use under a profile that refuses it
-    /// (`advice_for`).
+    /// (`advice_for`). False too for `wildcard_stats`: that call is no write, so the flag is no
+    /// advice for it, though a run with writes allowed skips the classifier and so this check.
     pub lifted_by_write: bool,
     /// What to do short of writing, where there is something (`Use a #temp table`). For a
     /// refusal writing doesn't lift, the advice in `sqlh mcp`, which names no flag.
@@ -153,6 +154,13 @@ impl Token<'_> {
     /// True for a bare word spelled `keyword` in any case; `keyword` is upper case.
     fn is_word(&self, keyword: &str) -> bool {
         self.kind == Kind::Word && self.name.eq_ignore_ascii_case(keyword)
+    }
+
+    /// True for a name spelled `name` in any case, bare or quoted; `name` is upper case. The
+    /// server ignores trailing spaces in a quoted name (`[sys ]` is `sys`).
+    fn names(&self, name: &str) -> bool {
+        matches!(self.kind, Kind::Word | Kind::Quoted)
+            && self.name.trim_end_matches(' ').eq_ignore_ascii_case(name)
     }
 }
 
@@ -303,6 +311,124 @@ const FLUSH_PROC: &str = "SP_QUERY_STORE_FLUSH_DB";
 const FLUSH_INSTEAD: &str = "Read sys.query_store_runtime_stats instead: it has the rows not yet \
                              flushed too; aggregate by plan_id, execution_type and \
                              runtime_stats_interval_id";
+
+/// The function one call of which `wildcard_stats` refuses, by the last part of its name.
+const PHYSICAL_STATS: &str = "DM_DB_INDEX_PHYSICAL_STATS";
+
+/// What a call of `PHYSICAL_STATS` made of its arguments (`read_stats_call`).
+#[derive(Debug, PartialEq, Eq)]
+enum StatsCall {
+    Other,
+    /// All databases, in this mode.
+    Wildcard(&'static str),
+    /// Its arguments name the function more than `MAX_STATS_NAMED` times.
+    TooNested,
+}
+
+/// Reads a call of `PHYSICAL_STATS`, from just past its `(`. Only the literal is looked for, as
+/// decision 30(d) has it: an expression in the first or the fifth place is left to the server.
+///
+/// Only the second to the fourth arguments are read to their end. A scan stops at the first
+/// token of the first or the fifth that isn't its literal, and a call's own `sys` is such a token,
+/// so a scan reads past another call only in those three, where it counts them. So no token is
+/// read by more than `MAX_STATS_NAMED + 1` scans and the work stays linear, as in
+/// `passes_argument`.
+fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
+    let mut depth = 0usize;
+    let mut argument = 0;
+    let mut literal_read = false;
+    let mut mode = None;
+    let mut named = 0;
+    for t in scan {
+        match t.kind {
+            Kind::Punct('(') => depth += 1,
+            Kind::Punct(')') if depth > 0 => depth -= 1,
+            Kind::Punct(')') => return mode.map_or(StatsCall::Other, StatsCall::Wildcard),
+            // Six arguments are the server's error to report.
+            Kind::Punct(',') if depth == 0 && argument == 4 => return StatsCall::Other,
+            Kind::Punct(',') if depth == 0 => {
+                argument += 1;
+                literal_read = false;
+            }
+            _ if (1..=3).contains(&argument) => {
+                if t.names(PHYSICAL_STATS) {
+                    named += 1;
+                    if named > MAX_STATS_NAMED {
+                        return StatsCall::TooNested;
+                    }
+                }
+            }
+            // A second token makes it an expression (`NULL + 1`).
+            _ if literal_read => return StatsCall::Other,
+            _ if argument == 0 => {
+                if !t.is_word("NULL") && !t.is_word("DEFAULT") {
+                    return StatsCall::Other;
+                }
+                literal_read = true;
+            }
+            _ => {
+                mode = stats_mode(&t);
+                if mode.is_none() {
+                    return StatsCall::Other;
+                }
+                literal_read = true;
+            }
+        }
+    }
+    StatsCall::Other
+}
+
+/// The mode that scans, if `token` is the literal of one. The server takes it in any case, with
+/// trailing spaces, split by a backslash at a line's end, and as `"DETAILED"` under `SET
+/// QUOTED_IDENTIFIER OFF`; with that on it would be a column, which a call over every database
+/// has no reason to be given.
+fn stats_mode(token: &Token<'_>) -> Option<&'static str> {
+    let value = match token.kind {
+        Kind::Str => token
+            .text
+            .strip_prefix(['N', 'n'])
+            .unwrap_or(token.text)
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?,
+        Kind::Quoted if token.text.starts_with('"') => token.name,
+        _ => return None,
+    };
+    let joined;
+    let value = if value.contains('\\') {
+        joined = value.replace("\\\r\n", "").replace("\\\n", "");
+        &joined
+    } else {
+        value
+    };
+    let value = value.trim_end_matches(' ');
+    ["DETAILED", "SAMPLED"]
+        .into_iter()
+        .find(|mode| value.eq_ignore_ascii_case(mode))
+}
+
+/// The refusal of `sys.dm_db_index_physical_stats` over every database in a mode that scans
+/// (decision 30(d), command-categories.md §6.10). It isn't a write, so no flag is offered in any
+/// run: the rewrite is what gets past it. `-t` wouldn't do: it stops sqlh's wait, not the I/O and
+/// the buffer-pool churn the call has caused by then.
+fn wildcard_stats(line: u32, mode: &str) -> Blocked {
+    // `SAMPLED` reads a 1% sample of an index, and the whole of one under 10,000 pages (the
+    // function's documentation), so "every page" would be false of it.
+    let reads = if mode == "SAMPLED" {
+        "at least 1% of the pages"
+    } else {
+        "every page"
+    };
+    Blocked {
+        line,
+        reason: format!(
+            "sys.dm_db_index_physical_stats(NULL, ..., '{mode}') would read {reads} of every \
+             index in every database"
+        ),
+        advice: "Name the database and object, or use 'LIMITED'".into(),
+        lifted_by_write: false,
+        instead: None,
+    }
+}
 
 /// DBCC commands that only read.
 const DBCC_READ: &[&str] = &[
@@ -513,6 +639,10 @@ const MAX_OPEN_TOP: usize = 16_384;
 /// How many parentheses (opening and closing) the arguments of a procedure in `ARG_CHECKS`,
 /// which takes none, may have.
 const MAX_ARG_PARENS: usize = 8;
+
+/// How many times the second to the fourth arguments of `PHYSICAL_STATS` may name it. Nothing
+/// real does this at all; the limit is what keeps `read_stats_call` linear.
+const MAX_STATS_NAMED: usize = 8;
 
 /// How much work a batch's classification has done, shared by every `Lexer` copy made for it.
 struct Work {
@@ -1148,8 +1278,13 @@ impl<'a> Guard<'a> {
                     depth = depth.saturating_sub(1);
                 }
                 // Once something is held, a later keyword can't come first.
-                Kind::Word if held.is_none() => {
-                    if let Err(blocked) = self.classify(&token, &lex, depth, &mut open) {
+                Kind::Word | Kind::Quoted if held.is_none() => {
+                    let checked = if token.kind == Kind::Word {
+                        self.classify(&token, &lex, depth, &mut open)
+                    } else {
+                        self.check_physical_stats(&token, &lex)
+                    };
+                    if let Err(blocked) = checked {
                         if open.is_empty() {
                             return Err(blocked);
                         }
@@ -1243,6 +1378,7 @@ impl<'a> Guard<'a> {
                 }
             }
             "EXEC" | "EXECUTE" => self.check_exec(line, lex)?,
+            "SYS" => self.check_physical_stats(token, lex)?,
             "BEGIN" => {
                 let kinds = ["TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG"];
                 if let Some(w) = lex.word(0).and_then(|w| find_entry(&kinds, w)) {
@@ -1277,6 +1413,33 @@ impl<'a> Guard<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// `token` may be the `sys` of a call of `PHYSICAL_STATS`; `lex` is just past it. The call is
+    /// found from its `sys`: the server answers a bare, `dbo.` or `master..` name with error 208,
+    /// so `sys.` is the only way to the function, with a database in front or not.
+    fn check_physical_stats(&self, token: &Token<'a>, lex: &Lexer<'a>) -> Result<(), Blocked> {
+        if !token.names("SYS") {
+            return Ok(());
+        }
+        let mut call = lex.clone();
+        let is_call = call.next().is_some_and(|t| t.kind == Kind::Punct('.'))
+            && call.next().is_some_and(|t| t.names(PHYSICAL_STATS))
+            && call.next().is_some_and(|t| t.kind == Kind::Punct('('));
+        if !is_call {
+            return Ok(());
+        }
+        match read_stats_call(call) {
+            StatsCall::Other => Ok(()),
+            StatsCall::Wildcard(mode) => Err(wildcard_stats(token.line, mode)),
+            StatsCall::TooNested => Err(too_complex(
+                token.line,
+                &format!(
+                    "the arguments of sys.dm_db_index_physical_stats name it more than \
+                     {MAX_STATS_NAMED} times"
+                ),
+            )),
+        }
     }
 
     /// A write keyword (`what`, on `line`) whose target follows `lex`. After a `TOP n` or
@@ -2609,6 +2772,410 @@ mod tests {
         assert!(work_of(&many) < 30, "{}", work_of(&many));
         let spent = check_within("ALTER EVENT SESSION s", READ_ONLY, 0, 0).expect_err("refused");
         assert!(spent.reason.contains("too complex"), "{}", spent.reason);
+    }
+
+    // Decision 30(d), command-categories.md §6.10.
+    const STATS_DETAILED: &str = "sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would \
+                                  read every page of every index in every database";
+    const STATS_SAMPLED: &str = "sys.dm_db_index_physical_stats(NULL, ..., 'SAMPLED') would read \
+                                 at least 1% of the pages of every index in every database";
+    const STATS_REWRITE: &str = "Name the database and object, or use 'LIMITED'";
+
+    #[test]
+    fn the_wildcard_stats_call_is_refused_in_every_spelling_the_server_takes() {
+        let cases: &[(&str, u32, &str)] = &[
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'SAMPLED')",
+                1,
+                STATS_SAMPLED,
+            ),
+            // The first argument's two literals; the other arguments don't matter to the rule.
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(DEFAULT, DEFAULT, DEFAULT, DEFAULT, \
+                 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(null, 5, 1, 1, 'SAMPLED')",
+                1,
+                STATS_SAMPLED,
+            ),
+            // Any case, of the name, the keyword and the mode.
+            (
+                "select * from SYS.DM_DB_INDEX_PHYSICAL_STATS(Null, null, NULL, nULL, 'detailed')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM Sys.Dm_Db_Index_Physical_Stats(default, 1, 1, 1, 'SaMpLeD')",
+                1,
+                STATS_SAMPLED,
+            ),
+            // Quoted and qualified, as the server takes them, trailing spaces in a name too.
+            (
+                "SELECT * FROM [sys].[dm_db_index_physical_stats](NULL, NULL, NULL, NULL, \
+                 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM \"sys\".\"DM_DB_INDEX_PHYSICAL_STATS\"(NULL, NULL, NULL, NULL, \
+                 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.[dm_db_index_physical_stats](NULL, NULL, NULL, NULL, 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM [sys ].[dm_db_index_physical_stats  ](NULL, NULL, NULL, NULL, \
+                 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM master.sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, \
+                 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM [Sales DB].[sys].[dm_db_index_physical_stats](NULL, NULL, NULL, \
+                 NULL, 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            // How the mode is written: N'', n'', trailing spaces, a line continued by a backslash,
+            // "" under QUOTED_IDENTIFIER OFF.
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAI\\\nLED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, N'SAM\\\r\nPLED')",
+                1,
+                STATS_SAMPLED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, N'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, n'sampled')",
+                1,
+                STATS_SAMPLED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED  ')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SET QUOTED_IDENTIFIER OFF; SELECT * FROM sys.dm_db_index_physical_stats(NULL, \
+                 NULL, NULL, NULL, \"DETAILED\")",
+                1,
+                STATS_DETAILED,
+            ),
+            // Comments and newlines between any two tokens; the line is the name's.
+            (
+                "SELECT *\nFROM /* a */ sys -- b\n . /* c */ dm_db_index_physical_stats /* d */\n\
+                 ( -- e\n NULL /* f */ , NULL,\n NULL, NULL\n, /* 'LIMITED' */ 'DETAILED' -- g\n)",
+                2,
+                STATS_DETAILED,
+            ),
+            // Parentheses, around a literal and inside the arguments before the fifth.
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats((NULL), (NULL), ((NULL)), NULL, \
+                 ('DETAILED'))",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(((NULL)), NULL, NULL, NULL, \
+                 (('SAMPLED')))",
+                1,
+                STATS_SAMPLED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, OBJECT_ID((N'dbo.T')), \
+                 ISNULL((SELECT MAX(x) FROM (VALUES (1), (2)) AS v (x)), (1)), COALESCE(NULL, 1, \
+                 2), 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            // Wherever a table can be: a subquery, an APPLY, a later statement, a CTE, a branch.
+            (
+                "SELECT (SELECT COUNT(*) FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, \
+                 NULL, 'DETAILED')) AS n",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, \
+                 NULL, 'SAMPLED')) AS s",
+                1,
+                STATS_SAMPLED,
+            ),
+            (
+                "SELECT * FROM sys.databases AS d\nCROSS APPLY \
+                 sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED') AS s",
+                2,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.objects AS o\nOUTER APPLY \
+                 sys.dm_db_index_physical_stats(DEFAULT, o.object_id, NULL, NULL, 'DETAILED')",
+                2,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT 1;\nSELECT 2\nSELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, \
+                 NULL, NULL, 'DETAILED')",
+                3,
+                STATS_DETAILED,
+            ),
+            (
+                "WITH c AS (SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, \
+                 'DETAILED')) SELECT * FROM c",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "IF 1 = 1 SELECT * INTO #t FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, \
+                 NULL, 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            // The second of two calls, and one inside another's arguments, either way round.
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'LIMITED')\n\
+                 SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+                2,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, (SELECT MAX(object_id) FROM \
+                 sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED')), NULL, \
+                 NULL, 'DETAILED')",
+                1,
+                STATS_DETAILED,
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(), (SELECT MAX(object_id) \
+                 FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'SAMPLED')), NULL, \
+                 NULL, 'LIMITED')",
+                1,
+                STATS_SAMPLED,
+            ),
+        ];
+        for (sql, line, reason) in cases {
+            let b = blocked(sql);
+            assert_eq!((b.line, b.reason.as_str()), (*line, *reason), "{sql}");
+            assert_eq!(b.advice, STATS_REWRITE, "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_wildcard_stats_refusal_offers_no_flag_anywhere() {
+        let b = blocked("SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED')");
+        for off in [
+            None,
+            Some(WritesOff::Mcp),
+            Some(WritesOff::Profile("d".into())),
+        ] {
+            assert_eq!(b.advice_for(off.as_ref()), STATS_REWRITE, "{off:?}");
+        }
+    }
+
+    // Each of these reads, or is the server's to refuse; none is decision 30(d)'s call.
+    #[test]
+    fn stats_calls_that_are_not_the_wildcard_scan_are_allowed() {
+        for sql in [
+            // A mode that doesn't scan: the rewrite the refusal offers.
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'LIMITED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, N'limited')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, NULL)",
+            "SELECT * FROM sys.dm_db_index_physical_stats(DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT)",
+            // A database named: the other rewrite.
+            "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(N'Sales'), OBJECT_ID(N'dbo.T'), \
+             NULL, NULL, 'SAMPLED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(7, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM sys.databases AS d CROSS APPLY \
+             sys.dm_db_index_physical_stats(d.database_id, NULL, NULL, NULL, 'DETAILED')",
+            // A variable can't be seen (E3): DESIGN.md §7 says so.
+            "DECLARE @m sysname = N'DETAILED';\nSELECT * FROM \
+             sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, @m)",
+            "DECLARE @d int = NULL;\nSELECT * FROM sys.dm_db_index_physical_stats(@d, NULL, NULL, \
+             NULL, 'DETAILED')",
+            // Nor can an expression, or a literal other than the two decision 30(d) names.
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DET' + 'AILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL + 1, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(CAST(NULL AS int), 1, 1, 1, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(N'typo'), 1, 1, 1, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(0, NULL, NULL, NULL, 'DETAILED')",
+            // A column called NULL, or a mode that is no mode.
+            "SELECT * FROM t CROSS APPLY sys.dm_db_index_physical_stats([NULL], 1, 1, 1, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, [DETAILED])",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, ' DETAILED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILEDX')",
+            // Too few or too many arguments, or none, or a call never closed: the server's error.
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL)",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL)",
+            "SELECT * FROM sys.dm_db_index_physical_stats()",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED', 1)",
+            "SELECT * FROM sys.dm_db_index_physical_stats",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED'",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED",
+            // Text, not a call.
+            "SELECT 1 -- sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT 1 /* sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED') */",
+            "SELECT 'sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, ''DETAILED'')'",
+            "EXEC sp_describe_first_result_set N'SELECT * FROM \
+             sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, ''DETAILED'')'",
+            // Other names. The server has no function by the first three (error 208), so one by
+            // that name is someone's own.
+            "SELECT * FROM dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM dbo.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM master..dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT * FROM sys.dm_db_index_operational_stats(NULL, NULL, NULL, NULL)",
+            "SELECT * FROM sys.other(NULL, NULL, NULL, NULL, 'DETAILED')",
+            "SELECT sys, [sys], s.sys, [sys].x FROM t AS sys",
+        ] {
+            allowed(sql);
+        }
+        // The classifier's other rules still hold past a call it lets by.
+        assert_eq!(
+            blocked(
+                "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(), 1, 1, 1, 'LIMITED')\n\
+                 DELETE dbo.T"
+            )
+            .reason,
+            "DELETE dbo.T would write"
+        );
+    }
+
+    // It lives in the write classifier: --check runs that, and a run with writes allowed doesn't
+    // (DESIGN.md §7).
+    #[test]
+    fn the_wildcard_stats_call_is_a_read_only_runs_refusal() {
+        let sql = "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED')";
+        let check_only = Policy {
+            writes: false,
+            compile_only: true,
+        };
+        assert_eq!(check(sql, check_only).unwrap_err().reason, STATS_DETAILED);
+        for writes in [
+            Policy {
+                writes: true,
+                compile_only: false,
+            },
+            Policy {
+                writes: true,
+                compile_only: true,
+            },
+        ] {
+            assert_eq!(check(sql, writes), Ok(()), "{writes:?}");
+        }
+    }
+
+    // The earliest keyword's refusal, here as everywhere, with a `TOP (` clause open too.
+    #[test]
+    fn the_wildcard_stats_refusal_takes_its_place_in_the_text() {
+        const CALL: &str = "sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'DETAILED')";
+        let b = blocked(&format!("DELETE dbo.T\nSELECT * FROM {CALL}"));
+        assert_eq!((b.line, b.reason.as_str()), (1, "DELETE dbo.T would write"));
+        let b = blocked(&format!("SELECT * FROM {CALL}\nDELETE dbo.T"));
+        assert_eq!((b.line, b.reason.as_str()), (1, STATS_DETAILED));
+        // A write whose target comes after the call starts earlier in the text, so it comes first.
+        let b = blocked(&format!("DELETE TOP (SELECT 1 FROM {CALL}) FROM dbo.T"));
+        assert_eq!((b.line, b.reason.as_str()), (1, "DELETE dbo.T would write"));
+        // A write that passes leaves the call to be refused when the clause closes.
+        let b = blocked(&format!("DELETE TOP (SELECT 1 FROM {CALL}) FROM #t"));
+        assert_eq!((b.line, b.reason.as_str()), (1, STATS_DETAILED));
+    }
+
+    // The bounds under decision 30(d)'s lookahead: `read_stats_call` says why these hold.
+    #[test]
+    fn reading_stats_calls_takes_linear_work() {
+        // The real shape, about 8 MB of it: one bounded scan a call, on top of the pass.
+        for call in [
+            "DB_ID(), NULL, NULL, NULL, 'DETAILED'",
+            "NULL, NULL, NULL, NULL, 'LIMITED'",
+        ] {
+            let n = 100_000;
+            let sql = format!("SELECT * FROM sys.dm_db_index_physical_stats({call});\n").repeat(n);
+            allowed(&sql);
+            assert!(work_of(&sql) < 60 * n as u64, "{call}: {}", work_of(&sql));
+        }
+        // A refusal after all of that is found, on its own line.
+        let sql = format!(
+            "{}SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'SAMPLED')",
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, 'LIMITED')\n"
+                .repeat(100_000)
+        );
+        let b = blocked(&sql);
+        assert_eq!((b.line, b.reason.as_str()), (100_001, STATS_SAMPLED));
+
+        // Unclosed calls, each with the next in its arguments: the quadratic shape, cut off by
+        // the first call's scan, however long the input is.
+        let open = "sys.dm_db_index_physical_stats(NULL, ";
+        let too_deep = format!(
+            "this input is too complex for the read-only check: the arguments of \
+             sys.dm_db_index_physical_stats name it more than {MAX_STATS_NAMED} times"
+        );
+        for n in [MAX_STATS_NAMED + 2, 1_000, 100_000, 250_000] {
+            let sql = format!("SELECT * FROM {}", open.repeat(n));
+            let b = blocked(&sql);
+            assert_eq!((b.line, b.reason.as_str()), (1, too_deep.as_str()), "{n}");
+            assert!(b.advice.contains("--allow-write"), "{}", b.advice);
+            assert!(work_of(&sql) < 100, "{n}: {}", work_of(&sql));
+        }
+        // At the limit they pass, and a long tail costs each scan one read a token at most.
+        let nested = format!("SELECT * FROM {}", open.repeat(MAX_STATS_NAMED + 1));
+        allowed(&nested);
+        let scans = MAX_STATS_NAMED as u64 + 1;
+        for n in [10_000, 50_000, 100_000] {
+            let sql = format!("{nested}{}", "1 + ".repeat(n));
+            allowed(&sql);
+            let tokens = 2 * n as u64;
+            let main_pass = tokens;
+            assert!(
+                work_of(&sql) <= scans * tokens + main_pass + 1_000,
+                "{n}: {}",
+                work_of(&sql)
+            );
+        }
+        // The budget stands behind all this.
+        let sql = format!("{nested}{}", "1 + ".repeat(100_000));
+        let b = check_within(&sql, READ_ONLY, 1_000, 0).expect_err("over the budget");
+        assert!(b.reason.contains("token reads"), "{}", b.reason);
+
+        // A literal's parentheses are read by one scan, since the next call's `sys` stops it, in
+        // the first argument and in the fifth.
+        let n = 100_000;
+        let sql = "sys.dm_db_index_physical_stats((((((((".repeat(n);
+        let sql = format!("SELECT * FROM {sql}");
+        allowed(&sql);
+        assert!(work_of(&sql) < 30 * n as u64, "{}", work_of(&sql));
+        let sql = "sys.dm_db_index_physical_stats(NULL, 1, 1, 1, (((((((( ".repeat(n);
+        let sql = format!("SELECT * FROM {sql}");
+        allowed(&sql);
+        assert!(work_of(&sql) < 60 * n as u64, "{}", work_of(&sql));
+        // A mention of `sys` alone costs a look at the next token or three, no more.
+        let sql = format!("SELECT {}", "sys.sys.".repeat(n));
+        allowed(&sql);
+        assert!(work_of(&sql) < 12 * n as u64, "{}", work_of(&sql));
     }
 
     #[test]
