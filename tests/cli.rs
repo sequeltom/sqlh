@@ -5959,7 +5959,8 @@ mod live {
         (profile, database)
     }
 
-    /// `target()` for the test that changes the scratch database's compatibility level: it
+    /// `target()` for a test that can't share the scratch database: one that changes its
+    /// compatibility level, or reads its whole catalog while others make and drop objects. It
     /// waits until no other live test holds the scratch lock, here or in another process, and
     /// none starts until the lock it returns is dropped.
     fn target_alone() -> (fs::File, String, String) {
@@ -6137,7 +6138,11 @@ mod live {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let name = format!("dbo.probe_{}_{nanos}", std::process::id());
+            // The clock alone isn't enough: two tests released together by `target_alone`'s
+            // lock read the same tick and made the same table (2026-11-01).
+            static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("dbo.probe_{}_{nanos}_{n}", std::process::id());
             let mut cleanup = Cleanup::new(server.clone());
             cleanup.arm(format!("DROP TABLE IF EXISTS {name}"));
             let r = server.write(&format!("CREATE TABLE {name} (id int NOT NULL)"));
@@ -8899,11 +8904,13 @@ mod live {
     // section for a table, and what applies to views, procedures, functions and synonyms; `def`
     // prints a counted block; `find`, `find --text` and `tables` match names and bodies; a name
     // resolves case-insensitively but never outside an explicit schema; an ambiguous or unknown
-    // name, and another database, are refused with what to do. All read-only.
+    // name, and another database, are refused with what to do. All read-only. It runs alone:
+    // `find --text` reads the whole catalog at low deadlock priority, so other tests' DDL made
+    // it the victim (error 1205, 2026-11-01, PLAN.md, Carried over from finished work).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn schema_commands_describe_what_the_catalog_holds() {
-        let (p, db) = target();
+        let (_alone, p, db) = target_alone();
         let schema = Schema::create(&p, &db);
         let run = |args: &[&str]| live(&p, &db, args);
         let ok = |args: &[&str]| {
