@@ -69,7 +69,7 @@ The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mc
 
 ### Profiles
 
-A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line.
+A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line. Profiles are saved in `%USERPROFILE%\.sqlh\profiles.toml`, where your shell and any agent read the same file; profiles from an older sqlh, under `%APPDATA%`, move there by themselves.
 
 ```powershell
 sqlh profiles add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"

@@ -13,6 +13,7 @@ Sizes: **S** is up to half a day, **M** is 1–2 days, **L** is longer. Each pha
 What the finished records left open and is still open (checked 2026-11-01 against the later records, AGENTS.md's Status and the code):
 - **The timeout trial:** agent trial 3 met no timeout (the profile's 60 s), so how a model reads a `-t` stop and recovers is untried; Phase 7 counts it (plan-history.md, Phase 5: connection reuse).
 - **The flake `the_read_uncommitted_note_counts_against_the_output_cap`:** fails now and then under a full parallel live run; when it fails, record its figures and diagnose it before any bound is loosened (AGENTS.md, Tests) (plan-history.md, R45 fix verification).
+- **A live test's deadlock with its neighbours (2026-11-01):** `schema_commands_describe_what_the_catalog_holds` failed once in three debug runs on SQL Server 2016, 60 of 61 passing: its `find @count --text` read the catalog of `sqlh_test` for 5,372 ms and was the deadlock victim (error 1205, severity 13, state 56, exit 1), reported correctly. The other live tests make and drop objects in that database at the same time under the shared scratch lock, and sqlh's session setup runs at low deadlock priority (decision 7), so the likely cause is the test's sharing, not sqlh; that is an inference, since the deadlock graph wasn't captured. Not seen on 2025, nor in three release runs on 2016. Possible fix: the test takes `target_alone()`. Not rerun to make it pass (AGENTS.md, Tests).
 - **The one-off live failure at `9b5318d`:** one debug live test failed once, its name not kept; the possible cause found in 5.4 (one `Reader` login name per test process, fixed in `fbbe1a8`) is not confirmed; if it recurs, keep the test's name and output (plan-history.md, Phase 5.2 and 5.3 review fixes).
 - **An IPv6 address with an instance name** (`addr\INST`): no TCP-only spelling, since a port replaces the instance, so a pipe open can follow a failed TCP connect (`db::data_source`, connect-failures.md); `addr,port` avoids it (plan-history.md, Phase 2 follow-up).
 - **`text`, `ntext` and `image` are read whole:** the driver has no streaming path for them (upstream-issues.md U3) and refuses a value past 100 MB (exit 10; DESIGN.md §11) (plan-history.md, Phase 2 follow-up).
@@ -51,11 +52,23 @@ The owner ran `sqlh mcp` from Claude Desktop (chat and Cowork) against a real SQ
    - (b) `info`: the name the connection dialed, the availability group role (`sys.dm_hadr_availability_replica_states`, which needs `VIEW SERVER STATE`), and the time zone name where the server has `CURRENT_TIMEZONE()` (2019 and later). Its catalog SQL must still run on 2016, which the client used.
 4. **Declined:** a key=value status line (`format: json` is that), cut markers moved to a footer, and the `definition` line count (correct). The reasons are in the note.
 
-### The profiles file under a packaged app (found 2026-11-01; open, an owner decision)
+### The profiles file under a packaged app (found and built 2026-11-01, decision 53)
 
-The Claude desktop app is a packaged (MSIX) Windows app, and Windows redirects `%APPDATA%` for what it starts, so sqlh there can read a different `profiles.toml` from the one a user's shell writes. Measured from a Code-tab shell: `C:\Users\<user>\AppData\Roaming\sqlh\profiles.toml` is served from `...\AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\sqlh\profiles.toml`, where it was first written from inside the package; a profile added in the user's shell, or in the app's Terminal panel, wrote the real Roaming file and never appeared there. The run fails with `no profile named "..."` and nothing says why. Credential Manager isn't split: both sides find the same stored password. Not measured: `sqlh mcp` launched by the app (the owner's earlier Cowork and Desktop runs worked, with their profiles not traced to a file), and a machine with no copy in the package's cache, where a read should fall through to the real file. The workaround is `SQLH_CONFIG`, a path outside `AppData`.
+The Claude desktop app is a packaged (MSIX) Windows app, and Windows redirects `%APPDATA%` for what it starts. A Code-tab shell's `C:\Users\<user>\AppData\Roaming\sqlh\profiles.toml` was served from `...\AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\sqlh\profiles.toml`; a profile added in the user's shell, or in the app's Terminal panel, wrote the real Roaming file and never appeared there, and the run failed with `no profile named "..."` and nothing to say why. Credential Manager isn't split.
 
-Options: keep the profiles file outside `AppData` (`%USERPROFILE%\.sqlh`, with a one-time move from today's path, as the move from `sqlharness` did, DESIGN.md §8); or keep the path and have the error name the file it read and the cause.
+Probes with throwaway files, between a Code-tab shell (in the package) and the Terminal panel (not):
+
+| Case | Result |
+|---|---|
+| A folder the real `AppData` has first; the package reads, adds to and changes files in it | passes through to the real files; nothing in the cache |
+| A folder the package made first; the same name then made outside | the package sees only its cached copy |
+| The package deletes its cached copy | the real file appears to it |
+| The package deletes that real file | the real file is gone |
+| The package writes under `%USERPROFILE%` | a real file, read from outside |
+
+Built: the file is `%USERPROFILE%\.sqlh\profiles.toml`, and runs bring in what's under `%APPDATA%` (DESIGN.md §8). On the owner's machine, from a Code-tab shell, one `profiles list` took the cached copy (two profiles), then the real file behind it (a third): nothing lost, no conflict, the cached copy's `default` kept, and the Terminal panel then read the same file. `test` and `test2016` connect with the passwords already stored, and `sqlh mcp` run from that shell does too. Tests: unit tests in `config.rs` (a copy, a merge, a difference set aside, a broken file, a file that can't be removed, both moves in a row) and one process-level test. The uncovering of a real file can't be arranged in a test, so it rests on the probes and that one run.
+
+Not measured: `sqlh mcp` launched by the desktop app itself, as its configured server; it should be the same as the Code-tab shell, also a child of the package. This touches where credentials' profiles are read, so it goes in the next external review (decision 52).
 
 ### Setting the default profile (owner, 2026-10-26, from manual testing; planned, not started)
 
@@ -271,10 +284,12 @@ Decided 2026-10-11, except where an item gives a later date:
     - **Before any release** (`0.1.0`, each `0.1.x`): every change since the last external review is covered by one.
     - **Why:** the reviews find real defects (R35–R39, R42, R48, R49), but R50, a one-line test fix, took a full brief, review and verification round, as R46's and R47's verifications did for little.
 
+53. **The profiles file moves out of `%APPDATA%`, to `%USERPROFILE%\.sqlh\profiles.toml` (owner decision, 2026-11-01).** Windows redirects `%APPDATA%` for packaged apps, so a user's shell and an agent started by the Claude desktop app could read different files, and the failure, `no profile named`, says nothing about why (§4, The profiles file under a packaged app). The alternative, keeping the path and explaining it in the error, would have left every colleague needing `SQLH_CONFIG`. Runs bring in what's under `%APPDATA%`, merging two copies without losing a profile (DESIGN.md §8); passwords stay in Credential Manager, unchanged.
+
 ## 7. First-release checklist (replaces the spike's "still to verify")
 
 - [x] SQL Server 2016 SP3 (decision 49): the smoke script and the live tests pass against the owner's 2016 instance, version-specific tests with their 2016 expectations (2026-11-01; rerun before the release, §4, SQL Server 2016 support)
-- [ ] The profiles file under a packaged client: a profile added in the user's own shell reaches sqlh started by the Claude desktop app (§4, The profiles file under a packaged app)
+- [ ] The profiles file under a packaged client: `sqlh mcp`, configured in the Claude desktop app, finds a profile added in the user's own shell (decision 53; a Code-tab shell does, §4, The profiles file under a packaged app)
 - [ ] Clean Windows 11 x64 workstation (§6.1): runs with no installs, `dumpbin` imports are in-box only, and the size is within budget
 - [ ] Against a remote SQL Server 2025 over a real network: connect latency measured (plan-history.md 2.1 measured the dev LAN; the release environment is still to do), encryption modes mandatory and strict
 - [ ] SQL Server 2025 **Standard** (not only Standard Developer): SQL auth, and Windows auth (decision 50: NTLM through a local Windows user on the test server; Kerberos recorded as unchecked unless a domain is at hand)

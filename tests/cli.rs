@@ -3673,15 +3673,17 @@ fn a_new_profile_refuses_writes_and_its_refusals_say_so() {
     assert!(section("sqlh-ut-flag").contains("\nwrite_policy = \"flag\"\n"));
 }
 
-// The rename to sqlh (DESIGN.md §8): profiles saved under %APPDATA%\sqlharness move to
-// %APPDATA%\sqlh the first time sqlh reads them, comments and all, and the old file goes. A
-// file already at the new place is never overwritten, and an SQLH_CONFIG file is never
-// moved. Windows-auth profiles only, so no password is involved; the move of stored passwords
-// has its own test against the real Credential Manager (`credman_moves_a_legacy_credential`).
+// The earlier places (DESIGN.md §8): profiles saved under %APPDATA%\sqlharness or
+// %APPDATA%\sqlh move to %USERPROFILE%\.sqlh the first time sqlh reads them, comments and all,
+// and the old file goes. A file already at the new place is never overwritten, and an
+// SQLH_CONFIG file is never moved. Windows-auth profiles only, so no password is involved; the
+// move of stored passwords has its own test against the real Credential Manager
+// (`credman_moves_a_legacy_credential`).
 #[test]
-fn profiles_from_before_the_rename_move_to_the_new_folder() {
+fn profiles_from_earlier_places_move_to_the_new_folder() {
     let appdata = scratch("rename_migration");
-    let (old_dir, new_dir) = (appdata.join("sqlharness"), appdata.join("sqlh"));
+    let home = scratch("rename_migration_home");
+    let (old_dir, new_dir) = (appdata.join("sqlharness"), home.join(".sqlh"));
     let old_text = "# saved by an earlier sqlh\ndefault = \"dev\"\n\n[profiles.dev]\n\
                     server = \"127.0.0.1,1\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n";
     let list = || {
@@ -3689,6 +3691,7 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
         command
             .env_remove("SQLH_CONFIG")
             .env("APPDATA", &appdata)
+            .env("USERPROFILE", &home)
             .args(["profiles", "list"]);
         run(&mut command)
     };
@@ -3721,6 +3724,21 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     assert!(!r.stdout.contains("stale"), "{}", r.stdout);
     assert!(old_dir.join("profiles.toml").exists());
 
+    // A copy under %APPDATA%\sqlh, as a packaged app's shell or an earlier sqlh left it, adds
+    // what the new file lacks, and goes.
+    let appdata_dir = appdata.join("sqlh");
+    fs::create_dir_all(&appdata_dir).unwrap();
+    fs::write(
+        appdata_dir.join("profiles.toml"),
+        "[profiles.qa]\nserver = \"qa\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n",
+    )
+    .unwrap();
+    let r = list();
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    assert!(r.stdout.contains("\ndev\t1\t127.0.0.1,1\t"), "{}", r.stdout);
+    assert!(r.stdout.contains("\nqa\t0\tqa\t"), "{}", r.stdout);
+    assert!(!appdata_dir.exists(), "the copy under APPDATA is gone");
+
     // An SQLH_CONFIG file is used where it is, with no move.
     let elsewhere = scratch("rename_migration_config");
     let config = elsewhere.join("profiles.toml");
@@ -3729,10 +3747,11 @@ fn profiles_from_before_the_rename_move_to_the_new_folder() {
     command
         .env("SQLH_CONFIG", &config)
         .env("APPDATA", &elsewhere)
+        .env("USERPROFILE", &elsewhere)
         .args(["profiles", "list"]);
     let r = run(&mut command);
     assert_eq!(r.code, 0, "{}", r.stdout);
-    assert!(config.exists() && !elsewhere.join("sqlh").exists());
+    assert!(config.exists() && !elsewhere.join(".sqlh").exists());
 }
 
 // docs/mcp-mode.md §2 and §3 (plan-history.md 5.3), through the real binary with no server: launch
@@ -11430,8 +11449,8 @@ mod live {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA is set"))
-                        .join("sqlh")
+                    PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE is set"))
+                        .join(".sqlh")
                         .join("profiles.toml")
                 });
             let text = fs::read_to_string(&path)

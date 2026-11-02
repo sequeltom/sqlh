@@ -1,6 +1,6 @@
 //! Connection profiles (DESIGN.md §8) and settings resolution.
 //!
-//! The file is `%APPDATA%\sqlh\profiles.toml` (override: `SQLH_CONFIG`), read with a
+//! The file is `%USERPROFILE%\.sqlh\profiles.toml` (override: `SQLH_CONFIG`), read with a
 //! small strict parser for the TOML subset we write: a top-level `default`, `[profiles.NAME]`
 //! tables, and string / integer / boolean values. Passwords are never in this file.
 //!
@@ -226,7 +226,7 @@ pub fn path() -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
-    default_paths().map(|(path, _)| path)
+    default_path()
 }
 
 /// How long a profile edit, the one-time migration, or a run whose stored password doesn't
@@ -277,21 +277,41 @@ pub fn fits(binding: &credman::Binding, profile: &Profile) -> bool {
             .is_none_or(|id| *id == identity(profile))
 }
 
-/// The profiles file at its default place, and where it was before the project was named sqlh.
-fn default_paths() -> Result<(PathBuf, PathBuf), String> {
-    let appdata = std::env::var_os("APPDATA")
+/// The profiles file at its default place. Not under `%APPDATA%`, which Windows redirects for
+/// a packaged app, so a harness and the user's shell would read different files (decision 53).
+fn default_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("USERPROFILE")
         .filter(|p| !p.is_empty())
-        .ok_or("APPDATA is not set; set SQLH_CONFIG to the profiles file path")?;
-    let appdata = PathBuf::from(appdata);
-    Ok((
-        appdata.join("sqlh").join("profiles.toml"),
-        appdata.join("sqlharness").join("profiles.toml"),
-    ))
+        .ok_or("USERPROFILE is not set; set SQLH_CONFIG to the profiles file path")?;
+    Ok(PathBuf::from(home).join(".sqlh").join("profiles.toml"))
+}
+
+/// Where earlier versions kept the profiles file.
+struct OldFiles {
+    /// `%APPDATA%\sqlh`, until decision 53.
+    appdata: PathBuf,
+    /// `%APPDATA%\sqlharness`, before the project was named sqlh.
+    sqlharness: PathBuf,
+}
+
+impl OldFiles {
+    fn at_default_places() -> Option<Self> {
+        let appdata = std::env::var_os("APPDATA").filter(|p| !p.is_empty())?;
+        let appdata = PathBuf::from(appdata);
+        Some(OldFiles {
+            appdata: appdata.join("sqlh").join("profiles.toml"),
+            sqlharness: appdata.join("sqlharness").join("profiles.toml"),
+        })
+    }
+
+    fn due(&self, new: &Path) -> bool {
+        self.appdata.exists() || (!new.exists() && self.sqlharness.exists())
+    }
 }
 
 /// Loads the profiles file; a missing file is an empty config. At the default place, profiles
-/// saved before the rename are moved across first (`migrate_from_sqlharness`), under the
-/// profiles lock. A caller that already holds the lock uses `load_locked`.
+/// from an earlier place are brought across first (`bring_across`), under the profiles lock.
+/// A caller that already holds the lock uses `load_locked`.
 pub fn load() -> Result<Config, String> {
     load_with(false)
 }
@@ -305,11 +325,11 @@ pub fn load_locked() -> Result<Config, String> {
 fn load_with(locked: bool) -> Result<Config, String> {
     let path = path()?;
     let old = if std::env::var_os("SQLH_CONFIG").is_none_or(|p| p.is_empty()) {
-        Some(default_paths()?.1)
+        OldFiles::at_default_places()
     } else {
         None
     };
-    load_at(&path, old.as_deref(), locked, &move_password)
+    load_at(&path, old.as_ref(), locked, &move_password)
 }
 
 /// The real move of one profile's password, for the migration.
@@ -317,24 +337,24 @@ fn move_password(profile: &Profile) -> std::io::Result<()> {
     credman::move_legacy(&profile.name, &identity(profile)).map(|_| ())
 }
 
-/// Loads the profiles file at `path`, first moving the one at `old` across if that is due.
-/// The check that a move is due is repeated under the lock, so of two runs that both see it
-/// due, the second finds it done (R21); `locked` says the caller holds the lock already.
+/// Loads the profiles file at `path`, first bringing across any at the `old` places if that is
+/// due. The check that a move is due is repeated under the lock, so of two runs that both see
+/// it due, the second finds it done (R21); `locked` says the caller holds the lock already.
 fn load_at(
     path: &Path,
-    old: Option<&Path>,
+    old: Option<&OldFiles>,
     locked: bool,
     move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
 ) -> Result<Config, String> {
     if let Some(old) = old
-        && migration_due(path, old)
+        && old.due(path)
     {
         let _lock = if locked {
             None
         } else {
             Some(files::lock(path, LOCK_WAIT).map_err(|e| e.to_string())?)
         };
-        migrate_from_sqlharness(path, old, move_password)?;
+        bring_across(path, old, move_password)?;
     }
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text).map_err(|e| format!("{}:{e}", path.display())),
@@ -343,16 +363,111 @@ fn load_at(
     }
 }
 
+/// The moves to the file at `new` (DESIGN.md §8). The caller holds the profiles lock. Twice at
+/// most for `%APPDATA%`: under a packaged app, removing the app's own copy uncovers the real
+/// file behind it, so one run takes both (measured 2026-11-01, PLAN.md decision 53).
+fn bring_across(
+    new: &Path,
+    old: &OldFiles,
+    move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if !new.exists() {
+        migrate_from_sqlharness(&old.appdata, &old.sqlharness, move_password)?;
+    }
+    for _ in 0..2 {
+        if old.appdata.exists() {
+            absorb(new, &old.appdata)?;
+        }
+    }
+    Ok(())
+}
+
+/// Moves the profiles in `old` into the file at `new`, then removes `old`. With no file at
+/// `new` it is copied as it is, comments included. Otherwise a profile `new` lacks is added,
+/// and one that differs keeps `new`'s version, the other staying readable in a file set aside
+/// and named on stderr, so no profile is lost. Stored passwords are by profile name, wherever
+/// the file is, so they stay where they are. A file left behind would add back a profile
+/// removed later, so failing to remove it is an error.
+fn absorb(new: &Path, old: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(old).map_err(|e| format!("{}: {e}", old.display()))?;
+    let incoming = parse(&text).map_err(|e| format!("{}:{e}", old.display()))?;
+    if new.exists() {
+        let current =
+            std::fs::read_to_string(new).map_err(|e| format!("{}: {e}", new.display()))?;
+        let mut merged = parse(&current).map_err(|e| format!("{}:{e}", new.display()))?;
+        let before = merged.clone();
+        let mut differ = Vec::new();
+        for profile in incoming.profiles {
+            match merged.find(&profile.name) {
+                None => merged.upsert(profile),
+                Some(kept) if *kept == profile => {}
+                Some(_) => differ.push(profile.name),
+            }
+        }
+        if merged.default.is_none() {
+            merged.default = incoming.default;
+        }
+        if merged != before {
+            save_at(new, &merged)?;
+        }
+        if !differ.is_empty() {
+            let aside = set_aside(new, &text)?;
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "sqlh: {} differed in {}: kept the one in {}; the other is in {}",
+                differ.join(", "),
+                old.display(),
+                new.display(),
+                aside.display()
+            );
+        }
+    } else {
+        if let Some(dir) = new.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        files::replace(new, text.as_bytes()).map_err(|e| format!("{}: {e}", new.display()))?;
+    }
+    std::fs::remove_file(old).map_err(|e| {
+        format!(
+            "{}: {e}; its profiles are now in {}, so remove it by hand",
+            old.display(),
+            new.display()
+        )
+    })?;
+    let mut lock = old.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(lock);
+    if let Some(dir) = old.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
+/// Writes `text` to a new file beside `new`, never over an earlier one.
+fn set_aside(new: &Path, text: &str) -> Result<PathBuf, String> {
+    let dir = new.parent().unwrap_or(Path::new(""));
+    let mut aside = dir.join("profiles.from-appdata.toml");
+    let mut n = 1;
+    while aside.exists() {
+        n += 1;
+        aside = dir.join(format!("profiles.from-appdata-{n}.toml"));
+    }
+    files::replace(&aside, text.as_bytes()).map_err(|e| format!("{}: {e}", aside.display()))?;
+    Ok(aside)
+}
+
 fn migration_due(new: &Path, old: &Path) -> bool {
     !new.exists() && old.exists()
 }
 
 /// The one-time move of profiles saved before the project was named sqlh (DESIGN.md §8):
-/// `%APPDATA%\sqlharness\profiles.toml` to `%APPDATA%\sqlh\profiles.toml`, and each SQL
-/// login's stored password from `sqlharness:<profile>` to `sqlh:<profile>`, bound to that
-/// profile's identity (R20). The caller holds the profiles lock, so no edit or other
-/// migration runs meanwhile, and this checks again that the move is due: it runs only while
-/// the new file doesn't exist and the old one does (R21), and never for a `SQLH_CONFIG` file.
+/// `%APPDATA%\sqlharness\profiles.toml` to `%APPDATA%\sqlh\profiles.toml`, from where `absorb`
+/// takes it, and each SQL login's stored password from `sqlharness:<profile>` to
+/// `sqlh:<profile>`, bound to that profile's identity (R20). The caller holds the profiles
+/// lock, so no edit or other migration runs meanwhile, and this checks again that the move is
+/// due: it runs only while the new file doesn't exist and the old one does (R21), and never
+/// for a `SQLH_CONFIG` file.
 /// The passwords move first and the file last, and each step can be repeated, so a move cut
 /// short by an error is finished by the next run. The file is copied as it is, comments
 /// included.
@@ -1300,10 +1415,29 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("sqlh-migration-{test}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            let new = dir.join("sqlh").join("profiles.toml");
+            let new = dir.join(".sqlh").join("profiles.toml");
             let old = dir.join("sqlharness").join("profiles.toml");
             std::fs::create_dir_all(old.parent().unwrap()).unwrap();
             std::fs::write(&old, OLD).unwrap();
+            (dir, new, old)
+        }
+
+        /// The earlier places, with `%APPDATA%\sqlh` empty until a test writes it.
+        fn places(sqlharness: &Path) -> OldFiles {
+            let appdata = sqlharness.parent().unwrap().parent().unwrap();
+            OldFiles {
+                appdata: appdata.join("sqlh").join("profiles.toml"),
+                sqlharness: sqlharness.to_owned(),
+            }
+        }
+
+        /// A folder for the moves from `%APPDATA%\sqlh`: the new file's path, and the
+        /// earlier places, holding nothing yet.
+        fn appdata_folder(test: &str) -> (PathBuf, PathBuf, OldFiles) {
+            let (dir, new, sqlharness) = folder(test);
+            std::fs::remove_file(&sqlharness).unwrap();
+            let old = places(&sqlharness);
+            std::fs::create_dir_all(old.appdata.parent().unwrap()).unwrap();
             (dir, new, old)
         }
 
@@ -1344,7 +1478,7 @@ mod tests {
         /// if that is due), change, save.
         fn edit(new: &Path, old: &Path, change: Change) {
             let _lock = files::lock(new, LOCK_WAIT).unwrap();
-            let mut config = load_at(new, Some(old), true, &|_| Ok(())).unwrap();
+            let mut config = load_at(new, Some(&places(old)), true, &|_| Ok(())).unwrap();
             change(&mut config);
             save_at(new, &config).unwrap();
         }
@@ -1401,12 +1535,13 @@ mod tests {
                 let lock = files::lock(&new, LOCK_WAIT).unwrap();
                 std::thread::scope(|scope| {
                     let first = scope.spawn(|| {
-                        load_at(&new, Some(&old), false, &|_| panic!("moved twice")).unwrap()
+                        load_at(&new, Some(&places(&old)), false, &|_| panic!("moved twice"))
+                            .unwrap()
                     });
                     std::thread::sleep(Duration::from_millis(200));
                     assert!(!first.is_finished(), "{what}: the load didn't wait");
                     // The other sqlh's edit, under the lock it holds.
-                    let mut config = load_at(&new, Some(&old), true, &|_| Ok(())).unwrap();
+                    let mut config = load_at(&new, Some(&places(&old)), true, &|_| Ok(())).unwrap();
                     change(&mut config);
                     save_at(&new, &config).unwrap();
                     drop(lock);
@@ -1432,7 +1567,7 @@ mod tests {
             let loaded: Vec<Config> = std::thread::scope(|scope| {
                 let load = || {
                     barrier.wait();
-                    load_at(&new, Some(&old), false, &mover).unwrap()
+                    load_at(&new, Some(&places(&old)), false, &mover).unwrap()
                 };
                 let a = scope.spawn(load);
                 let b = scope.spawn(load);
@@ -1450,12 +1585,149 @@ mod tests {
         fn without_an_old_file_nothing_moves() {
             let (dir, new, old) = folder("nothing");
             std::fs::remove_file(&old).unwrap();
-            let none = load_at(&new, Some(&old), false, &|_| panic!("moved")).unwrap();
+            let none = load_at(&new, Some(&places(&old)), false, &|_| panic!("moved")).unwrap();
             assert_eq!(none, Config::default());
             std::fs::write(&old, OLD).unwrap();
             let config = load_at(&new, None, false, &|_| panic!("moved")).unwrap();
             assert_eq!(config, Config::default());
             assert!(old.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        const WIN: &str = "server = \"srv\"\nauth = \"windows\"\nwrite_policy = \"flag\"\n";
+
+        fn no_password_moves(_: &Profile) -> std::io::Result<()> {
+            panic!("a password moved")
+        }
+
+        // Decision 53: with no file at the new place, the old one is copied as it is and goes,
+        // with its lock file and its empty folder.
+        #[test]
+        fn profiles_under_appdata_move_out_as_they_are() {
+            let (dir, new, old) = appdata_folder("appdata-copy");
+            let text = format!("# by hand\n[profiles.dev]\n{WIN}");
+            std::fs::write(&old.appdata, &text).unwrap();
+            std::fs::write(old.appdata.with_extension("toml.lock"), "").unwrap();
+            let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+            assert!(config.find("dev").is_some());
+            assert_eq!(std::fs::read_to_string(&new).unwrap(), text);
+            assert!(!old.appdata.parent().unwrap().exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Decision 53: a packaged app's copy and the user's file can hold different profiles.
+        // The second to arrive adds what the first lacks, and the default stays unless there
+        // was none.
+        #[test]
+        fn a_second_copy_adds_the_profiles_the_first_lacks() {
+            let (dir, new, old) = appdata_folder("appdata-merge");
+            std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+            std::fs::write(
+                &new,
+                format!("default = \"dev\"\n\n[profiles.dev]\n{WIN}\n[profiles.same]\n{WIN}"),
+            )
+            .unwrap();
+            std::fs::write(
+                &old.appdata,
+                format!("default = \"qa\"\n\n[profiles.qa]\n{WIN}\n[profiles.same]\n{WIN}"),
+            )
+            .unwrap();
+            let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+            let names: Vec<_> = config.profiles.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["dev", "same", "qa"]);
+            assert_eq!(config.default.as_deref(), Some("dev"));
+            assert!(!old.appdata.exists());
+            assert!(
+                !dir.join(".sqlh")
+                    .join("profiles.from-appdata.toml")
+                    .exists()
+            );
+
+            std::fs::write(&new, format!("[profiles.dev]\n{WIN}")).unwrap();
+            std::fs::create_dir_all(old.appdata.parent().unwrap()).unwrap();
+            std::fs::write(
+                &old.appdata,
+                format!("default = \"dev\"\n[profiles.dev]\n{WIN}"),
+            )
+            .unwrap();
+            let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+            assert_eq!(config.default.as_deref(), Some("dev"), "there was none");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Decision 53: a profile that differs keeps the new file's version, and the other stays
+        // readable in a file set aside, never over an earlier one.
+        #[test]
+        fn a_profile_that_differs_is_set_aside_not_lost() {
+            let (dir, new, old) = appdata_folder("appdata-differs");
+            std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+            let kept = format!("[profiles.dev]\n{WIN}");
+            std::fs::write(&new, &kept).unwrap();
+            let other = kept.replace("srv", "elsewhere");
+            for aside in ["profiles.from-appdata.toml", "profiles.from-appdata-2.toml"] {
+                std::fs::create_dir_all(old.appdata.parent().unwrap()).unwrap();
+                std::fs::write(&old.appdata, &other).unwrap();
+                let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+                assert_eq!(config.find("dev").unwrap().server.as_deref(), Some("srv"));
+                let aside = new.parent().unwrap().join(aside);
+                assert_eq!(std::fs::read_to_string(aside).unwrap(), other);
+                assert!(!old.appdata.exists());
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // A file that can't be read as profiles stops the move with its name, and nothing is
+        // lost: an error here is one the user can act on, a dropped file isn't.
+        #[test]
+        fn a_broken_old_file_stops_the_move_and_stays() {
+            let (dir, new, old) = appdata_folder("appdata-broken");
+            std::fs::write(&old.appdata, "not profiles").unwrap();
+            let error = load_at(&new, Some(&old), false, &no_password_moves).unwrap_err();
+            assert!(
+                error.contains(&old.appdata.display().to_string()),
+                "{error}"
+            );
+            assert!(old.appdata.exists() && !new.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Left in place, the old file would add back a profile removed later, so a failure to
+        // remove it is an error that names it. The next run finishes the move.
+        #[cfg(windows)]
+        #[test]
+        fn an_old_file_that_cannot_be_removed_is_an_error() {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_SHARE_READ: u32 = 1;
+            let (dir, new, old) = appdata_folder("appdata-held");
+            std::fs::write(&old.appdata, format!("[profiles.dev]\n{WIN}")).unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&old.appdata)
+                .unwrap();
+            let error = load_at(&new, Some(&old), false, &no_password_moves).unwrap_err();
+            assert!(error.contains("remove it by hand"), "{error}");
+            drop(held);
+            let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+            assert!(config.find("dev").is_some());
+            assert!(!old.appdata.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Profiles from before the rename come all the way, with their passwords moved.
+        #[test]
+        fn profiles_from_before_the_rename_come_all_the_way() {
+            let (dir, new, old) = folder("both-moves");
+            let moved = AtomicUsize::new(0);
+            let mover = |_: &Profile| {
+                moved.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+            let places = places(&old);
+            let config = load_at(&new, Some(&places), false, &mover).unwrap();
+            assert_eq!(config, parse(OLD).unwrap());
+            assert_eq!(moved.load(Ordering::SeqCst), 1);
+            assert!(new.exists() && !old.exists() && !places.appdata.exists());
             let _ = std::fs::remove_dir_all(dir);
         }
     }
