@@ -43,8 +43,8 @@ impl Blocked {
         }
     }
 
-    /// A refusal of what sqlh doesn't know, so it doesn't call it a write (decision 23). `tail`
-    /// is the run's `Guard::as_written`.
+    /// A refusal of what sqlh doesn't know to write, so it doesn't call it a write (decision 23).
+    /// `tail` is the run's `Guard::as_written`.
     fn unknown(line: u32, reason: String, tail: &str) -> Blocked {
         Blocked {
             line,
@@ -413,7 +413,8 @@ fn in_list(list: &[&str], name: &str) -> bool {
     find_entry(list, name).is_some()
 }
 
-/// The longest word the main loop acts on: OPENDATASOURCE, with 14 letters.
+/// The longest word the main loop acts on through `keyword`: OPENDATASOURCE, with 14 letters.
+/// `SENDS_TEXT_OUT` is longer, so `keyword` gives "" for it, and its arm reads the token.
 const KEYWORD_MAX: usize = 16;
 
 /// The words the `match`es on `keyword` act on that the servers don't reserve (measured on both,
@@ -472,6 +473,13 @@ fn keyword<'b>(name: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> &'b str {
         _ => "",
     }
 }
+
+/// A word blocked like those of `BLOCKED` that writes nothing, so its refusal says what it does
+/// instead: on SQL Server 2025 this function can send its text to an outside endpoint, which no
+/// rollback calls back (decision 55, DESIGN.md §7). The servers reach it by this bare word alone, in
+/// any case, so it goes by `Token::is_word`: each BMP code point in each place in it is their error
+/// 195 or 102.
+const SENDS_TEXT_OUT: &str = "AI_GENERATE_EMBEDDINGS";
 
 /// Words that block outright in read-only mode.
 const BLOCKED: &[&str] = &[
@@ -2109,6 +2117,16 @@ impl<'a> Guard<'a> {
                         "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
                         shown(token.text)
                     ),
+                ));
+            }
+            "" if token.is_word(SENDS_TEXT_OUT) => {
+                return Err(Blocked::unknown(
+                    line,
+                    format!(
+                        "{SENDS_TEXT_OUT} is not allowed in read-only mode: it can send its text to an outside endpoint (if it is a column name, write it as [{}])",
+                        shown(token.text)
+                    ),
+                    self.as_written(),
                 ));
             }
             _ => {}
@@ -6291,6 +6309,146 @@ mod tests {
                 entry.len() <= KEYWORD_MAX,
                 "{entry} doesn't fit KEYWORD_MAX"
             );
+        }
+    }
+
+    // Decision 55. Every spelling here that calls the function reached it on SQL Server 2025 (error
+    // 15151, for a model that doesn't exist), and every one below the refusals didn't, by a sweep of
+    // the BMP through each place in the word (live
+    // `the_servers_read_ai_generate_embeddings_as_the_guard_does` holds them).
+    #[test]
+    fn ai_generate_embeddings_is_refused_by_its_bare_word() {
+        const CALL: &str = "(N'x' USE MODEL m)";
+        let refusal = |spelled: &str| {
+            format!(
+                "AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it can send its text to \
+                 an outside endpoint (if it is a column name, write it as [{spelled}])"
+            )
+        };
+        let writes = Policy {
+            writes: true,
+            ..READ_ONLY
+        };
+        for spelled in [
+            "AI_GENERATE_EMBEDDINGS",
+            "ai_generate_embeddings",
+            "Ai_GeNeRaTe_EmBeDdInGs",
+        ] {
+            for sql in [
+                format!("SELECT {spelled}{CALL}"),
+                format!("SELECT {spelled} {CALL}"),
+                format!("SELECT {spelled} /*c*/ {CALL}"),
+                format!("SELECT {spelled} --c\n{CALL}"),
+                format!("SELECT {spelled}\r\n\t{CALL}"),
+                format!("SELECT {spelled}\u{A0}{CALL}"),
+                format!("SELECT {spelled}\u{3000}{CALL}"),
+                format!("SELECT {spelled}\u{0}{CALL}"),
+                format!("SELECT -{spelled}{CALL}"),
+                format!("SELECT ~{spelled}{CALL}"),
+                format!("SELECT\u{A0}{spelled}{CALL}"),
+                format!("SELECT {spelled}(N'x', m)"),
+                format!("SELECT {spelled}(N'x' USE MODEL [m])"),
+                format!("SELECT {spelled}(N'x' USE MODEL dbo.m)"),
+                format!("SELECT {spelled}(N'x' USE MODEL m PARAMETERS '{{}}')"),
+                format!("SELECT {spelled}(c USE MODEL m) FROM (SELECT N'x' AS c) AS t"),
+                format!("IF {spelled}{CALL} IS NULL SELECT 1"),
+                format!("IF 1=0 SELECT {spelled}{CALL}"),
+                format!("DECLARE @v vector(3) = {spelled}{CALL}"),
+                format!("SELECT 1 AS a WHERE {spelled}{CALL} IS NULL"),
+                format!("USE sqlh_test; SELECT {spelled}{CALL}"),
+                // No call in these: it costs a column of that name its bare spelling, as the other
+                // unreserved words of the list do.
+                format!("SELECT {spelled} FROM t"),
+                format!("SELECT t.{spelled} FROM t"),
+                format!("SELECT 1 AS {spelled}"),
+                format!("SELECT * FROM {spelled}"),
+            ] {
+                let b = blocked(&sql);
+                assert_eq!(b.reason, refusal(spelled), "{sql:?}");
+                assert_eq!(
+                    b.advice, "Rerun with --allow-write to run it as written",
+                    "{sql:?}"
+                );
+                assert!(b.lifted_by_write, "{sql:?}");
+                assert!(check(&sql, writes).is_ok(), "{sql:?}");
+            }
+        }
+        assert_eq!(
+            blocked("SELECT 1 AS a\n\n  , AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)").line,
+            3
+        );
+        assert!(
+            blocked("DELETE dbo.t; SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)")
+                .reason
+                .starts_with("DELETE dbo.t")
+        );
+        // At a batch's start it isn't told from a procedure call, which is refused all the same.
+        assert!(
+            blocked("AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)")
+                .reason
+                .contains(" starts the batch, ")
+        );
+        let under_check = Policy {
+            compile_only: true,
+            ..READ_ONLY
+        };
+        let b = check("SELECT AI_GENERATE_EMBEDDINGS(N'x', m)", under_check).unwrap_err();
+        assert_eq!(
+            b.advice,
+            "Rerun with --allow-write to compile it as written"
+        );
+        assert_eq!(b.advice_for(Some(&WritesOff::Mcp)), "sqlh mcp is read-only");
+        assert_eq!(
+            b.advice_for(Some(&WritesOff::Profile("p".into()))),
+            "Profile p doesn't allow writes (write_policy = \"deny\")"
+        );
+
+        for sql in [
+            // A quoted name is a column, or before a parenthesis the servers' syntax error.
+            "SELECT [AI_GENERATE_EMBEDDINGS] FROM t",
+            "SELECT t.[AI_GENERATE_EMBEDDINGS] FROM t",
+            "SELECT \"AI_GENERATE_EMBEDDINGS\" FROM t",
+            "SELECT 1 AS [AI_GENERATE_EMBEDDINGS]",
+            "SELECT [AI_GENERATE_EMBEDDINGS](N'x' USE MODEL m)",
+            "SELECT \"AI_GENERATE_EMBEDDINGS\"(N'x' USE MODEL m)",
+            "SELECT [sys].[AI_GENERATE_EMBEDDINGS](N'x', m)",
+            // Text, not a call.
+            "SELECT 'AI_GENERATE_EMBEDDINGS(N''x'' USE MODEL m)' AS a",
+            "SELECT N'AI_GENERATE_EMBEDDINGS' AS a",
+            "SELECT 1 AS a -- AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT 1 AS a /* AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m) */",
+            // Compiled, never run.
+            "SELECT * FROM sys.dm_exec_describe_first_result_set(N'SELECT \
+             AI_GENERATE_EMBEDDINGS(N''x'' USE MODEL m)', NULL, 0)",
+            // Another name.
+            "SELECT AI_GENERATE_EMBEDDINGSX FROM t",
+            "SELECT XAI_GENERATE_EMBEDDINGS FROM t",
+            "SELECT AI_GENERATE_EMBEDDING FROM t",
+            "SELECT AI_GENERATE_EMBEDDINGS_2 FROM t",
+            "SELECT AI_GENERATE_EMBEDDINGSX(N'x', m)",
+            "SELECT * FROM AI_GENERATE_CHUNKS(source = N'x', chunk_type = FIXED, chunk_size = 5)",
+            "SELECT VECTOR_DISTANCE('cosine', a, b) FROM t",
+            "SELECT @AI_GENERATE_EMBEDDINGS AS a",
+            "SELECT a FROM #AI_GENERATE_EMBEDDINGS",
+            // The servers don't read this word by a collation (error 195): what the comparison
+            // skips or reads as a letter makes another name here.
+            "SELECT AI_GENERATE_EMBEDDINGS\u{218}(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE\u{218}_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENE\u{200D}RATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE_EMBED\u{FEFF}DINGS(N'x' USE MODEL m)",
+            "SELECT \u{218}AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT A\u{26A}_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_\u{262}ENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GE\u{274}ERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENE\u{280}ATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE_EM\u{299}EDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE_EMBED\u{3031}INGS(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE_EMBED\u{30FC}INGS(N'x' USE MODEL m)",
+            "SELECT \u{FF21}I_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_GENERATE\u{301}_EMBEDDINGS(N'x' USE MODEL m)",
+            "SELECT AI_G\u{C9}NERATE_EMBEDDINGS(N'x' USE MODEL m)",
+        ] {
+            allowed(sql);
         }
     }
 

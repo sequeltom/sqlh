@@ -2386,6 +2386,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             STATS_REWRITE.into(),
             STATS_REWRITE.into(),
         ),
+        // Decision 55: no write either, and the flag runs it.
+        (
+            "SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it can send its text to an \
+             outside endpoint (if it is a column name, write it as [AI_GENERATE_EMBEDDINGS])",
+            AS_WRITTEN.into(),
+            DENIED_ALONE.into(),
+        ),
     ];
     let with = |profile: &str, sql: &str, extra: &[&str]| {
         run(sqlh()
@@ -3012,6 +3020,103 @@ fn an_accented_spelling_of_the_scan_never_connects() {
     ] {
         let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
         assert_eq!(r.code, 2, "{sql}: {}", r.stdout);
+    }
+}
+
+// Decision 55: a read-only run never connects, so the call can't reach a server; `--allow-write`
+// gets it as far as the connect, as it does `OPENROWSET`.
+#[test]
+fn ai_generate_embeddings_never_connects_unless_writes_are_allowed() {
+    const REASON: &str = "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only \
+                          mode: it can send its text to an outside endpoint (if it is a column \
+                          name, write it as [";
+    for (sql, spelled) in [
+        (
+            "SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            "AI_GENERATE_EMBEDDINGS",
+        ),
+        (
+            "SELECT ai_generate_embeddings /*c*/ (N'x', m)",
+            "ai_generate_embeddings",
+        ),
+        (
+            "SELECT Ai_Generate_Embeddings\u{A0}(N'x' USE MODEL m)",
+            "Ai_Generate_Embeddings",
+        ),
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert_eq!(
+            r.stdout.lines().next().unwrap_or(""),
+            format!(
+                "{REASON}{spelled}]); nothing was run. Rerun with --allow-write to run it as \
+                 written"
+            ),
+            "{sql}"
+        );
+        let r = sqlh_args(&[DEAD, &["--allow-write", "-Q", sql]].concat());
+        assert_eq!(r.code, 2, "{sql}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.starts_with("-- error: cannot connect")
+                || r.stderr.starts_with("-- error: cannot connect"),
+            "{sql}: {}{}",
+            r.stdout,
+            r.stderr
+        );
+    }
+    // What a variable makes is what the guard reads.
+    let r = sqlh_args(
+        &[
+            DEAD,
+            &[
+                "-v",
+                "w=EMBEDDINGS",
+                "-Q",
+                "SELECT AI_GENERATE_$(w)(N'x', m)",
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(r.stdout.starts_with(REASON), "{}", r.stdout);
+    let r = sqlh_args(
+        &[
+            DEAD,
+            &["--check", "-Q", "SELECT AI_GENERATE_EMBEDDINGS(N'x', m)"],
+        ]
+        .concat(),
+    );
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout
+            .lines()
+            .next()
+            .unwrap_or("")
+            .ends_with("nothing was run. Rerun with --allow-write to compile it as written"),
+        "{}",
+        r.stdout
+    );
+    // Its advice, the word as text, another name: past the guard, to the closed port.
+    for sql in [
+        "SELECT [AI_GENERATE_EMBEDDINGS] FROM dbo.t",
+        "SELECT 'AI_GENERATE_EMBEDDINGS(x)' AS a -- AI_GENERATE_EMBEDDINGS(x)",
+        "SELECT AI_GENERATE_EMBEDDINGSX, XAI_GENERATE_EMBEDDINGS FROM dbo.t",
+        "SELECT * FROM AI_GENERATE_CHUNKS(source = N'x', chunk_type = FIXED, chunk_size = 5)",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 2, "{sql}: {}{}", r.stdout, r.stderr);
+    }
+    // sqlh's own SQL isn't classified, so a schema command takes the word as a name.
+    for command in [
+        &["describe", "dbo.AI_GENERATE_EMBEDDINGS"][..],
+        &["def", "AI_GENERATE_EMBEDDINGS"],
+        &["deps", "AI_GENERATE_EMBEDDINGS"],
+        &["tables", "AI_GENERATE_EMBEDDINGS"],
+        &["find", "AI_GENERATE_EMBEDDINGS"],
+        &["find", "AI_GENERATE_EMBEDDINGS", "--text"],
+    ] {
+        let r = sqlh_args(&[DEAD, command].concat());
+        assert_eq!(r.code, 2, "{command:?}: {}{}", r.stdout, r.stderr);
     }
 }
 
@@ -4920,6 +5025,18 @@ mod mcp {
                  which SQL Server doesn't read as whitespace, so it would run this as a stored \
                  procedure; nothing was run. Remove the mark; sqlh mcp is read-only",
             ),
+            (
+                "SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
+                "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it \
+                 can send its text to an outside endpoint (if it is a column name, write it as \
+                 [AI_GENERATE_EMBEDDINGS]); nothing was run. sqlh mcp is read-only",
+            ),
+            (
+                "SELECT ai_generate_embeddings\u{A0}/*c*/(N'x', m)",
+                "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it \
+                 can send its text to an outside endpoint (if it is a column name, write it as \
+                 [ai_generate_embeddings]); nothing was run. sqlh mcp is read-only",
+            ),
         ];
         let lines: Vec<String> = (1..)
             .zip(&cases)
@@ -4953,6 +5070,8 @@ mod mcp {
             "CLOSE MASTER KEY",
             "SET NOCOUNT ON",
             "SELECT 'SET AUTOPILOT ON' -- OPEN MASTER KEY",
+            "SELECT [AI_GENERATE_EMBEDDINGS] FROM dbo.t",
+            "SELECT 'AI_GENERATE_EMBEDDINGS(x)' AS a",
         ];
         let lines: Vec<String> = (1..)
             .zip(&cases)
@@ -4971,6 +5090,59 @@ mod mcp {
                 .unwrap();
             assert!(!text.contains("-- blocked:"), "{sql}: {text}");
             assert!(text.contains("(exit 2)"), "{sql}: {text}");
+        }
+    }
+
+    // Decision 55 in both tools that take SQL. A schema tool's SQL is sqlh's own, so it gets as far
+    // as the closed port with the word as a name.
+    #[test]
+    fn ai_generate_embeddings_is_refused_in_each_tool_that_takes_sql() {
+        let config = profiles("mcp_embeddings");
+        let sql = "SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)";
+        let lines: Vec<String> = [
+            ("query", serde_json::json!({"sql": sql})),
+            ("check", serde_json::json!({"sql": sql})),
+            (
+                "describe",
+                serde_json::json!({"object": "dbo.AI_GENERATE_EMBEDDINGS"}),
+            ),
+            (
+                "definition",
+                serde_json::json!({"object": "AI_GENERATE_EMBEDDINGS"}),
+            ),
+        ]
+        .iter()
+        .zip(1..)
+        .map(|((tool, arguments), id)| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"{tool}","arguments":{arguments}}}}}"#
+            )
+        })
+        .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let text = |id: i64| {
+            by_id(&messages, id)["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for id in [1, 2] {
+            let text = text(id);
+            assert_eq!(
+                text.lines().next(),
+                Some(
+                    "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: \
+                     it can send its text to an outside endpoint (if it is a column name, write \
+                     it as [AI_GENERATE_EMBEDDINGS]); nothing was run. sqlh mcp is read-only"
+                ),
+                "{text}"
+            );
+        }
+        for id in [3, 4] {
+            let text = text(id);
+            assert!(!text.contains("-- blocked:"), "{text}");
+            assert!(text.contains("(exit 2)"), "{text}");
         }
     }
 
@@ -8789,6 +8961,158 @@ mod live {
         }
         let (plain, marked) = (errors[rows.len()], errors[rows.len() + 1]);
         assert_eq!(plain, marked, "{classification:?}");
+    }
+
+    // What the guard's refusal of `AI_GENERATE_EMBEDDINGS` goes by (decision 55, DESIGN.md §7).
+    // These are only compiled, and no model of this name exists, so nothing can leave the server:
+    // error 15151 is the function, as far as can be seen without a model. Older servers have no
+    // such function, and each row states what they answer.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_read_ai_generate_embeddings_as_the_guard_does() {
+        let (p, db) = target();
+        const CALL: &str = "(N''x'' USE MODEL no_such_model_sqlh)";
+        const NAME: &str = "AI_GENERATE_EMBEDDINGS";
+        let server = Live::server(&p, &db);
+        let has_it = server_major(&*server) >= 17;
+        let call = |name: &str| format!("SELECT {name}{CALL}");
+        // The statement; its first error where the function exists, and on an older server.
+        let mut rows: Vec<(String, &str, &str)> = [
+            // What the guard refuses, and the only spellings that reach the function.
+            call(NAME),
+            call("ai_generate_embeddings"),
+            call("Ai_GeNeRaTe_EmBeDdInGs"),
+            call("AI_GENERATE_EMBEDDINGS /*c*/ "),
+            call("AI_GENERATE_EMBEDDINGS --c\n"),
+            call("AI_GENERATE_EMBEDDINGS\r\n\t"),
+            call("AI_GENERATE_EMBEDDINGS\u{A0}"),
+            call("AI_GENERATE_EMBEDDINGS\u{3000}"),
+            call("-AI_GENERATE_EMBEDDINGS"),
+            call("~AI_GENERATE_EMBEDDINGS"),
+            format!("IF 1=0 {}", call(NAME)),
+        ]
+        .into_iter()
+        .map(|shape| (shape, "15151", "156"))
+        .collect();
+        rows.push((
+            "SELECT AI_GENERATE_EMBEDDINGS(N''x'', no_such_model_sqlh)".to_owned(),
+            "15151",
+            "195",
+        ));
+        // What the guard reads as another name. A quoted name isn't a function's without a schema,
+        // and a schema makes it a user's.
+        for name in [
+            "[AI_GENERATE_EMBEDDINGS]",
+            "\"AI_GENERATE_EMBEDDINGS\"",
+            "\u{200D}AI_GENERATE_EMBEDDINGS",
+        ] {
+            rows.push((call(name), "102", "102"));
+        }
+        for name in [
+            "sys.AI_GENERATE_EMBEDDINGS",
+            "dbo.AI_GENERATE_EMBEDDINGS",
+            "[sys].[AI_GENERATE_EMBEDDINGS]",
+        ] {
+            rows.push((call(name), "156", "156"));
+        }
+        rows.push((
+            "SELECT sys.AI_GENERATE_EMBEDDINGS(N''x'', no_such_model_sqlh)".to_owned(),
+            "4121",
+            "4121",
+        ));
+        // The servers don't read this word by a collation, though they do read `SEND` by one.
+        for name in [
+            "AI_GENERATE_EMBEDDINGS\u{218}",
+            "AI_GENERATE\u{218}_EMBEDDINGS",
+            "AI_GENE\u{200D}RATE_EMBEDDINGS",
+            "AI_GENERATE_EMBED\u{FEFF}DINGS",
+            "\u{218}AI_GENERATE_EMBEDDINGS",
+            "A\u{26A}_GENERATE_EMBEDDINGS",
+            "AI_\u{262}ENERATE_EMBEDDINGS",
+            "AI_GE\u{274}ERATE_EMBEDDINGS",
+            "AI_GENE\u{280}ATE_EMBEDDINGS",
+            "AI_GENERATE_EM\u{299}EDDINGS",
+            "AI_GENERATE_EMBED\u{3031}INGS",
+            "AI_GENERATE_EMBED\u{30FC}INGS",
+            "AI_GENERATE_EMBED\u{651}INGS",
+            "\u{FF21}I_GENERATE_EMBEDDINGS",
+            "AI_GENERATE\u{301}_EMBEDDINGS",
+            "AI_G\u{C9}NERATE_EMBEDDINGS",
+        ] {
+            rows.push((call(name), "195", "156"));
+        }
+        // A name like any other, which is what the refusal costs (and `[...]` gets back).
+        for shape in [
+            "SELECT 1 AS AI_GENERATE_EMBEDDINGS",
+            "SELECT 1 AI_GENERATE_EMBEDDINGS",
+            "SELECT AI_GENERATE_EMBEDDINGS = 1",
+            "SELECT AI_GENERATE_EMBEDDINGS.name FROM sys.objects AS AI_GENERATE_EMBEDDINGS",
+            "WITH AI_GENERATE_EMBEDDINGS AS (SELECT 1 AS a) SELECT a FROM AI_GENERATE_EMBEDDINGS",
+            "SELECT a FROM (SELECT 1 AS a) AS AI_GENERATE_EMBEDDINGS",
+        ] {
+            rows.push((shape.to_owned(), "", ""));
+        }
+        for (shape, here, older) in &rows {
+            let sql = format!(
+                "SELECT error_number FROM sys.dm_exec_describe_first_result_set(N'{shape}', NULL, \
+                 0) AS r WHERE r.error_number <> 11501"
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{shape:?}: {}{}", r.stdout, r.stderr);
+            let expected = if has_it { here } else { older };
+            assert_eq!(
+                r.stdout.lines().nth(1).unwrap_or(""),
+                *expected,
+                "{shape:?}: {}",
+                r.stdout
+            );
+        }
+
+        // `--allow-write` lifts it, and the server answers for itself.
+        let r = server.write("SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL no_such_model_sqlh)");
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        let error = if has_it { "error 15151" } else { "error 156" };
+        assert!(r.stdout.contains(error), "{}", r.stdout);
+
+        // The refusal's advice runs, and sqlh's own SQL shows the word.
+        let r = live(
+            &p,
+            &db,
+            &[
+                "--format",
+                "csv",
+                "-Q",
+                "CREATE TABLE #t ([AI_GENERATE_EMBEDDINGS] int); INSERT #t VALUES (7); \
+                 SELECT [AI_GENERATE_EMBEDDINGS] AS a FROM #t",
+            ],
+        );
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert_eq!(r.stdout.lines().nth(1), Some("7"), "{}", r.stdout);
+        let mut objects = Objects::new(&p, &db);
+        let table = objects.name("embeddings");
+        objects.make(
+            &format!("CREATE TABLE {table} ([AI_GENERATE_EMBEDDINGS] int)"),
+            format!("DROP TABLE IF EXISTS {table}"),
+        );
+        let view = objects.name("embeddings_v");
+        objects.make(
+            &format!(
+                "CREATE VIEW {view} AS SELECT [AI_GENERATE_EMBEDDINGS] AS a \
+                 /* AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m) */ FROM {table}"
+            ),
+            format!("DROP VIEW IF EXISTS {view}"),
+        );
+        for command in [
+            &["describe", table.as_str()][..],
+            &["def", view.as_str()],
+            &["find", NAME],
+        ] {
+            let r = live(&p, &db, command);
+            assert_eq!(r.code, 0, "{command:?}: {}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(NAME), "{command:?}: {}", r.stdout);
+        }
+        let r = live(&p, &db, &["deps", view.as_str()]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
     }
 
     // What the guard's readings of these rest on, each parsed and none run.
