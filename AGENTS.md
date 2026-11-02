@@ -74,7 +74,8 @@ src/console.rs   echo-off password prompt; the Git Bash path hint (the console c
 src/signals.rs   the console events that cancel a run: Ctrl+C, Ctrl+Break, close, logoff, shutdown
 src/files.rs     -o files: identity (refusing an input file) and the run's own .partial file
 src/script.rs    input decoding, GO splitting, $(var) substitution, line mapping
-src/guard.rs     read-only classifier (own T-SQL lexer, streamed, linear lookahead, work budget); XACT_ABORT detection
+src/guard.rs     read-only classifier (own T-SQL lexer, streamed, linear lookahead, work budget); XACT_ABORT detection;
+                 guard_ignored.rs, its measured table of what the servers ignore in a word, shared with a live test
 src/db/          the only mssql-tds user: connect (a failed connect's hints name flags, or in sqlh mcp
                  the profile's keys: Hints), run a batch into a BatchSink, the bounded count of
                  hidden rows (Counting), value/type rendering;

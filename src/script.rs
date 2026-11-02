@@ -190,6 +190,13 @@ fn terminator_repeat(line: &str, terminator: &str) -> Option<u32> {
     }
     let mut rest = &line[terminator.len()..];
     if let Some(comment) = rest.find("--") {
+        // A lone CR ends this comment as it does any other (DESIGN.md §7), and what follows it is
+        // a statement, which must reach the server rather than go with the terminator. The `trim`
+        // above took a CR at the line's end. The line then is no terminator, and the server reads
+        // the `GO` in it.
+        if rest[comment..].contains('\r') {
+            return None;
+        }
         rest = &rest[..comment];
     }
     let rest = rest.trim();
@@ -411,6 +418,13 @@ mod tests {
     fn a_lone_cr_ends_a_line_comment_when_finding_terminators() {
         let sql = "SELECT 1 --c\r, 'a\nGO\nb' AS x";
         assert_eq!(batches(sql), vec![(sql.into(), 1, 1)]);
+        // The byte just past the CR counts: a quote right there opens the string.
+        let sql = "SELECT 1 --c\r'a\nGO\nb' AS x";
+        assert_eq!(batches(sql), vec![(sql.into(), 1, 1)]);
+        // On a terminator's own line too: what follows the CR is a statement, not a comment's end
+        // to drop, so the line goes to the server, whose error says the `GO` is in the way.
+        let sql = "SELECT 1 AS a\nGO --c\rSELECT 2 AS b\nSELECT 3 AS c\n";
+        assert_eq!(batches(sql), vec![(sql.into(), 1, 1)]);
         let ended = "SELECT 1 --it's\r\nGO\nSELECT 2 --'\n";
         assert_eq!(
             batches(ended),
@@ -440,6 +454,9 @@ mod tests {
         assert_eq!(terminator_repeat("  go  \r\n", "GO"), Some(1));
         assert_eq!(terminator_repeat("GO 5", "GO"), Some(5));
         assert_eq!(terminator_repeat("GO -- done", "GO"), Some(1));
+        assert_eq!(terminator_repeat("GO -- done\r\n", "GO"), Some(1));
+        assert_eq!(terminator_repeat("GO 2 -- done\r", "GO"), Some(2));
+        assert_eq!(terminator_repeat("GO --c\rSELECT 2\n", "GO"), None);
         assert_eq!(terminator_repeat("GOTO x", "GO"), None);
         assert_eq!(terminator_repeat("GO x", "GO"), None);
         assert_eq!(terminator_repeat("GO 0", "GO"), None);

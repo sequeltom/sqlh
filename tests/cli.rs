@@ -2144,6 +2144,13 @@ fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
         bytes("SELECT 1 AS a\u{2003}COMMIT"),
         bytes("SELECT 1 AS a\u{85}COMMIT"),
         bytes("SELECT 1 AS a\u{200B}COMMIT"),
+        // A sign after an exponent or a currency sign is the literal's, so `--` is no comment.
+        b"SELECT 1e--1 COMMIT".to_vec(),
+        b"SELECT 1.5E--1 COMMIT".to_vec(),
+        b"SELECT $--1 COMMIT".to_vec(),
+        b"SELECT $ --1 COMMIT".to_vec(),
+        b"SELECT \\--1 COMMIT".to_vec(),
+        bytes("SELECT £--1 COMMIT"),
     ];
     // The same text as UTF-16, the input's other encoding.
     let utf16: Vec<u8> = [0xFF, 0xFE]
@@ -2162,13 +2169,52 @@ fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
         assert_eq!(r.stdout.lines().next(), Some(COMMIT), "{input:?}");
     }
     // Refused in --check too, and NOEXEC there can't be hidden the same way.
-    let r = sqlh_args(&[DEAD, &["--check", "-Q", "SELECT 1 --c\rSET NOEXEC OFF"]].concat());
-    assert_eq!(r.code, 5, "{}", r.stdout);
-    assert!(
-        r.stdout.contains("SET NOEXEC can't be used"),
-        "{}",
-        r.stdout
-    );
+    for sql in [
+        "SELECT 1 --c\rSET NOEXEC OFF",
+        // Letters the servers ignore in a word they don't reserve, and read as others'.
+        "SET NOEXEC\u{218} OFF\nSELECT 1 AS ran_for_real",
+        "SET NOE\u{1F00}XEC OFF\nSELECT 1 AS ran_for_real",
+        "SET \u{274}OEXEC OFF; SELECT 1 AS ran_for_real",
+        "SET N\u{153}XEC OFF; SELECT 1 AS ran_for_real",
+    ] {
+        for flags in [&["--check"][..], &["--check", "--allow-write"][..]] {
+            let r = sqlh_args(&[DEAD, flags, &["-Q", sql]].concat());
+            assert_eq!(r.code, 5, "{sql:?}: {}", r.stdout);
+            assert!(
+                r.stdout.contains("SET NOEXEC can't be used"),
+                "{sql:?}: {}",
+                r.stdout
+            );
+        }
+    }
+
+    // A word the servers don't reserve, with such a letter, is the statement to them.
+    for (sql, refused) in [
+        (
+            "SELECT 1; DISABLE\u{218} TRIGGER t ON DATABASE",
+            "DISABLE is not allowed",
+        ),
+        (
+            "SELECT 1; \u{280}ECEIVE TOP (1) * FROM dbo.q",
+            "RECEIVE is not allowed",
+        ),
+        (
+            "SELECT NEXT\u{218} VALUE FOR dbo.s",
+            "NEXT VALUE FOR dbo.s advances",
+        ),
+        (
+            "SELECT 1 a; ADD SIGNATURE TO dbo.p BY CERTIFICATE c",
+            "ADD SIGNATURE would write",
+        ),
+        // A name with leading dots or a temp procedure's is an implicit call to them.
+        (".sqlh_nope", ".sqlh_nope starts the batch"),
+        ("...sqlh_nope", "...sqlh_nope starts the batch"),
+        ("##sqlh_nope 1", "##sqlh_nope starts the batch"),
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql:?}: {}", r.stdout);
+        assert!(r.stdout.contains(refused), "{sql:?}: {}", r.stdout);
+    }
 
     // Reads with the same characters get past the guard, to the closed port.
     for sql in [
@@ -2177,6 +2223,12 @@ fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
         "SELECT 1e5, 0xFF, $1.50, $ 1, £1 --COMMIT\n",
         "SELECT 0xDELETE FROM t",
         "SELECT 1EXEC",
+        "SELECT 1e+--1 COMMIT",
+        "SELECT $---1 COMMIT",
+        // A real read isn't refused for a name that only looks like a keyword.
+        "SELECT TOP 1 Id AS Dele\u{301}te FROM dbo.Users",
+        "SELECT TOP 1 Id AS \u{FF33}\u{FF21}\u{FF36}\u{FF25} FROM dbo.Users",
+        "SELECT TOP 1 Id AS SEND\u{65F6}\u{95F4} FROM dbo.Users",
     ] {
         assert_reached_connect(&sqlh_args(&[DEAD, &["-Q", sql]].concat()), sql);
     }
@@ -4548,6 +4600,16 @@ mod mcp {
             ("SET\u{A0}AUTOPILOT ON", AUTOPILOT),
             ("SET\u{B}AUTOPILOT ON", AUTOPILOT),
             ("SET AUTOPILOT\u{B}ON", AUTOPILOT),
+            ("SET AUTOP\u{26A}LOT ON", AUTOPILOT),
+            ("SET AUTOPILOT\u{218} ON", AUTOPILOT),
+            (
+                "OPEN S\u{28F}MMETRIC KEY k DECRYPTION BY PASSWORD = 'x'",
+                KEY,
+            ),
+            (
+                "OPEN SYMMETRIC\u{218} KEY k DECRYPTION BY PASSWORD = 'x'",
+                KEY,
+            ),
             ("SELECT 1 --c\rSET AUTOPILOT ON", AUTOPILOT),
             ("SELECT 1SET AUTOPILOT ON", AUTOPILOT),
             ("SET\u{3000}IDENTITY_INSERT #i ON", IDENTITY),
@@ -8120,8 +8182,31 @@ mod live {
         // What makes a statement of the keyword after a number (no error from the parse), and what
         // the number takes for itself: an `E` for its exponent, a `.`, what is hex.
         for (shape, parses) in [
-            ("SELECT 1 --c\rDELETE #t", true),
-            ("SELECT 1 --c\u{2028}DELETE #t", true),
+            // Garbage after the character tells a comment that ended from one that went on: a
+            // statement after it would parse either way.
+            ("SELECT 1 --c\r)))", false),
+            ("SELECT 1 --c\n)))", false),
+            ("SELECT 1 --c\u{2028})))", true),
+            ("SELECT 1 --c\u{2029})))", true),
+            ("SELECT 1 --c\u{85})))", true),
+            // A sign after an exponent or a currency sign is the literal's, digit or none, so
+            // `--` right after it is no comment, and a `--` after that one is.
+            ("SELECT 1e-- )))", false),
+            ("SELECT 1.e-- )))", false),
+            ("SELECT .5e-- )))", false),
+            ("SELECT 1e+-- )))", true),
+            ("SELECT 1e--- )))", true),
+            ("SELECT 1e -- )))", true),
+            ("SELECT 0x-- )))", true),
+            ("SELECT $-- )))", false),
+            ("SELECT $ -- )))", false),
+            ("SELECT $   -- )))", false),
+            ("SELECT \\-- )))", false),
+            ("SELECT \u{A3}-- )))", false),
+            ("SELECT $+-- )))", true),
+            ("SELECT $--- )))", true),
+            ("SELECT $ --- )))", true),
+            ("SELECT $ /*c*/ -- )))", true),
             ("SELECT 1DELETE #t", true),
             ("SELECT 1.DELETE #t", true),
             ("SELECT 1eDELETE #t", true),
@@ -8152,6 +8237,167 @@ mod live {
             let expected = if parses { "0" } else { "1" };
             assert_eq!(r.stdout.lines().nth(1), Some(expected), "{shape:?}");
         }
+    }
+
+    include!("../src/guard_ignored.rs");
+
+    // `IGNORED_IN_A_WORD` against the servers, which is what makes `SET NOEXEC` so spelled a
+    // refusal and not a real run under --check, and every word they compare by collation with it.
+    // The letters they read as others', and what stays exact, go with it (DESIGN.md §7).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_ignore_what_the_guard_ignores() {
+        let (p, db) = target();
+        let sql = "WITH d AS (SELECT n FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+                   (11),(12),(13),(14),(15)) AS v (n)), nums AS (SELECT a.n + 16 * b.n + 256 * c.n \
+                   + 4096 * e.n AS i FROM d AS a, d AS b, d AS c, d AS e) SELECT i FROM nums WHERE \
+                   i NOT BETWEEN 55296 AND 57343 AND NOT EXISTS (SELECT 1 FROM \
+                   sys.dm_exec_describe_first_result_set(N'SET NOEXE' + NCHAR(i) + N'C OFF; SELECT \
+                   1 AS x', NULL, 0) AS r WHERE r.error_number IS NOT NULL) ORDER BY i";
+        let r = live(&p, &db, &["--format", "csv", "--max-rows", "0", "-Q", sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let parsed: Vec<u32> = r
+            .stdout
+            .lines()
+            .skip(1)
+            .map(|line| line.parse().expect("a number"))
+            .collect();
+        let table: Vec<u32> = IGNORED_IN_A_WORD
+            .iter()
+            .flat_map(|&(from, to)| u32::from(from)..=u32::from(to))
+            .collect();
+        assert_eq!(parsed, table);
+
+        // A row's statement follows a `SELECT`, so that it can't be read as a procedure call.
+        for (statement, parses) in [
+            ("SET \u{274}OEXEC OFF", true),
+            ("SET N\u{153}XEC OFF", true),
+            ("SET XACT_A\u{299}ORT ON", true),
+            ("SET S\u{29C}OWPLAN_XML ON", true),
+            ("SET AUTOP\u{26A}LOT ON", true),
+            ("SET \u{FF2E}OEXEC OFF", false),
+            ("SET \u{207F}OEXEC OFF", false),
+            ("SET NOEXEC\u{301} OFF", false),
+            ("DISABLE\u{218} TRIGGER t ON DATABASE", true),
+            ("D\u{26A}SABLE TRIGGER t ON DATABASE", true),
+            ("ENABLE\u{218} TRIGGER t ON DATABASE", true),
+            ("RECEIVE\u{218} * FROM q", true),
+            ("\u{280}ECEIVE * FROM q", true),
+            (
+                "MERGE\u{218} t USING s ON 1=1 WHEN MATCHED THEN DELETE;",
+                true,
+            ),
+            ("SELECT NEXT\u{218} VALUE FOR s", true),
+            ("SELECT \u{274}EXT VALUE FOR s", true),
+            ("SELECT NEXT VA\u{29F}UE FOR s", true),
+            (
+                "OPEN SYMMETRIC\u{218} KEY k DECRYPTION BY PASSWORD=''x''",
+                true,
+            ),
+            ("OPEN MASTER\u{218} KEY DECRYPTION BY PASSWORD=''x''", true),
+            ("OPEN MA\u{FB06}ER KEY DECRYPTION BY PASSWORD=''x''", true),
+            ("ADD SIGNATURE\u{218} TO p BY CERTIFICATE c", true),
+            ("ADD COUNTER\u{218} SIGNATURE TO p BY CERTIFICATE c", true),
+            // Reserved words, and the rest of what the guard reads exactly.
+            ("COMMIT\u{218}", false),
+            ("COMMIT\u{200D}", false),
+            ("DELETE\u{218} t", false),
+            ("DELETE\u{200D} t", false),
+            ("DROP\u{218} TABLE t", false),
+            ("EXEC\u{218} sp_who", false),
+            ("KILL\u{218} 1", false),
+            ("BEGIN TRAN\u{218}", false),
+            ("SET\u{218} NOCOUNT ON", false),
+            (
+                "OPEN SYMMETRIC KEY\u{218} k DECRYPTION BY PASSWORD=''x''",
+                false,
+            ),
+            ("OPEN MASTER KEY\u{218} DECRYPTION BY PASSWORD=''x''", false),
+            ("SET IDENTITY_INSERT\u{218} t ON", false),
+            ("SET STATISTICS\u{218} IO ON", false),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ\u{218} UNCOMMITTED",
+                false,
+            ),
+            ("ADD\u{218} SIGNATURE TO p BY CERTIFICATE c", false),
+            ("SELECT DISTINCT\u{218} 1 AS a", false),
+        ] {
+            let sql = format!(
+                "SELECT COUNT(*) AS syntax_errors FROM \
+                 sys.dm_exec_describe_first_result_set(N'SELECT 1 AS a; {statement}', NULL, 0) \
+                 WHERE error_number IN (102, 156, 195)"
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{statement:?}: {}{}", r.stdout, r.stderr);
+            let expected = if parses { "0" } else { "1" };
+            assert_eq!(r.stdout.lines().nth(1), Some(expected), "{statement:?}");
+        }
+
+        // A name longer than an identifier can be stops its batch whatever it would have read
+        // as, which is why the comparison need not read one (`guard::NAME_MAX_BYTES`).
+        for (word, too_long) in [("122", false), ("123", true)] {
+            let sql = format!(
+                "SELECT COUNT(*) AS too_long FROM sys.dm_exec_describe_first_result_set(N'SET \
+                 NOEXEC' + REPLICATE(NCHAR(536), {word}) + N' OFF; SELECT 1 AS x', NULL, 0) WHERE \
+                 error_number = 103"
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            let expected = if too_long { "1" } else { "0" };
+            assert_eq!(r.stdout.lines().nth(1), Some(expected), "{word}");
+        }
+    }
+
+    // The spellings of the mode that decision 30(d)'s refusal goes by, on a call scoped to a table
+    // of the run's own so that nothing is scanned but that: a `record_count` is only there when
+    // the mode scanned. The servers take each as the mode that scans.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_take_the_spellings_the_scan_refusal_goes_by() {
+        let (p, _) = target();
+        for mode in [
+            "'DETAILED'",
+            "'DETAILED            zz'",
+            "N'DETAILED            zz'",
+            "'SAMPLED             zz'",
+            "N'DETA\u{26A}LED'",
+            "N'DE\u{218}TAILED'",
+            "'D\u{112}TAILED'",
+            "'DETA\u{131}LED'",
+            "'\u{FF24}ETAILED'",
+        ] {
+            let sql = format!(
+                "CREATE TABLE #t (a int); INSERT #t VALUES (1); SELECT record_count FROM \
+                 sys.dm_db_index_physical_stats(DB_ID('tempdb'), OBJECT_ID('tempdb..#t'), NULL, \
+                 NULL, {mode})"
+            );
+            let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+            assert!(
+                r.stdout.lines().any(|line| line == "1"),
+                "{mode}: {}",
+                r.stdout
+            );
+        }
+    }
+
+    // Nothing is lost on a line that starts with the terminator: past a lone CR the text is a
+    // statement, and the server reports the `GO` left in front of it.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_statement_after_a_lone_cr_on_a_go_line_is_not_lost() {
+        let (p, db) = target();
+        let dir = OwnScratch::new("go_lone_cr");
+        let file = dir.0.join("input.sql");
+        fs::write(
+            &file,
+            "SELECT 1 AS a\nGO --c\rSELECT 2 AS b\nSELECT 3 AS c\n",
+        )
+        .unwrap();
+        let r = live(&p, &db, &["-i", file.to_str().unwrap()]);
+        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+        let output = format!("{}{}", r.stdout, r.stderr);
+        assert!(output.contains("error 102"), "{output}");
     }
 
     // The note counts against --max-output like any note; how many rows it costs is held
