@@ -2118,6 +2118,121 @@ fn input_size_and_repeats_are_bounded() {
     assert!(r.stdout.contains("at least 4096"), "{}", r.stdout);
 }
 
+// Decision 23 (command-categories.md §6.9): a refusal says what sqlh knows about the statement and
+// what lifts it, whatever the profile allows. Agents act on these words, so they are held whole.
+#[test]
+fn refusals_say_what_they_are_and_what_lifts_them() {
+    let dir = scratch("refusal_wording");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.flagged]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"flag\"\n\n\
+         [profiles.denied]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"deny\"\n",
+    )
+    .unwrap();
+    const DENIED: &str = "profile denied doesn't allow writes (write_policy = \"deny\")";
+    const DENIED_ALONE: &str = "Profile denied doesn't allow writes (write_policy = \"deny\")";
+    const AS_WRITTEN: &str = "Rerun with --allow-write to run it as written";
+    const FLUSH: &str = "Read sys.query_store_runtime_stats instead: it has the rows not yet \
+                         flushed too; aggregate by plan_id, execution_type and \
+                         runtime_stats_interval_id";
+    let cases: Vec<(&str, &str, String, String)> = vec![
+        (
+            "EXEC sp_WhoIsActive",
+            "EXEC sp_WhoIsActive isn't on sqlh's list of read-only procedures, so sqlh can't \
+             tell what it does",
+            AS_WRITTEN.into(),
+            DENIED_ALONE.into(),
+        ),
+        (
+            "sp_WhoIsActive",
+            "sp_WhoIsActive starts the batch, so SQL Server would run it as a stored procedure \
+             (a typo?); it isn't on sqlh's list of read-only procedures",
+            "Fix it if it's a typo, or rerun with --allow-write to run it as written".into(),
+            format!("Fix it if it's a typo; {DENIED}"),
+        ),
+        (
+            "DBCC PAGE (N'Sales', 1, 100, 3)",
+            "DBCC PAGE isn't on sqlh's list of read-only DBCC commands",
+            "Read sys.dm_db_page_info (SQL Server 2019 and later) instead, or rerun with \
+             --allow-write"
+                .into(),
+            format!("Read sys.dm_db_page_info (SQL Server 2019 and later) instead; {DENIED}"),
+        ),
+        (
+            "DBCC FREEPROCCACHE",
+            "DBCC FREEPROCCACHE isn't on sqlh's list of read-only DBCC commands",
+            AS_WRITTEN.into(),
+            DENIED_ALONE.into(),
+        ),
+        (
+            "ALTER EVENT SESSION [system_health] ON SERVER STATE = STOP",
+            "ALTER EVENT SESSION would write",
+            "Rerun with --allow-write if the write is intended".into(),
+            DENIED_ALONE.into(),
+        ),
+        (
+            "EXEC sys.sp_query_store_flush_db",
+            "EXEC sys.sp_query_store_flush_db isn't on sqlh's list of read-only procedures: it \
+             writes Query Store's in-memory data to disk",
+            FLUSH.into(),
+            format!("{FLUSH}; {DENIED}"),
+        ),
+        (
+            "DELETE dbo.T",
+            "DELETE dbo.T would write",
+            "Rerun with --allow-write if the write is intended".into(),
+            DENIED_ALONE.into(),
+        ),
+    ];
+    let with = |profile: &str, sql: &str, extra: &[&str]| {
+        run(sqlh()
+            .args(["--profile", profile, "-Q", sql])
+            .args(extra)
+            .env("SQLH_CONFIG", &config))
+    };
+    for (sql, reason, flagged, denied) in &cases {
+        for (profile, advice) in [("flagged", flagged), ("denied", denied)] {
+            let r = with(profile, sql, &[]);
+            assert_eq!(r.code, 5, "{profile}: {sql}: {}", r.stdout);
+            assert_eq!(
+                r.stdout.lines().next().unwrap_or(""),
+                format!("-- blocked: line 1: {reason}; nothing was run. {advice}"),
+                "{profile}: {sql}"
+            );
+            assert!(
+                last_line(&r.stdout).starts_with("-- failed (exit 5): blocked by the read-only"),
+                "{profile}: {sql}: {}",
+                r.stdout
+            );
+            let r = with(profile, sql, &["--format", "json"]);
+            assert_eq!(r.code, 5, "{profile}: {sql}: {}", r.stdout);
+            let document: serde_json::Value =
+                serde_json::from_str(r.stdout.trim_end()).expect("a JSON document");
+            assert_eq!(
+                document["error"],
+                format!("line 1: {reason}; nothing was run. {advice}"),
+                "{profile}: {sql}"
+            );
+        }
+        // Under a deny profile, none of them offers a flag that would be a usage error.
+        assert!(!denied.contains("--allow-write"), "{sql}");
+        // Every one of them is lifted as its advice says, or as the flag does for the flush.
+        let r = with("flagged", sql, &["--allow-write"]);
+        assert_reached_connect(&r, sql);
+    }
+    // The line is the statement's, past a batch that is fine.
+    let r = with("flagged", "SELECT 1\nEXEC dbo.usp_x", &[]);
+    assert_eq!(
+        r.stdout.lines().next().unwrap_or(""),
+        "-- blocked: line 2: EXEC dbo.usp_x isn't on sqlh's list of read-only procedures, so \
+         sqlh can't tell what it does; nothing was run. Rerun with --allow-write to run it as \
+         written"
+    );
+}
+
 // plan-history.md 2.14: the read-only guard takes memory in proportion to the size of the input,
 // not to the number of tokens in it. It used to keep about 56 bytes for each token: 10 MB of
 // one-character tokens peaked at 795 MB of working set, 9.9 MB of `SELECT 1` lines at 233 MB.
@@ -4000,6 +4115,80 @@ mod mcp {
         let r = sqlh_args(&["--profile", "win", "mcp"]);
         assert_eq!(r.code, 3, "{}", r.stdout);
         assert!(r.stdout.contains("mcp must come first"), "{}", r.stdout);
+    }
+
+    // Decision 23 in `sqlh mcp`, read-only for good (decision 16): the same reasons, the
+    // alternative where there is one, and no flag anywhere in them.
+    #[test]
+    fn refusals_say_what_they_are_and_offer_no_flag() {
+        let config = profiles("mcp_refusal_wording");
+        const READ_ONLY: &str = "sqlh mcp is read-only";
+        let cases = [
+            (
+                "EXEC sp_WhoIsActive",
+                "EXEC sp_WhoIsActive isn't on sqlh's list of read-only procedures, so sqlh \
+                 can't tell what it does"
+                    .to_owned(),
+                READ_ONLY.to_owned(),
+            ),
+            (
+                "sp_WhoIsActive",
+                "sp_WhoIsActive starts the batch, so SQL Server would run it as a stored \
+                 procedure (a typo?); it isn't on sqlh's list of read-only procedures"
+                    .to_owned(),
+                format!("Fix it if it's a typo; {READ_ONLY}"),
+            ),
+            (
+                "DBCC PAGE (N'Sales', 1, 100, 3)",
+                "DBCC PAGE isn't on sqlh's list of read-only DBCC commands".to_owned(),
+                format!(
+                    "Read sys.dm_db_page_info (SQL Server 2019 and later) instead; {READ_ONLY}"
+                ),
+            ),
+            (
+                "DBCC FREEPROCCACHE",
+                "DBCC FREEPROCCACHE isn't on sqlh's list of read-only DBCC commands".to_owned(),
+                READ_ONLY.to_owned(),
+            ),
+            (
+                "ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4",
+                "ALTER DATABASE SCOPED CONFIGURATION would write".to_owned(),
+                READ_ONLY.to_owned(),
+            ),
+            (
+                "EXEC sys.sp_query_store_flush_db",
+                "EXEC sys.sp_query_store_flush_db isn't on sqlh's list of read-only procedures: \
+                 it writes Query Store's in-memory data to disk"
+                    .to_owned(),
+                format!(
+                    "Read sys.query_store_runtime_stats instead: it has the rows not yet flushed \
+                     too; aggregate by plan_id, execution_type and runtime_stats_interval_id; \
+                     {READ_ONLY}"
+                ),
+            ),
+        ];
+        let lines: Vec<String> = (1..)
+            .zip(&cases)
+            .map(|(id, (sql, _, _))| {
+                let sql = serde_json::Value::from(*sql);
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":{sql}}}}}}}"#
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (id, (sql, reason, advice)) in (1..).zip(&cases) {
+            let result = &by_id(&messages, id)["result"];
+            assert_eq!(result["isError"], true, "{sql}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(
+                text.lines().next().unwrap_or(""),
+                format!("-- blocked: line 1: {reason}; nothing was run. {advice}"),
+                "{sql}"
+            );
+            assert!(!text.contains("--allow-write"), "{sql}: {text}");
+        }
     }
 
     #[test]
@@ -11740,8 +11929,9 @@ mod live {
                 assert_eq!(
                     split_status(&text).0,
                     format!(
-                        "-- blocked: line 1: EXEC {procedure} would write; nothing was run. \
-                         sqlh mcp is read-only\n"
+                        "-- blocked: line 1: EXEC {procedure} isn't on sqlh's list of read-only \
+                         procedures, so sqlh can't tell what it does; nothing was run. sqlh mcp \
+                         is read-only\n"
                     )
                 );
             }

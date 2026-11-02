@@ -20,7 +20,8 @@ pub struct Blocked {
     /// How to get past the refusal; the output puts it after "nothing was run.".
     pub advice: String,
     /// Whether `--allow-write` lifts the refusal (it skips the classifier). `advice` then
-    /// offers it, which is no use under a profile that refuses it (`advice_for`).
+    /// offers it, except for `FLUSH_PROC`, which is no use under a profile that refuses it
+    /// (`advice_for`).
     pub lifted_by_write: bool,
     /// What to do short of writing, where there is something (`Use a #temp table`). For a
     /// refusal writing doesn't lift, the advice in `sqlh mcp`, which names no flag.
@@ -34,6 +35,17 @@ impl Blocked {
             line,
             reason,
             advice: WRITE_ADVICE.into(),
+            lifted_by_write: true,
+            instead: None,
+        }
+    }
+
+    /// A refusal of what sqlh doesn't know, so it doesn't call it a write (decision 23).
+    fn unknown(line: u32, reason: String) -> Blocked {
+        Blocked {
+            line,
+            reason,
+            advice: "Rerun with --allow-write to run it as written".into(),
             lifted_by_write: true,
             instead: None,
         }
@@ -285,6 +297,13 @@ const UNRESERVED_STARTS: &[&str] = &[
     "DISABLE", "ENABLE", "GET", "MOVE", "RECEIVE", "SEND", "THROW",
 ];
 
+/// `sp_query_store_flush_db`, whose reason for being run is served by a read, so its refusal
+/// points there and offers no flag (decision 23, command-categories.md §3.2, F3).
+const FLUSH_PROC: &str = "SP_QUERY_STORE_FLUSH_DB";
+const FLUSH_INSTEAD: &str = "Read sys.query_store_runtime_stats instead: it has the rows not yet \
+                             flushed too; aggregate by plan_id, execution_type and \
+                             runtime_stats_interval_id";
+
 /// DBCC commands that only read.
 const DBCC_READ: &[&str] = &[
     "INPUTBUFFER",
@@ -293,6 +312,122 @@ const DBCC_READ: &[&str] = &[
     "TRACESTATUS",
     "USEROPTIONS",
 ];
+
+/// What to read in place of a DBCC command not in `DBCC_READ` (command-categories.md §6.9). The
+/// guard runs before connecting, so it can't ask the server's version, and the refusal states
+/// what the reader may not have or may not find in the docs. Each was run on SQL Server 2016 SP3
+/// and 2025, except `sys.dm_db_page_info`, which 2016 lacks (decision 49).
+const DBCC_INSTEAD: &[(&str, &str)] = &[
+    ("DBINFO", "DATABASEPROPERTYEX(name, 'LastGoodCheckDbTime')"),
+    ("IND", "sys.dm_db_database_page_allocations (undocumented)"),
+    ("LOGINFO", "sys.dm_db_log_info"),
+    ("PAGE", "sys.dm_db_page_info (SQL Server 2019 and later)"),
+    ("PROCCACHE", "sys.dm_exec_cached_plans"),
+    ("SHOWCONTIG", "sys.dm_db_index_physical_stats"),
+    ("SHOWFILESTATS", "sys.dm_db_file_space_usage"),
+];
+
+/// The statements `ALTER` and `CREATE` make, for a refusal to name one (decision 23). An entry
+/// that begins another comes after it, as the first match is the one named. Only these are
+/// ever shown, never the input's words, so what follows `ALTER` can't turn up as a statement.
+const DDL_STATEMENTS: &[&str] = &[
+    "AGGREGATE",
+    "APPLICATION ROLE",
+    "ASSEMBLY",
+    "ASYMMETRIC KEY",
+    "AUTHORIZATION",
+    "AVAILABILITY GROUP",
+    "BROKER PRIORITY",
+    "CERTIFICATE",
+    "COLUMN ENCRYPTION KEY",
+    "COLUMN MASTER KEY",
+    "COLUMNSTORE INDEX",
+    "CONTRACT",
+    "CREDENTIAL",
+    "CRYPTOGRAPHIC PROVIDER",
+    "DATABASE AUDIT SPECIFICATION",
+    "DATABASE ENCRYPTION KEY",
+    "DATABASE SCOPED CONFIGURATION",
+    "DATABASE SCOPED CREDENTIAL",
+    "DATABASE",
+    "DEFAULT",
+    "ENDPOINT",
+    "EVENT NOTIFICATION",
+    "EVENT SESSION",
+    "EXTERNAL DATA SOURCE",
+    "EXTERNAL FILE FORMAT",
+    "EXTERNAL LANGUAGE",
+    "EXTERNAL LIBRARY",
+    "EXTERNAL RESOURCE POOL",
+    "EXTERNAL TABLE",
+    "FULLTEXT CATALOG",
+    "FULLTEXT INDEX",
+    "FULLTEXT STOPLIST",
+    "FUNCTION",
+    "INDEX",
+    "LOGIN",
+    "MASTER KEY",
+    "MESSAGE TYPE",
+    "PARTITION FUNCTION",
+    "PARTITION SCHEME",
+    "PRIMARY XML INDEX",
+    "PROC",
+    "PROCEDURE",
+    "QUEUE",
+    "REMOTE SERVICE BINDING",
+    "RESOURCE GOVERNOR",
+    "RESOURCE POOL",
+    "ROLE",
+    "ROUTE",
+    "RULE",
+    "SCHEMA",
+    "SEARCH PROPERTY LIST",
+    "SECURITY POLICY",
+    "SELECTIVE XML INDEX",
+    "SEQUENCE",
+    "SERVER AUDIT SPECIFICATION",
+    "SERVER AUDIT",
+    "SERVER CONFIGURATION",
+    "SERVER ROLE",
+    "SERVICE MASTER KEY",
+    "SERVICE",
+    "SPATIAL INDEX",
+    "STATISTICS",
+    "SYMMETRIC KEY",
+    "SYNONYM",
+    "TRIGGER",
+    "TYPE",
+    "USER",
+    "VIEW",
+    "WORKLOAD CLASSIFIER",
+    "WORKLOAD GROUP",
+    "XML INDEX",
+    "XML SCHEMA COLLECTION",
+];
+
+/// The most words an entry of `DDL_STATEMENTS` has.
+const DDL_WORDS: usize = 3;
+
+/// `verb` and the statement of `DDL_STATEMENTS` the input names at `after`, or `verb` alone. It
+/// reads a few tokens once, and only on the way to a refusal, which ends the pass.
+fn ddl_statement(verb: &str, after: &Lexer<'_>) -> String {
+    let mut lex = after.clone();
+    let written: [&str; DDL_WORDS] = std::array::from_fn(|_| {
+        lex.next()
+            .filter(|t| t.kind == Kind::Word)
+            .map_or("", |t| t.name)
+    });
+    let statement = DDL_STATEMENTS.iter().find(|statement| {
+        statement
+            .split(' ')
+            .zip(written)
+            .all(|(word, seen)| word.eq_ignore_ascii_case(seen))
+    });
+    match statement {
+        Some(statement) => format!("{verb} {statement}"),
+        None => verb.to_owned(),
+    }
+}
 
 /// Words that can start a statement. A batch that starts with any other word is an
 /// implicit procedure call (`sp_who2` alone runs the procedure).
@@ -1064,7 +1199,10 @@ impl<'a> Guard<'a> {
             }
             "DELETE" => self.write_after_top(Write::Delete, line, lex, depth, open)?,
             "TRUNCATE" => self.require_table(line, lex, "TRUNCATE TABLE")?,
-            "ALTER" => self.require_table(line, lex, "ALTER")?,
+            "ALTER" if lex.word_is(0, "TABLE") => {
+                self.require_scratch(line, &lex.after(1), "ALTER TABLE")?;
+            }
+            "ALTER" => return Err(self.blocked(line, &ddl_statement("ALTER", lex))),
             "CREATE" => {
                 let mut j = lex.clone();
                 while j
@@ -1078,8 +1216,11 @@ impl<'a> Guard<'a> {
                 } else if j.word_is(0, "INDEX") && j.word_is(2, "ON") {
                     // CREATE INDEX name ON #t
                     self.require_scratch(line, &j.after(3), "CREATE INDEX")?;
+                } else if j.word_is(0, "OR") && j.word_is(1, "ALTER") {
+                    let what = ddl_statement("CREATE OR ALTER", &j.after(2));
+                    return Err(self.blocked(line, &what));
                 } else {
-                    return Err(self.blocked(line, "CREATE"));
+                    return Err(self.blocked(line, &ddl_statement("CREATE", &j)));
                 }
             }
             "DROP" => {
@@ -1111,8 +1252,7 @@ impl<'a> Guard<'a> {
             "DBCC" => {
                 let command = lex.word(0).unwrap_or("");
                 if !in_list(DBCC_READ, command) {
-                    let command = command.to_ascii_uppercase();
-                    return Err(self.blocked(line, &format!("DBCC {command}")));
+                    return Err(self.unknown_dbcc(line, command, lex));
                 }
             }
             // Sequence allocation survives a rollback, so the wrapper can't undo it.
@@ -1254,22 +1394,46 @@ impl<'a> Guard<'a> {
         let end = parts.rest();
         let last = last.filter(|t| matches!(t.kind, Kind::Word | Kind::Quoted));
         let name = last.map_or("", |t| t.name);
-        if !in_list(PROCS, name) && batch_start {
-            // A batch that starts with an unknown word is run as a procedure call by SQL
-            // Server, so a typo like `SELEC 1` lands here too.
-            return Err(Blocked::write_or(
+        if !in_list(PROCS, name) {
+            let shown = self.name_at(start);
+            if name.eq_ignore_ascii_case(FLUSH_PROC) {
+                let reason = if batch_start {
+                    shown
+                } else {
+                    format!("{what} {shown}")
+                };
+                // sqlh does know this one, so its reason doesn't say it can't tell.
+                return Err(Blocked {
+                    line,
+                    reason: format!(
+                        "{reason} isn't on sqlh's list of read-only procedures: it writes Query \
+                         Store's in-memory data to disk"
+                    ),
+                    advice: FLUSH_INSTEAD.into(),
+                    lifted_by_write: true,
+                    instead: Some(FLUSH_INSTEAD.into()),
+                });
+            }
+            if batch_start {
+                // A batch that starts with an unknown word is run as a procedure call by SQL
+                // Server, so a typo like `SELEC 1` lands here too.
+                return Err(Blocked::write_or(
+                    line,
+                    format!(
+                        "{shown} starts the batch, so SQL Server would run it as a stored \
+                         procedure (a typo?); it isn't on sqlh's list of read-only procedures"
+                    ),
+                    "Fix it if it's a typo".into(),
+                    " to run it as written",
+                ));
+            }
+            return Err(Blocked::unknown(
                 line,
                 format!(
-                    "{} starts the batch, so SQL Server would run it as a stored procedure (a typo?); \
-                     only read-only system procedures may run without --allow-write",
-                    self.name_at(start)
+                    "{what} {shown} isn't on sqlh's list of read-only procedures, so sqlh can't \
+                     tell what it does"
                 ),
-                "Fix it if it's a typo".into(),
-                " to call the procedure",
             ));
-        }
-        if !in_list(PROCS, name) {
-            return Err(self.blocked(line, &format!("{what} {}", self.name_at(start))));
         }
         if !self.local_system_qualifier(start) {
             // The policy, not a claim about what the name resolves to: it may well be the
@@ -1428,6 +1592,24 @@ impl<'a> Guard<'a> {
     /// A refusal for `what`, at the keyword on `line`.
     fn blocked(&self, line: u32, what: &str) -> Blocked {
         Blocked::write(line, format!("{what} would write"))
+    }
+
+    /// The refusal of a DBCC command not in `DBCC_READ`. `command` is the word at `after`, the
+    /// position just past `DBCC`: empty when that is no bare word.
+    fn unknown_dbcc(&self, line: u32, command: &str, after: &Lexer<'a>) -> Blocked {
+        let shown = if command.is_empty() {
+            self.name_at(after)
+        } else {
+            command.to_ascii_uppercase()
+        };
+        let reason = format!("DBCC {shown} isn't on sqlh's list of read-only DBCC commands");
+        match DBCC_INSTEAD
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(command))
+        {
+            Some((_, read)) => Blocked::write_or(line, reason, format!("Read {read} instead"), ""),
+            None => Blocked::unknown(line, reason),
+        }
     }
 }
 
@@ -1758,7 +1940,8 @@ mod tests {
         allowed("label: SELECT 1");
         assert_eq!(
             blocked("EXEC dbo.PurgeOrders").reason,
-            "EXEC dbo.PurgeOrders would write"
+            "EXEC dbo.PurgeOrders isn't on sqlh's list of read-only procedures, so sqlh can't \
+             tell what it does"
         );
         assert!(blocked("dbo.PurgeOrders 5").reason.starts_with(
             "dbo.PurgeOrders starts the batch, so SQL Server would run it as a stored procedure"
@@ -1988,6 +2171,446 @@ mod tests {
         );
     }
 
+    /// The refusal of `sql` as an agent reads it: the reason, then the advice in a run where
+    /// `--allow-write` works, under a deny profile, and in `sqlh mcp`.
+    fn worded(sql: &str) -> (String, String, String, String) {
+        let b = blocked(sql);
+        (
+            b.reason.clone(),
+            b.advice_for(None),
+            b.advice_for(Some(&WritesOff::Profile("p".into()))),
+            b.advice_for(Some(&WritesOff::Mcp)),
+        )
+    }
+
+    // Decision 23, command-categories.md §6.9: what sqlh doesn't know isn't called a write.
+    #[test]
+    fn unknown_procedures_are_not_called_writes() {
+        const DENIED: &str = "Profile p doesn't allow writes (write_policy = \"deny\")";
+        const AS_WRITTEN: &str = "Rerun with --allow-write to run it as written";
+        const UNKNOWN: &str =
+            "isn't on sqlh's list of read-only procedures, so sqlh can't tell what it does";
+        for (sql, shown) in [
+            ("EXEC sp_WhoIsActive", "EXEC sp_WhoIsActive"),
+            ("execute dbo.sp_BlitzCache", "EXEC dbo.sp_BlitzCache"),
+            (
+                "EXEC master.dbo.sp_WhoIsActive",
+                "EXEC master.dbo.sp_WhoIsActive",
+            ),
+            ("EXEC [dbo].[usp_x] 1", "EXEC [dbo].[usp_x]"),
+            ("EXEC @rc = dbo.usp_x", "EXEC dbo.usp_x"),
+            ("INSERT #t EXEC dbo.usp_x", "EXEC dbo.usp_x"),
+            ("EXEC sp_executesql N'SELECT 1'", "EXEC sp_executesql"),
+            ("EXEC xp_cmdshell 'dir'", "EXEC xp_cmdshell"),
+            ("EXEC", "EXEC ?"),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!("{shown} {UNKNOWN}"),
+                    AS_WRITTEN.to_owned(),
+                    DENIED.to_owned(),
+                    "sqlh mcp is read-only".to_owned(),
+                ),
+                "{sql}"
+            );
+        }
+        const IMPLICIT: &str = "starts the batch, so SQL Server would run it as a stored \
+                                procedure (a typo?); it isn't on sqlh's list of read-only \
+                                procedures";
+        for (sql, shown) in [
+            ("sp_WhoIsActive", "sp_WhoIsActive"),
+            ("sp_WhoIsActive @find_block_leaders = 1", "sp_WhoIsActive"),
+            ("dbo.Purge 5", "dbo.Purge"),
+            ("[dbo].[Purge]", "[dbo].[Purge]"),
+            ("SELEC 1", "SELEC"),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!("{shown} {IMPLICIT}"),
+                    "Fix it if it's a typo, or rerun with --allow-write to run it as written".to_owned(),
+                    "Fix it if it's a typo; profile p doesn't allow writes (write_policy = \"deny\")"
+                        .to_owned(),
+                    "Fix it if it's a typo; sqlh mcp is read-only".to_owned(),
+                ),
+                "{sql}"
+            );
+        }
+        // What sqlh does say about a call stays what it was.
+        for (sql, reason) in [
+            ("EXEC ('DELETE FROM t')", "EXEC (dynamic SQL) would write"),
+            (
+                "EXEC @p",
+                "EXEC of a procedure named by a variable would write",
+            ),
+            ("EXECUTE AS USER = 'x'", "EXECUTE AS would write"),
+        ] {
+            assert_eq!(blocked(sql).reason, reason, "{sql}");
+        }
+    }
+
+    // §3.2, F3: a flush isn't needed to read recent data, so the refusal says what to read.
+    #[test]
+    fn the_query_store_flush_gets_a_read_in_place_of_a_flag() {
+        const READ: &str = "Read sys.query_store_runtime_stats instead: it has the rows not yet \
+                            flushed too; aggregate by plan_id, execution_type and \
+                            runtime_stats_interval_id";
+        for (sql, shown) in [
+            (
+                "EXEC sp_query_store_flush_db",
+                "EXEC sp_query_store_flush_db",
+            ),
+            (
+                "exec SYS.SP_QUERY_STORE_FLUSH_DB",
+                "EXEC SYS.SP_QUERY_STORE_FLUSH_DB",
+            ),
+            (
+                "EXEC master.sys.sp_query_store_flush_db",
+                "EXEC master.sys.sp_query_store_flush_db",
+            ),
+            ("sp_query_store_flush_db", "sp_query_store_flush_db"),
+            (
+                "[sys].[sp_query_store_flush_db]",
+                "[sys].[sp_query_store_flush_db]",
+            ),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!(
+                        "{shown} isn't on sqlh's list of read-only procedures: it writes Query \
+                         Store's in-memory data to disk"
+                    ),
+                    READ.to_owned(),
+                    format!("{READ}; profile p doesn't allow writes (write_policy = \"deny\")"),
+                    format!("{READ}; sqlh mcp is read-only"),
+                ),
+                "{sql}"
+            );
+        }
+        // Its neighbours, which change what is stored, are plain unknown procedures.
+        assert_eq!(
+            blocked("EXEC sys.sp_query_store_force_plan 1, 2").advice,
+            "Rerun with --allow-write to run it as written"
+        );
+        // --allow-write skips the classifier, for this as for the rest.
+        let writes = Policy {
+            writes: true,
+            compile_only: false,
+        };
+        assert_eq!(check("EXEC sys.sp_query_store_flush_db", writes), Ok(()));
+    }
+
+    // §6.9's replacements, in each form the advice takes.
+    #[test]
+    fn unknown_dbcc_commands_name_their_replacement_first() {
+        const UNKNOWN: &str = "isn't on sqlh's list of read-only DBCC commands";
+        for (sql, command, read) in [
+            (
+                "DBCC DBINFO WITH TABLERESULTS",
+                "DBINFO",
+                "DATABASEPROPERTYEX(name, 'LastGoodCheckDbTime')",
+            ),
+            (
+                "DBCC IND (N'Sales', N'dbo.Orders', -1)",
+                "IND",
+                "sys.dm_db_database_page_allocations (undocumented)",
+            ),
+            ("DBCC LOGINFO", "LOGINFO", "sys.dm_db_log_info"),
+            (
+                "dbcc page (N'Sales', 1, 100, 3)",
+                "PAGE",
+                "sys.dm_db_page_info (SQL Server 2019 and later)",
+            ),
+            ("DBCC PROCCACHE", "PROCCACHE", "sys.dm_exec_cached_plans"),
+            (
+                "DBCC ShowContig",
+                "SHOWCONTIG",
+                "sys.dm_db_index_physical_stats",
+            ),
+            (
+                "DBCC SHOWFILESTATS",
+                "SHOWFILESTATS",
+                "sys.dm_db_file_space_usage",
+            ),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!("DBCC {command} {UNKNOWN}"),
+                    format!("Read {read} instead, or rerun with --allow-write"),
+                    format!(
+                        "Read {read} instead; profile p doesn't allow writes (write_policy = \
+                         \"deny\")"
+                    ),
+                    format!("Read {read} instead; sqlh mcp is read-only"),
+                ),
+                "{sql}"
+            );
+        }
+        for (sql, command) in [
+            ("DBCC FREEPROCCACHE", "FREEPROCCACHE"),
+            ("DBCC WRITEPAGE (N'Sales', 1, 100, 0, 1, 0x00)", "WRITEPAGE"),
+            ("DBCC SQLPERF(LOGSPACE)", "SQLPERF"),
+            ("DBCC CHECKDB WITH ESTIMATEONLY", "CHECKDB"),
+            ("DBCC MEMORYSTATUS", "MEMORYSTATUS"),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!("DBCC {command} {UNKNOWN}"),
+                    "Rerun with --allow-write to run it as written".to_owned(),
+                    "Profile p doesn't allow writes (write_policy = \"deny\")".to_owned(),
+                    "sqlh mcp is read-only".to_owned(),
+                ),
+                "{sql}"
+            );
+        }
+        for (command, _) in DBCC_INSTEAD {
+            assert_eq!(*command, command.to_ascii_uppercase());
+            assert!(
+                !in_list(DBCC_READ, command),
+                "{command} is on the read list"
+            );
+        }
+    }
+
+    // The probes command-categories.md §6.9 names (Appendix A), and how far a name is read.
+    #[test]
+    fn ddl_refusals_name_the_statement() {
+        for (probe, sql, statement) in [
+            (
+                "C6",
+                "ALTER RESOURCE GOVERNOR RESET STATISTICS",
+                "ALTER RESOURCE GOVERNOR",
+            ),
+            (
+                "Q15",
+                "ALTER DATABASE CURRENT SET QUERY_STORE CLEAR",
+                "ALTER DATABASE",
+            ),
+            (
+                "Q16",
+                "ALTER DATABASE CURRENT SET QUERY_STORE = ON",
+                "ALTER DATABASE",
+            ),
+            (
+                "Q22",
+                "ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE 0x0600",
+                "ALTER DATABASE SCOPED CONFIGURATION",
+            ),
+            (
+                "Q27",
+                "ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4",
+                "ALTER DATABASE SCOPED CONFIGURATION",
+            ),
+            (
+                "E8",
+                "CREATE STATISTICS s ON #work (c)",
+                "CREATE STATISTICS",
+            ),
+            ("E9", "ALTER INDEX ALL ON #work REBUILD", "ALTER INDEX"),
+            (
+                "E25",
+                "ALTER INDEX IX_Orders_CustomerId ON dbo.Orders REBUILD WITH (ONLINE = ON \
+                 (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = BLOCKERS)))",
+                "ALTER INDEX",
+            ),
+            (
+                "F10",
+                "ALTER AVAILABILITY GROUP ag FAILOVER",
+                "ALTER AVAILABILITY GROUP",
+            ),
+            (
+                "F22",
+                "CREATE EVENT SESSION s ON SERVER ADD EVENT sqlserver.sql_batch_completed",
+                "CREATE EVENT SESSION",
+            ),
+            (
+                "F23",
+                "ALTER EVENT SESSION [system_health] ON SERVER STATE = STOP",
+                "ALTER EVENT SESSION",
+            ),
+            (
+                "I9",
+                "ALTER EVENT SESSION system_health ON SERVER DROP EVENT \
+                 sqlserver.xml_deadlock_report",
+                "ALTER EVENT SESSION",
+            ),
+            (
+                "J12",
+                "ALTER INDEX IX_Orders_CustomerId ON dbo.Orders REORGANIZE",
+                "ALTER INDEX",
+            ),
+            (
+                "J34",
+                "ALTER DATABASE Sales SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
+                "ALTER DATABASE",
+            ),
+        ] {
+            assert_eq!(
+                worded(sql),
+                (
+                    format!("{statement} would write"),
+                    WRITE_ADVICE.to_owned(),
+                    "Profile p doesn't allow writes (write_policy = \"deny\")".to_owned(),
+                    "sqlh mcp is read-only".to_owned(),
+                ),
+                "{probe}: {sql}"
+            );
+        }
+        for (sql, reason) in [
+            // In any case and however it is spaced, in sqlh's own spelling.
+            (
+                "alter event session s on server",
+                "ALTER EVENT SESSION would write",
+            ),
+            (
+                "ALTER /* a */ DATABASE -- b\n SCOPED\nCONFIGURATION SET MAXDOP = 4",
+                "ALTER DATABASE SCOPED CONFIGURATION would write",
+            ),
+            // The longest statement that fits, and a database that only sounds like one.
+            (
+                "ALTER DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'x'",
+                "ALTER DATABASE SCOPED CREDENTIAL would write",
+            ),
+            (
+                "ALTER DATABASE SCOPED SET READ_ONLY",
+                "ALTER DATABASE would write",
+            ),
+            (
+                "ALTER DATABASE audit SET READ_ONLY",
+                "ALTER DATABASE would write",
+            ),
+            (
+                "ALTER SERVER AUDIT SPECIFICATION s WITH (STATE = ON)",
+                "ALTER SERVER AUDIT SPECIFICATION would write",
+            ),
+            (
+                "ALTER SERVER AUDIT s WITH (STATE = ON)",
+                "ALTER SERVER AUDIT would write",
+            ),
+            (
+                "ALTER SERVICE MASTER KEY REGENERATE",
+                "ALTER SERVICE MASTER KEY would write",
+            ),
+            ("ALTER SERVICE s", "ALTER SERVICE would write"),
+            ("ALTER LOGIN x DISABLE", "ALTER LOGIN would write"),
+            ("ALTER PROC p AS SELECT 1", "ALTER PROC would write"),
+            ("ALTER VIEW v AS SELECT 1", "ALTER VIEW would write"),
+            (
+                "CREATE PROCEDURE p AS SELECT 1",
+                "CREATE PROCEDURE would write",
+            ),
+            (
+                "CREATE LOGIN x WITH PASSWORD = 'y'",
+                "CREATE LOGIN would write",
+            ),
+            (
+                "CREATE XML SCHEMA COLLECTION c AS ''",
+                "CREATE XML SCHEMA COLLECTION would write",
+            ),
+            (
+                "CREATE OR ALTER VIEW v AS SELECT 1",
+                "CREATE OR ALTER VIEW would write",
+            ),
+            ("CREATE OR ALTER", "CREATE OR ALTER would write"),
+            // Past what CREATE INDEX may start with.
+            (
+                "CREATE CLUSTERED COLUMNSTORE INDEX ix ON #t",
+                "CREATE COLUMNSTORE INDEX would write",
+            ),
+            (
+                "CREATE PRIMARY XML INDEX ix ON #t (c)",
+                "CREATE PRIMARY XML INDEX would write",
+            ),
+            (
+                "CREATE UNIQUE STATISTICS s ON t (c)",
+                "CREATE STATISTICS would write",
+            ),
+            ("CREATE INDEX a.b ON #t (c)", "CREATE INDEX would write"),
+            ("CREATE UNIQUE CLUSTERED", "CREATE would write"),
+            // What the input says past the keyword isn't taken for a statement: only sqlh's
+            // own names are shown, so a truncated or unknown one stays bare, and is refused.
+            ("ALTER", "ALTER would write"),
+            ("CREATE", "CREATE would write"),
+            ("ALTER EVENT", "ALTER would write"),
+            ("ALTER EVENT dbo.s", "ALTER would write"),
+            ("ALTER [EVENT] SESSION s", "ALTER would write"),
+            ("ALTER 'EVENT SESSION'", "ALTER would write"),
+            ("ALTER EVENT 'x' SESSION", "ALTER would write"),
+            ("ALTER NOSUCH x", "ALTER would write"),
+            ("CREATE NOSUCH x", "CREATE would write"),
+            // Named as before.
+            (
+                "ALTER TABLE dbo.T ADD x int",
+                "ALTER TABLE dbo.T would write",
+            ),
+            ("ALTER TABLE", "ALTER TABLE ? would write"),
+            (
+                "CREATE TABLE dbo.T (x int)",
+                "CREATE TABLE dbo.T would write",
+            ),
+            (
+                "CREATE INDEX ix ON dbo.T (a)",
+                "CREATE INDEX dbo.T would write",
+            ),
+            ("UPDATE STATISTICS dbo.T", "UPDATE STATISTICS would write"),
+        ] {
+            assert_eq!(blocked(sql).reason, reason, "{sql}");
+        }
+        assert_eq!(
+            blocked("ALTER TABLE ##g ADD x int").reason,
+            "ALTER TABLE ##g would write to a global temp table, which other sessions share"
+        );
+        // Only the words of a refusal change: what passed before still does.
+        allowed("ALTER TABLE #t ADD x int");
+        allowed("ALTER TABLE @t ADD x int");
+        allowed("CREATE TABLE #t (x int)");
+        allowed("CREATE UNIQUE CLUSTERED INDEX ix ON #t (x)");
+        assert_eq!(blocked("SELECT 1\nALTER\nINDEX ix ON #t REBUILD").line, 2);
+
+        for (i, statement) in DDL_STATEMENTS.iter().enumerate() {
+            assert_eq!(*statement, statement.to_ascii_uppercase());
+            assert!(statement.split(' ').count() <= DDL_WORDS, "{statement}");
+            // The first match is the one named, so no entry may hide a longer one after it.
+            for later in &DDL_STATEMENTS[i + 1..] {
+                assert!(
+                    !later.starts_with(&format!("{statement} ")),
+                    "{statement} hides {later}"
+                );
+            }
+        }
+    }
+
+    // A name is lookahead under the budget, read once on the way to a refusal.
+    #[test]
+    fn naming_a_statement_reads_a_few_tokens_once() {
+        let filler = "SELECT 1\n".repeat(100_000);
+        for sql in [
+            format!("ALTER EVENT SESSION s\n{filler}"),
+            format!("CREATE OR ALTER VIEW v\n{filler}"),
+            format!("ALTER NOSUCH x\n{filler}"),
+            format!("DBCC PAGE\n{filler}"),
+        ] {
+            assert!(work_of(&sql) < 30, "{}: {}", &sql[..20], work_of(&sql));
+        }
+        // Inside TOP clauses that must close first, and past the budget, the answer is as before.
+        let n = 10_000;
+        let nested = format!(
+            "{}ALTER EVENT SESSION s{}",
+            "UPDATE TOP (".repeat(n),
+            ") @t ".repeat(n)
+        );
+        assert_eq!(blocked(&nested).reason, "ALTER EVENT SESSION would write");
+        assert!(work_of(&nested) < 12 * n as u64, "{}", work_of(&nested));
+        let many = "ALTER NOSUCH x\n".repeat(100_000);
+        assert!(work_of(&many) < 30, "{}", work_of(&many));
+        let spent = check_within("ALTER EVENT SESSION s", READ_ONLY, 0, 0).expect_err("refused");
+        assert!(spent.reason.contains("too complex"), "{}", spent.reason);
+    }
+
     #[test]
     fn sp_spaceused_update_usage_is_blocked() {
         allowed("EXEC sp_spaceused");
@@ -2079,7 +2702,14 @@ mod tests {
             ("EXEC sp_configure_peer", "EXEC sp_configure_peer"),
         ] {
             let b = blocked(sql);
-            assert_eq!(b.reason, format!("{what} would write"), "{sql}");
+            assert_eq!(
+                b.reason,
+                format!(
+                    "{what} isn't on sqlh's list of read-only procedures, so sqlh can't tell \
+                     what it does"
+                ),
+                "{sql}"
+            );
         }
         // Only the local system procedure counts, as for the sp_ ones.
         for sql in [
@@ -2625,6 +3255,9 @@ mod tests {
             "FOR",
             "NOEXEC",
             "INSERT",
+            "ALTER",
+            "CREATE",
+            "DBCC",
             "INTO",
             "TOP",
             "GO",
@@ -2838,9 +3471,21 @@ mod tests {
         }
         assert_eq!(
             blocked("dbcc freeproccache").reason,
-            "DBCC FREEPROCCACHE would write"
+            "DBCC FREEPROCCACHE isn't on sqlh's list of read-only DBCC commands"
         );
-        assert_eq!(blocked("dbcc").reason, "DBCC  would write");
+        // No command to name, or none that is a bare word: refused all the same.
+        assert_eq!(
+            blocked("dbcc").reason,
+            "DBCC ? isn't on sqlh's list of read-only DBCC commands"
+        );
+        assert_eq!(
+            blocked("DBCC [OPENTRAN]").reason,
+            "DBCC [OPENTRAN] isn't on sqlh's list of read-only DBCC commands"
+        );
+        assert_eq!(
+            blocked("DBCC 'x'").reason,
+            "DBCC ? isn't on sqlh's list of read-only DBCC commands"
+        );
         for word in STATEMENT_START {
             for spelled in [word.to_ascii_lowercase(), alternating(word)] {
                 // Whatever else the batch does, it isn't taken for a procedure call.
@@ -2895,13 +3540,35 @@ mod tests {
         assert!(b.reason.starts_with("OPENDATASOURCE is not allowed"));
         // A name's message carries the name as written, whatever its length.
         let b = blocked(&format!("EXEC {long}"));
-        assert_eq!(b.reason, format!("EXEC {long} would write"));
+        assert_eq!(
+            b.reason,
+            format!(
+                "EXEC {long} isn't on sqlh's list of read-only procedures, so sqlh can't tell \
+                 what it does"
+            )
+        );
         assert_eq!(
             blocked(&format!("{long} 1")).reason,
             format!(
                 "{long} starts the batch, so SQL Server would run it as a stored procedure (a typo?); \
-                 only read-only system procedures may run without --allow-write"
+                 it isn't on sqlh's list of read-only procedures"
             )
+        );
+        assert_eq!(
+            blocked(&format!("DBCC {long}")).reason,
+            format!(
+                "DBCC {} isn't on sqlh's list of read-only DBCC commands",
+                long.to_ascii_uppercase()
+            )
+        );
+        // The name of a DDL statement is sqlh's own, so a long word after it isn't shown.
+        assert_eq!(
+            blocked(&format!("ALTER {long}")).reason,
+            "ALTER would write"
+        );
+        assert_eq!(
+            blocked(&format!("CREATE {long} ON t")).reason,
+            "CREATE would write"
         );
     }
 
@@ -3245,11 +3912,10 @@ mod tests {
         assert_eq!(b.line, 2);
         let b = blocked(&format!("EXEC {}a", "a.".repeat(n)));
         assert!(b.reason.starts_with("EXEC a.a.a.a."), "{}", &b.reason[..20]);
-        assert!(b.reason.ends_with(".a.a would write"));
-        assert_eq!(
-            b.reason.len(),
-            "EXEC ".len() + 2 * n + 1 + " would write".len()
-        );
+        let unknown =
+            " isn't on sqlh's list of read-only procedures, so sqlh can't tell what it does";
+        assert!(b.reason.ends_with(&format!(".a.a{unknown}")));
+        assert_eq!(b.reason.len(), "EXEC ".len() + 2 * n + 1 + unknown.len());
         // A TOP clause that is never closed reads to the end and finds no target.
         let b = blocked(&format!("DELETE TOP ({}", "(".repeat(n)));
         assert_eq!(b.reason, "DELETE ? would write");

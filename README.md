@@ -130,7 +130,7 @@ Each tool also takes `profile` (needed when several are listed), `database`, `ma
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md) and [docs/history/plan-history.md](docs/history/plan-history.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 44 built, 2 planned.**
+**Tally: 45 built, 2 planned.**
 
 ### Built
 
@@ -151,6 +151,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Exit codes with a meaning.** 0 ok, 1 SQL error, 2 connect, 3 usage, 4 timeout, 5 blocked, 6 cancelled, 7 output not delivered, 10 internal. Exit 7 means "don't trust what you received", and it is no reason to retry a write blindly. *(MVP; exit 7 in Phase 1)*
 - **A result an error cut short says so.** The rows before a SQL error are marked incomplete in every format (`-- 2 rows so far (interrupted)`), so an agent never takes them for the whole answer. *(Phase 2 review)*
 - **Refusals say how to fix them.** A blocked write names the statement and the better spelling (`#temp` instead of `##t`, `sys.sp_who`) before it suggests `--allow-write`. *(Phase 1)*
+- **A refusal doesn't call everything a write.** A procedure or DBCC command sqlh doesn't know is refused as just that, so an agent doesn't reach for `--allow-write` to run what may only read. Where a view does the job the refusal names it first (`sys.dm_db_log_info` for `DBCC LOGINFO`), and DDL names its statement (`ALTER EVENT SESSION`, not `ALTER`). *(Phase 6, slice 1)*
 - **Connection errors name what was tried** (server, port, auth, encryption) and hint at the usual cause: SQL Browser, certificate trust, TLS version. *(MVP)*
 
 **Safe to hand to a model**
