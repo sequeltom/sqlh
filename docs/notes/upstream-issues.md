@@ -82,6 +82,14 @@ Each entry says what was read or observed, in which version, why it matters to s
 - **sqlh's workaround:** none yet; a workaround belongs in `src/db/` if one is wanted, and nothing is planned.
 - **Possible fix:** no count on a token stream that keeps making progress, a much higher limit, or an option to set it.
 
+### U11. More than 1,000 errors before a DONE is an error of its own
+
+- **Seen in:** 0.3.0, on SQL Server 2025, under `--check`, and read in the source (`connection/tds_client.rs`, `MAX_ERRORS_PER_FAILED_STATEMENT`, `too_many_errors_for_one_statement`). Not tried without `--check`, or on 2016.
+- **What:** under `BatchErrorMode::Continue` the driver gives up with `ProtocolError("Too many ERROR tokens for one statement without a DONE")` at the 1,001st ERROR token before a DONE, as a guard against a misbehaving server, and drops the errors it collected (`abandon_failed_statement`). A legal batch produces that many, plain ASCII: `SELECT nope_zz FROM (SELECT 1 a) t;` repeated, with `--check`. 999 and 1,000 statements give exit 1 and each error; 1,001, 1,002 and 5,000 give exit 10 and none.
+- **Why it matters to sqlh:** the run ends with `-- error: Protocol Error: Too many ERROR tokens for one statement without a DONE` and `-- failed (exit 10): internal error`, so a generated script checked with `--check` gets none of the errors that would have fixed it, one more statement having lost them all, and nothing says that its size is the cause.
+- **sqlh's workaround:** none yet; a workaround belongs in `src/db/` if one is wanted, and nothing is planned.
+- **Possible fix:** keep the first 1,000, count the rest and read on to the DONE, as `SkippedErrors` already does for a drain; failing that, return what was collected with the error, or an option to set the limit.
+
 ## Decided not to raise
 
 - **The password in debug packet dumps** (owner decision 9, 2026-10-12): at debug level the driver hex-dumps every TDS packet before encryption, the login packet included. sqlh's own rule is the defense: no general logger while the driver runs (AGENTS.md, Driver logging). Re-check the dump when bumping the driver.

@@ -2937,6 +2937,39 @@ fn a_write_past_a_dotted_temp_name_never_connects() {
     }
 }
 
+// Decision 30(d) under a database whose collation folds accents, as measured by OBJECT_ID on one
+// (DESIGN.md §7). This shape is never sent to a server: the refusal comes before any connection.
+#[test]
+fn an_accented_spelling_of_the_scan_never_connects() {
+    for sql in [
+        "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+        "SELECT * FROM s\u{FD}\u{301}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+        "SELECT * FROM [\u{24C8}ys].dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+        "SELECT * FROM sys.dm_db_\u{ED}ndex_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+        "SELECT * FROM [some db].s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert_eq!(
+            r.stdout.lines().next(),
+            Some(
+                "-- blocked: line 1: sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would \
+                 read every page of every index in every database; nothing was run. Name the \
+                 database and object, or use 'LIMITED'"
+            ),
+            "{sql}"
+        );
+    }
+    // The scoped call and the mode that doesn't scan get as far as connecting.
+    for sql in [
+        "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(DB_ID(),NULL,NULL,NULL,'DETAILED')",
+        "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'LIMITED')",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 2, "{sql}: {}", r.stdout);
+    }
+}
+
 // plan-history.md 2.13, Windows shells and paths. The measurements are in
 // docs/notes/windows-shells.md.
 
@@ -4811,6 +4844,12 @@ mod mcp {
                 "IF 1=0 RAISERROR('x', 1, 1) WITH LOG",
                 "-- blocked: line 1: RAISERROR ... WITH LOG writes to the error log, which a \
                  rollback can't undo; nothing was run. Leave WITH LOG out; sqlh mcp is read-only",
+            ),
+            (
+                "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+                "-- blocked: line 1: sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would \
+                 read every page of every index in every database; nothing was run. Name the \
+                 database and object, or use 'LIMITED'",
             ),
             (
                 "\u{FEFF}SELECT 1 AS a",

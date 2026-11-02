@@ -281,12 +281,12 @@ fn word_letters(c: char, before: Option<u8>) -> Option<&'static [u8]> {
     }
 }
 
-/// What resolving an object's name, or the mode of `PHYSICAL_STATS`, reads `c` as. Wider than a
-/// word: it takes full-width forms, and a quoted name or a string can hold what a word can't, so
-/// everything else beyond ASCII is nothing. That takes in a repeat mark, which can't matter here: no
-/// name, mode or parameter this reads has two letters that match. Only what a match refuses goes by
-/// this, and nothing real has a name that spells one of those once a letter is dropped from it.
-fn name_letters(c: char, _before: Option<u8>) -> Option<&'static [u8]> {
+/// What the mode of `PHYSICAL_STATS` reads `c` as, which doesn't follow the database's collation
+/// (measured, DESIGN.md §7). Wider than a word: it takes full-width forms, and a string
+/// can hold what a word can't, so everything else beyond ASCII is nothing. That takes in a repeat
+/// mark, which can't matter here: neither mode has two letters that match. Only a refusal goes by
+/// this, and the servers answer any other mode with error 2561.
+fn mode_letters(c: char, _before: Option<u8>) -> Option<&'static [u8]> {
     match c {
         c if c.is_ascii() => ascii_letter(c as u32),
         '\u{FF01}'..='\u{FF5E}' => ascii_letter(c as u32 - 0xFEE0),
@@ -334,9 +334,72 @@ fn spells(name: &str, keyword: &str) -> bool {
     name.len() <= NAME_MAX_BYTES && reads_as(name, keyword, word_letters)
 }
 
-/// Whether `name` can resolve to the object `object`.
+/// Whether `name` could resolve to the object `object` (upper case), under some collation. Resolving
+/// follows the database's collation, and one server's databases can each have their own: 893
+/// one-character spellings of `PHYSICAL_STATS` and `SYS` resolve under `Latin1_General_100_CI_AI`,
+/// 118 under `SQL_Latin1_General_CP1_CI_AS` (DESIGN.md §7). So there is no table of what folds to
+/// what: a byte beyond ASCII stands for any number of the object's letters, none included. So does
+/// a control character, which a quoted name can hold and the sweep didn't try: unmeasured, and free
+/// to refuse. Other ASCII must spell the letters in order, in any case, so an ordinary name is
+/// compared as it always was. Only decision 30(d)'s refusal goes by this, and its call's shape is
+/// what keeps a real read out of it.
+///
+/// Each run of ASCII is found once, its place only ever moving on, so a name costs its own length
+/// and at most the square of the object's, however the two are mixed.
 fn names(name: &str, object: &str) -> bool {
-    name.len() <= NAME_MAX_BYTES && reads_as(name, object, name_letters)
+    if name.len() > NAME_MAX_BYTES {
+        return false;
+    }
+    let stands_in = |byte: &u8| !byte.is_ascii() || byte.is_ascii_control();
+    let name = name.as_bytes();
+    // Every word of a batch comes here, and almost all stop at this.
+    if let (Some(first), Some(letter)) = (name.first(), object.as_bytes().first())
+        && !stands_in(first)
+        && !first.eq_ignore_ascii_case(letter)
+    {
+        return false;
+    }
+    // After the last letter of ASCII, spaces are trailing ones, whatever else is among them.
+    let end = name
+        .iter()
+        .rposition(|byte| *byte != b' ' && !stands_in(byte))
+        .map_or(0, |last| last + 1);
+    let (spelled, tail) = name.split_at(end);
+    let takes_the_rest = tail.first().is_some_and(stands_in);
+    let mut runs = spelled.split(stands_in);
+    let Some(mut letters) = runs
+        .next()
+        .and_then(|first| after_run(object.as_bytes(), first))
+    else {
+        return false;
+    };
+    let last = if takes_the_rest {
+        None
+    } else {
+        runs.next_back()
+    };
+    for run in runs {
+        // The leftmost place leaves the most letters for the runs after this one.
+        let found = (0..=letters.len()).find_map(|at| after_run(letters.get(at..)?, run));
+        let Some(rest) = found else {
+            return false;
+        };
+        letters = rest;
+    }
+    match last {
+        Some(run) => letters
+            .len()
+            .checked_sub(run.len())
+            .and_then(|at| after_run(letters.get(at..)?, run))
+            .is_some(),
+        None => takes_the_rest || letters.is_empty(),
+    }
+}
+
+/// `letters` past `run`, if they start with it in any case.
+fn after_run<'l>(letters: &'l [u8], run: &[u8]) -> Option<&'l [u8]> {
+    let (start, rest) = letters.split_at_checked(run.len())?;
+    start.eq_ignore_ascii_case(run).then_some(rest)
 }
 
 /// The entry of `list` (upper case) that `name` spells in any case.
@@ -545,6 +608,55 @@ enum StatsCall {
     TooNested,
 }
 
+/// How far the tokens just read have come towards a call of `PHYSICAL_STATS`, each with the line of
+/// its `sys`. Followed in the pass rather than looked for ahead of a `sys`: a name beyond ASCII can
+/// be that `sys`, and a lookahead on each would read such text twice. `sys.` is the only way to the
+/// function, with a database in front or not: the server answers a bare, `dbo.` or `master..` name
+/// with error 208. A name can be both parts at once (`<U+00E9>.<U+00E9>.<U+00E9>(`).
+#[derive(Default)]
+struct StatsCallSeen {
+    sys: Option<u32>,
+    dot: Option<u32>,
+    name: Option<u32>,
+}
+
+impl StatsCallSeen {
+    /// The line of the call's `sys`, if `token` is the `(` of such a call.
+    fn read(&mut self, token: &Token<'_>) -> Option<u32> {
+        let (sys, dot, name) = (self.sys.take(), self.dot.take(), self.name.take());
+        match token.kind {
+            Kind::Punct('.') => self.dot = sys,
+            Kind::Punct('(') => return name,
+            Kind::Word | Kind::Quoted => {
+                if token.spells_name("SYS") {
+                    self.sys = Some(token.line);
+                }
+                if dot.is_some() && token.spells_name(PHYSICAL_STATS) {
+                    self.name = dot;
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// The refusal, if any, of the call of `PHYSICAL_STATS` whose `sys` is on `line`; `lex` is just past
+/// its `(`.
+fn check_physical_stats(line: u32, lex: &Lexer<'_>) -> Result<(), Blocked> {
+    match read_stats_call(lex.clone()) {
+        StatsCall::Other => Ok(()),
+        StatsCall::Wildcard(mode) => Err(wildcard_stats(line, mode)),
+        StatsCall::TooNested => Err(too_complex(
+            line,
+            &format!(
+                "the arguments of sys.dm_db_index_physical_stats name it more than \
+                 {MAX_STATS_NAMED} times"
+            ),
+        )),
+    }
+}
+
 /// Reads a call of `PHYSICAL_STATS`, from just past its `(`. Only the literal is looked for, as
 /// decision 30(d) has it: an expression in the first or the fifth place is left to the server.
 ///
@@ -552,14 +664,23 @@ enum StatsCall {
 /// token of the first or the fifth that isn't its literal, and a call's own `sys` is such a token,
 /// so a scan reads past another call only in those three, where it counts them. So no token is
 /// read by more than `MAX_STATS_NAMED + 1` scans and the work stays linear, as in
-/// `passes_argument`.
+/// `passes_argument`. Only a name with its `(` counts, which is all that starts a scan: any name
+/// beyond ASCII spells this one (`names`), and a subquery of such columns is no call.
 fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
     let mut depth = 0usize;
     let mut argument = 0;
     let mut literal_read = false;
     let mut mode = None;
     let mut named = 0;
+    let mut after_a_name = false;
     for t in scan {
+        if after_a_name && t.kind == Kind::Punct('(') {
+            named += 1;
+            if named > MAX_STATS_NAMED {
+                return StatsCall::TooNested;
+            }
+        }
+        after_a_name = (1..=3).contains(&argument) && t.spells_name(PHYSICAL_STATS);
         match t.kind {
             Kind::Punct('(') => depth += 1,
             Kind::Punct(')') if depth > 0 => depth -= 1,
@@ -570,14 +691,7 @@ fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
                 argument += 1;
                 literal_read = false;
             }
-            _ if (1..=3).contains(&argument) => {
-                if t.spells_name(PHYSICAL_STATS) {
-                    named += 1;
-                    if named > MAX_STATS_NAMED {
-                        return StatsCall::TooNested;
-                    }
-                }
-            }
+            _ if (1..=3).contains(&argument) => {}
             // A second token makes it an expression (`NULL + 1`).
             _ if literal_read => return StatsCall::Other,
             _ if argument == 0 => {
@@ -625,7 +739,7 @@ fn stats_mode(token: &Token<'_>) -> Option<&'static str> {
     let value = value.split('\0').next().unwrap_or(value);
     ["DETAILED", "SAMPLED"]
         .into_iter()
-        .find(|mode| names(value, mode) || best_fits(value, mode))
+        .find(|mode| reads_as(value, mode, mode_letters) || best_fits(value, mode))
 }
 
 /// The mode's parameter is `nvarchar(20)`, and the servers cut a longer literal without a word:
@@ -961,8 +1075,8 @@ const MAX_OPEN_TOP: usize = 16_384;
 /// which takes none, may have.
 const MAX_ARG_PARENS: usize = 8;
 
-/// How many times the second to the fourth arguments of `PHYSICAL_STATS` may name it. Nothing
-/// real does this at all; the limit is what keeps `read_stats_call` linear.
+/// How many times the second to the fourth arguments of `PHYSICAL_STATS` may call it, or a name
+/// that spells it. Nothing real does this at all; the limit is what keeps `read_stats_call` linear.
 const MAX_STATS_NAMED: usize = 8;
 
 /// How much work a batch's classification has done, shared by every `Lexer` copy made for it.
@@ -1646,9 +1760,22 @@ impl<'a> Guard<'a> {
         // until the clauses before it have closed, because one of them may refuse too, and the
         // refusal is the earliest keyword's, as it is when each target is looked up at once.
         let mut held: Option<(usize, Blocked)> = None;
+        let mut stats_call = StatsCallSeen::default();
         while let Some(token) = lex.next() {
+            let call_on = stats_call.read(&token);
             match token.kind {
-                Kind::Punct('(') => depth += 1,
+                Kind::Punct('(') => {
+                    depth += 1;
+                    if let Some(line) = call_on
+                        && held.is_none()
+                        && let Err(blocked) = check_physical_stats(line, &lex)
+                    {
+                        if open.is_empty() {
+                            return Err(blocked);
+                        }
+                        hold(&mut held, lex.pos, blocked);
+                    }
+                }
                 Kind::Punct(')') => {
                     if open.last().is_some_and(|top| top.depth == depth)
                         && let Some(top) = open.pop()
@@ -1659,13 +1786,8 @@ impl<'a> Guard<'a> {
                     depth = depth.saturating_sub(1);
                 }
                 // Once something is held, a later keyword can't come first.
-                Kind::Word | Kind::Quoted if held.is_none() => {
-                    let checked = if token.kind == Kind::Word {
-                        self.classify(&token, &lex, depth, &mut open)
-                    } else {
-                        self.check_physical_stats(&token, &lex)
-                    };
-                    if let Err(blocked) = checked {
+                Kind::Word if held.is_none() => {
+                    if let Err(blocked) = self.classify(&token, &lex, depth, &mut open) {
                         if open.is_empty() {
                             return Err(blocked);
                         }
@@ -1704,10 +1826,6 @@ impl<'a> Guard<'a> {
     ) -> Result<(), Blocked> {
         let mut buf = [0; KEYWORD_MAX];
         let line = token.line;
-        // `keyword` reads a word as the parser does, which isn't how a name is resolved.
-        if !token.name.is_ascii() {
-            self.check_physical_stats(token, lex)?;
-        }
         match keyword(token.name, &mut buf) {
             "INSERT" => self.write_after_top(Write::Insert, line, lex, depth, open)?,
             "INTO" => self.require_scratch(line, lex, "INTO")?,
@@ -1766,7 +1884,6 @@ impl<'a> Guard<'a> {
                 }
             }
             "EXEC" | "EXECUTE" => self.check_exec(line, lex)?,
-            "SYS" => self.check_physical_stats(token, lex)?,
             "SET" if self.reused_session => {
                 if let Some(what) = set_of_unknown_state(lex) {
                     return Err(session_state(line, what));
@@ -1838,33 +1955,6 @@ impl<'a> Guard<'a> {
             _ => {}
         }
         Ok(())
-    }
-
-    /// `token` may be the `sys` of a call of `PHYSICAL_STATS`; `lex` is just past it. The call is
-    /// found from its `sys`: the server answers a bare, `dbo.` or `master..` name with error 208,
-    /// so `sys.` is the only way to the function, with a database in front or not.
-    fn check_physical_stats(&self, token: &Token<'a>, lex: &Lexer<'a>) -> Result<(), Blocked> {
-        if !token.spells_name("SYS") {
-            return Ok(());
-        }
-        let mut call = lex.clone();
-        let is_call = call.next().is_some_and(|t| t.kind == Kind::Punct('.'))
-            && call.next().is_some_and(|t| t.spells_name(PHYSICAL_STATS))
-            && call.next().is_some_and(|t| t.kind == Kind::Punct('('));
-        if !is_call {
-            return Ok(());
-        }
-        match read_stats_call(call) {
-            StatsCall::Other => Ok(()),
-            StatsCall::Wildcard(mode) => Err(wildcard_stats(token.line, mode)),
-            StatsCall::TooNested => Err(too_complex(
-                token.line,
-                &format!(
-                    "the arguments of sys.dm_db_index_physical_stats name it more than \
-                     {MAX_STATS_NAMED} times"
-                ),
-            )),
-        }
     }
 
     /// A write keyword (`what`, on `line`) whose target follows `lex`. After a `TOP n` or
@@ -4659,10 +4749,10 @@ mod tests {
         let sql = format!("SELECT * FROM {sql}");
         allowed(&sql);
         assert!(work_of(&sql) < 60 * n as u64, "{}", work_of(&sql));
-        // A mention of `sys` alone costs a look at the next token or three, no more.
+        // A mention of `sys` alone costs no lookahead.
         let sql = format!("SELECT {}", "sys.sys.".repeat(n));
         allowed(&sql);
-        assert!(work_of(&sql) < 12 * n as u64, "{}", work_of(&sql));
+        assert!(work_of(&sql) < 5 * n as u64, "{}", work_of(&sql));
     }
 
     #[test]
@@ -6806,13 +6896,242 @@ mod tests {
         ] {
             let sql = format!(
                 "SELECT * FROM sys.dm_db_index_physical_stats(NULL, {}",
-                format!("{spelled} ").repeat(MAX_STATS_NAMED + 1)
+                format!("{spelled}( ").repeat(MAX_STATS_NAMED + 1)
             );
             assert!(
                 blocked(&sql).reason.contains("name it more than"),
                 "{sql:?}"
             );
         }
+        // Without its `(` it starts no scan, so a name beyond ASCII, which spells this one, doesn't
+        // use up the limit.
+        let columns = "\u{5217} + ".repeat(MAX_STATS_NAMED + 1);
+        allowed(&format!(
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, (SELECT {columns}1), 1, 1, 'LIMITED')"
+        ));
+    }
+
+    #[test]
+    fn a_name_goes_by_its_ascii_letters_alone() {
+        const NAME: &str = "dm_db_index_physical_stats";
+        for (name, object) in [
+            // Measured: each resolves under Latin1_General_100_CI_AI, and U+FB06 under the usual
+            // collation as well.
+            ("s\u{FD}s", "SYS"),
+            ("s\u{FD}\u{301}s", "SYS"),
+            ("\u{24C8}ys", "SYS"),
+            ("dm_db_\u{ED}ndex_physical_stats", PHYSICAL_STATS),
+            ("dm_db_index_physical_\u{FB06}ats", PHYSICAL_STATS),
+            // Several at once.
+            ("s\u{FD}\u{15B}", "SYS"),
+            (
+                "\u{1E0D}m_\u{1E0D}b_\u{ED}nd\u{E9}x_ph\u{FD}s\u{ED}c\u{E0}l_st\u{E0}ts",
+                PHYSICAL_STATS,
+            ),
+            // Not measured, and no table's business: Turkish, whose I and i aren't each other's, and
+            // beyond the BMP, which a word can't hold and a quoted name can.
+            ("DM_DB_\u{130}NDEX_PHYSICAL_STATS", PHYSICAL_STATS),
+            ("DM_DB_\u{131}NDEX_PHYSICAL_STATS", PHYSICAL_STATS),
+            ("\u{1D42C}ys", "SYS"),
+            ("sy\u{1D42C}", "SYS"),
+            // A character can stand for more letters, or for none.
+            ("\u{E9}", "SYS"),
+            ("\u{E9}", PHYSICAL_STATS),
+            ("sys\u{E9}", "SYS"),
+            ("\u{E9}sys", "SYS"),
+            ("sy\u{E9}s", "SYS"),
+            ("s\u{E9}", "SYS"),
+            ("\u{E9}s", "SYS"),
+            ("dm_\u{E9}_stats", PHYSICAL_STATS),
+            // Any case, trailing spaces, with what is ignored after them.
+            ("SYS", "SYS"),
+            ("s\u{FD}S  ", "SYS"),
+            ("sys \u{200D}", "SYS"),
+            ("sys \u{200D} ", "SYS"),
+            // A quoted name can hold a control character. Not measured.
+            ("sy\u{1}s", "SYS"),
+            ("sys\u{7F}", "SYS"),
+            (NAME, PHYSICAL_STATS),
+        ] {
+            assert!(names(name, object), "{name:?} as {object}");
+        }
+        for (name, object) in [
+            ("", "SYS"),
+            ("sy", "SYS"),
+            ("sysx", "SYS"),
+            ("x\u{E9}", "SYS"),
+            ("\u{E9}x", "SYS"),
+            ("s\u{E9}x", "SYS"),
+            ("ss\u{E9}y", "SYS"),
+            ("s y\u{E9}s", "SYS"),
+            ("\u{E9} sys", "SYS"),
+            ("sysy\u{E9}", "SYS"),
+            ("Sales", "SYS"),
+            ("Sales\u{E9}", "SYS"),
+            ("Syst\u{E8}me", "SYS"),
+            // A letter out of its order.
+            ("\u{E9}ss\u{E9}", PHYSICAL_STATS),
+            ("stats_\u{E9}dm", PHYSICAL_STATS),
+            ("dm_db_\u{ED}ndice_physical_stats", PHYSICAL_STATS),
+            ("dm_db_index_operational_stats", PHYSICAL_STATS),
+            ("dm_db_\u{ED}ndex_operational_stats", PHYSICAL_STATS),
+            ("dm_db_index_physical_stats_\u{E9}", PHYSICAL_STATS),
+            // Past the length the servers take in a name (error 103), and the bound on the cost.
+            ("\u{E9}".repeat(193).as_str(), PHYSICAL_STATS),
+            (format!("sys{}", " ".repeat(382)).as_str(), "SYS"),
+        ] {
+            assert!(!names(name, object), "{name:?} as {object}");
+        }
+        assert!(names(&"\u{E9}".repeat(192), PHYSICAL_STATS));
+
+        // Every name up to six characters over these, against the rule written the slow way: which
+        // of the object's letters can have been spelled, after each character.
+        let by_states = |name: &str, object: &str| {
+            let name = name.trim_end_matches(' ');
+            let letters = object.as_bytes();
+            let mut states = vec![false; letters.len() + 1];
+            states[0] = true;
+            for c in name.chars() {
+                let mut next = vec![false; letters.len() + 1];
+                for i in (0..states.len()).filter(|&i| states[i]) {
+                    if !c.is_ascii() || c.is_ascii_control() {
+                        next[i..].fill(true);
+                    } else if c == ' ' {
+                        next[i] |= i == letters.len();
+                    } else if letters
+                        .get(i)
+                        .is_some_and(|l| l.eq_ignore_ascii_case(&(c as u8)))
+                    {
+                        next[i + 1] = true;
+                    }
+                }
+                states = next;
+            }
+            states[letters.len()]
+        };
+        for (object, alphabet) in [
+            ("SYS", ['s', 'Y', 'x', ' ', '\u{E9}', '\u{1}']),
+            ("ABAB", ['a', 'B', 'x', ' ', '\u{E9}', '\u{7F}']),
+            ("A_A", ['a', '_', 'x', ' ', '\u{1D42C}', '\u{301}']),
+        ] {
+            let mut names_of_this_length = vec![String::new()];
+            for _ in 0..=6 {
+                for name in &names_of_this_length {
+                    assert_eq!(
+                        names(name, object),
+                        by_states(name, object),
+                        "{name:?} {object}"
+                    );
+                }
+                names_of_this_length = names_of_this_length
+                    .iter()
+                    .flat_map(|name| alphabet.map(|c| format!("{name}{c}")))
+                    .collect();
+            }
+        }
+
+        // In one letter's place and in two: every code point in `SYS`, and one in 13 in the long
+        // name, which holds what was swept there.
+        for object in ["SYS", PHYSICAL_STATS] {
+            for at in 0..object.len() {
+                for c in (0x80..=0xFFFF)
+                    .step_by(if object == "SYS" { 1 } else { 13 })
+                    .chain([0x10000, 0x1D42C, 0x10FFFF])
+                    .filter_map(char::from_u32)
+                {
+                    let spelled = format!("{}{c}{}", &object[..at], &object[at + 1..]);
+                    assert!(names(&spelled, object), "{spelled:?}");
+                    if at + 2 <= object.len() {
+                        let spelled = format!("{}{c}{}", &object[..at], &object[at + 2..]);
+                        assert!(names(&spelled, object), "{spelled:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Decision 30(d), by every shape a name can come in. The swept list of 893 spellings went
+    // through the exe; these stand for it here, since no server of that collation stays around.
+    #[test]
+    fn an_accent_doesnt_hide_the_scan_of_every_database() {
+        const CALL: &str = "(NULL,NULL,NULL,NULL,'DETAILED')";
+        for name in [
+            "s\u{FD}s.dm_db_index_physical_stats",
+            "s\u{FD}\u{301}s.dm_db_index_physical_stats",
+            "[s\u{FD}s].dm_db_index_physical_stats",
+            "\"s\u{FD}s\".[dm_db_index_physical_stats]",
+            "[\u{24C8}ys].dm_db_index_physical_stats",
+            "sys.dm_db_\u{ED}ndex_physical_stats",
+            "sys.[dm_db_\u{ED}ndex_physical_stats]",
+            "s\u{FD}s.dm_db_\u{ED}ndex_physical_\u{E5}tats",
+            "sys.dm_db_index_physical_\u{FB06}ats",
+            "sys.[DM_DB_\u{130}NDEX_PHYSICAL_STATS]",
+            "[\u{1D42C}ys].dm_db_index_physical_stats",
+            "[sy\u{1}s].dm_db_index_physical_stats",
+            // A database in front, which reaches it from any database on the server.
+            "sqlh_scratch.s\u{FD}s.dm_db_index_physical_stats",
+            "[some db].[s\u{FD}s].[dm_db_index_physical_stats]",
+            "master.sys.dm_db_\u{ED}ndex_physical_stats",
+        ] {
+            let sql = format!("SELECT * FROM {name}{CALL}");
+            let b = blocked(&sql);
+            assert_eq!(b.reason, STATS_DETAILED, "{sql:?}");
+            assert!(!b.lifted_by_write, "{sql:?}");
+            let b = blocked(&format!("SELECT * FROM {name}(DEFAULT,1,1,1,N'sampled')"));
+            assert_eq!(b.reason, STATS_SAMPLED, "{name:?}");
+        }
+
+        for sql in [
+            // Another function, by a letter of ASCII.
+            "SELECT * FROM s\u{FD}s.dm_db_index_operational_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM s\u{FD}s.dm_db_index_usage_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.dm_db_\u{ED}ndice_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            // Another schema, with ASCII letters of its own.
+            "SELECT * FROM Sales_\u{E9}.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM [Syst\u{E8}me].[dm_db_\u{ED}ndex_physical_stats](NULL,NULL,NULL,NULL,'DETAILED')",
+            // A scoped call, and what doesn't scan.
+            "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(DB_ID(),NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(7,NULL,NULL,NULL,'SAMPLED')",
+            "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'LIMITED')",
+            "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,NULL)",
+            "SELECT * FROM s\u{FD}s.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,@m)",
+            // Names that spell it under this reading, but aren't its call.
+            "SELECT \u{E9}.\u{E9} FROM \u{E9}",
+            "SELECT \u{5217}.\u{5217}, [\u{5217}].[\u{5217}] FROM \u{8868}.\u{8868}",
+            "SELECT * FROM \u{8868}.\u{95A2}\u{6570}(1, 2, 3, 4, 'DETAILED')",
+            "SELECT * FROM \u{8868}.\u{95A2}\u{6570}(NULL, 2, 3, 4)",
+            "SELECT * FROM \u{8868}.\u{95A2}\u{6570}(NULL, 2, 3, 4, N'\u{8A73}\u{7D30}')",
+        ] {
+            allowed(sql);
+        }
+        // What this reading costs: a function whose schema and name have no letter of ASCII to tell
+        // them apart, called with a NULL first and one of these modes as its fifth argument.
+        let b = blocked("SELECT * FROM \u{8868}.\u{95A2}\u{6570}(NULL, 2, 3, 4, 'DETAILED')");
+        assert_eq!(b.reason, STATS_DETAILED);
+    }
+
+    // A name beyond ASCII can be the `sys`, so a lookahead from each would read such text twice.
+    #[test]
+    fn a_name_beyond_ascii_costs_no_lookahead() {
+        let n = 100_000;
+        for (unit, tokens) in [
+            ("sys.sys.", 4),
+            ("\u{E9}.\u{E9}.", 4),
+            ("[\u{E9}].[\u{E9}].", 4),
+            ("\u{E9} ", 1),
+            ("\u{E9}.\u{E9}(1) ", 6 + 1),
+            // The scan's own reads, up to the `)`.
+            ("\u{E9}.\u{E9}(NULL,1,1,1,1) ", 14 + 10),
+        ] {
+            let sql = format!("SELECT {}", unit.repeat(n));
+            allowed(&sql);
+            let work = work_of(&sql);
+            assert!(work < tokens * n as u64 + 100, "{unit:?}: {work}");
+        }
+        // The limit on a scan holds as it does for the name itself.
+        let sql = format!("SELECT * FROM {}", "\u{E9}.\u{E9}(NULL, ".repeat(250_000));
+        assert!(blocked(&sql).reason.contains("name it more than"));
+        assert!(work_of(&sql) < 100, "{}", work_of(&sql));
     }
 
     // Each is refused the same way past the word's bound: error 103, whatever follows, so the
@@ -6946,15 +7265,8 @@ mod tests {
                 "UNCOMMITTED"
             ]
         );
-        // What this reads as nothing, none of which has such a pair.
-        for name in [
-            PHYSICAL_STATS,
-            "SYS",
-            "DETAILED",
-            "SAMPLED",
-            "@UPDATEUSAGE",
-            "@CONFIGVALUE",
-        ] {
+        // What `mode_letters` and an argument check read a mark as nothing in, none with such a pair.
+        for name in ["DETAILED", "SAMPLED", "@UPDATEUSAGE", "@CONFIGVALUE"] {
             let pair = name.as_bytes().windows(2).any(|p| p[0] == p[1]);
             assert!(!pair, "{name}");
         }
@@ -7231,6 +7543,7 @@ mod tests {
             ("sys\u{00E9}", "SYS", true),
             ("sys\u{00E9} ", "SYS", true),
             ("sys\u{301}", "SYS", true),
+            ("s\u{FD}s", "SYS", true),
             ("sy", "SYS", false),
             ("sysx", "SYS", false),
             ("dm_db_i\u{207F}dex", "DM_DB_INDEX", true),
