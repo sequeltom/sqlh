@@ -10,6 +10,7 @@
 //!
 //! The guard reduces accidents. It is not a security boundary: database permissions are.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -657,7 +658,9 @@ fn check_physical_stats(line: u32, lex: &Lexer<'_>) -> Result<(), Blocked> {
 }
 
 /// Reads a call of `PHYSICAL_STATS`, from just past its `(`. Only the literal is looked for, as
-/// decision 30(d) has it: an expression in the first or the fifth place is left to the server.
+/// decision 30(d) has it: an expression in the first or the fifth place is left to the server. The
+/// sign of a number is part of the literal, as the servers' documentation has it, and that of
+/// anything else makes an expression (DESIGN.md §7).
 ///
 /// Only the second to the fourth arguments are read to their end. A scan stops at the first
 /// token of the first or the fifth that isn't its literal, and a call's own `sys` is such a token,
@@ -669,6 +672,8 @@ fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
     let mut depth = 0usize;
     let mut argument = 0;
     let mut literal_read = false;
+    let mut signed = false;
+    let mut after_point = false;
     let mut mode = None;
     let mut named = 0;
     let mut after_a_name = false;
@@ -693,12 +698,13 @@ fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
             _ if (1..=3).contains(&argument) => {}
             // A second token makes it an expression (`NULL + 1`).
             _ if literal_read => return StatsCall::Other,
-            _ if argument == 0 => {
-                if !t.is_word("NULL") && !t.is_word("DEFAULT") {
-                    return StatsCall::Other;
-                }
-                literal_read = true;
-            }
+            _ if argument == 0 => match t.kind {
+                Kind::Punct('+' | '-') if !after_point => signed = true,
+                // The lexer reads the point of `.5` as a token of its own.
+                Kind::Punct('.') if !after_point => after_point = true,
+                _ if means_every_database(&t, signed, after_point) => literal_read = true,
+                _ => return StatsCall::Other,
+            },
             _ => {
                 mode = stats_mode(&t);
                 if mode.is_none() {
@@ -711,34 +717,188 @@ fn read_stats_call(scan: Lexer<'_>) -> StatsCall {
     StatsCall::Other
 }
 
-/// The mode that scans, if `token` is the literal of one. The server takes it in any case, with
-/// trailing spaces, split by a backslash at a line's end, and as `"DETAILED"` under `SET
-/// QUOTED_IDENTIFIER OFF`; with that on it would be a column, which a call over every database
-/// has no reason to be given.
-fn stats_mode(token: &Token<'_>) -> Option<&'static str> {
-    let value = match token.kind {
-        Kind::Str => token
-            .text
-            .strip_prefix(['N', 'n'])
-            .unwrap_or(token.text)
-            .strip_prefix('\'')?
-            .strip_suffix('\'')?,
-        Kind::Quoted if token.text.starts_with('"') => token.name,
+/// Whether `token`, as the first argument with what came before it, is a literal the servers take
+/// as every database: `NULL` and `DEFAULT`, or whatever converts to the `smallint` 0 (measured on
+/// both servers, DESIGN.md §7).
+fn means_every_database(token: &Token<'_>, signed: bool, after_point: bool) -> bool {
+    match token.kind {
+        Kind::Num => number_is_zero(token.text, after_point),
+        _ if signed || after_point => false,
+        Kind::Word => token.is_word("NULL") || token.is_word("DEFAULT"),
+        _ => string_value(token)
+            .is_some_and(|(value, national)| string_is_zero(value.as_bytes(), national)),
+    }
+}
+
+/// Whether a number, `money` or binary literal converts to the `smallint` 0: only the last two
+/// bytes of a binary literal count, and a number's fraction is cut.
+fn number_is_zero(text: &str, after_point: bool) -> bool {
+    match text.as_bytes() {
+        [b'0', b'x' | b'X', digits @ ..] => {
+            !after_point
+                && digits
+                    .iter()
+                    .rev()
+                    .filter(|digit| digit.is_ascii_hexdigit())
+                    .take(4)
+                    .all(|digit| *digit == b'0')
+        }
+        [first, ..] if first.is_ascii_digit() => is_below_one(text, after_point),
+        _ => !after_point && money_rounds_to_zero(text),
+    }
+}
+
+/// Whether a number is under 1, with no arithmetic that could lose it: `1e-400` is, and `0.1e1`
+/// isn't. A float that rounds up to 1 counts as under it (`0.99999999999999999999e0`), though the
+/// servers read it as database 1: a refusal that costs only a rewrite of what nobody writes.
+fn is_below_one(number: &str, after_point: bool) -> bool {
+    let (mantissa, exponent) = number.split_once(['e', 'E']).unwrap_or((number, ""));
+    let (whole, fraction) = if after_point {
+        ("", mantissa)
+    } else {
+        mantissa.split_once('.').unwrap_or((mantissa, ""))
+    };
+    let not_zero = |digit: u8| digit != b'0';
+    let power_of_first_digit = if let Some(at) = whole.bytes().position(not_zero) {
+        (whole.len() - at - 1) as i64
+    } else if let Some(at) = fraction.bytes().position(not_zero) {
+        -(at as i64) - 1
+    } else {
+        return true;
+    };
+    let size = |digits: &str| {
+        digits.bytes().fold(0i64, |size, digit| {
+            size.saturating_mul(10)
+                .saturating_add(i64::from(digit - b'0'))
+        })
+    };
+    let exponent = match exponent.strip_prefix('-') {
+        Some(digits) => -size(digits),
+        None => size(exponent.strip_prefix('+').unwrap_or(exponent)),
+    };
+    power_of_first_digit.saturating_add(exponent) < 0
+}
+
+/// Whether a `money` literal rounds to 0: it keeps four decimals and then rounds, so `$.49994` is 0
+/// and `$.49995` is 1. What follows the currency is `money_end`'s: spaces, a sign, a number.
+fn money_rounds_to_zero(text: &str) -> bool {
+    let mut after_currency = text.chars();
+    after_currency.next();
+    let number = after_currency.as_str().trim_start_matches(' ');
+    let number = number.strip_prefix(['+', '-']).unwrap_or(number);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    whole.bytes().all(|digit| digit == b'0')
+        && fraction
+            .bytes()
+            .chain(std::iter::repeat(b'0'))
+            .take(5)
+            .fold(0, |first_five, digit| {
+                first_five * 10 + u32::from(digit - b'0')
+            })
+            < 49_995
+}
+
+/// Whether a string converts to the `smallint` 0: spaces (U+0020 only) around at most one sign and
+/// any number of zeros, of which it needs none (`''`, `'+'`, `' - 0 '`). Without the `N` it goes to
+/// the database's code page first, by best fit, so `'<U+FF10>'` and `'<U+3000>'` are 0, and which
+/// characters do that depends on the code page: any character beyond ASCII counts, as in
+/// `best_fits`. That takes in what converts to another number (`'<U+FF11>'`, database 1) and what
+/// the servers answer with error 245.
+fn string_is_zero(value: &[u8], national: bool) -> bool {
+    let (mut sign, mut zeros, mut ended) = (false, false, false);
+    value.iter().all(|byte| match byte {
+        b' ' => {
+            ended = zeros;
+            true
+        }
+        b'+' | b'-' if !sign && !zeros => {
+            sign = true;
+            true
+        }
+        b'0' if !ended => {
+            zeros = true;
+            true
+        }
+        byte => !national && !byte.is_ascii(),
+    })
+}
+
+/// The text of a string literal, and whether it has the `N`. It may be split by a backslash at a
+/// line's end, and be `"0"` or `"DETAILED"` under `SET QUOTED_IDENTIFIER OFF`, which is not
+/// tracked; with that on it would be a column, which this call has no reason to be given.
+fn string_value<'t>(token: &Token<'t>) -> Option<(Cow<'t, str>, bool)> {
+    let (value, national) = match token.kind {
+        Kind::Str => {
+            let national = token.text.strip_prefix(['N', 'n']);
+            let quoted = national.unwrap_or(token.text);
+            (
+                quoted.strip_prefix('\'')?.strip_suffix('\'')?,
+                national.is_some(),
+            )
+        }
+        Kind::Quoted if token.text.starts_with('"') => (token.name, false),
         _ => return None,
     };
-    let joined;
     let value = if value.contains('\\') {
-        joined = value.replace("\\\r\n", "").replace("\\\n", "");
-        &joined
+        Cow::Owned(value.replace("\\\r\n", "").replace("\\\n", ""))
     } else {
-        value
+        Cow::Borrowed(value)
     };
+    Some((value, national))
+}
+
+/// The mode that scans, if `token` is the literal of one, in a string or in binary.
+fn stats_mode(token: &Token<'_>) -> Option<&'static str> {
+    if token.kind == Kind::Num {
+        let digits = token
+            .text
+            .strip_prefix("0x")
+            .or_else(|| token.text.strip_prefix("0X"))?;
+        // Binary goes to `nvarchar` by no code page, so best fit has no part in it: `D<U+0112>TAILED`
+        // in binary is error 2561 where the string without the `N` scans.
+        let value = binary_as_text(digits);
+        return scanning_mode(&value, |value, mode| reads_as(value, mode, mode_letters));
+    }
+    scanning_mode(&string_value(token)?.0, |value, mode| {
+        reads_as(value, mode, mode_letters) || best_fits(value, mode)
+    })
+}
+
+/// What the servers read a binary literal as, up to the mode's `nvarchar(20)`, whose length is all
+/// that is read of the rest: UTF-16 LE, where a last byte on its own is a unit whose high byte is 0
+/// (`N'DETAILE'` and `0x44` scan). Odd digits have a 0 put in front, and a lone surrogate reads as
+/// nothing, as U+FFFD does (`mode_letters`).
+fn binary_as_text(digits: &str) -> String {
+    let mut nibbles = digits
+        .bytes()
+        .filter_map(|digit| char::from(digit).to_digit(16));
+    let mut padded = nibbles.clone().count() % 2 == 1;
+    let mut bytes = std::iter::from_fn(move || {
+        let high = if std::mem::take(&mut padded) {
+            0
+        } else {
+            nibbles.next()?
+        };
+        Some(high << 4 | nibbles.next()?)
+    });
+    let units = std::iter::from_fn(move || {
+        let low = bytes.next()?;
+        Some((bytes.next().unwrap_or(0) << 8 | low) as u16)
+    })
+    .take(STATS_MODE_UNITS);
+    char::decode_utf16(units)
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/// The mode that scans, if `value` reads as one by `reads`, as the function's parameter has it.
+fn scanning_mode(value: &str, reads: impl Fn(&str, &str) -> bool) -> Option<&'static str> {
     let value = cut_to_units(value, STATS_MODE_UNITS);
     // The function reads its mode up to a NUL: `'DETAILED<NUL>zz'` scans.
     let value = value.split('\0').next().unwrap_or(value);
     ["DETAILED", "SAMPLED"]
         .into_iter()
-        .find(|mode| reads_as(value, mode, mode_letters) || best_fits(value, mode))
+        .find(|mode| reads(value, mode))
 }
 
 /// The mode's parameter is `nvarchar(20)`, and the servers cut a longer literal without a word:
@@ -2708,14 +2868,23 @@ fn money_end(bytes: &[u8], from: usize) -> usize {
 /// Where the number from `i` ends. The servers end one at the first byte that can't continue it,
 /// so what comes next is a token of its own however close it is: `1DELETE` and `0xINSERT` are a
 /// number and a keyword, and `1e` and `1e+5` are whole numbers. An exponent's sign is part of it
-/// with no digit after it: `1e--1` is `1e-` and `-1`, no comment.
-fn number_end(bytes: &[u8], i: usize) -> usize {
+/// with no digit after it: `1e--1` is `1e-` and `-1`, no comment. A binary literal goes on past a
+/// backslash at a line's end, LF or CRLF with nothing between, so `0xAA\<LF>AWAITFOR` is `0x0AAA`
+/// and a keyword, on the next line.
+fn number_end(bytes: &[u8], i: usize, line: &mut u32) -> usize {
     if matches!(bytes.get(i..i + 2), Some(b"0x" | b"0X")) {
         let mut i = i + 2;
-        while bytes.get(i).is_some_and(u8::is_ascii_hexdigit) {
-            i += 1;
+        loop {
+            while bytes.get(i).is_some_and(u8::is_ascii_hexdigit) {
+                i += 1;
+            }
+            i = match bytes.get(i..) {
+                Some([b'\\', b'\n', ..]) => i + 2,
+                Some([b'\\', b'\r', b'\n', ..]) => i + 3,
+                _ => return i,
+            };
+            *line += 1;
         }
-        return i;
     }
     let mut i = decimal_end(bytes, i);
     if matches!(bytes.get(i), Some(b'e' | b'E')) {
@@ -2736,7 +2905,7 @@ pub(crate) fn plain_token_end(line: &str, i: usize) -> Option<usize> {
     let bytes = line.as_bytes();
     match *bytes.get(i)? {
         b'@' | b'#' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => Some(word_end(line, i + 1)),
-        b'0'..=b'9' => Some(number_end(bytes, i)),
+        b'0'..=b'9' => Some(number_end(bytes, i, &mut 0)),
         b'\\' => Some(money_end(bytes, i + 1)),
         b'$' if bytes
             .get(i + 1)
@@ -2855,7 +3024,7 @@ impl<'a> Lexer<'a> {
                     if c == b'@' { Kind::Var } else { Kind::Temp }
                 }
                 c if c.is_ascii_digit() => {
-                    i = number_end(bytes, i);
+                    i = number_end(bytes, i, &mut line);
                     Kind::Num
                 }
                 // `$action`, `$DELETE` and the like go on as a name (error 126 if it is none). `\`
@@ -4130,7 +4299,7 @@ mod tests {
                 1,
                 STATS_SAMPLED,
             ),
-            // The first argument's two literals; the other arguments don't matter to the rule.
+            // `DEFAULT`, and a NULL in any place; the other arguments don't matter to the rule.
             (
                 "SELECT * FROM sys.dm_db_index_physical_stats(DEFAULT, DEFAULT, DEFAULT, DEFAULT, \
                  'DETAILED')",
@@ -4319,6 +4488,404 @@ mod tests {
             assert_eq!((b.line, b.reason.as_str()), (*line, *reason), "{sql}");
             assert_eq!(b.advice, STATS_REWRITE, "{sql}");
         }
+    }
+
+    // Decision 30(d), amended 2026-11-02. Each first argument was read on both servers with
+    // `'LIMITED'` and an object id: error 2561 is that id with no database, a row or none is a real
+    // database, and 245 is no number at all.
+    #[test]
+    fn every_literal_the_servers_take_as_no_database_is_refused() {
+        for first in [
+            // The owner's four.
+            "0",
+            "'0'",
+            "''",
+            "N''",
+            // In parentheses, after a comment, split by a backslash, as the rule reads NULL.
+            "(0)",
+            "((0))",
+            "('')",
+            "(N'')",
+            "((NULL))",
+            "/*c*/ 0",
+            "-- c\n''",
+            "'\\\n'",
+            "N'\\\r\n0'",
+            // The same zero in another spelling.
+            "00",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0.",
+            "0.0",
+            ".0",
+            "0e0",
+            "0E0",
+            "0e",
+            "0e5",
+            "0e+5",
+            "0e-5",
+            "0e99999999999999999999999",
+            // A sign is part of a number.
+            "-0",
+            "+0",
+            "- 0",
+            "-+-0",
+            "-(0)",
+            "(-0)",
+            "-.0",
+            // A fraction is cut.
+            "0.5",
+            "0.999999",
+            ".9",
+            "-.5",
+            "-0.9",
+            "+0.9",
+            "1e-5",
+            "5e-1",
+            "10e-2",
+            "0.1e0",
+            ".01e1",
+            "1.e-1",
+            "1e-99999999999999999999999",
+            // `money` rounds, at four decimals and then to a whole number.
+            "$",
+            "$0",
+            "$.",
+            "$.0",
+            "$0.0",
+            "$0.4",
+            "$0.49",
+            "$0.4999",
+            "$.49994",
+            "$ 0",
+            "$ -0",
+            "$+0",
+            "$-.4",
+            "-$0",
+            "+$",
+            "-$0.4",
+            "\\",
+            "\\0",
+            "\\0.4",
+            "\u{20AC}0",
+            "\u{A3}0",
+            "\u{A5}0",
+            // Binary: the last two bytes, and odd digits are padded on the left.
+            "0x",
+            "0X",
+            "0x0",
+            "0x00",
+            "0X00",
+            "0x0000",
+            "0x000000",
+            "0x00000000",
+            "0x010000",
+            "0x10000",
+            "0xFFFF0000",
+            "+0x00",
+            "0x\\\n",
+            "0x\\\n0000",
+            "0x00\\\n00",
+            "0x00\\\r\n00",
+            "0x01\\\n0000",
+            // A string: spaces, a sign, zeros, of each of which it needs none.
+            "N'0'",
+            "'00'",
+            "N'00'",
+            "' '",
+            "N' '",
+            "'   '",
+            "' 0'",
+            "'0 '",
+            "N' 0'",
+            "N'0 '",
+            "'+'",
+            "'-'",
+            "N'+'",
+            "'+0'",
+            "'-0'",
+            "N'-0'",
+            "' +0 '",
+            "' - '",
+            "'+ 0'",
+            "'+  00  '",
+            // Without the `N`, by best fit, which depends on the code page.
+            "'\u{3000}'",
+            "'\u{2003}'",
+            "'\u{FF10}'",
+            "'\u{FF0B}'",
+            "'\u{FF0D}'",
+            "'\u{2212}'",
+            "'\u{3000}\u{FF10}\u{3000}'",
+            // Under SET QUOTED_IDENTIFIER OFF, which isn't tracked.
+            "\"\"",
+            "\"0\"",
+            "\" \"",
+        ] {
+            let call = |mode: &str| {
+                format!("SELECT * FROM sys.dm_db_index_physical_stats({first}, 5, 1, 1, {mode})")
+            };
+            assert_eq!(
+                blocked(&call("'DETAILED'")).reason,
+                STATS_DETAILED,
+                "{first}"
+            );
+            assert_eq!(
+                blocked(&call("N'sampled'")).reason,
+                STATS_SAMPLED,
+                "{first}"
+            );
+            assert_eq!(
+                blocked(&call("0x530041004D0050004C0045004400")).reason,
+                STATS_SAMPLED,
+                "{first}"
+            );
+            allowed(&call("'LIMITED'"));
+            allowed(&call("NULL"));
+            allowed(&call("0x4C0049004D0049005400450044"));
+            let other = format!("SELECT * FROM sys.other({first}, 5, 1, 1, 'DETAILED')");
+            allowed(&other);
+        }
+    }
+
+    #[test]
+    fn a_first_argument_that_is_a_real_database_or_no_literal_passes() {
+        for first in [
+            // A real id, whatever it is written as.
+            "1",
+            "5",
+            "001",
+            "001.0",
+            "1.0",
+            "1.5",
+            "1e0",
+            "1E+0",
+            "1e+0",
+            "10e-1",
+            "100e-2",
+            "0.1e1",
+            "0.01e2",
+            ".1e1",
+            "0.5e1",
+            "$1",
+            "$0.5",
+            "$.5",
+            "$0.99",
+            "$.49995",
+            "$0.49999",
+            "0x01",
+            "0x1",
+            "0x0001",
+            "0x\\\n01",
+            "0x0001\\\n",
+            "'1'",
+            "' 1'",
+            "'+1'",
+            "N'5'",
+            // No such database, or no such number: the servers' errors.
+            "-1",
+            "-$0.5",
+            "99999",
+            "0x0100",
+            "0x00FF",
+            "'-1'",
+            "'0 0'",
+            "'++0'",
+            "'+-'",
+            "'0+'",
+            "'.'",
+            "'0.'",
+            "'0.0'",
+            "'0e0'",
+            "'$0'",
+            "'0x0'",
+            "'\t'",
+            "'\n'",
+            "'\u{0}'",
+            "'0\u{0}'",
+            "N'\u{0}'",
+            "N'\u{3000}'",
+            "N'\u{2003}'",
+            "N'\u{FF10}'",
+            "N'\u{A0}'",
+            "'Sales'",
+            // Function calls, columns and expressions: what the text doesn't show.
+            "DB_ID()",
+            "DB_ID(N'Sales')",
+            "[0]",
+            "[NULL]",
+            "@d",
+            "0 + 0",
+            "0 - 1",
+            "'' + ''",
+            "'' COLLATE Latin1_General_CI_AS",
+            "~0",
+            "CAST(0 AS int)",
+            // A sign on anything but a number is an expression too, though these act as NULL.
+            "+''",
+            "+'0'",
+            "+N''",
+            "+NULL",
+            "-NULL",
+            "+(NULL)",
+            "-(NULL)",
+            "-''",
+            // Not literals: the servers' syntax errors.
+            ".e0",
+            ".0x00",
+            "$0,0",
+            "$ - 0",
+            "0\\\n",
+            "0.\\\n0",
+            "0x00 00",
+            "0x00\\ \n00",
+            "0x00\\\r00",
+        ] {
+            allowed(&format!(
+                "SELECT * FROM sys.dm_db_index_physical_stats({first}, 5, 1, 1, 'DETAILED')"
+            ));
+        }
+    }
+
+    // Measured with scoped calls: `record_count` is only there when the mode scanned.
+    #[test]
+    fn a_binary_mode_is_read_as_the_servers_read_it() {
+        const D: &str = "440045005400410049004C0045004400";
+        const S: &str = "530041004D0050004C0045004400";
+        let spaces = "2000".repeat(12);
+        let de = "44004500";
+        let tailed = "5400410049004C0045004400";
+        let joiners = |n: usize| format!("{de}{}{tailed}", "0D20".repeat(n));
+        let call = |mode: &str| {
+            format!("SELECT * FROM sys.dm_db_index_physical_stats(NULL, 5, 1, 1, {mode})")
+        };
+        let detailed = [
+            format!("0x{D}"),
+            format!("0X{D}"),
+            format!("0x{}", D.to_lowercase()),
+            // Any case, trailing spaces.
+            "0x640065007400610069006C00650064".to_string(),
+            format!("0x{D}20002000"),
+            // A byte on its own at the end is a unit: `D`, a space, a NUL.
+            "0x440045005400410049004C00450044".to_string(),
+            format!("0x{D}20"),
+            format!("0x{D}00"),
+            // Up to a NUL.
+            format!("0x{D}0000"),
+            format!("0x{D}00007A007A00"),
+            // Up to the 20th unit, so that what follows is never read.
+            format!("0x{D}{spaces}"),
+            format!("0x{D}{spaces}7A007A00"),
+            format!("0x{D}{spaces}41"),
+            format!("0x{D}{spaces}{}", "7A00".repeat(4_500)),
+            format!("0x{}", joiners(12)),
+            // Past what a collation or the function reads as nothing.
+            format!("0x{de}0D20{tailed}"),
+            format!("0x{de}1802{tailed}"),
+            "0x44004500540041006A024C0045004400".to_string(),
+            format!("0x{de}00D8{tailed}"),
+            format!("0x{de}00DC{tailed}"),
+            format!("0x{de}FDFF{tailed}"),
+            format!("0x{de}3DD800DE{tailed}"),
+            // Odd digits have a 0 in front: U+200D, then the mode.
+            format!("0xD20{D}"),
+            // Split by a backslash at a line's end, anywhere.
+            format!("0x\\\n{D}"),
+            format!("0x{D}\\\n"),
+            format!("0x4400\\\n4500\\\n{tailed}"),
+            format!("0x44004\\\n500{tailed}"),
+            format!("0x44004500\\\r\n{tailed}"),
+            format!("0x4400\\\n\\\n4500{tailed}"),
+            // As the rule reads the string.
+            format!("(0x{D})"),
+            format!("((0x{D}))"),
+            format!("/*c*/ 0x{D}"),
+            // A full-width letter, which `mode_letters` takes, is the servers' error 2561 here.
+            "0x24FF45005400410049004C0045004400".to_string(),
+        ];
+        for mode in &detailed {
+            assert_eq!(blocked(&call(mode)).reason, STATS_DETAILED, "{mode}");
+        }
+        for mode in [format!("0x{S}"), format!("0x{S}0000"), format!("0x{S}20")] {
+            assert_eq!(blocked(&call(&mode)).reason, STATS_SAMPLED, "{mode}");
+        }
+        for mode in [
+            // The mode that doesn't scan, as binary: the rewrite the refusal offers.
+            "0x4C0049004D0049005400450044".to_string(),
+            "0x6C0069006D0069007400650064".to_string(),
+            // Empty: the function's default.
+            "0x".to_string(),
+            "0x00".to_string(),
+            format!("0x0000{D}"),
+            // Single bytes, big-endian, and what else reads as no mode: error 2561.
+            "0x44455441494C4544".to_string(),
+            "0x53414D504C4544".to_string(),
+            "0x00440045005400410049004C00450044".to_string(),
+            "0x440012015400410049004C0045004400".to_string(),
+            format!("0x{D}41"),
+            format!("0x{S}7A"),
+            format!("0x2000{D}"),
+            format!("0x0{D}"),
+            "0x4400450054000000410049004C0045004400".to_string(),
+            format!("0x{}", joiners(13)),
+            // Not a binary literal: the servers' error 102.
+            format!("0x44004500\\\r{tailed}"),
+            format!("0x44004500\\\n  {tailed}"),
+            format!("0x44004500\\ \n{tailed}"),
+            // Expressions: what the text doesn't show.
+            format!("+0x{D}"),
+            format!("0x{D} + 0x00"),
+            "+'DETAILED'".to_string(),
+            "5".to_string(),
+            "$0".to_string(),
+        ] {
+            allowed(&call(&mode));
+        }
+    }
+
+    // On both servers `SELECT 0xAA\<LF>AWAITFOR DELAY ...` waited, past a word `AWAITFOR` the guard
+    // used to read after the literal.
+    #[test]
+    fn a_keyword_after_a_binary_literal_split_over_lines_is_seen() {
+        let b = blocked("SELECT 0xAA\\\nAUPDATE dbo.T SET a = 1");
+        assert_eq!((b.line, b.reason.as_str()), (2, "UPDATE dbo.T would write"));
+        let b = blocked("SELECT 0x\\\nAA\\\r\nBB\nDELETE dbo.T");
+        assert_eq!((b.line, b.reason.as_str()), (4, "DELETE dbo.T would write"));
+        allowed("SELECT 0xAA\\\nBB AS a, 0x\\\n AS b");
+    }
+
+    // Decoded lazily, and a literal is read by one scan: `read_stats_call` says why.
+    #[test]
+    fn a_long_binary_literal_costs_no_more_than_its_length() {
+        let bytes = 1_000_000;
+        // Its charge is one read a 32 bytes, for the pass and for the scan.
+        let most = 2 * (bytes / 32) as u64 + 100;
+        for sql in [
+            format!(
+                "SELECT * FROM sys.dm_db_index_physical_stats(0x{}, 5, 1, 1, 'DETAILED')",
+                "01".repeat(bytes / 2)
+            ),
+            format!(
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 5, 1, 1, 0x{})",
+                "7A00".repeat(bytes / 4)
+            ),
+            format!(
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 5, 1, 1, 0x{})",
+                "4C0049004D0049005400450044".repeat(bytes / 26)
+            ),
+        ] {
+            allowed(&sql);
+            assert!(work_of(&sql) < most, "{}", work_of(&sql));
+        }
+        let sql = format!(
+            "SELECT * FROM sys.dm_db_index_physical_stats(0x{}, 5, 1, 1, 'SAMPLED')",
+            "00".repeat(bytes / 2)
+        );
+        assert_eq!(blocked(&sql).reason, STATS_SAMPLED);
+        let sql = format!(
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 5, 1, 1, 0x440045005400410049004C0045004400{})",
+            "20".repeat(bytes / 2)
+        );
+        assert_eq!(blocked(&sql).reason, STATS_DETAILED);
     }
 
     #[test]
@@ -4587,16 +5154,11 @@ mod tests {
              sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, @m)",
             "DECLARE @d int = NULL;\nSELECT * FROM sys.dm_db_index_physical_stats(@d, NULL, NULL, \
              NULL, 'DETAILED')",
-            // Nor can an expression, or a literal other than the two decision 30(d) names.
+            // Nor can an expression.
             "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DET' + 'AILED')",
-            // A binary literal does scan (it is `N'DETAILED'` in UTF-16), and the decision names
-            // no such literal: DESIGN.md §7, with the owner's question on the first argument's.
-            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, \
-             0x440045005400410049004C0045004400)",
             "SELECT * FROM sys.dm_db_index_physical_stats(NULL + 1, NULL, NULL, NULL, 'DETAILED')",
             "SELECT * FROM sys.dm_db_index_physical_stats(CAST(NULL AS int), 1, 1, 1, 'DETAILED')",
             "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(N'typo'), 1, 1, 1, 'DETAILED')",
-            "SELECT * FROM sys.dm_db_index_physical_stats(0, NULL, NULL, NULL, 'DETAILED')",
             // A column called NULL, or a mode that is no mode.
             "SELECT * FROM t CROSS APPLY sys.dm_db_index_physical_stats([NULL], 1, 1, 1, 'DETAILED')",
             "SELECT * FROM sys.dm_db_index_physical_stats(NULL, 1, 1, 1, [DETAILED])",
@@ -4748,6 +5310,13 @@ mod tests {
         let sql = format!("SELECT * FROM {sql}");
         allowed(&sql);
         assert!(work_of(&sql) < 60 * n as u64, "{}", work_of(&sql));
+        // So are a number's signs.
+        let sql = format!(
+            "SELECT * FROM {}",
+            "sys.dm_db_index_physical_stats(- + - + ".repeat(n)
+        );
+        allowed(&sql);
+        assert!(work_of(&sql) < 30 * n as u64, "{}", work_of(&sql));
         // A mention of `sys` alone costs no lookahead.
         let sql = format!("SELECT {}", "sys.sys.".repeat(n));
         allowed(&sql);
@@ -5448,6 +6017,8 @@ mod tests {
             ".5e",
             "0x",
             "0xFF",
+            "0xFF\\\nA",
+            "0xFF\\\r\n",
             "0xDELETE",
             "1EXEC",
             "$",
@@ -6297,6 +6868,17 @@ mod tests {
             ("0XINSERT", &["0X", "INSERT"]),
             ("0xDELETE", &["0xDE", "LETE"]),
             ("0x1FKILL", &["0x1F", "KILL"]),
+            // A backslash at a line's end is inside a binary literal, and nothing else's.
+            ("0xAA\\\nAWAITFOR", &["0xAA\\\nA", "WAITFOR"]),
+            ("0xAA\\\r\nAWAITFOR", &["0xAA\\\r\nA", "WAITFOR"]),
+            (
+                "0x\\\nAA\\\n\\\nBB\\\nKILL",
+                &["0x\\\nAA\\\n\\\nBB\\\n", "KILL"],
+            ),
+            ("0xAA\\\rAWAITFOR", &["0xAA", "\\", "AWAITFOR"]),
+            ("0xAA\\ \nAWAITFOR", &["0xAA", "\\", "AWAITFOR"]),
+            ("0xAA\\\n AWAITFOR", &["0xAA\\\n", "AWAITFOR"]),
+            ("1\\\n2", &["1", "\\", "2"]),
             ("1N'a'", &["1", "N'a'"]),
             // A money literal takes no exponent: `$1eDELETE` is `$1` with an alias.
             ("$1DELETE", &["$1", "DELETE"]),
@@ -6432,6 +7014,11 @@ mod tests {
             ("SELECT 0x", "INSERT t VALUES (1)"),
             ("SELECT 0x", "KILL 1"),
             ("SELECT 0X1F", "KILL 1"),
+            // A backslash at a line's end goes on with the literal, whose last digit this is.
+            ("SELECT 0xAA\\\nA", "INSERT t VALUES (1)"),
+            ("SELECT 0xAA\\\r\nA", "KILL 1"),
+            ("SELECT 0x\\\n", "KILL 1"),
+            ("SELECT 0xAA\\\nBB\\\nC", "WAITFOR DELAY '00:00:01'"),
         ] {
             blocked(&format!("{start}{keyword}"));
         }

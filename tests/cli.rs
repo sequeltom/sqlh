@@ -2508,6 +2508,49 @@ fn the_wildcard_stats_call_is_refused_before_connecting() {
     assert_reached_connect(&with("flagged", CALL, &["--allow-write"]), "--allow-write");
     assert_reached_connect(&with("allowed", CALL, &[]), "write_policy = allow");
 
+    // Decision 30(d), as amended: what the servers take as no database, and a mode in binary.
+    for (first, mode) in [
+        ("0", "'DETAILED'"),
+        ("'0'", "N'DETAILED'"),
+        ("''", "'DETAILED'"),
+        ("N''", "'DETAILED'"),
+        ("0.5", "'DETAILED'"),
+        ("-0", "'DETAILED'"),
+        ("0x010000", "'DETAILED'"),
+        ("NULL", "0x440045005400410049004C0045004400"),
+        ("0", "0x440045005400410049004C00450044"),
+        ("''", "0x4400\\\n45005400410049004C0045004400"),
+    ] {
+        let call =
+            format!("SELECT * FROM sys.dm_db_index_physical_stats({first}, 5, 1, 1, {mode})");
+        let r = with("flagged", &call, &[]);
+        assert_eq!(r.code, 5, "{call}: {}", r.stdout);
+        assert!(r.stdout.contains("would read every page"), "{}", r.stdout);
+    }
+    for (first, mode) in [
+        ("5", "'DETAILED'"),
+        ("1", "'DETAILED'"),
+        ("DB_ID()", "'DETAILED'"),
+        ("1.0", "'DETAILED'"),
+        ("0", "'LIMITED'"),
+        ("''", "N'limited'"),
+        ("0", "0x4C0049004D0049005400450044"),
+        ("NULL", "0x44455441494C4544"),
+        ("5", "0x440045005400410049004C0045004400"),
+    ] {
+        let call =
+            format!("SELECT * FROM sys.dm_db_index_physical_stats({first}, 5, 1, 1, {mode})");
+        assert_reached_connect(&with("flagged", &call, &[]), &call);
+    }
+    assert_reached_connect(
+        &with(
+            "flagged",
+            "SELECT * FROM sys.dm_db_index_operational_stats(0, 5, 1, 0x4400)",
+            &[],
+        ),
+        "another function",
+    );
+
     for sql in [
         "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'LIMITED')",
         "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, NULL)",
@@ -4850,6 +4893,24 @@ mod mcp {
                 "-- blocked: line 1: sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would \
                  read every page of every index in every database; nothing was run. Name the \
                  database and object, or use 'LIMITED'",
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats('',NULL,NULL,NULL,'DETAILED')",
+                "-- blocked: line 1: sys.dm_db_index_physical_stats(NULL, ..., 'DETAILED') would \
+                 read every page of every index in every database; nothing was run. Name the \
+                 database and object, or use 'LIMITED'",
+            ),
+            (
+                "SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,\
+                 0x530041004D0050004C0045004400)",
+                "-- blocked: line 1: sys.dm_db_index_physical_stats(NULL, ..., 'SAMPLED') would \
+                 read at least 1% of the pages of every index in every database; nothing was run. \
+                 Name the database and object, or use 'LIMITED'",
+            ),
+            (
+                "SELECT 0xAA\\\nAWAITFOR DELAY '00:00:01'",
+                "-- blocked: line 2: WAITFOR is not allowed in read-only mode (if it is a column \
+                 name, write it as [WAITFOR]); nothing was run. sqlh mcp is read-only",
             ),
             (
                 "\u{FEFF}SELECT 1 AS a",
@@ -8956,9 +9017,27 @@ mod live {
             joined(6),
             joined(12),
             format!("N'DETAILED{}zz'", "\u{1F600}".repeat(6)),
-            // Not refused, DESIGN.md §7: `N'DETAILED'` and `N'SAMPLED'` as binary literals.
+            // Binary literals, UTF-16 LE: `N'DETAILED'` and `N'SAMPLED'`, in any case, with a lone
+            // last byte as a unit (a `D`, a space, a NUL), cut at a NUL and at 20 units, with odd
+            // digits padded on the left (U+200D, then the mode), split at a line's end, and past
+            // a joiner or a lone surrogate.
             "0x440045005400410049004C0045004400".to_string(),
             "0x530041004D0050004C0045004400".to_string(),
+            "0x640065007400610069006C00650064".to_string(),
+            "0x440045005400410049004C00450044".to_string(),
+            "0x440045005400410049004C004500440020".to_string(),
+            "0x440045005400410049004C004500440000".to_string(),
+            "0x440045005400410049004C004500440000007A00".to_string(),
+            format!(
+                "0x440045005400410049004C0045004400{}7A00",
+                "2000".repeat(12)
+            ),
+            format!("0x440045005400410049004C0045004400{}41", "2000".repeat(12)),
+            "0xD20440045005400410049004C0045004400".to_string(),
+            "0x44004500\\\n5400410049004C0045004400".to_string(),
+            "0x44004\\\r\n500\\\n\\\n5400410049004C0045004400".to_string(),
+            "0x440045000D205400410049004C0045004400".to_string(),
+            "0x4400450000D85400410049004C0045004400".to_string(),
         ] {
             let sql = scoped(&mode);
             let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
@@ -8969,16 +9048,153 @@ mod live {
                 r.stdout
             );
         }
-        // 21 units cut the `D` off, so the servers have no such mode. `N'LIMITED'` as a binary
-        // literal doesn't scan, so the rows above are the mode's doing.
-        let sql = scoped(&joined(13));
-        let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
-        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
-        assert!(r.stderr.contains("error 2561"), "{}", r.stderr);
-        let sql = scoped("0x4C0049004D0049005400450044");
-        let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+        // 21 units cut the `D` off, so the servers have no such mode; nor have they what a binary
+        // literal reads as otherwise: single bytes, a last byte that is a letter, a space first,
+        // a NUL inside.
+        for mode in [
+            joined(13),
+            "0x44455441494C4544".to_string(),
+            "0x440045005400410049004C004500440041".to_string(),
+            "0x2000440045005400410049004C0045004400".to_string(),
+            "0x4400450054000000410049004C0045004400".to_string(),
+        ] {
+            let sql = scoped(&mode);
+            let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 1, "{mode}: {}{}", r.stdout, r.stderr);
+            assert!(r.stderr.contains("error 2561"), "{mode}: {}", r.stderr);
+        }
+        // A backslash has to be at the line's end, and only LF or CRLF ends one here.
+        for mode in [
+            "0x44004500\\\r5400410049004C0045004400",
+            "0x44004500\\ \n5400410049004C0045004400",
+        ] {
+            let sql = scoped(mode);
+            let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 1, "{mode}: {}{}", r.stdout, r.stderr);
+            assert!(r.stderr.contains("error 102"), "{mode}: {}", r.stderr);
+        }
+        // `N'LIMITED'` as a binary literal, and empty ones, don't scan, so the rows above are the
+        // mode's doing.
+        for mode in ["0x4C0049004D0049005400450044", "0x", "0x00"] {
+            let sql = scoped(mode);
+            let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
+            assert!(!r.stdout.lines().any(|line| line == "1"), "{}", r.stdout);
+        }
+    }
+
+    // Decision 30(d): which first arguments the servers take as no database, by the mode that
+    // doesn't scan and an object id. With no database the object id is their error 2561 before
+    // anything is read, and with a database it is at most that one object, so nothing here reads
+    // every database. A first argument is never tried here with a mode that scans.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_take_as_no_database_what_the_scan_refusal_goes_by() {
+        let (p, db) = target();
+        let run = |first: &str| {
+            let sql = format!(
+                "SELECT TOP (1) database_id FROM sys.dm_db_index_physical_stats({first}, 5, NULL, \
+                 NULL, 'LIMITED')"
+            );
+            live(&p, &db, &["--format", "csv", "-Q", &sql])
+        };
+        for first in [
+            "NULL",
+            "DEFAULT",
+            "((NULL))",
+            "0",
+            "'0'",
+            "''",
+            "N''",
+            "(0)",
+            "('')",
+            "(N'')",
+            "/*c*/ 0",
+            "00",
+            "0.",
+            "0.0",
+            ".0",
+            "0e0",
+            "0e",
+            "-0",
+            "+0",
+            "- 0",
+            "-+-0",
+            "0.5",
+            ".9",
+            "-0.9",
+            "1e-5",
+            "10e-2",
+            "$",
+            "$0",
+            "$.",
+            "$0.4",
+            "$.49994",
+            "-$0.4",
+            "$ -0",
+            "\\0",
+            "\u{20AC}0",
+            "0x",
+            "0x00",
+            "0x0000",
+            "0x010000",
+            "0xFFFF0000",
+            "0x\\\n00",
+            "N'0'",
+            "'00'",
+            "' '",
+            "N' '",
+            "' 0'",
+            "'0 '",
+            "'+'",
+            "'-'",
+            "N'-0'",
+            "' + 0 '",
+            "'\u{3000}'",
+            "'\u{FF10}'",
+            "'\\\n'",
+        ] {
+            let r = run(first);
+            assert_eq!(r.code, 1, "{first}: {}{}", r.stdout, r.stderr);
+            assert!(r.stderr.contains("error 2561"), "{first}: {}", r.stderr);
+        }
+        // A database, by any of these: a row or none, and no error.
+        for first in [
+            "1", "1.0", "1.5", "1e0", "10e-1", "0.1e1", "$1", "$0.5", "$.49995", "0x01", "0x0001",
+            "0x\\\n01", "'1'", "' 1'", "'+1'", "N'1'",
+        ] {
+            let r = run(first);
+            assert_eq!(r.code, 0, "{first}: {}{}", r.stdout, r.stderr);
+        }
+        // Neither a database nor none.
+        for (first, error) in [
+            ("-1", "error 2521"),
+            ("0x0100", "error 2521"),
+            ("99999", "error 220"),
+            ("'0 0'", "error 245"),
+            ("'++0'", "error 245"),
+            ("'0+'", "error 245"),
+            ("'0.0'", "error 245"),
+            ("'\t'", "error 245"),
+            ("N'\u{3000}'", "error 245"),
+            ("N'\u{FF10}'", "error 245"),
+        ] {
+            let r = run(first);
+            assert_eq!(r.code, 1, "{first}: {}{}", r.stdout, r.stderr);
+            assert!(r.stderr.contains(error), "{first}: {}", r.stderr);
+        }
+    }
+
+    // On both servers `0xAA\<LF>A` is one literal, and what follows it a token of its own, which
+    // the guard used to read as part of a word.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_read_a_binary_literal_past_a_backslash_at_a_lines_end() {
+        let (p, db) = target();
+        let sql = "SELECT 0xAA\\\nA AS a, 0x\\\n01\\\r\n02 AS b";
+        let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
-        assert!(!r.stdout.lines().any(|line| line == "1"), "{}", r.stdout);
+        assert!(r.stdout.starts_with("a,b\n0x0AAA,0x0102\n"), "{}", r.stdout);
     }
 
     // Nothing is lost on a line that starts with the terminator: past a lone CR the text is a
