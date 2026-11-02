@@ -2249,6 +2249,43 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
     );
 }
 
+// Decision 30(e): what `sqlh mcp` refuses for its reused session is the CLI's to run, under every
+// policy: each of these gets past the guard to the (closed) server, as it did before.
+#[test]
+fn the_cli_keeps_the_session_state_mcp_refuses() {
+    let dir = scratch("cli_session_state");
+    let config = dir.join("profiles.toml");
+    fs::write(
+        &config,
+        "[profiles.flagged]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"flag\"\n\n\
+         [profiles.denied]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"deny\"\n\n\
+         [profiles.allowed]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+         write_policy = \"allow\"\n",
+    )
+    .unwrap();
+    let reaches_connect = |profile: &str, extra: &[&str], sql: &str| {
+        let r = run(sqlh()
+            .args(["--profile", profile, "-Q", sql])
+            .args(extra)
+            .env("SQLH_CONFIG", &config));
+        assert_reached_connect(&r, &format!("{profile} {extra:?}: {sql}"));
+    };
+    for sql in [
+        "SET AUTOPILOT ON",
+        "SET IDENTITY_INSERT #t ON",
+        "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c",
+        "OPEN MASTER KEY DECRYPTION BY PASSWORD = 'x'",
+    ] {
+        reaches_connect("flagged", &[], sql);
+        reaches_connect("denied", &[], sql);
+    }
+    reaches_connect("flagged", &["--check"], "SET AUTOPILOT ON");
+    reaches_connect("flagged", &["--allow-write"], "SET AUTOPILOT ON");
+    reaches_connect("allowed", &[], "SET AUTOPILOT ON");
+}
+
 // Decision 30(d) from the command line: refused before anything connects, wherever the guard
 // runs, and passed by a run with writes on, where it doesn't, and by what the advice offers.
 #[test]
@@ -4263,6 +4300,140 @@ mod mcp {
                 "{sql}"
             );
             assert!(!text.contains("--allow-write"), "{sql}: {text}");
+        }
+    }
+
+    // Decision 30(e), in both tools that take SQL and both formats, whatever the profile's
+    // `write_policy`: refused before anything connects, in words that name no flag.
+    #[test]
+    fn session_state_the_reset_may_not_clear_is_refused_in_every_tool_that_takes_sql() {
+        let config = scratch("mcp_session_state").join("profiles.toml");
+        fs::write(
+            &config,
+            "[profiles.win]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\n\
+             [profiles.allowed]\nserver = \"127.0.0.1,1\"\nauth = \"windows\"\nlogin_timeout = 1\n\
+             write_policy = \"allow\"\n",
+        )
+        .unwrap();
+        const ADVICE: &str = "Run it with the sqlh CLI, whose session ends with the run";
+        let cases = [
+            ("SET AUTOPILOT ON", 1, "SET AUTOPILOT"),
+            ("set autopilot off", 1, "SET AUTOPILOT"),
+            ("SET /* c */ AUTOPILOT, AUTOPILOT ON", 1, "SET AUTOPILOT"),
+            ("SELECT 1;\nSET AUTOPILOT ON", 2, "SET AUTOPILOT"),
+            ("SELECT 1\nGO\nSET AUTOPILOT ON", 3, "SET AUTOPILOT"),
+            ("SET IDENTITY_INSERT #t ON", 1, "SET IDENTITY_INSERT"),
+            (
+                "CREATE TABLE #t (id int IDENTITY, c int);\nSET IDENTITY_INSERT #t ON;",
+                2,
+                "SET IDENTITY_INSERT",
+            ),
+            (
+                "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c",
+                1,
+                "OPEN SYMMETRIC KEY",
+            ),
+            (
+                "open /* c */ symmetric -- d\nkey k decryption by certificate c;\n\
+                 SELECT DECRYPTBYKEY(s) FROM t",
+                1,
+                "OPEN SYMMETRIC KEY",
+            ),
+            (
+                "OPEN MASTER KEY DECRYPTION BY PASSWORD = 'x'",
+                1,
+                "OPEN MASTER KEY",
+            ),
+        ];
+        // A session of its own for each: one takes at most 64 calls at once.
+        for profile in ["win", "allowed"] {
+            for tool in ["query", "check"] {
+                for format in ["text", "json"] {
+                    let lines: Vec<String> = (1..)
+                        .zip(&cases)
+                        .map(|(id, (sql, _, _))| {
+                            let arguments = serde_json::json!({
+                                "sql": sql, "format": format, "profile": profile,
+                            });
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"{tool}","arguments":{arguments}}}}}"#
+                            )
+                        })
+                        .collect();
+                    let (r, messages) = session(
+                        &config,
+                        &["--profile", "win", "--profile", "allowed"],
+                        &lines,
+                    );
+                    assert_eq!(r.code, 0, "{}", r.stderr);
+                    for (id, (sql, line, what)) in (1..).zip(&cases) {
+                        let at = format!("{profile}, {tool}, {format}: {sql}");
+                        let result = &by_id(&messages, id)["result"];
+                        assert_eq!(result["isError"], true, "{at}: {result}");
+                        let text = result["content"][0]["text"].as_str().unwrap();
+                        let said = format!(
+                            "line {line}: {what} leaves session state sqlh mcp's reset isn't \
+                             known to clear; nothing was run. {ADVICE}"
+                        );
+                        if format == "text" {
+                            let mut shown = text.lines();
+                            assert_eq!(
+                                shown.next(),
+                                Some(format!("-- blocked: {said}").as_str()),
+                                "{at}"
+                            );
+                            let status = shown.next().unwrap_or("");
+                            assert!(
+                                status.starts_with(
+                                    "-- failed (exit 5): blocked by the read-only guard, "
+                                ),
+                                "{at}: {status}"
+                            );
+                            assert_eq!(shown.next(), None, "{at}: {text}");
+                        } else {
+                            let document: serde_json::Value =
+                                serde_json::from_str(text.trim_end()).expect("a JSON document");
+                            assert_eq!(document["error"], said, "{at}");
+                        }
+                        assert!(!text.contains("--allow-write"), "{at}: {text}");
+                        assert!(!text.contains("sqlh mcp is read-only"), "{at}: {text}");
+                    }
+                }
+            }
+        }
+    }
+
+    // What only looks like it stays allowed: past the guard, a call fails at the closed port.
+    #[test]
+    fn what_only_looks_like_session_state_gets_past_the_guard() {
+        let config = profiles("mcp_not_session_state");
+        let cases = [
+            "UPDATE #t SET autopilot = 1",
+            "OPEN GLOBAL c",
+            "OPEN [master]",
+            "CLOSE SYMMETRIC KEY k",
+            "CLOSE ALL SYMMETRIC KEYS",
+            "CLOSE MASTER KEY",
+            "SET NOCOUNT ON",
+            "SELECT 'SET AUTOPILOT ON' -- OPEN MASTER KEY",
+        ];
+        let lines: Vec<String> = (1..)
+            .zip(&cases)
+            .map(|(id, sql)| {
+                let sql = serde_json::Value::from(*sql);
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{{META},"name":"query","arguments":{{"sql":{sql}}}}}}}"#
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (id, sql) in (1..).zip(&cases) {
+            let text = by_id(&messages, id)["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            assert!(!text.contains("-- blocked:"), "{sql}: {text}");
+            assert!(text.contains("(exit 2)"), "{sql}: {text}");
         }
     }
 
@@ -11904,6 +12075,73 @@ mod live {
             assert!(status.ends_with(", connect 0 ms\n"), "{status}");
             let (code, _, stderr) = mcp.finish();
             assert_eq!(code, 0, "{stderr}");
+        }
+
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_refuses_the_session_state_the_cli_keeps() {
+            let (p, db) = target();
+            // The CLI, whose session ends with the run: AUTOPILOT takes hold of the next batch,
+            // and an explicit identity goes in. All of it in the wrapper, on a #temp table.
+            let autopilot = live(&p, &db, &["-Q", "SET AUTOPILOT ON\nGO\nSELECT 1 AS one"]);
+            assert_eq!(autopilot.code, 0, "{}", autopilot.stdout);
+            assert!(
+                autopilot.stdout.contains("<ShowPlanXML"),
+                "{}",
+                autopilot.stdout
+            );
+            let identity = live(
+                &p,
+                &db,
+                &[
+                    "-Q",
+                    "CREATE TABLE #t (id int IDENTITY, c int);\nSET IDENTITY_INSERT #t ON;\n\
+                     INSERT #t (id, c) VALUES (7, 1);\nSET IDENTITY_INSERT #t OFF;\n\
+                     SELECT id, c FROM #t",
+                ],
+            );
+            assert_eq!(identity.code, 0, "{}", identity.stdout);
+            assert!(identity.stdout.contains("\n7\t1\n"), "{}", identity.stdout);
+
+            let mut mcp = Mcp::on(&p);
+            let opened = "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c";
+            for (id, tool, sql, what) in [
+                (1, "query", "SET AUTOPILOT ON", "SET AUTOPILOT"),
+                (2, "check", "SET AUTOPILOT ON", "SET AUTOPILOT"),
+                (
+                    3,
+                    "query",
+                    "SET IDENTITY_INSERT #t ON",
+                    "SET IDENTITY_INSERT",
+                ),
+                (4, "query", opened, "OPEN SYMMETRIC KEY"),
+                (5, "check", opened, "OPEN SYMMETRIC KEY"),
+                (
+                    6,
+                    "query",
+                    "OPEN MASTER KEY DECRYPTION BY PASSWORD = 'x'",
+                    "OPEN MASTER KEY",
+                ),
+            ] {
+                let result = mcp.call(id, tool, json!({"sql": sql}));
+                assert_eq!(result["isError"], true, "{tool}: {sql}: {result}");
+                let text = result["content"][0]["text"].as_str().unwrap();
+                assert_eq!(
+                    text.lines().next().unwrap_or(""),
+                    format!(
+                        "-- blocked: line 1: {what} leaves session state sqlh mcp's reset isn't \
+                         known to clear; nothing was run. Run it with the sqlh CLI, whose \
+                         session ends with the run"
+                    ),
+                    "{tool}: {sql}"
+                );
+            }
+            // Nothing took hold: the next call on the session gets its rows, not a plan.
+            let result = mcp.call(7, "query", json!({"sql": "SELECT 1 AS one"}));
+            assert_eq!(result["isError"], false, "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("-- result 1\none:int\n1\n"), "{text}");
+            mcp.finish();
         }
 
         // The external review's question 3 (plan-history.md, Phase 5.2 and 5.3 external review), on

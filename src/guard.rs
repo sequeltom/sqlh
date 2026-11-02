@@ -23,6 +23,7 @@ pub struct Blocked {
     /// offers it, except for `FLUSH_PROC`, which is no use under a profile that refuses it
     /// (`advice_for`). False too for `wildcard_stats`: that call is no write, so the flag is no
     /// advice for it, though a run with writes allowed skips the classifier and so this check.
+    /// And for `session_state`, which only `sqlh mcp` refuses, where the flag doesn't exist.
     pub lifted_by_write: bool,
     /// What to do short of writing, where there is something (`Use a #temp table`). For a
     /// refusal writing doesn't lift, the advice in `sqlh mcp`, which names no flag.
@@ -113,6 +114,10 @@ pub struct Policy {
     pub writes: bool,
     /// `--check`: refuse anything that could switch compile-only mode off.
     pub compile_only: bool,
+    /// `sqlh mcp`, whose session goes on to the next call: refuse the session state its reset
+    /// isn't known to clear (decision 30(e)). The write classifier reads this, and writes are
+    /// never allowed there (`mcp::for_read_tools`).
+    pub reused_session: bool,
 }
 
 impl Policy {
@@ -430,6 +435,53 @@ fn wildcard_stats(line: u32, mode: &str) -> Blocked {
     }
 }
 
+/// The session state `SET`, at `after`, would leave, if it is one the reset isn't known to clear.
+fn set_of_unknown_state(after: &Lexer<'_>) -> Option<&'static str> {
+    // A reserved word, so no column: `SET identity_insert = 1` is already the server's syntax
+    // error (156 on SQL Server 2016 SP3 and 2025).
+    if after.word_is(0, "IDENTITY_INSERT") {
+        return Some("SET IDENTITY_INSERT");
+    }
+    if !after.word_is(0, "AUTOPILOT") {
+        return None;
+    }
+    // Not reserved, so `UPDATE #t SET autopilot = 1`, `+=` and `.modify(...)` are a column's. A
+    // comma never follows a column there, and the servers take `SET AUTOPILOT, AUTOPILOT ON`;
+    // with any other option in the list, or AUTOPILOT not first, they refuse it (1067 or 195).
+    match after.kind(1) {
+        Some(Kind::Punct(c)) if c != ',' => None,
+        _ => Some("SET AUTOPILOT"),
+    }
+}
+
+/// The key `OPEN`, at `after`, would leave open, if it opens one. The servers take these bare
+/// words only (`OPEN [MASTER] KEY` is a syntax error), and `OPEN [master]` is a cursor's.
+fn open_of_key(after: &Lexer<'_>) -> Option<&'static str> {
+    if !after.word_is(1, "KEY") {
+        return None;
+    }
+    if after.word_is(0, "SYMMETRIC") {
+        Some("OPEN SYMMETRIC KEY")
+    } else if after.word_is(0, "MASTER") {
+        Some("OPEN MASTER KEY")
+    } else {
+        None
+    }
+}
+
+/// The refusal in `sqlh mcp` of state that could reach the next call on the connection (decision
+/// 30(e), command-categories.md §6.3), until a reset test covers it. The CLI's session ends with
+/// its run, so the CLI runs these. `advice_for` shows the advice as it is: it names no flag.
+fn session_state(line: u32, what: &str) -> Blocked {
+    Blocked {
+        line,
+        reason: format!("{what} leaves session state sqlh mcp's reset isn't known to clear"),
+        advice: "Run it with the sqlh CLI, whose session ends with the run".into(),
+        lifted_by_write: false,
+        instead: None,
+    }
+}
+
 /// DBCC commands that only read.
 const DBCC_READ: &[&str] = &[
     "INPUTBUFFER",
@@ -709,10 +761,12 @@ fn check_within(sql: &str, policy: Policy, base: u64, per_byte: u64) -> Result<(
         return Ok(());
     }
     if policy.compile_only {
-        metered(sql, base, per_byte, |guard| guard.check_compile_only())?;
+        metered(sql, policy, base, per_byte, |guard| {
+            guard.check_compile_only()
+        })?;
     }
     if !policy.writes {
-        metered(sql, base, per_byte, |guard| guard.check_writes())?;
+        metered(sql, policy, base, per_byte, |guard| guard.check_writes())?;
     }
     Ok(())
 }
@@ -723,12 +777,17 @@ fn check_within(sql: &str, policy: Policy, base: u64, per_byte: u64) -> Result<(
 /// budget, and stands.
 fn metered(
     sql: &str,
+    policy: Policy,
     base: u64,
     per_byte: u64,
     pass: impl FnOnce(&Guard<'_>) -> Result<(), Blocked>,
 ) -> Result<(), Blocked> {
     let work = Work::new(sql, base, per_byte);
-    let result = pass(&Guard { sql, work: &work });
+    let result = pass(&Guard {
+        sql,
+        work: &work,
+        reused_session: policy.reused_session,
+    });
     if work.exceeded() {
         return Err(work.refusal());
     }
@@ -1184,6 +1243,8 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
 struct Guard<'a> {
     sql: &'a str,
     work: &'a Work,
+    /// `Policy::reused_session`.
+    reused_session: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1379,6 +1440,16 @@ impl<'a> Guard<'a> {
             }
             "EXEC" | "EXECUTE" => self.check_exec(line, lex)?,
             "SYS" => self.check_physical_stats(token, lex)?,
+            "SET" if self.reused_session => {
+                if let Some(what) = set_of_unknown_state(lex) {
+                    return Err(session_state(line, what));
+                }
+            }
+            "OPEN" if self.reused_session => {
+                if let Some(what) = open_of_key(lex) {
+                    return Err(session_state(line, what));
+                }
+            }
             "BEGIN" => {
                 let kinds = ["TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG"];
                 if let Some(w) = lex.word(0).and_then(|w| find_entry(&kinds, w)) {
@@ -2049,6 +2120,7 @@ mod tests {
     const READ_ONLY: Policy = Policy {
         writes: false,
         compile_only: false,
+        reused_session: false,
     };
 
     fn allowed(sql: &str) {
@@ -2310,6 +2382,7 @@ mod tests {
         let check_mode = Policy {
             writes: false,
             compile_only: true,
+            reused_session: false,
         };
         let b = check("SET NOEXEC OFF", check_mode).expect_err("refused");
         assert_eq!(
@@ -2461,6 +2534,7 @@ mod tests {
         let writes = Policy {
             writes: true,
             compile_only: false,
+            reused_session: false,
         };
         assert_eq!(check("EXEC sys.sp_query_store_flush_db", writes), Ok(()));
     }
@@ -2997,6 +3071,238 @@ mod tests {
         }
     }
 
+    // Decision 30(e), command-categories.md §6.3.
+    const MCP: Policy = Policy {
+        writes: false,
+        compile_only: false,
+        reused_session: true,
+    };
+    const MCP_CHECK: Policy = Policy {
+        writes: false,
+        compile_only: true,
+        reused_session: true,
+    };
+    const STATE_ADVICE: &str = "Run it with the sqlh CLI, whose session ends with the run";
+
+    fn state_reason(what: &str) -> String {
+        format!("{what} leaves session state sqlh mcp's reset isn't known to clear")
+    }
+
+    #[test]
+    fn a_reused_session_refuses_the_state_its_reset_is_not_known_to_clear() {
+        const AUTOPILOT: &str = "SET AUTOPILOT";
+        const IDENTITY: &str = "SET IDENTITY_INSERT";
+        const SYMMETRIC: &str = "OPEN SYMMETRIC KEY";
+        const MASTER: &str = "OPEN MASTER KEY";
+        let cases: &[(&str, u32, &str)] = &[
+            ("SET AUTOPILOT ON", 1, AUTOPILOT),
+            ("SET AUTOPILOT OFF", 1, AUTOPILOT),
+            ("set autopilot on", 1, AUTOPILOT),
+            ("SeT aUtOpIlOt On;", 1, AUTOPILOT),
+            (";SET AUTOPILOT ON", 1, AUTOPILOT),
+            ("SET/**/AUTOPILOT--x\n ON", 1, AUTOPILOT),
+            ("SET\n\n  AUTOPILOT\nON", 1, AUTOPILOT),
+            ("/* SET NOCOUNT ON */ SET AUTOPILOT ON", 1, AUTOPILOT),
+            // The servers take this one list; the rest of these are their errors to give, and
+            // refusing them loses nothing.
+            ("SET AUTOPILOT, AUTOPILOT ON", 1, AUTOPILOT),
+            ("SET AUTOPILOT, NOCOUNT ON", 1, AUTOPILOT),
+            ("SET AUTOPILOT", 1, AUTOPILOT),
+            ("BEGIN SET AUTOPILOT ON END", 1, AUTOPILOT),
+            ("IF 1 = 0 SET AUTOPILOT ON", 1, AUTOPILOT),
+            ("SELECT 1;\nSET AUTOPILOT ON", 2, AUTOPILOT),
+            ("SELECT 1\nSET NOCOUNT ON\n\nSET AUTOPILOT ON", 4, AUTOPILOT),
+            ("UPDATE #t SET a = 1\nSET AUTOPILOT ON", 2, AUTOPILOT),
+            ("SET IDENTITY_INSERT #t ON", 1, IDENTITY),
+            ("SET IDENTITY_INSERT #t OFF", 1, IDENTITY),
+            ("set identity_insert #t on", 1, IDENTITY),
+            ("SET IDENTITY_INSERT dbo.T ON", 1, IDENTITY),
+            ("SET IDENTITY_INSERT [#t] ON", 1, IDENTITY),
+            ("SET IDENTITY_INSERT \"#t\" ON", 1, IDENTITY),
+            ("SET IDENTITY_INSERT ..#t ON", 1, IDENTITY),
+            ("SET IDENTITY_INSERT tempdb..#t ON", 1, IDENTITY),
+            ("SET /*x*/ IDENTITY_INSERT -- y\n #t ON", 1, IDENTITY),
+            (
+                "CREATE TABLE #t (id int IDENTITY, c int);\nSET IDENTITY_INSERT #t ON;",
+                2,
+                IDENTITY,
+            ),
+            (
+                "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c",
+                1,
+                SYMMETRIC,
+            ),
+            (
+                "open symmetric key k decryption by certificate c",
+                1,
+                SYMMETRIC,
+            ),
+            (
+                "OPEN /*a*/ SYMMETRIC --b\n KEY k DECRYPTION BY CERTIFICATE c",
+                1,
+                SYMMETRIC,
+            ),
+            (
+                "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c;\nSELECT DECRYPTBYKEY(s) FROM t",
+                1,
+                SYMMETRIC,
+            ),
+            (
+                "SELECT 1\nOPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c",
+                2,
+                SYMMETRIC,
+            ),
+            ("OPEN MASTER KEY DECRYPTION BY PASSWORD = 'x'", 1, MASTER),
+            ("oPeN mAsTeR kEy DECRYPTION BY PASSWORD = 'x'", 1, MASTER),
+            (
+                "SELECT 1;\n\nOPEN MASTER KEY DECRYPTION BY PASSWORD = 'x'",
+                3,
+                MASTER,
+            ),
+        ];
+        for (sql, line, what) in cases {
+            for policy in [MCP, MCP_CHECK] {
+                let b = check(sql, policy).expect_err(&format!("should be refused: {sql}"));
+                assert_eq!(
+                    (b.line, b.reason.as_str()),
+                    (*line, state_reason(what).as_str()),
+                    "{sql:?}"
+                );
+                assert_eq!(b.advice_for(Some(&WritesOff::Mcp)), STATE_ADVICE, "{sql:?}");
+            }
+            // The CLI keeps them, whatever else applies to the run.
+            allowed(sql);
+            for writes in [false, true] {
+                for compile_only in [false, true] {
+                    let cli = Policy {
+                        writes,
+                        compile_only,
+                        reused_session: false,
+                    };
+                    assert_eq!(check(sql, cli), Ok(()), "{sql:?}, {cli:?}");
+                }
+            }
+        }
+    }
+
+    // Each of these leaves nothing the reset isn't known to clear, or is no statement at all, so
+    // refusing it would be a false refusal of a legal read. `autopilot` isn't a reserved word.
+    #[test]
+    fn a_reused_session_allows_what_only_looks_like_that_state() {
+        for sql in [
+            // A column or variable, not the option: the servers ran `=`, `+=` and `.modify` on #t.
+            "UPDATE #t SET autopilot = 1",
+            "UPDATE #t SET autopilot=1, a = 2",
+            "UPDATE #t SET a = 2, autopilot = 1",
+            "UPDATE #t SET autopilot += 3",
+            "UPDATE #t SET autopilot.modify('delete /a')",
+            "UPDATE @t SET autopilot.x = 1",
+            "DECLARE @autopilot int; SET @autopilot = 1",
+            "SELECT autopilot, identity_insert = 1 FROM dbo.T",
+            "SELECT [SET] autopilot FROM dbo.T",
+            "SELECT [OPEN] master FROM dbo.T",
+            // Not the statement: quoted, a string, a comment.
+            "SELECT 'SET AUTOPILOT ON', N'OPEN MASTER KEY', 'SET IDENTITY_INSERT #t ON'",
+            "SELECT 1 -- SET AUTOPILOT ON\n/* OPEN SYMMETRIC KEY k */",
+            // What the reset is shown to clear, or the setup sets again.
+            "SET NOCOUNT ON",
+            "SET ROWCOUNT 2",
+            "SET STATISTICS IO, TIME ON",
+            "SET SHOWPLAN_XML ON",
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            "SET DEADLOCK_PRIORITY LOW",
+            // A cursor, which the reset is shown to close, whatever it is called.
+            "OPEN c",
+            "OPEN GLOBAL c",
+            "OPEN [master]",
+            "OPEN [symmetric]",
+            "OPEN [key]",
+            "OPEN GLOBAL [key]",
+            // Closing a key leaves none open, and decision 30(e) names only the opening.
+            "CLOSE SYMMETRIC KEY k",
+            "CLOSE ALL SYMMETRIC KEYS",
+            "CLOSE MASTER KEY",
+            "CLOSE c",
+            // The servers' errors (102, 156, 1067 on both): nothing they could leave.
+            "SET [AUTOPILOT] ON",
+            "SET \"AUTOPILOT\" ON",
+            "SET [IDENTITY_INSERT] #t ON",
+            "SET NOCOUNT, AUTOPILOT ON",
+            "OPEN [SYMMETRIC] KEY k DECRYPTION BY CERTIFICATE c",
+            "OPEN SYMMETRIC [KEY] k DECRYPTION BY CERTIFICATE c",
+            "OPEN [MASTER] KEY DECRYPTION BY PASSWORD = 'x'",
+        ] {
+            assert_eq!(check(sql, MCP), Ok(()), "{sql:?}");
+        }
+    }
+
+    // The new check adds refusals and takes none away, and the earliest keyword's stays first.
+    #[test]
+    fn the_session_state_refusal_takes_its_place_in_the_text() {
+        const AUTOPILOT: &str = "SET AUTOPILOT ON";
+        let reason = state_reason("SET AUTOPILOT");
+        let first = |sql: &str| check(sql, MCP).expect_err("refused");
+        let b = first(&format!("DELETE dbo.T\n{AUTOPILOT}"));
+        assert_eq!((b.line, b.reason.as_str()), (1, "DELETE dbo.T would write"));
+        let b = first(&format!("{AUTOPILOT}\nDELETE dbo.T"));
+        assert_eq!((b.line, b.reason.as_str()), (1, reason.as_str()));
+        let b = first(&format!("DELETE TOP (SELECT 1) FROM #t\n{AUTOPILOT}"));
+        assert_eq!((b.line, b.reason.as_str()), (2, reason.as_str()));
+        let b = first(&format!("WAITFOR DELAY '00:00:01'\n{AUTOPILOT}"));
+        assert!(
+            b.reason.starts_with("WAITFOR is not allowed"),
+            "{}",
+            b.reason
+        );
+        for (sql, reason) in [
+            (
+                "ALTER MASTER KEY REGENERATE",
+                "ALTER MASTER KEY would write",
+            ),
+            ("DROP MASTER KEY", "DROP would write"),
+            (
+                "CREATE SYMMETRIC KEY k WITH ALGORITHM = AES_256",
+                "CREATE SYMMETRIC KEY would write",
+            ),
+            ("UPDATE dbo.T SET autopilot = 1", "UPDATE dbo.T would write"),
+        ] {
+            assert_eq!(first(sql).reason, reason, "{sql:?}");
+            assert_eq!(blocked(sql).reason, reason, "{sql:?}");
+        }
+    }
+
+    // A few tokens read per `SET` or `OPEN`, whatever follows and however many there are, and
+    // the budget stands behind them as it does for the other lookups.
+    #[test]
+    fn looking_for_session_state_takes_linear_work() {
+        let work_in_mcp = |sql: &str| {
+            let work = Work::new(sql, WORK_BASE, WORK_PER_BYTE);
+            let result = Guard {
+                sql,
+                work: &work,
+                reused_session: true,
+            }
+            .check_writes();
+            assert_eq!(result, Ok(()), "{}", &sql[..20]);
+            work.used.get()
+        };
+        let n = 100_000;
+        for (statement, most) in [
+            ("SET ", 4),
+            ("SET AUTOPILOT = ", 8),
+            ("OPEN ", 4),
+            ("OPEN MASTER ", 7),
+            ("OPEN c\n", 5),
+            ("UPDATE #t SET autopilot = 1\n", 16),
+        ] {
+            let sql = statement.repeat(n);
+            let used = work_in_mcp(&sql);
+            assert!(used < most * n as u64, "{statement:?}: {used}");
+        }
+        let spent = check_within("SET AUTOPILOT ON", MCP, 0, 0).expect_err("refused");
+        assert!(spent.reason.contains("too complex"), "{}", spent.reason);
+    }
+
     // Each of these reads, or is the server's to refuse; none is decision 30(d)'s call.
     #[test]
     fn stats_calls_that_are_not_the_wildcard_scan_are_allowed() {
@@ -3073,16 +3379,19 @@ mod tests {
         let check_only = Policy {
             writes: false,
             compile_only: true,
+            reused_session: false,
         };
         assert_eq!(check(sql, check_only).unwrap_err().reason, STATS_DETAILED);
         for writes in [
             Policy {
                 writes: true,
                 compile_only: false,
+                reused_session: false,
             },
             Policy {
                 writes: true,
                 compile_only: true,
+                reused_session: false,
             },
         ] {
             assert_eq!(check(sql, writes), Ok(()), "{writes:?}");
@@ -3726,10 +4035,12 @@ mod tests {
         let check_writes = Policy {
             writes: true,
             compile_only: true,
+            reused_session: false,
         };
         let check_read_only = Policy {
             writes: false,
             compile_only: true,
+            reused_session: false,
         };
         for policy in [check_writes, check_read_only] {
             for sql in [
@@ -3753,6 +4064,7 @@ mod tests {
         let open = Policy {
             writes: true,
             compile_only: false,
+            reused_session: false,
         };
         assert_eq!(check("SET NOEXEC OFF; DROP TABLE dbo.T", open), Ok(()));
     }
@@ -3777,6 +4089,7 @@ mod tests {
                 Policy {
                     writes: true,
                     compile_only: true,
+                    reused_session: false,
                 },
             );
         }
@@ -3848,6 +4161,7 @@ mod tests {
                 Policy {
                     writes: true,
                     compile_only: true,
+                    reused_session: false,
                 },
             );
         }
@@ -4075,7 +4389,8 @@ mod tests {
                 "sET nOeXeC oN",
                 Policy {
                     writes: true,
-                    compile_only: true
+                    compile_only: true,
+                    reused_session: false,
                 }
             )
             .is_err()
@@ -4169,6 +4484,7 @@ mod tests {
             Policy {
                 writes: true,
                 compile_only: true,
+                reused_session: false,
             },
         )
         .expect_err("refused");
@@ -4269,7 +4585,12 @@ mod tests {
     /// The work a write-classifier pass over `sql` takes, in the units of `Work`.
     fn work_of(sql: &str) -> u64 {
         let work = Work::new(sql, WORK_BASE, WORK_PER_BYTE);
-        let _ = Guard { sql, work: &work }.check_writes();
+        let _ = Guard {
+            sql,
+            work: &work,
+            reused_session: false,
+        }
+        .check_writes();
         work.used.get()
     }
 
@@ -4318,6 +4639,7 @@ mod tests {
         let writes = Policy {
             writes: true,
             compile_only: false,
+            reused_session: false,
         };
         assert_eq!(check(&sql, writes), Ok(()));
     }
@@ -4408,12 +4730,14 @@ mod tests {
         let open = Policy {
             writes: true,
             compile_only: false,
+            reused_session: false,
         };
         assert_eq!(check_within(&sql, open, 0, 0), Ok(()));
         // --check's NOEXEC search has a budget of its own, and the write classifier another.
         let both = Policy {
             writes: false,
             compile_only: true,
+            reused_session: false,
         };
         let sql = "SELECT 1\n".repeat(1_000);
         assert_eq!(check_within(&sql, both, 3_000, 0), Ok(()));

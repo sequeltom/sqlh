@@ -202,6 +202,8 @@ pub(crate) struct RunPolicy {
     pub(crate) check: bool,
     /// `--continue-on-error`.
     pub(crate) continue_on_error: bool,
+    /// `sqlh mcp`: the session goes on to the next call (`guard::Policy::reused_session`).
+    pub(crate) reused_session: bool,
 }
 
 impl RunPolicy {
@@ -212,6 +214,7 @@ impl RunPolicy {
             allow_write: settings.allow_write && origin == QueryOrigin::User,
             check: request.check,
             continue_on_error: request.continue_on_error,
+            reused_session: settings.writes_off == Some(guard::WritesOff::Mcp),
         }
     }
 
@@ -220,6 +223,7 @@ impl RunPolicy {
         guard::Policy {
             writes: self.allow_write,
             compile_only: self.check,
+            reused_session: self.reused_session,
         }
     }
 
@@ -1743,6 +1747,7 @@ mod tests {
             allow_write,
             check,
             continue_on_error: false,
+            reused_session: false,
         };
         for (allow_write, check, wrap) in [
             (false, false, true),
@@ -1766,6 +1771,7 @@ mod tests {
                 allow_write: true,
                 check: true,
                 continue_on_error: true,
+                reused_session: false,
             }
         );
         // sqlh's own SQL never runs with writes allowed: the wrapper stays (the Phase 3
@@ -1788,9 +1794,43 @@ mod tests {
                 allow_write,
                 check,
                 continue_on_error: false,
+                reused_session: false,
             };
             assert_eq!(policy.application_name(), name, "{policy:?}");
         }
+    }
+
+    // Decision 30(e): only `sqlh mcp`'s session goes on to another call. A `deny` profile's writes
+    // are off too, and its session ends with the run like any other CLI's.
+    #[test]
+    fn only_sqlh_mcp_reuses_a_session() {
+        let sql = "SET AUTOPILOT ON";
+        for (writes_off, refused) in [
+            (None, false),
+            (Some(guard::WritesOff::Profile("p".into())), false),
+            (Some(guard::WritesOff::Mcp), true),
+        ] {
+            let settings = Settings {
+                writes_off,
+                ..settings(false)
+            };
+            for check in [false, true] {
+                let request = Request {
+                    check,
+                    ..query(sql)
+                };
+                let prepared = prepare(request, &settings, QueryOrigin::User).unwrap();
+                assert_eq!(prepared.policy.reused_session, refused);
+                assert_eq!(prepared.blocked.is_some(), refused, "check {check}");
+            }
+        }
+        // sqlh's own SQL is taken as it is, in a session reused or not.
+        let settings = Settings {
+            writes_off: Some(guard::WritesOff::Mcp),
+            ..settings(false)
+        };
+        let generated = prepare(query(sql), &settings, QueryOrigin::Generated).unwrap();
+        assert!(generated.blocked.is_none());
     }
 
     // plan-history.md 3.1: the user's SQL gets $(var) and the guard; sqlh's own SQL (QueryOrigin::
