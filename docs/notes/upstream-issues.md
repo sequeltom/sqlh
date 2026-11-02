@@ -74,6 +74,14 @@ Each entry says what was read or observed, in which version, why it matters to s
 - **sqlh's workaround:** `db::spn_if_lookup_is_slow` runs the same lookup on its own thread first and, past 500 ms, sets `server_spn` so the driver skips it (DESIGN.md §4.2, `-E`). The driver's lookup still runs on the runtime thread when sqlh's came back in time.
 - **Possible fix:** run the lookup on `spawn_blocking`, inside the connect's timeout and cancel, with a bound of its own; failing that, an option to skip canonicalization.
 
+### U10. A long run of DONE tokens before the first result is an error
+
+- **Seen in:** 0.3.0, on SQL Server 2025 and 2016 SP3, and read in the source (`connection/tds_client.rs`, `advance_to_result_boundary`, `loop_count > 10000`).
+- **What:** the driver gives up with `UsageError("Too many Done tokens with has_more=true without ColMetadata")` after 10,000 DONE tokens with `has_more` before a result's metadata, as a guard against a malicious server. A legal read-only loop produces that many: under `SET NOCOUNT ON`, `CREATE TABLE #s (n int); DECLARE @i int = 0; WHILE @i < 5000 BEGIN INSERT #s VALUES (@i); SET @i += 1; END; SELECT COUNT(*) AS c FROM #s` fails at 5,000, 20,000 and 60,000 iterations and returns `c` at 2,000.
+- **Why it matters to sqlh:** the run ends with `-- failed (exit 10): internal error`, its later result is lost, and nothing about it says the loop is the cause. A `#temp` table filled in a loop is ordinary in an investigation.
+- **sqlh's workaround:** none yet; a workaround belongs in `src/db/` if one is wanted, and nothing is planned.
+- **Possible fix:** no count on a token stream that keeps making progress, a much higher limit, or an option to set it.
+
 ## Decided not to raise
 
 - **The password in debug packet dumps** (owner decision 9, 2026-10-12): at debug level the driver hex-dumps every TDS packet before encryption, the login packet included. sqlh's own rule is the defense: no general logger while the driver runs (AGENTS.md, Driver logging). Re-check the dump when bumping the driver.
