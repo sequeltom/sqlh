@@ -1831,7 +1831,7 @@ impl<'a> Guard<'a> {
                     line,
                     format!(
                         "{word} is not allowed in read-only mode (if it is a column name, write it as [{}])",
-                        token.text
+                        shown(token.text)
                     ),
                 ));
             }
@@ -2095,7 +2095,7 @@ impl<'a> Guard<'a> {
                      procedure (another schema, database or linked server can name a different one)",
                     self.name_at(start)
                 ),
-                format!("Call it as sys.{}", last.map_or("", |t| t.text)),
+                format!("Call it as sys.{}", shown(last.map_or("", |t| t.text))),
                 self.as_written(),
             ));
         }
@@ -2232,9 +2232,8 @@ impl<'a> Guard<'a> {
         Some(false)
     }
 
-    /// The dotted name starting at `at`, for messages: as written, but for what `shown` cuts and
-    /// a byte order mark, which can't be seen. A name has four parts at most, so what is past
-    /// them is only counted.
+    /// The dotted name starting at `at`, for messages: as written, but for what `shown` changes.
+    /// A name has four parts at most, so what is past them is only counted.
     fn name_at(&self, at: &Lexer<'a>) -> String {
         let mut name = String::new();
         let mut left = 0;
@@ -2250,8 +2249,6 @@ impl<'a> Guard<'a> {
         }
         if name.is_empty() {
             "?".to_owned()
-        } else if name.contains('\u{FEFF}') {
-            name.replace('\u{FEFF}', BOM_SHOWN)
         } else {
             name
         }
@@ -2323,11 +2320,17 @@ const SHOWN_NAME_TOKENS: usize = 7;
 /// How many tokens are read for a switch's `TO`. `PARTITION $PARTITION.f(1)` has 7.
 const MAX_BEFORE_SWITCH_TO: usize = 16;
 
-/// `text`, cut for a refusal and ended as other cut text is (DESIGN.md §4.4).
+/// `text`, for a refusal: cut and ended as other cut text is (DESIGN.md §4.4), with a byte order
+/// mark, which can't be seen, written out.
 fn shown(text: &str) -> std::borrow::Cow<'_, str> {
-    match text.char_indices().nth(SHOWN_TOKEN_CHARS) {
+    let cut: std::borrow::Cow<'_, str> = match text.char_indices().nth(SHOWN_TOKEN_CHARS) {
         Some((at, _)) => format!("{}…[+{}]", &text[..at], text[at..].chars().count()).into(),
         None => text.into(),
+    };
+    if cut.contains('\u{FEFF}') {
+        cut.replace('\u{FEFF}', BOM_SHOWN).into()
+    } else {
+        cut
     }
 }
 
@@ -2400,7 +2403,7 @@ fn names_a_cte(after: &Lexer<'_>) -> bool {
     }
     while at
         .next()
-        .is_some_and(|t| matches!(t.kind, Kind::Word | Kind::Quoted))
+        .is_some_and(|t| matches!(t.kind, Kind::Word | Kind::Quoted | Kind::Temp))
     {
         match at.next().map(|t| t.kind) {
             Some(Kind::Punct(',')) => {}
@@ -3196,6 +3199,7 @@ mod tests {
             "WITH LOG\u{218} AS (SELECT 1 AS a) SELECT 1 AS b",
             "WITH log (a) AS (SELECT 1) SELECT a FROM log",
             "WITH log (a, [b]) AS (SELECT 1, 2) SELECT a FROM log",
+            "WITH log (#a) AS (SELECT 1) SELECT * FROM log",
             "WITH nowait AS (SELECT 1 AS a), log AS (SELECT 2 AS b) SELECT a FROM nowait",
             "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
             "SELECT LOG(2.0) AS a FROM sys.objects WITH (NOLOCK)",
@@ -3416,9 +3420,19 @@ mod tests {
                  tell what it does",
             ),
             ("DELETE \u{FEFF}t", "DELETE <U+FEFF>t would write"),
+            (
+                "DBCC FOO\u{FEFF}",
+                "DBCC FOO<U+FEFF> isn't on sqlh's list of read-only DBCC commands",
+            ),
+            (
+                "SELECT 1 a; SEND\u{FEFF} ON x",
+                "SEND is not allowed in read-only mode (if it is a column name, write it as \
+                 [SEND<U+FEFF>])",
+            ),
         ] {
             assert_eq!(blocked(sql).reason, reason);
         }
+        assert!(blocked("DELETE ##x\u{FEFF}").reason.contains("##x<U+FEFF>"));
         assert!(!blocked("SELEC 1").reason.contains("U+FEFF"));
     }
 
@@ -6990,6 +7004,11 @@ mod tests {
             let mut buf = [0; KEYWORD_MAX];
             assert_eq!(
                 keyword(&format!("readuncom{mark}itted"), &mut buf),
+                "READUNCOMMITTED"
+            );
+            // An ignored character between them doesn't lose the letter the mark repeats.
+            assert_eq!(
+                keyword(&format!("readuncom\u{200D}{mark}itted"), &mut buf),
                 "READUNCOMMITTED"
             );
             // One letter past the buffer, from a mark too.
