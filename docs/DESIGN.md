@@ -500,6 +500,8 @@ In read-only mode, three layers apply:
 
      All of them run inside the read-only wrapper, and so does `INSERT INTO #t EXEC xp_readerrorlog ...` (or `sp_readerrorlog`). None of them takes an app lock, sets session context or waits, so they leave `sqlh mcp`'s reset where it was (mcp-mode.md §5).
 
+     **Reads that disclose the host stay allowed (decision 30(b)).** Registry values (`xp_instance_regread`), the services and their accounts (`sys.dm_server_services`, a plain `SELECT`, which a login with `VIEW SERVER STATE` can read), drives (`xp_fixeddrives`, `sys.dm_os_volume_stats`) and `xp_msver` tell a reader about the machine, not the database. That is a disclosure, not a write, and an investigation needs it, so sqlh refuses none of them in read-only runs or in `sqlh mcp`, and no setting does; the table above says which the server opens to whom. `xp_instance_regread` matters most, since it needs no permission: a DBA stops it at the server, by revoking `EXECUTE` from public (in `master`, `REVOKE EXECUTE ON sys.xp_instance_regread FROM public`). The login then gets the server's error like any other it isn't allowed.
+
      The name may be bare or qualified only as `sys.`, `master.sys.`, `master.dbo.` or `master..`. Other qualifications are blocked: a linked server (`Lnk.master.sys.sp_who`), another database, or another schema (`sales.sp_who`, `dbo.sp_who`) can name a different procedure with the same name. This is a conservative policy, not a claim about what a given name resolves to, and the refusal suggests the `sys.` spelling (`sys.sp_who`), as Microsoft recommends for system procedures.
 
      Dynamic SQL (`EXEC (...)`), `EXEC @variable`, `EXECUTE AS` and everything else are blocked, including `sp_executesql` and every other `xp_` procedure.

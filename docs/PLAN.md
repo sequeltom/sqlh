@@ -85,6 +85,8 @@ Not measured: `sqlh mcp` launched by the desktop app itself, as its configured s
 
 **Build order (decision 51, 2026-11-01):** Part 1 in six thin slices, each released and used before the next, starting with refusal wording and the five small items; Part 2 waits for real use. §6, decision 51, lists the slices and the live checks each needs.
 
+**Slice 1, as built:** decision 30(b), documented (DESIGN.md §7; docs only, decision 52).
+
 This is design work with the owner before any code:
 1. List concrete DBA investigation workflows: blocking chains, wait stats, Query Store, plan cache and showplans, index usage, statistics, `sp_who2`, and common community procedures.
 2. List their risks.
