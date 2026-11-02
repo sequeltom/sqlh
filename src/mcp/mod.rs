@@ -195,10 +195,7 @@ fn resolve(opts: &McpOpts) -> Result<(Vec<(String, config::Settings)>, Launch), 
             ..Opts::default()
         };
         let mut settings = config::resolve(&run_opts)?;
-        settings.allow_write = false;
-        settings.writes_off = Some(crate::guard::WritesOff::Mcp);
-        settings.limits.advice = crate::output::Advice::Mcp;
-        settings.connect.hints = crate::db::Hints::Profile;
+        for_read_tools(&mut settings);
         // The profile's name as the file has it (`--profile` matches it in any case).
         let profile = config.find(name);
         // `resolve` drops a profile's read_uncommitted when the profile allows writes (a write
@@ -217,6 +214,17 @@ fn resolve(opts: &McpOpts) -> Result<(Vec<(String, config::Settings)>, Launch), 
         max_cell: opts.max_cell,
     };
     Ok((profiles, launch))
+}
+
+/// What a profile's resolved settings become under `sqlh mcp`'s read tools, whatever its
+/// `write_policy`. The login's name goes on every connection of the pool, reused or replaced
+/// (decision 30(c)); a tool that could write would need connections of its own.
+fn for_read_tools(settings: &mut config::Settings) {
+    settings.allow_write = false;
+    settings.writes_off = Some(crate::guard::WritesOff::Mcp);
+    settings.limits.advice = crate::output::Advice::Mcp;
+    settings.connect.hints = crate::db::Hints::Profile;
+    settings.connect.application_name = crate::db::APP_MCP;
 }
 
 /// The server: what it shares with its calls.
@@ -1293,6 +1301,15 @@ async fn flush_log(log: Option<&Log>) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    // Decisions 16 and 30(c): a profile that allows writes still reads here, under this name.
+    #[test]
+    fn the_read_tools_log_in_as_sqlh_mcp_whatever_the_profile_allows() {
+        let mut settings = crate::run::unconnected_settings(true);
+        for_read_tools(&mut settings);
+        assert_eq!(settings.connect.application_name, "sqlh mcp");
+        assert!(!settings.allow_write);
+    }
 
     fn lines(input: &[u8], max: usize) -> Vec<Option<Vec<u8>>> {
         let mut reader = io::BufReader::with_capacity(4, input);

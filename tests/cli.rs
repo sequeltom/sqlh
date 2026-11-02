@@ -10891,6 +10891,75 @@ mod live {
             }
         }
 
+        // Decision 30(c), as the server sees it: `sqlh` for a read-only run, `sqlh (writes)` for
+        // --allow-write (the SELECT writes nothing), and `sqlh mcp` on a pooled connection, on
+        // its first call and on the next, which reuses it.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn the_login_names_what_the_run_may_do() {
+            let (p, db) = target();
+            let sql = "SELECT @@SPID AS spid, APP_NAME() AS app, s.program_name \
+                       FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID";
+            for (flags, name) in [(&[][..], "sqlh"), (&["--allow-write"][..], "sqlh (writes)")] {
+                let mut args = vec!["--format", "json", "-Q", sql];
+                args.extend(flags);
+                let r = live(&p, &db, &args);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                let row = first_row(&serde_json::from_str(r.stdout.trim_end()).expect("JSON"));
+                assert_eq!(row["app"], name);
+                assert_eq!(row["program_name"], name);
+            }
+
+            let mut mcp = Mcp::on(&p);
+            let mut call = |id| {
+                let arguments = json!({"sql": sql, "format": "json"});
+                first_row(&ok_document(&mcp.call(id, "query", arguments)))
+            };
+            let (first, second) = (call(1), call(2));
+            assert_eq!(
+                first["spid"], second["spid"],
+                "--pool 1 reuses its connection"
+            );
+            for row in [first, second] {
+                assert_eq!(row["app"], "sqlh mcp");
+                assert_eq!(row["program_name"], "sqlh mcp");
+            }
+            assert_eq!(mcp.finish().0, 0);
+        }
+
+        // Decision 30(c), for what shows no rows of its own: a schema command and `profiles
+        // test` are read-only runs whatever --allow-write says. The debug seam checks the name
+        // in the session's first batch, and fails the run if it is another; the plain query
+        // shows the seam can fail.
+        #[cfg(debug_assertions)]
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn sqlhs_own_sql_logs_in_as_read_only_under_allow_write() {
+            let (p, db) = target();
+            let env = [(
+                "SQLH_DEBUG_SESSION_PREFIX",
+                "IF APP_NAME() <> N'sqlh' THROW 50000, N'logged in as another', 1;",
+            )];
+
+            let command = live_with(&p, &db, &env, &["--allow-write", "tables"]);
+            assert_eq!(command.code, 0, "{}", command.stdout);
+
+            let mut test = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            test.stdin(Stdio::null())
+                .args(["profiles", "test", &p])
+                .env(env[0].0, env[0].1);
+            let test = run(&mut test);
+            assert_eq!(test.code, 0, "{}", test.stdout);
+
+            let write = live_with(&p, &db, &env, &["--allow-write", "-Q", "SELECT 1"]);
+            assert_ne!(write.code, 0, "{}", write.stdout);
+            assert!(
+                write.stdout.contains("logged in as another"),
+                "{}",
+                write.stdout
+            );
+        }
+
         // docs/mcp-mode.md §4: the query tool through sqlh mcp and the test profile. Rows come
         // back in the text format, its status line last, isError false. A SQL error is isError
         // with the error's number and its line in the call's SQL (line 4, in the second

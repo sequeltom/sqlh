@@ -51,6 +51,13 @@ impl Auth {
     }
 }
 
+/// The login's application names (`APP_NAME()`, `program_name`): what a DBA's `sp_who2` or
+/// `sp_WhoIsActive` shows of what a run may do (decision 30(c)). Client-asserted, so a courtesy
+/// label and not evidence.
+pub const APP_READ_ONLY: &str = "sqlh";
+pub const APP_MCP: &str = "sqlh mcp";
+pub const APP_WRITES: &str = "sqlh (writes)";
+
 pub struct ConnectOptions {
     pub server: String,
     pub database: Option<String>,
@@ -62,6 +69,8 @@ pub struct ConnectOptions {
     pub multi_subnet_failover: bool,
     /// What a failed connect's hint names: the command line's flags, or the profile's keys.
     pub hints: Hints,
+    /// Fixed at login, so a connection keeps it for life: one of the `APP_` names.
+    pub application_name: &'static str,
 }
 
 /// What a failed connect's hint tells its reader to change (`connect_error`): the command
@@ -666,7 +675,7 @@ enum Row {
 impl Session {
     pub async fn connect(options: &ConnectOptions, cancel: &Cancel) -> Result<Session, DbError> {
         let mut context = ClientContext::default();
-        context.application_name = "sqlh".into();
+        context.application_name = options.application_name.into();
         context.database = options.database.clone().unwrap_or_default();
         match &options.auth {
             Auth::Integrated => {
@@ -3307,6 +3316,7 @@ pub(crate) mod fake_server {
             read_only_intent: false,
             multi_subnet_failover: false,
             hints: super::Hints::Flags,
+            application_name: super::APP_READ_ONLY,
         }
     }
 
@@ -3725,6 +3735,29 @@ pub(crate) mod fake_server {
         );
     }
 
+    // Decision 30(c): the name the caller chose is the one the login sends (ibAppName, bytes
+    // 48..52 of LOGIN7's OffsetLength block), spelled as the contract spells it.
+    #[test]
+    fn the_login_sends_the_application_name_it_was_given() {
+        for (name, sent) in [
+            (crate::db::APP_READ_ONLY, "sqlh"),
+            (crate::db::APP_MCP, "sqlh mcp"),
+            (crate::db::APP_WRITES, "sqlh (writes)"),
+        ] {
+            let (port, seen) = serve_login(login_reply());
+            let mut options = options(format!("127.0.0.1,{port}"));
+            options.application_name = name;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Session::connect(&options, &Cancel::new()))
+                .expect("connected");
+            let login = seen.lock().unwrap().clone().expect("a LOGIN7");
+            assert_eq!(login_text(&login, 48).as_deref(), Some(sent));
+        }
+    }
+
     /// A connect to a gateway whose login reply is `reply`, with a second fake listening as the
     /// route's target: the connect's outcome, and the LOGIN7 that reached the target, if any.
     fn route_through(
@@ -3750,14 +3783,20 @@ pub(crate) mod fake_server {
     }
 
     /// The database a LOGIN7 payload asks for: ibDatabase and cchDatabase (bytes 68..72 of the
-    /// OffsetLength block, MS-TDS 2.2.6.4), UTF-16 characters.
+    /// OffsetLength block, MS-TDS 2.2.6.4).
     fn login_database(login: &[u8]) -> Option<String> {
+        login_text(login, 68)
+    }
+
+    /// A LOGIN7 payload's text field: its offset at `at` in the OffsetLength block, its length
+    /// after that, in UTF-16 characters.
+    fn login_text(login: &[u8], at: usize) -> Option<String> {
         let field = |i: usize| {
             login
                 .get(i..i + 2)
                 .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
         };
-        let (offset, chars) = (field(68)?, field(70)?);
+        let (offset, chars) = (field(at)?, field(at + 2)?);
         let units: Vec<u16> = login
             .get(offset..offset + 2 * chars)?
             .as_chunks::<2>()

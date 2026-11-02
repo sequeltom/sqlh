@@ -189,7 +189,7 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     };
     // Everything that can fail before the run happens before `-o` is opened, so bad input
     // never truncates or replaces an existing output file.
-    let prepared = match request(&opts).and_then(|r| run::prepare(r, &settings, origin)) {
+    let prepared = match prepare_named(&opts, &mut settings, origin) {
         Ok(prepared) => prepared,
         Err(failure) => return fail_within(failure, format, settings.limits, started),
     };
@@ -227,6 +227,18 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
     // waited for, so a signal's grace bounds the exit (DESIGN.md §4.3).
     runtime.shutdown_background();
     exit
+}
+
+/// The prepared run, and the login named for what it may do: only the run's policy knows, since
+/// the flags alone would call sqlh's own SQL under `--allow-write` a write run.
+fn prepare_named(
+    opts: &Opts,
+    settings: &mut Settings,
+    origin: QueryOrigin,
+) -> Result<Prepared, Failure> {
+    let prepared = run::prepare(request(opts)?, settings, origin)?;
+    settings.connect.application_name = prepared.application_name();
+    Ok(prepared)
 }
 
 /// What the run core is asked to do (`run::Request`), from the command line.
@@ -725,6 +737,31 @@ mod tests {
             Box::new(Failing { ok, fail_flush }),
             Limits::default(),
         )
+    }
+
+    // Decision 30(c): settings.allow_write is `--allow-write` or `write_policy = "allow"`, and
+    // Generated is a schema command or `profiles test`, which log in as read-only runs.
+    #[test]
+    fn a_cli_login_is_named_for_what_the_prepared_run_may_do() {
+        for (allow_write, check, origin, name) in [
+            (false, false, QueryOrigin::User, "sqlh"),
+            (true, false, QueryOrigin::User, "sqlh (writes)"),
+            (true, true, QueryOrigin::User, "sqlh"),
+            (false, false, QueryOrigin::Generated, "sqlh"),
+            (true, false, QueryOrigin::Generated, "sqlh"),
+        ] {
+            let opts = Opts {
+                query: Some("SELECT 1".into()),
+                check,
+                ..Opts::default()
+            };
+            let mut settings = run::unconnected_settings(allow_write);
+            assert!(prepare_named(&opts, &mut settings, origin).is_ok());
+            assert_eq!(
+                settings.connect.application_name, name,
+                "allow_write {allow_write}, check {check}, {origin:?}"
+            );
+        }
     }
 
     // plan-history.md 2.15: the status line says how many batches had a count stopped, in a run

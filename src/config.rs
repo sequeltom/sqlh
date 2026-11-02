@@ -734,6 +734,9 @@ fn attempt(opts: &Opts, sources: &Sources) -> Result<Settings, Attempt> {
             read_only_intent: opts.read_only_intent,
             multi_subnet_failover: opts.multi_subnet_failover,
             hints: crate::db::Hints::Flags,
+            // Named for what the run may do once that is known, which takes more than the
+            // settings: `app` (the run's policy), `mcp` (its read tools).
+            application_name: crate::db::APP_READ_ONLY,
         },
         limits: Limits {
             max_rows: opts.max_rows.or(p.max_rows).unwrap_or(defaults.max_rows),

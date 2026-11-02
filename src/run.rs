@@ -206,6 +206,17 @@ impl RunPolicy {
     fn wrap(self) -> bool {
         !self.allow_write || self.check
     }
+
+    /// The login's name for a CLI run (decision 30(c)), by what it may do rather than by the
+    /// flag: under the wrapper nothing it does is kept, so `--check --allow-write`, and sqlh's
+    /// own SQL under a profile that allows writes, are read-only runs.
+    fn application_name(self) -> &'static str {
+        if self.wrap() {
+            db::APP_READ_ONLY
+        } else {
+            db::APP_WRITES
+        }
+    }
 }
 
 /// Where a run's SQL comes from.
@@ -513,6 +524,11 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
+    /// `RunPolicy::application_name`.
+    pub(crate) fn application_name(&self) -> &'static str {
+        self.policy.application_name()
+    }
+
     /// Whether the request asked to count every hidden row (`Request::exact_count`).
     #[cfg(test)]
     pub(crate) fn exact_count(&self) -> bool {
@@ -534,6 +550,7 @@ pub(crate) fn unconnected_settings(allow_write: bool) -> Settings {
             read_only_intent: false,
             multi_subnet_failover: false,
             hints: db::Hints::Flags,
+            application_name: db::APP_READ_ONLY,
         },
         limits: output::Limits::default(),
         query_timeout: 60,
@@ -1670,6 +1687,25 @@ mod tests {
         // review's design follow-up).
         let generated = RunPolicy::of(&request, &settings(true), QueryOrigin::Generated);
         assert!(!generated.allow_write && generated.wrap(), "{generated:?}");
+    }
+
+    // Decision 30(c): `sqlh (writes)` only where nothing would undo a write; --check keeps the
+    // wrapper and NOEXEC, whatever --allow-write says.
+    #[test]
+    fn the_run_policy_names_the_login_for_what_the_run_may_do() {
+        for (allow_write, check, name) in [
+            (false, false, "sqlh"),
+            (true, false, "sqlh (writes)"),
+            (false, true, "sqlh"),
+            (true, true, "sqlh"),
+        ] {
+            let policy = RunPolicy {
+                allow_write,
+                check,
+                continue_on_error: false,
+            };
+            assert_eq!(policy.application_name(), name, "{policy:?}");
+        }
     }
 
     // plan-history.md 3.1: the user's SQL gets $(var) and the guard; sqlh's own SQL (QueryOrigin::
