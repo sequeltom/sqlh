@@ -2881,6 +2881,9 @@ fn number_end(bytes: &[u8], i: usize, line: &mut u32) -> usize {
             i = match bytes.get(i..) {
                 Some([b'\\', b'\n', ..]) => i + 2,
                 Some([b'\\', b'\r', b'\n', ..]) => i + 3,
+                // Part of the literal, which it ends: `0x\<CR>` is `0x`, and a digit after it the
+                // next token. A lone CR starts no line (`Lexer::read`).
+                Some([b'\\', b'\r', ..]) => return i + 2,
                 _ => return i,
             };
             *line += 1;
@@ -4587,6 +4590,11 @@ mod tests {
             "0x00\\\n00",
             "0x00\\\r\n00",
             "0x01\\\n0000",
+            "0x\\\r",
+            "0X\\\r",
+            "0x00\\\r",
+            "0x010000\\\r",
+            "(0x\\\r)",
             // A string: spaces, a sign, zeros, of each of which it needs none.
             "N'0'",
             "'00'",
@@ -4795,6 +4803,8 @@ mod tests {
             format!("0x44004\\\n500{tailed}"),
             format!("0x44004500\\\r\n{tailed}"),
             format!("0x4400\\\n\\\n4500{tailed}"),
+            // Ended by a backslash and a lone CR.
+            format!("0x{D}\\\r"),
             // As the rule reads the string.
             format!("(0x{D})"),
             format!("((0x{D}))"),
@@ -4886,6 +4896,8 @@ mod tests {
             "20".repeat(bytes / 2)
         );
         assert_eq!(blocked(&sql).reason, STATS_DETAILED);
+        // The work above doesn't charge for decoding, which stops at the mode's 20 units.
+        assert_eq!(binary_as_text(&"4100".repeat(1_000)), "A".repeat(20));
     }
 
     #[test]
@@ -6019,6 +6031,7 @@ mod tests {
             "0xFF",
             "0xFF\\\nA",
             "0xFF\\\r\n",
+            "0xFF\\\r",
             "0xDELETE",
             "1EXEC",
             "$",
@@ -6875,7 +6888,10 @@ mod tests {
                 "0x\\\nAA\\\n\\\nBB\\\nKILL",
                 &["0x\\\nAA\\\n\\\nBB\\\n", "KILL"],
             ),
-            ("0xAA\\\rAWAITFOR", &["0xAA", "\\", "AWAITFOR"]),
+            ("0xAA\\\rAWAITFOR", &["0xAA\\\r", "AWAITFOR"]),
+            ("0xAA\\\rBB", &["0xAA\\\r", "BB"]),
+            ("0xAA\\\r\rBB", &["0xAA\\\r", "BB"]),
+            ("1\\\r2", &["1", "\\", "2"]),
             ("0xAA\\ \nAWAITFOR", &["0xAA", "\\", "AWAITFOR"]),
             ("0xAA\\\n AWAITFOR", &["0xAA\\\n", "AWAITFOR"]),
             ("1\\\n2", &["1", "\\", "2"]),

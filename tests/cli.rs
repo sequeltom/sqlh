@@ -2520,6 +2520,8 @@ fn the_wildcard_stats_call_is_refused_before_connecting() {
         ("NULL", "0x440045005400410049004C0045004400"),
         ("0", "0x440045005400410049004C00450044"),
         ("''", "0x4400\\\n45005400410049004C0045004400"),
+        ("0x\\\r", "'DETAILED'"),
+        ("NULL", "0x440045005400410049004C0045004400\\\r"),
     ] {
         let call =
             format!("SELECT * FROM sys.dm_db_index_physical_stats({first}, 5, 1, 1, {mode})");
@@ -9022,6 +9024,7 @@ mod live {
             // digits padded on the left (U+200D, then the mode), split at a line's end, and past
             // a joiner or a lone surrogate.
             "0x440045005400410049004C0045004400".to_string(),
+            "0x440045005400410049004C0045004400\\\r".to_string(),
             "0x530041004D0050004C0045004400".to_string(),
             "0x640065007400610069006C00650064".to_string(),
             "0x440045005400410049004C00450044".to_string(),
@@ -9140,6 +9143,9 @@ mod live {
             "0x010000",
             "0xFFFF0000",
             "0x\\\n00",
+            "0x\\\r",
+            "0x00\\\r",
+            "0x010000\\\r",
             "N'0'",
             "'00'",
             "' '",
@@ -9160,8 +9166,23 @@ mod live {
         }
         // A database, by any of these: a row or none, and no error.
         for first in [
-            "1", "1.0", "1.5", "1e0", "10e-1", "0.1e1", "$1", "$0.5", "$.49995", "0x01", "0x0001",
-            "0x\\\n01", "'1'", "' 1'", "'+1'", "N'1'",
+            "1",
+            "1.0",
+            "1.5",
+            "1e0",
+            "10e-1",
+            "0.1e1",
+            "$1",
+            "$0.5",
+            "$.49995",
+            "0x01",
+            "0x0001",
+            "0x\\\n01",
+            "0x0001\\\r",
+            "'1'",
+            "' 1'",
+            "'+1'",
+            "N'1'",
         ] {
             let r = run(first);
             assert_eq!(r.code, 0, "{first}: {}{}", r.stdout, r.stderr);
@@ -9195,6 +9216,12 @@ mod live {
         let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert!(r.stdout.starts_with("a,b\n0x0AAA,0x0102\n"), "{}", r.stdout);
+
+        // A lone CR after the backslash ends the literal: the digits after it are an alias.
+        let sql = "SELECT 0xAB\\\r AS a, 0x\\\r AS b, 0xAB\\\rCD";
+        let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.starts_with("a,b,CD\n0xAB,0x,"), "{}", r.stdout);
     }
 
     // Nothing is lost on a line that starts with the terminator: past a lone CR the text is a
