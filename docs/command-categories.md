@@ -351,7 +351,7 @@ Each argument check uses literals only, with today's argument scanner and its ca
 
 **What these additions keep:** none of them takes an app lock or sets session context, and none waits as `WAITFOR` does, once `sp_server_diagnostics`'s repeat form is refused. So the letter of plan-history.md 5.4's MCP rule holds (§6.11). One addition is not instant: the one-shot `sp_server_diagnostics` runs about 5 s on the server, on a preemptive thread at high priority [doc], a bounded internal wait the caller doesn't choose. D5 accepts it in MCP explicitly, or keeps it to the CLI.
 
-**Doc fix that rides along:** DESIGN.md §7 says "`sp_helptrigger` and other `sp_help*`", but the code lists exact names: `sp_helprotect` passes (A25) and `sp_help_revlogin` (A24), `sp_helplogins` (F11) and `sp_helpsrvrolemember` (J16) are refused. §7 should list the names.
+**Doc fix that rides along (done 2026-11-02):** DESIGN.md §7 said "`sp_helptrigger` and other `sp_help*`", but the code lists exact names: `sp_helprotect` passes (A25) and `sp_help_revlogin` (A24), `sp_helplogins` (F11) and `sp_helpsrvrolemember` (J16) are refused. §7 now lists the names.
 
 ### 6.2 Exact-shape reads that run alone outside the wrapper (D5)
 
@@ -852,7 +852,7 @@ Live tests run only against `sqlh_test` on the test server, never production, wi
 **From the docs:** whether SQL Server 2025 Standard supports `ONLINE = ON` rebuilds; the GA status of `ABORT_QUERY_EXECUTION`; which statements raise Msg 226 and 574 (the messages' texts are [live: sys.messages]; which statements raise them is [doc]).
 
 **Doc fixes, no decision needed:**
-- DESIGN.md §7's "other `sp_help*`" (§6.1).
+- DESIGN.md §7's "other `sp_help*`" (§6.1; done 2026-11-02).
 - DESIGN.md §7's "and so does `INSERT INTO #t EXEC xp_readerrorlog ...` (or `sp_readerrorlog`)": the `sp_` form is unmeasured; mark it inferred until item 10 measures it.
 - DESIGN.md §7's backstop note, and the skill (Phase 8): a CLR function with `EXTERNAL_ACCESS` or `UNSAFE` called from a `SELECT` can send what it reads off the server, and enabling such CLR for an agent's login defeats read-only intent (§2, §4).
 

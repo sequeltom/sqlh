@@ -24,7 +24,7 @@ CONNECTION
 
 EXECUTION
   -i file         input file, repeatable; "-i -" reads stdin. UTF-8, or UTF-16 with a BOM
-  -v n=v ...      values for $(n); environment variables also resolve. -x turns this off
+  -v n=v ...      values for $(n); environment variables also resolve, not SQLCMDPASSWORD. -x turns this off
   -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
   -t seconds      per-batch query timeout, also for a stalled reader (default 60; 0 = none)
   --lock-timeout S      seconds a statement waits for a lock, then error 1222 (default 10; 0 = none)

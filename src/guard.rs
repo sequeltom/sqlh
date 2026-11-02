@@ -906,6 +906,7 @@ const STATEMENT_START: &[&str] = &[
     "IF",
     "INSERT",
     "KILL",
+    "LINENO",
     "MERGE",
     "MOVE",
     "OPEN",
@@ -942,8 +943,8 @@ const STATEMENT_START: &[&str] = &[
 /// bytes it went over, so a huge string or comment that a lookahead crosses over and over is
 /// not free. Each pass over a batch (the write classifier, and `--check`'s NOEXEC search) gets
 /// `WORK_BASE` plus `WORK_PER_BYTE` for each byte of the text. A plain pass costs at most 1
-/// unit a byte (a token of one byte) and the costliest input found, a 10 MB `DROP TABLE` list,
-/// 1.7, so no ordinary input comes near it: it is there for the shape nobody thought of. For
+/// unit a byte (a token of one byte) and the costliest input found, a `DROP TABLE #,#,...` list,
+/// 2.5, so no ordinary input comes near it: it is there for the shape nobody thought of. For
 /// the largest batch it is 32 million units, which took 0.4 s at the fastest rate measured
 /// (75 million units a second) and 1 s at the slowest (31 million): DESIGN.md §11,
 /// notes/memory.md. A comparison by collation walks what a read has already been charged for, at
@@ -1087,6 +1088,7 @@ const SILENT_STARTS: &[&str] = &[
     "ELSE",
     "END",
     "IF",
+    "LINENO",
     "OPEN",
     "RETURN",
     "REVERT",
@@ -1213,7 +1215,10 @@ pub fn several_outputs(sql: &str) -> bool {
                     || (token.is_word("SET") && lex.ahead(0).is_some_and(adds_output))
                 {
                     outputs += 2;
-                } else if in_list(STATEMENT_START, name) && !in_list(SILENT_STARTS, name) {
+                } else if in_list(STATEMENT_START, name)
+                    && !in_list(SILENT_STARTS, name)
+                    && !(name.eq_ignore_ascii_case("MERGE") && is_merge_hint(&lex))
+                {
                     outputs += 1;
                 }
             }
@@ -1546,9 +1551,9 @@ fn starts_an_implicit_call(start: &Lexer<'_>) -> bool {
 
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
-/// therefore doesn't depend on how many tokens the input has (plan-history.md 2.14); only a
-/// refusal's message can be as long as the name it quotes, and the open `TOP ( ... )` clauses
-/// (at most `MAX_OPEN_TOP`, a few bytes each). Every read is paid for out of `work`.
+/// therefore doesn't depend on how many tokens the input has (plan-history.md 2.14), but for the
+/// open `TOP ( ... )` clauses (at most `MAX_OPEN_TOP`, a few bytes each). Every read is paid for
+/// out of `work`.
 struct Guard<'a> {
     sql: &'a str,
     work: &'a Work,
@@ -1715,7 +1720,8 @@ impl<'a> Guard<'a> {
             "DELETE" => self.write_after_top(Write::Delete, line, lex, depth, open)?,
             "TRUNCATE" => self.require_table(line, lex, "TRUNCATE TABLE")?,
             "ALTER" if lex.word_is(0, "TABLE") => {
-                self.require_scratch(line, &lex.after(1), "ALTER TABLE")?;
+                let after = self.past_scratch(line, &lex.after(1), "ALTER TABLE")?;
+                self.check_switch(line, &after)?;
             }
             "ALTER" => return Err(self.blocked(line, &ddl_statement("ALTER", lex))),
             "CREATE" => {
@@ -1747,10 +1753,7 @@ impl<'a> Guard<'a> {
                     j = j.after(2);
                 }
                 loop {
-                    self.require_scratch(line, &j, "DROP TABLE")?;
-                    // Past the name just checked, then past a comma if one follows.
-                    let mut next = j.clone();
-                    next.next();
+                    let mut next = self.past_scratch(line, &j, "DROP TABLE")?;
                     if next.next().is_none_or(|t| t.kind != Kind::Punct(',')) {
                         break;
                     }
@@ -1797,6 +1800,30 @@ impl<'a> Guard<'a> {
                         "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
                         self.name_at(&lex.after(2))
                     ),
+                ));
+            }
+            // Neither makes a MERGE, whose target can't be a reserved word: these are the join and
+            // union hints (`INNER MERGE JOIN`, `OPTION (MERGE UNION)`).
+            "MERGE" if is_merge_hint(lex) => {}
+            // What reaches the server's log and the Windows application log stays there, and at
+            // severity 20 and above it also ends the connection (DESIGN.md §7).
+            "WITH" if with_log(lex) => {
+                return Err(Blocked::write_or(
+                    line,
+                    "RAISERROR ... WITH LOG writes to the error log, which a rollback can't undo"
+                        .into(),
+                    "Leave WITH LOG out".into(),
+                    " if the write is intended",
+                ));
+            }
+            // A plain `UPDATE ? would write` would point at no target. A trigger's `FOR UPDATE`
+            // never gets here: its CREATE or ALTER is refused first.
+            "FOR" if lex.word_is(0, "UPDATE") => {
+                return Err(Blocked::write_or(
+                    line,
+                    "FOR UPDATE declares a cursor to write through".into(),
+                    "Leave FOR UPDATE out to only read".into(),
+                    " if the write is intended",
                 ));
             }
             word if BLOCKED.contains(&word) => {
@@ -1874,8 +1901,16 @@ impl<'a> Guard<'a> {
         Ok(())
     }
 
-    /// The write `what` on `line` has its target at `after`, past any `TOP` clause.
+    /// The write `what` on `line` has its target at `after`, past any `TOP` clause but for its
+    /// `PERCENT`, a reserved word, so no target's name.
     fn finish_write(&self, what: Write, line: u32, after: &Lexer<'a>) -> Result<(), Blocked> {
+        let past_percent;
+        let after = if after.word_is(0, "PERCENT") {
+            past_percent = after.after(1);
+            &past_percent
+        } else {
+            after
+        };
         let (name, skipped) = match what {
             Write::Insert => ("INSERT", "INTO"),
             Write::Update => ("UPDATE", ""),
@@ -1889,23 +1924,72 @@ impl<'a> Guard<'a> {
         self.require_scratch(line, &target, name)
     }
 
-    /// The token at `target` must be a session temp table (`#t`) or a table variable (`@t`).
+    /// The token at `target` must be a session temp table (`#t`) or a table variable (`@t`), and
+    /// the whole name. With a dot after it, its first part is a database, a schema or a linked
+    /// server (`#x.dbo.t`: the servers' 2702 and 7202 name it so), and no real target has one.
     /// Global temp tables (`##t`) are shared with other sessions, so writing to them blocks.
     /// `line` is the line of the keyword that makes the write.
     fn require_scratch(&self, line: u32, target: &Lexer<'a>, what: &str) -> Result<(), Blocked> {
-        match target.ahead(0) {
-            Some(t) if t.kind == Kind::Temp && t.text.starts_with("##") => Err(Blocked::write_or(
-                line,
-                format!(
-                    "{what} {} would write to a global temp table, which other sessions share",
-                    t.text
-                ),
-                "Use a #temp table".into(),
-                "",
-            )),
-            Some(t) if matches!(t.kind, Kind::Temp | Kind::Var) => Ok(()),
-            _ => Err(self.blocked(line, &format!("{what} {}", self.name_at(target)))),
+        self.past_scratch(line, target, what).map(|_| ())
+    }
+
+    /// `require_scratch`, and the position just past the name, for what comes after it: a list's
+    /// next name is read from there, so that a `DROP TABLE` list costs no more reads a name.
+    fn past_scratch(
+        &self,
+        line: u32,
+        target: &Lexer<'a>,
+        what: &str,
+    ) -> Result<Lexer<'a>, Blocked> {
+        let mut after = target.clone();
+        match after.next() {
+            Some(t) if t.kind == Kind::Temp && t.text.starts_with("##") => {
+                Err(global_temp(line, what, &shown(t.text)))
+            }
+            Some(t)
+                if matches!(t.kind, Kind::Temp | Kind::Var)
+                    && after.kind(0) != Some(Kind::Punct('.')) =>
+            {
+                Ok(after)
+            }
+            _ => Err(self.not_scratch(line, target, what)),
         }
+    }
+
+    /// The refusal of a target that isn't a bare `#t` or `@t`. A temp table written another way
+    /// (`[#t]`, `tempdb..#t`) is still refused, since the rule stays one token's, but the advice
+    /// says what would pass: `--allow-write` may be no way out.
+    fn not_scratch(&self, line: u32, target: &Lexer<'a>, what: &str) -> Blocked {
+        let name = self.name_at(target);
+        match temp_written_otherwise(target) {
+            Some(temp) if temp.starts_with("##") => global_temp(line, what, &name),
+            Some(temp) => Blocked::write_or(
+                line,
+                format!("{what} {name} isn't read as a temp table: only the bare name is"),
+                format!("Write it as {temp}"),
+                " if the write is intended",
+            ),
+            None => self.blocked(line, &format!("{what} {name}")),
+        }
+    }
+
+    /// `after` is just past the name of an `ALTER TABLE`'s scratch table. A switch moves its rows
+    /// to the table after `TO`, which has to be scratch too. `[PARTITION n]` comes between, a few
+    /// tokens; a temp table has no use for a longer expression, so one is refused.
+    fn check_switch(&self, line: u32, after: &Lexer<'a>) -> Result<(), Blocked> {
+        if !after.spells(0, "SWITCH") {
+            return Ok(());
+        }
+        let mut at = after.after(1);
+        for _ in 0..MAX_BEFORE_SWITCH_TO {
+            let Some(t) = at.next() else {
+                break;
+            };
+            if t.is_word("TO") {
+                return self.require_scratch(line, &at, "ALTER TABLE ... SWITCH TO");
+            }
+        }
+        Err(self.blocked(line, "ALTER TABLE ... SWITCH"))
     }
 
     /// `KEYWORD TABLE #t` is allowed; anything else after KEYWORD blocks. `after` is the
@@ -1978,6 +2062,9 @@ impl<'a> Guard<'a> {
             if batch_start {
                 // A batch that starts with an unknown word is run as a procedure call by SQL
                 // Server, so a typo like `SELEC 1` lands here too.
+                if shown.contains(BOM_SHOWN) {
+                    return Err(stray_bom(line, &shown));
+                }
                 return Err(Blocked::write_or(
                     line,
                     format!(
@@ -2145,11 +2232,26 @@ impl<'a> Guard<'a> {
         Some(false)
     }
 
-    /// The dotted name starting at `at`, as written, for messages.
+    /// The dotted name starting at `at`, for messages: as written, but for what `shown` cuts and
+    /// a byte order mark, which can't be seen. A name has four parts at most, so what is past
+    /// them is only counted.
     fn name_at(&self, at: &Lexer<'a>) -> String {
-        let name: String = Dotted::new(at).map(|t| t.text).collect();
+        let mut name = String::new();
+        let mut left = 0;
+        for (i, t) in Dotted::new(at).enumerate() {
+            if i < SHOWN_NAME_TOKENS {
+                name.push_str(&shown(t.text));
+            } else {
+                left += t.text.chars().count();
+            }
+        }
+        if left > 0 {
+            name.push_str(&format!("…[+{left}]"));
+        }
         if name.is_empty() {
             "?".to_owned()
+        } else if name.contains('\u{FEFF}') {
+            name.replace('\u{FEFF}', BOM_SHOWN)
         } else {
             name
         }
@@ -2163,12 +2265,12 @@ impl<'a> Guard<'a> {
     /// The refusal of a DBCC command not in `DBCC_READ`. `command` is the word at `after`, the
     /// position just past `DBCC`: empty when that is no bare word.
     fn unknown_dbcc(&self, line: u32, command: &str, after: &Lexer<'a>) -> Blocked {
-        let shown = if command.is_empty() {
+        let name = if command.is_empty() {
             self.name_at(after)
         } else {
-            command.to_ascii_uppercase()
+            shown(command).to_ascii_uppercase()
         };
-        let reason = format!("DBCC {shown} isn't on sqlh's list of read-only DBCC commands");
+        let reason = format!("DBCC {name} isn't on sqlh's list of read-only DBCC commands");
         match DBCC_INSTEAD
             .iter()
             .find(|(known, _)| known.eq_ignore_ascii_case(command))
@@ -2177,6 +2279,136 @@ impl<'a> Guard<'a> {
             None => Blocked::unknown(line, reason, self.as_written()),
         }
     }
+}
+
+/// The refusal of a write to `name`, a global temp table's.
+fn global_temp(line: u32, what: &str, name: &str) -> Blocked {
+    Blocked::write_or(
+        line,
+        format!("{what} {name} would write to a global temp table, which other sessions share"),
+        "Use a #temp table".into(),
+        "",
+    )
+}
+
+/// How a refusal shows a byte order mark in a name.
+const BOM_SHOWN: &str = "<U+FEFF>";
+
+/// The refusal of a batch whose first word holds a byte order mark, where `script::decode` can't
+/// have taken it: `-Q`, `sqlh mcp`, or a file's text past the first (`cat a.sql b.sql`). Raw, it
+/// would read as a false reason (`SELECT starts the batch`), since the mark can't be seen. The
+/// servers' answer to it is a syntax error, so the flag has nothing to offer.
+fn stray_bom(line: u32, name: &str) -> Blocked {
+    const REMOVE: &str = "Remove the mark";
+    Blocked {
+        line,
+        reason: format!(
+            "{name} starts the batch: U+FEFF is a byte order mark, which SQL Server doesn't read \
+             as whitespace, so it would run this as a stored procedure"
+        ),
+        advice: REMOVE.into(),
+        lifted_by_write: true,
+        instead: Some(REMOVE.into()),
+    }
+}
+
+/// The most of one token of a name a refusal shows: the longest a name can be (past 128 UTF-16
+/// units it is the servers' error 103) and its two delimiters. The rest would cost a model its own
+/// input back, up to `--max-output`, for a name that can't be real.
+const SHOWN_TOKEN_CHARS: usize = 130;
+
+/// The tokens a refusal shows of a dotted name: the four parts a name can have and their dots.
+const SHOWN_NAME_TOKENS: usize = 7;
+
+/// How many tokens are read for a switch's `TO`. `PARTITION $PARTITION.f(1)` has 7.
+const MAX_BEFORE_SWITCH_TO: usize = 16;
+
+/// `text`, cut for a refusal and ended as other cut text is (DESIGN.md §4.4).
+fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(SHOWN_TOKEN_CHARS) {
+        Some((at, _)) => format!("{}…[+{}]", &text[..at], text[at..].chars().count()).into(),
+        None => text.into(),
+    }
+}
+
+/// The bare name of a temp table written in a way the servers read as that table but the rule
+/// doesn't: quoted, or in `tempdb`. Only if it can be written bare.
+fn temp_written_otherwise<'a>(target: &Lexer<'a>) -> Option<&'a str> {
+    let mut parts = 0;
+    let mut dots = 0;
+    let mut first = "";
+    let mut last = None;
+    for t in Dotted::new(target) {
+        if t.kind == Kind::Punct('.') {
+            dots += 1;
+        } else {
+            if parts == 0 {
+                first = t.name;
+            }
+            parts += 1;
+            last = Some(t);
+        }
+    }
+    let last = last?;
+    let written_otherwise = match (dots, parts) {
+        (0, 1) => last.kind == Kind::Quoted,
+        (2, 2 | 3) => first.eq_ignore_ascii_case("tempdb"),
+        _ => false,
+    };
+    let bare = last.name.starts_with('#')
+        && last.name.len() <= SHOWN_TOKEN_CHARS
+        && last.name.bytes().all(word_char);
+    (written_otherwise && bare).then_some(last.name)
+}
+
+/// Whether the `MERGE` just read is a join or union hint: the next word is reserved, so it can't be
+/// the statement's target. Spelled exactly, since `MERGE JOIN<U+0218> USING ...` parses as the
+/// statement.
+fn is_merge_hint(after: &Lexer<'_>) -> bool {
+    after.word_is(0, "JOIN") || after.word_is(0, "UNION")
+}
+
+/// Whether the options after a `WITH` just read include `LOG`, which only RAISERROR takes. Its
+/// options are a comma's list of `LOG`, `NOWAIT` and `SETERROR`, any of them repeated, read by the
+/// comparison (DESIGN.md §7); a CTE called one of them isn't such a list. Each `WITH` reads its own
+/// list and no other, so this stays linear.
+fn with_log(after: &Lexer<'_>) -> bool {
+    let mut at = after.clone();
+    while let Some(option) = at.next() {
+        if option.spells_word("LOG") {
+            return !names_a_cte(&at);
+        }
+        if !option.spells_word("NOWAIT") && !option.spells_word("SETERROR") {
+            return false;
+        }
+        if at.next().is_none_or(|t| t.kind != Kind::Punct(',')) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether `after`, just past a word after `WITH`, goes on as a CTE's name does: `AS`, or a list of
+/// column names and `AS`. A `(` alone proves nothing: `RAISERROR(...) WITH LOG (SELECT 1)` is the
+/// option and a query in parentheses.
+fn names_a_cte(after: &Lexer<'_>) -> bool {
+    let mut at = after.clone();
+    match at.next() {
+        Some(t) if t.is_word("AS") => return true,
+        Some(t) if t.kind == Kind::Punct('(') => {}
+        _ => return false,
+    }
+    while at
+        .next()
+        .is_some_and(|t| matches!(t.kind, Kind::Word | Kind::Quoted))
+    {
+        match at.next().map(|t| t.kind) {
+            Some(Kind::Punct(',')) => {}
+            Some(Kind::Punct(')')) => return at.word_is(0, "AS"),
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The tokens of a dotted name (`db..obj` allowed): name parts and dots.
@@ -2764,6 +2996,432 @@ mod tests {
         allowed("FETCH NEXT FROM c INTO @x");
     }
 
+    // A `#` name with a dot after it is a database, a schema or a linked server to the servers
+    // (2702, 3701, 208, 1088, 7202, each with this statement's name in it), so a write there
+    // reached them, and a `DROP TABLE` list's later names went unread.
+    #[test]
+    fn a_dot_after_a_temp_name_makes_it_no_temp_table() {
+        for (sql, what) in [
+            ("DROP TABLE #x.dbo.t", "DROP TABLE #x.dbo.t"),
+            ("DROP TABLE #x.t", "DROP TABLE #x.t"),
+            ("DROP TABLE IF EXISTS #x.dbo.t", "DROP TABLE #x.dbo.t"),
+            ("DROP TABLE #a.b, dbo.t", "DROP TABLE #a.b"),
+            ("DROP TABLE IF EXISTS #a.b, dbo.t", "DROP TABLE #a.b"),
+            ("DROP TABLE #t.[b], [dbo].[t]", "DROP TABLE #t.[b]"),
+            ("DROP TABLE #t /*c*/ . /*c*/ b , dbo.t", "DROP TABLE #t.b"),
+            ("DROP TABLE #a.b.c, dbo.t", "DROP TABLE #a.b.c"),
+            ("DROP TABLE #a..b, dbo.t", "DROP TABLE #a..b"),
+            ("DROP TABLE #t, #u.v, dbo.t", "DROP TABLE #u.v"),
+            ("DROP TABLE #t, dbo.t", "DROP TABLE dbo.t"),
+            ("DELETE #x.dbo.t", "DELETE #x.dbo.t"),
+            ("DELETE FROM #x.dbo.t", "DELETE #x.dbo.t"),
+            ("DELETE TOP (1) FROM #x.dbo.t", "DELETE #x.dbo.t"),
+            ("DELETE #x.a.b.c", "DELETE #x.a.b.c"),
+            ("UPDATE #x.dbo.t SET a = 1", "UPDATE #x.dbo.t"),
+            ("UPDATE TOP (1) #x.dbo.t SET a = 1", "UPDATE #x.dbo.t"),
+            ("INSERT #x.dbo.t VALUES (1)", "INSERT #x.dbo.t"),
+            ("INSERT INTO #x..t VALUES (1)", "INSERT #x..t"),
+            ("INSERT TOP (1) INTO #x.dbo.t VALUES (1)", "INSERT #x.dbo.t"),
+            ("TRUNCATE TABLE #x.dbo.t", "TRUNCATE TABLE #x.dbo.t"),
+            ("CREATE TABLE #x.dbo.t (a int)", "CREATE TABLE #x.dbo.t"),
+            ("ALTER TABLE #x.dbo.t ADD b int", "ALTER TABLE #x.dbo.t"),
+            ("SELECT 1 AS a INTO #x.dbo.t", "INTO #x.dbo.t"),
+            ("CREATE INDEX i ON #x.dbo.t (a)", "CREATE INDEX #x.dbo.t"),
+            ("INSERT #t OUTPUT inserted.a INTO #x.dbo.t", "INTO #x.dbo.t"),
+            ("DELETE @x.dbo.t", "DELETE @x.dbo.t"),
+        ] {
+            assert_eq!(blocked(sql).reason, format!("{what} would write"), "{sql}");
+        }
+        allowed("DROP TABLE #a, #b, @c");
+        allowed("INSERT #t OUTPUT inserted.a INTO @u VALUES (1)");
+        allowed("UPDATE #t SET x.modify('delete /a')");
+        allowed("FETCH NEXT FROM c INTO @a, @b");
+    }
+
+    #[test]
+    fn a_temp_table_written_another_way_is_told_how_to_write_it() {
+        for (sql, what, write) in [
+            ("INSERT [#t] VALUES (1)", "INSERT [#t]", "#t"),
+            ("INSERT INTO \"#t\" VALUES (1)", "INSERT \"#t\"", "#t"),
+            ("DELETE [#t]", "DELETE [#t]", "#t"),
+            ("UPDATE [#t] SET a = 1", "UPDATE [#t]", "#t"),
+            ("CREATE TABLE [#t] (a int)", "CREATE TABLE [#t]", "#t"),
+            ("SELECT 1 AS a INTO [#t]", "INTO [#t]", "#t"),
+            ("DROP TABLE [#t]", "DROP TABLE [#t]", "#t"),
+            ("DROP TABLE #a, [#t]", "DROP TABLE [#t]", "#t"),
+            ("TRUNCATE TABLE [#t]", "TRUNCATE TABLE [#t]", "#t"),
+            ("DROP TABLE tempdb..#t", "DROP TABLE tempdb..#t", "#t"),
+            ("INSERT tempdb..#t VALUES (1)", "INSERT tempdb..#t", "#t"),
+            ("DELETE TEMPDB.dbo.[#t]", "DELETE TEMPDB.dbo.[#t]", "#t"),
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason,
+                format!("{what} isn't read as a temp table: only the bare name is"),
+                "{sql}"
+            );
+            assert_eq!(
+                b.advice,
+                format!(
+                    "Write it as {write}, or rerun with --allow-write if the write is intended"
+                ),
+                "{sql}"
+            );
+            assert_eq!(
+                b.advice_for(Some(&WritesOff::Mcp)),
+                format!("Write it as {write}; sqlh mcp is read-only"),
+                "{sql}"
+            );
+        }
+        for sql in ["DELETE [##t]", "DROP TABLE tempdb..##t"] {
+            assert!(blocked(sql).reason.contains("global temp table"), "{sql}");
+        }
+        // Not a temp table, or no way to write it bare, or somewhere else: the plain refusal.
+        for sql in [
+            "DELETE [t]",
+            "DELETE [#a b]",
+            "DELETE [#t\u{E9}]",
+            "DELETE dbo.[#t]",
+            "DELETE sales..#t",
+            "DELETE lnk.tempdb.dbo.#t",
+            "DELETE tempdb.#t",
+        ] {
+            assert_eq!(blocked(sql).advice, WRITE_ADVICE, "{sql}");
+        }
+    }
+
+    // Each of these parses, on both servers, and a TOP's PERCENT is reserved.
+    #[test]
+    fn a_top_clauses_percent_is_no_target() {
+        allowed("DELETE TOP (10) PERCENT FROM #t");
+        allowed("DELETE TOP (10) PERCENT #t");
+        allowed("UPDATE TOP (1) PERCENT #t SET a = 1");
+        allowed("INSERT TOP (1) PERCENT INTO #t SELECT 1");
+        allowed("INSERT TOP (1) percent #t SELECT 1");
+        for (sql, what) in [
+            ("DELETE TOP (10) PERCENT FROM dbo.T", "DELETE dbo.T"),
+            ("DELETE TOP (10) PERCENT dbo.T", "DELETE dbo.T"),
+            ("UPDATE TOP (1) PERCENT dbo.T SET a = 1", "UPDATE dbo.T"),
+            ("INSERT TOP (1) PERCENT INTO dbo.T SELECT 1", "INSERT dbo.T"),
+            ("DELETE TOP (10) [PERCENT]", "DELETE [PERCENT]"),
+            (
+                "DELETE TOP (10) PERCENT\u{218} FROM #t",
+                "DELETE PERCENT\u{218}",
+            ),
+            ("DELETE TOP (10) PERCENT", "DELETE ?"),
+        ] {
+            assert_eq!(blocked(sql).reason, format!("{what} would write"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_switch_from_a_temp_table_goes_to_a_scratch_table_only() {
+        allowed("ALTER TABLE #t SWITCH TO #u");
+        allowed("ALTER TABLE #t SWITCH TO #u PARTITION 1");
+        allowed("ALTER TABLE #t SWITCH PARTITION 1 TO #u");
+        allowed("ALTER TABLE #t SWITCH PARTITION $PARTITION.f(1) TO #u");
+        allowed("ALTER TABLE #t ADD switch int");
+        allowed("ALTER TABLE #t ADD a int; SELECT 1 AS x");
+        for (sql, what) in [
+            (
+                "ALTER TABLE #t SWITCH TO dbo.T",
+                "ALTER TABLE ... SWITCH TO dbo.T",
+            ),
+            (
+                "ALTER TABLE #t SWITCH TO #x.dbo.T",
+                "ALTER TABLE ... SWITCH TO #x.dbo.T",
+            ),
+            (
+                "ALTER TABLE #t switch /*c*/ to T",
+                "ALTER TABLE ... SWITCH TO T",
+            ),
+            // By the comparison, as the servers read the word.
+            (
+                "ALTER TABLE #t SW\u{218}ITCH TO dbo.T",
+                "ALTER TABLE ... SWITCH TO dbo.T",
+            ),
+            (
+                "ALTER TABLE #t SWITCH PARTITION 1 TO dbo.T",
+                "ALTER TABLE ... SWITCH TO dbo.T",
+            ),
+            ("ALTER TABLE #t SWITCH", "ALTER TABLE ... SWITCH"),
+            (
+                "ALTER TABLE #t SWITCH TO\u{218} dbo.T",
+                "ALTER TABLE ... SWITCH",
+            ),
+        ] {
+            assert_eq!(blocked(sql).reason, format!("{what} would write"), "{sql}");
+        }
+        let long = format!("ALTER TABLE #t SWITCH PARTITION {} TO #u", "1 + ".repeat(8));
+        assert_eq!(blocked(&long).reason, "ALTER TABLE ... SWITCH would write");
+    }
+
+    #[test]
+    fn raiserror_with_log_is_refused_and_a_cte_called_log_is_not() {
+        for sql in [
+            "RAISERROR('x', 1, 1) WITH LOG",
+            "raiserror('x', 1, 1) with log",
+            "IF 1=0 RAISERROR('x', 1, 1) WITH LOG",
+            "RAISERROR(50000, 1, 1) WITH LOG, NOWAIT",
+            "RAISERROR('x', 1, 1) WITH NOWAIT, LOG",
+            "RAISERROR('x', 1, 1) WITH SETERROR, LOG, NOWAIT",
+            "RAISERROR('x', 1, 1) WITH NOWAIT, NOWAIT, SETERROR, LOG",
+            "RAISERROR('x', 20, 1) /*c*/ WITH /*c*/ LOG",
+            // A query in parentheses comes after the option, with no `;`.
+            "RAISERROR('x', 1, 1) WITH LOG (SELECT 1)",
+            "RAISERROR('x', 1, 1) WITH LOG (SELECT a) AS",
+            // Each parses on both servers: the options go by the comparison.
+            "RAISERROR('x', 1, 1) WITH LOG\u{218}",
+            "RAISERROR('x', 1, 1) WITH LO\u{200D}G",
+            "RAISERROR('x', 1, 1) WITH \u{29F}OG",
+            "RAISERROR('x', 1, 1) WITH NOWAIT\u{218}, LOG",
+            "RAISERROR('x', 1, 1) WITH SETERROR\u{218}, LOG",
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason,
+                "RAISERROR ... WITH LOG writes to the error log, which a rollback can't undo",
+                "{sql}"
+            );
+            assert_eq!(
+                b.advice,
+                "Leave WITH LOG out, or rerun with --allow-write if the write is intended"
+            );
+        }
+        for sql in [
+            "RAISERROR('x', 1, 1)",
+            "RAISERROR('x', 1, 1) WITH NOWAIT",
+            "RAISERROR('x', 1, 1) WITH SETERROR, NOWAIT",
+            "WITH log AS (SELECT 1 AS a) SELECT a FROM log",
+            "WITH LOG\u{218} AS (SELECT 1 AS a) SELECT 1 AS b",
+            "WITH log (a) AS (SELECT 1) SELECT a FROM log",
+            "WITH log (a, [b]) AS (SELECT 1, 2) SELECT a FROM log",
+            "WITH nowait AS (SELECT 1 AS a), log AS (SELECT 2 AS b) SELECT a FROM nowait",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+            "SELECT LOG(2.0) AS a FROM sys.objects WITH (NOLOCK)",
+            "SELECT 1 AS a FROM sys.objects WITH (NOLOCK)",
+            "SELECT a FROM t GROUP BY a WITH ROLLUP",
+            "SELECT 1 AS [WITH], 2 AS log",
+            "SELECT 1 AS [WITH] -- WITH LOG",
+        ] {
+            allowed(sql);
+        }
+    }
+
+    #[test]
+    fn with_log_stays_linear() {
+        let n = 200_000;
+        allowed(&format!(
+            "RAISERROR('x', 1, 1) WITH {}NOWAIT",
+            "NOWAIT, ".repeat(n)
+        ));
+        allowed(&"WITH log (a) AS ".repeat(n));
+        allowed(&format!(
+            "WITH log ({}a) AS (SELECT 1) SELECT 1",
+            "a, ".repeat(n)
+        ));
+        allowed(&"WITH NOWAIT, ".repeat(n));
+    }
+
+    #[test]
+    fn the_merge_hints_are_reads_and_the_statement_is_not() {
+        for sql in [
+            "SELECT 1 FROM a JOIN b ON 1 = 1 OPTION (MERGE JOIN)",
+            "SELECT 1 FROM a INNER MERGE JOIN b ON 1 = 1",
+            "SELECT 1 FROM a LEFT OUTER MERGE JOIN b ON 1 = 1",
+            "SELECT 1 FROM a FULL merge join b ON 1 = 1",
+            "SELECT 1 FROM a RIGHT MERGE /*c*/ JOIN b ON 1 = 1",
+            "SELECT 1 AS a UNION SELECT 2 OPTION (MERGE UNION)",
+            "SELECT 1 AS a UNION SELECT 2 OPTION (HASH JOIN, MERGE UNION, MERGE JOIN)",
+            // Both servers read this as the hint, by the comparison.
+            "SELECT 1 FROM a INNER MERGE\u{218} JOIN b ON 1 = 1",
+        ] {
+            allowed(sql);
+        }
+        for sql in [
+            "MERGE dbo.T USING s ON 1 = 0 WHEN NOT MATCHED THEN INSERT VALUES (1);",
+            "MERGE #t USING s ON 1 = 0 WHEN NOT MATCHED THEN INSERT VALUES (1);",
+            "MERGE INTO dbo.T USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            "MERGE TOP (1) dbo.T USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            // The name is quoted, or is no reserved word: each parses as the statement.
+            "MERGE [JOIN] USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            "MERGE \"UNION\" USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            "MERGE JOIN\u{218} USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            "MERGE UNION\u{218} USING s ON 1 = 0 WHEN MATCHED THEN DELETE;",
+            "SELECT merge FROM t",
+            "SELECT 1 AS merge",
+        ] {
+            assert!(
+                blocked(sql).reason.starts_with("MERGE is not allowed"),
+                "{sql}"
+            );
+        }
+        // A hint in a statement of its own isn't a second statement that could be cancelled unseen.
+        assert!(!several_outputs(
+            "SELECT 1 FROM a INNER MERGE JOIN b ON 1 = 1"
+        ));
+        assert!(!several_outputs("SELECT 1 AS a OPTION (MERGE JOIN)"));
+        assert!(several_outputs(
+            "SELECT 1 AS a; MERGE dbo.T USING s ON 1 = 0"
+        ));
+        assert!(several_outputs(
+            "SELECT 1 AS a; MERGE [JOIN] USING s ON 1 = 0"
+        ));
+        assert!(uncommitted_reads("SELECT 1 FROM a INNER MERGE JOIN b (NOLOCK) ON 1 = 1").nolock);
+    }
+
+    #[test]
+    fn a_cursor_for_update_is_refused_for_what_it_is() {
+        for sql in [
+            "DECLARE c CURSOR FOR SELECT name FROM sys.objects FOR UPDATE",
+            "DECLARE c CURSOR FOR SELECT name FROM sys.objects for update OF name",
+            "DECLARE c CURSOR FOR SELECT name FROM sys.objects FOR /*c*/ UPDATE; DEALLOCATE c",
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason, "FOR UPDATE declares a cursor to write through",
+                "{sql}"
+            );
+            assert_eq!(
+                b.advice,
+                "Leave FOR UPDATE out to only read, or rerun with --allow-write if the write is \
+                 intended"
+            );
+        }
+        allowed("DECLARE c CURSOR FOR SELECT name FROM sys.objects; DEALLOCATE c");
+        allowed("DECLARE c CURSOR FOR SELECT name FROM sys.objects FOR READ ONLY");
+        assert_eq!(
+            blocked("CREATE TRIGGER x ON t FOR UPDATE AS SELECT 1").reason,
+            "CREATE TRIGGER would write"
+        );
+    }
+
+    #[test]
+    fn lineno_starts_no_call() {
+        allowed("LINENO 5");
+        allowed("lineno 5 SELECT 1 AS a");
+        allowed("SELECT 1 AS a; LINENO 5");
+        assert!(!several_outputs("LINENO 5 SELECT 1 AS a"));
+        // `LINENO 5 sys.sp_who` is error 102 on both servers, so nothing comes in by it.
+        assert_eq!(
+            blocked("LINENO 5 DELETE dbo.T").reason,
+            "DELETE dbo.T would write"
+        );
+    }
+
+    #[test]
+    fn a_refusal_cuts_a_name_that_cant_be_real() {
+        let x = |n: usize| "x".repeat(n);
+        let cut = |n: usize| format!("{}…[+{n}]", x(130));
+        for (sql, reason) in [
+            (
+                format!("DELETE {}", x(130)),
+                format!("DELETE {} would write", x(130)),
+            ),
+            (
+                format!("DELETE {}", x(131)),
+                format!("DELETE {} would write", cut(1)),
+            ),
+            (
+                format!("DELETE [{}]", x(5_000_000)),
+                format!("DELETE [{}…[+4999872] would write", x(129)),
+            ),
+            (
+                format!("{} 1", x(5_000_000)),
+                format!(
+                    "{} starts the batch, so SQL Server would run it as a stored procedure (a \
+                     typo?); it isn't on sqlh's list of read-only procedures",
+                    cut(4_999_870)
+                ),
+            ),
+            (
+                format!("EXEC {}", x(500)),
+                format!(
+                    "EXEC {} isn't on sqlh's list of read-only procedures, so sqlh can't tell \
+                     what it does",
+                    cut(370)
+                ),
+            ),
+            (
+                format!("DELETE ##{}", x(500)),
+                format!(
+                    "DELETE ##{}…[+372] would write to a global temp table, which other sessions \
+                     share",
+                    x(128)
+                ),
+            ),
+            (
+                format!("DBCC {}", x(500)),
+                format!(
+                    "DBCC {}…[+370] isn't on sqlh's list of read-only DBCC commands",
+                    "X".repeat(130)
+                ),
+            ),
+            (
+                format!("DBCC [{}]", x(500)),
+                format!(
+                    "DBCC [{}…[+372] isn't on sqlh's list of read-only DBCC commands",
+                    x(129)
+                ),
+            ),
+            (
+                format!("SELECT NEXT VALUE FOR {}", x(500)),
+                format!(
+                    "NEXT VALUE FOR {} advances a sequence, which a rollback can't undo",
+                    cut(370)
+                ),
+            ),
+            // A character is cut whole, however many bytes it has.
+            (
+                format!("DELETE {}", "日".repeat(131)),
+                format!("DELETE {}…[+1] would write", "日".repeat(130)),
+            ),
+        ] {
+            assert_eq!(blocked(&sql).reason, reason);
+        }
+        // Past the four parts a name can have, what is left is counted.
+        assert_eq!(
+            blocked("DELETE a.b.c.d.e.f").reason,
+            "DELETE a.b.c.d…[+4] would write"
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_in_a_refusal_can_be_seen() {
+        let b = blocked("\u{FEFF}SELECT 1 AS a");
+        assert_eq!(
+            b.reason,
+            "<U+FEFF>SELECT starts the batch: U+FEFF is a byte order mark, which SQL Server \
+             doesn't read as whitespace, so it would run this as a stored procedure"
+        );
+        assert_eq!(b.advice, "Remove the mark");
+        assert_eq!(
+            b.advice_for(Some(&WritesOff::Mcp)),
+            "Remove the mark; sqlh mcp is read-only"
+        );
+        assert!(
+            blocked("\u{FEFF}\nSELECT 1")
+                .reason
+                .starts_with("<U+FEFF> starts the batch: U+FEFF is"),
+        );
+        assert!(
+            blocked("sp_\u{FEFF}who")
+                .reason
+                .starts_with("sp_<U+FEFF>who starts the batch: U+FEFF is"),
+        );
+        for (sql, reason) in [
+            (
+                "EXEC \u{FEFF}sp_who",
+                "EXEC <U+FEFF>sp_who isn't on sqlh's list of read-only procedures, so sqlh can't \
+                 tell what it does",
+            ),
+            ("DELETE \u{FEFF}t", "DELETE <U+FEFF>t would write"),
+        ] {
+            assert_eq!(blocked(sql).reason, reason);
+        }
+        assert!(!blocked("SELEC 1").reason.contains("U+FEFF"));
+    }
+
     #[test]
     fn global_temp_tables_are_blocked() {
         for sql in [
@@ -3342,7 +4000,7 @@ mod tests {
             ") @t ".repeat(n)
         );
         assert_eq!(blocked(&nested).reason, "ALTER EVENT SESSION would write");
-        assert!(work_of(&nested) < 12 * n as u64, "{}", work_of(&nested));
+        assert!(work_of(&nested) < 13 * n as u64, "{}", work_of(&nested));
         let many = "ALTER NOSUCH x\n".repeat(100_000);
         assert!(work_of(&many) < 30, "{}", work_of(&many));
         let spent = check_within("ALTER EVENT SESSION s", READ_ONLY, 0, 0).expect_err("refused");
@@ -5059,28 +5717,20 @@ mod tests {
         allowed("SELECT OPENDATASOURCES, OPENDATASOURCEXX, SENDER, CREATED FROM t");
         let b = blocked("SELECT OPENDATASOURCE");
         assert!(b.reason.starts_with("OPENDATASOURCE is not allowed"));
-        // A name's message carries the name as written, whatever its length.
-        let b = blocked(&format!("EXEC {long}"));
-        assert_eq!(
-            b.reason,
-            format!(
-                "EXEC {long} isn't on sqlh's list of read-only procedures, so sqlh can't tell \
-                 what it does"
-            )
+        // Long words are refused like short ones, whatever `shown` does to the message
+        // (`a_refusal_cuts_a_name_that_cant_be_real`).
+        assert!(blocked(&format!("EXEC {long}")).reason.ends_with(
+            "isn't on sqlh's list of read-only procedures, so sqlh can't tell what it does"
+        ));
+        assert!(
+            blocked(&format!("{long} 1"))
+                .reason
+                .contains(" starts the batch, ")
         );
-        assert_eq!(
-            blocked(&format!("{long} 1")).reason,
-            format!(
-                "{long} starts the batch, so SQL Server would run it as a stored procedure (a typo?); \
-                 it isn't on sqlh's list of read-only procedures"
-            )
-        );
-        assert_eq!(
-            blocked(&format!("DBCC {long}")).reason,
-            format!(
-                "DBCC {} isn't on sqlh's list of read-only DBCC commands",
-                long.to_ascii_uppercase()
-            )
+        assert!(
+            blocked(&format!("DBCC {long}"))
+                .reason
+                .ends_with("isn't on sqlh's list of read-only DBCC commands")
         );
         // The name of a DDL statement is sqlh's own, so a long word after it isn't shown.
         assert_eq!(
@@ -5243,8 +5893,8 @@ mod tests {
         for n in [2_000, 4_000, 8_000, 16_000, MAX_OPEN_TOP] {
             let sql = format!("{}@t{}", "UPDATE TOP (".repeat(n), ") @t ".repeat(n));
             allowed(&sql);
-            // About 10 reads a level; the old scan read n^2 of them.
-            assert!(work_of(&sql) < 12 * n as u64, "{n}: {}", work_of(&sql));
+            // 12 reads a level; the old scan read n^2 of them.
+            assert!(work_of(&sql) < 13 * n as u64, "{n}: {}", work_of(&sql));
             // A refusal at the end of it is found and named with its own line.
             let b = blocked(&format!("{sql}\nDELETE FROM dbo.T"));
             assert_eq!((b.line, b.reason.as_str()), (2, "DELETE dbo.T would write"));
@@ -5431,6 +6081,12 @@ mod tests {
         allowed(&"SELECT 1\n".repeat(n));
         allowed(&"(".repeat(n));
         allowed(&format!("DROP TABLE {}#a", "#a, ".repeat(n)));
+        // A list's costliest shape, under its budget of 3 units a byte (DESIGN.md §7's figure): a
+        // name's two reads and the comma's, then the main pass's two, on two bytes.
+        let list = format!("DROP TABLE {}#", "#,".repeat(n));
+        allowed(&list);
+        let cost = work_of(&list) as f64 / list.len() as f64;
+        assert!(cost < 2.6, "{cost}");
         allowed(&format!(
             "UPDATE TOP ({}1{}) #t SET x = 1",
             "(".repeat(n),
@@ -5441,12 +6097,16 @@ mod tests {
         let b = blocked(&format!("{}\nDROP TABLE #a, dbo.T", ",".repeat(n)));
         assert_eq!(b.reason, "DROP TABLE dbo.T would write");
         assert_eq!(b.line, 2);
+        // Read to its end, though a refusal shows only as much as a name can have.
         let b = blocked(&format!("EXEC {}a", "a.".repeat(n)));
-        assert!(b.reason.starts_with("EXEC a.a.a.a."), "{}", &b.reason[..20]);
-        let unknown =
-            " isn't on sqlh's list of read-only procedures, so sqlh can't tell what it does";
-        assert!(b.reason.ends_with(&format!(".a.a{unknown}")));
-        assert_eq!(b.reason.len(), "EXEC ".len() + 2 * n + 1 + unknown.len());
+        assert_eq!(
+            b.reason,
+            format!(
+                "EXEC a.a.a.a…[+{}] isn't on sqlh's list of read-only procedures, so sqlh can't \
+                 tell what it does",
+                2 * n + 1 - 7
+            )
+        );
         // A TOP clause that is never closed reads to the end and finds no target.
         let b = blocked(&format!("DELETE TOP ({}", "(".repeat(n)));
         assert_eq!(b.reason, "DELETE ? would write");

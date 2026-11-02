@@ -318,7 +318,17 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Short('l') | Long("login-timeout") => o.login_timeout = Some(number(p.value(), "-l")?),
             Short('t') | Long("query-timeout") => o.query_timeout = Some(number(p.value(), "-t")?),
             Short('b') => {} // stopping at the first failed batch is already the default
-            Short('c') => o.terminator = Some(string(p.value())?),
+            Short('c') => {
+                let terminator = string(p.value())?;
+                // An empty one would make every blank or comment-only line a terminator, and one
+                // with a space in it could never match, so GO would go to the server.
+                if terminator.is_empty() || terminator.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "-c {terminator:?}: a batch terminator is one word, with no spaces"
+                    ));
+                }
+                o.terminator = Some(terminator);
+            }
             Short('C') => o.trust_server_certificate = Some(true),
             Long("trust-server-certificate") => {
                 o.trust_server_certificate = Some(switch(&mut p, "--trust-server-certificate")?)
@@ -527,6 +537,18 @@ mod tests {
     fn password_flag_is_refused() {
         let err = parse_args(&["-U", "sa", "-P", "secret"]).err().unwrap();
         assert!(err.contains("SQLCMDPASSWORD") && !err.contains("secret"));
+    }
+
+    #[test]
+    fn a_batch_terminator_is_one_word() {
+        for bad in ["", " ", "G O", "GO ", "\t", "G\u{A0}O"] {
+            let err = parse_args(&["-c", bad, "-Q", "x"]).err().unwrap();
+            assert!(err.contains("one word"), "{bad:?}: {err}");
+        }
+        for good in ["GO", "go", "RUN", "$$"] {
+            let o = opts(&["-c", good, "-Q", "x"]);
+            assert_eq!(o.terminator.as_deref(), Some(good));
+        }
     }
 
     #[test]

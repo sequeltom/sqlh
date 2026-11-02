@@ -72,10 +72,24 @@ pub fn decode(bytes: Vec<u8>, name: &str) -> Result<String, String> {
         [0xEF, 0xBB, 0xBF, rest @ ..] => std::str::from_utf8(rest)
             .map(str::to_owned)
             .map_err(|e| not_utf8(name, e.valid_up_to() + 3)),
+        // UTF-32's BOMs, the first of which starts as UTF-16 LE's does.
+        [0xFF, 0xFE, 0, 0, ..] | [0, 0, 0xFE, 0xFF, ..] => Err(wide_without_bom(name)),
         [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
         [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        // NUL is valid UTF-8, so this text would decode, and the guard would refuse it for a false
+        // reason (`S starts the batch`) and offer a flag that sends it to the server. One NUL
+        // beside each of the first two characters is no one's SQL: the servers read NUL as
+        // whitespace, but nobody writes it so.
+        [_, 0, _, 0, ..] | [0, _, 0, _, ..] => Err(wide_without_bom(name)),
         _ => String::from_utf8(bytes).map_err(|e| not_utf8(name, e.utf8_error().valid_up_to())),
     }
+}
+
+fn wide_without_bom(name: &str) -> String {
+    format!(
+        "{name}: looks like UTF-16 without a BOM, or UTF-32 (NUL bytes among its first characters); \
+         save it as UTF-8, or UTF-16 with a BOM"
+    )
 }
 
 fn not_utf8(name: &str, at: usize) -> String {
@@ -97,6 +111,8 @@ pub fn prepare(
                     source.name, raw.terminator_line, raw.repeat, raw.repeat
                 ));
             }
+            let line_at =
+                |offset: usize| raw.line + raw.text[..offset].matches('\n').count() as u32;
             let (sql, line_map) = match vars {
                 // Told how much of the limit is left, so that a value repeated a million times
                 // is refused when it reaches the limit, not after it has been built.
@@ -104,9 +120,18 @@ pub fn prepare(
                     substitute(&raw.text, vars, MAX_INPUT_BYTES.saturating_sub(total)).map_err(
                         |stop| match stop {
                             Stop::TooLarge => too_large(),
+                            Stop::Password(offset) => {
+                                let line = line_at(offset);
+                                format!(
+                                    "{}:{line}: $({PASSWORD_VAR}) isn't substituted, since rows, \
+                                     refusals and the server's errors would print the password \
+                                     sqlh logs in with; remove it, or pass -x to turn substitution \
+                                     off",
+                                    source.name
+                                )
+                            }
                             Stop::Undefined(name, offset) => {
-                                let line =
-                                    raw.line + raw.text[..offset].matches('\n').count() as u32;
+                                let line = line_at(offset);
                                 format!(
                                     "{}:{line}: undefined variable $({name}); pass -v {name}=value, or -x to turn substitution off",
                                     source.name
@@ -290,12 +315,19 @@ impl Lexer {
 enum Stop {
     /// A name without a value, with its byte offset in the text.
     Undefined(String, usize),
+    /// The password variable, with its byte offset in the text.
+    Password(usize),
     /// The text would pass the room it was given.
     TooLarge,
 }
 
-/// Replaces `$(name)` with values from `-v`, then environment variables (as sqlcmd does).
-/// Names are case-insensitive. A `$(` that isn't a well-formed reference stays literal.
+/// The variable a password comes from (`config::resolve`). No reference reads it from the
+/// environment (DESIGN.md §4.3, §8): a model that may run sqlh could print it with one `SELECT`.
+const PASSWORD_VAR: &str = "SQLCMDPASSWORD";
+
+/// Replaces `$(name)` with values from `-v`, then environment variables (as sqlcmd does), the
+/// password's excepted. Names are case-insensitive. A `$(` that isn't a well-formed reference stays
+/// literal.
 /// Returns the text and its line map (see `Batch::line_map`).
 ///
 /// `room` is how many bytes of SQL the run may still take (`MAX_INPUT_BYTES` less the earlier
@@ -338,6 +370,9 @@ fn substitute(
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
             {
                 Some((_, value)) => Cow::Borrowed(value.as_str()),
+                None if name.eq_ignore_ascii_case(PASSWORD_VAR) => {
+                    return Err(Stop::Password(offset + pos));
+                }
                 None => Cow::Owned(
                     std::env::var(name)
                         .map_err(|_| Stop::Undefined(name.to_owned(), offset + pos))?,
@@ -883,6 +918,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn wide_text_without_a_usable_bom_is_no_utf8() {
+        for bytes in [
+            &b"S\0E\0L\0"[..],           // UTF-16 LE
+            &b"\0S\0E\0L"[..],           // UTF-16 BE
+            &b"S\0\0\0E\0\0\0"[..],      // UTF-32 LE
+            &b"\0\0\0S\0\0\0E"[..],      // UTF-32 BE
+            &b"\xFF\xFE\0\0S\0\0\0"[..], // UTF-32 LE, read as UTF-16 LE until now
+            &b"\0\0\xFE\xFF\0\0\0S"[..], // UTF-32 BE
+            &b"\n\0S\0E\0"[..],          // whatever the first character is
+        ] {
+            let err = decode(bytes.to_vec(), "f.sql").unwrap_err();
+            assert!(err.contains("without a BOM"), "{bytes:?}: {err}");
+            assert!(err.starts_with("f.sql: "), "{err}");
+        }
+        // A NUL elsewhere is still text, which the guard and the server read as whitespace.
+        for text in [
+            "SELECT\0 1",
+            "S\0ELECT 1",
+            "SELECT 1\0",
+            "\0SELECT",
+            "S\0",
+            "\0",
+        ] {
+            assert_eq!(decode(text.as_bytes().to_vec(), "f.sql").unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn the_password_variable_is_never_read_from_the_environment() {
+        for sql in [
+            "SELECT '$(SQLCMDPASSWORD)'",
+            "SELECT '$(sqlcmdpassword)'",
+            "SELECT '$(SqlCmdPassword)'",
+        ] {
+            let sources = [Source {
+                name: "-Q".into(),
+                path: None,
+                text: format!("SELECT 1\n{sql}"),
+            }];
+            let err = prepare(&sources, "GO", Some(&[])).err().unwrap();
+            assert_eq!(
+                err,
+                "-Q:2: $(SQLCMDPASSWORD) isn't substituted, since rows, refusals and the server's \
+                 errors would print the password sqlh logs in with; remove it, or pass -x to turn \
+                 substitution off"
+            );
+        }
+        // Given on purpose it is any variable's value, and -x leaves the text alone.
+        let sources = [Source {
+            name: "-Q".into(),
+            path: None,
+            text: "SELECT '$(SQLCMDPASSWORD)'".into(),
+        }];
+        let vars = [("sqlcmdpassword".to_owned(), "x".to_owned())];
+        let given = prepare(&sources, "GO", Some(&vars)).unwrap();
+        assert_eq!(given[0].sql, "SELECT 'x'");
+        let off = prepare(&sources, "GO", None).unwrap();
+        assert_eq!(off[0].sql, "SELECT '$(SQLCMDPASSWORD)'");
     }
 
     #[test]

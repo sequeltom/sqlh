@@ -1055,12 +1055,12 @@ struct SlowRun {
     elapsed: Duration,
 }
 
-/// Runs sqlh on a refused statement far bigger than a pipe, with `-t 1`, and reads stdout (or
+/// Runs sqlh on an error far bigger than a pipe, with `-t 1`, and reads stdout (or
 /// stderr) slowly: 1,024 bytes every 50 ms. Delivering that takes several times `-t`, but the
 /// reader never pauses for anywhere near it.
 fn run_read_slowly(test: &str, extra: &[&str], slow_stderr: bool) -> SlowRun {
     let input = scratch(test).join("big.sql");
-    fs::write(&input, format!("UPDATE [{}] SET x = 1", "a".repeat(96_000))).unwrap();
+    fs::write(&input, format!("SELECT '$({})'", "a".repeat(48_000))).unwrap();
     let input_arg = input.display().to_string();
     let mut child = sqlh()
         .args(["-i", &input_arg, "-t", "1", "--max-output", "0"])
@@ -1105,17 +1105,18 @@ fn run_read_slowly(test: &str, extra: &[&str], slow_stderr: bool) -> SlowRun {
 }
 
 // R11: the stall limit (-t) is about a reader that stops reading, not one that is slow. This
-// refusal is far bigger than a pipe, and the reader takes 1,024 bytes every 50 ms, so
-// delivering it outlasts -t several times over. The reader never pauses for anywhere near -t,
-// so the output is delivered whole, and the exit code is the guard's own (5), not 7.
+// error is far bigger than a pipe, and the reader takes 1,024 bytes every 50 ms, so delivering
+// it outlasts -t several times over. The reader never pauses for anywhere near -t, so the output
+// is delivered whole, and the exit code is the error's own (3), not 7. A guard refusal was this
+// error until it stopped quoting more of a name than a name can hold.
 #[test]
 fn a_slow_reader_that_keeps_reading_is_not_a_stall() {
     let r = run_read_slowly("r11_slow_reader", &[], false);
-    assert_eq!(r.code, Some(5), "{}", r.fast);
+    assert_eq!(r.code, Some(3), "{}", r.fast);
     assert_eq!(r.fast, "");
     assert!(
-        r.slow.contains(&"a".repeat(96_000))
-            && last_line(&r.slow).starts_with("-- failed (exit 5)"),
+        r.slow.matches(&"a".repeat(48_000)).count() == 2
+            && last_line(&r.slow).starts_with("-- failed (exit 3)"),
         "the refusal wasn't delivered whole ({} bytes)",
         r.slow.len()
     );
@@ -1126,16 +1127,16 @@ fn a_slow_reader_that_keeps_reading_is_not_a_stall() {
     );
 }
 
-// R11: the same for csv, which writes its metadata and the refusal to stderr, a second stream
+// R11: the same for csv, which writes its metadata and the error to stderr, a second stream
 // that the one delivery thread writes in order with stdout.
 #[test]
 fn a_slow_reader_of_csv_metadata_is_not_a_stall() {
     let r = run_read_slowly("r11_slow_csv_reader", &["--format", "csv"], true);
-    assert_eq!(r.code, Some(5), "{}", last_line(&r.slow));
+    assert_eq!(r.code, Some(3), "{}", last_line(&r.slow));
     assert_eq!(r.fast, "");
     assert!(
-        r.slow.contains(&"a".repeat(96_000))
-            && last_line(&r.slow).starts_with("-- failed (exit 5)"),
+        r.slow.matches(&"a".repeat(48_000)).count() == 2
+            && last_line(&r.slow).starts_with("-- failed (exit 3)"),
         "the refusal wasn't delivered whole ({} bytes)",
         r.slow.len()
     );
@@ -1152,7 +1153,7 @@ fn a_slow_reader_of_csv_metadata_is_not_a_stall() {
 #[test]
 fn a_reader_that_reads_nothing_is_still_a_stall() {
     let input = scratch("r11_unread").join("big.sql");
-    fs::write(&input, format!("UPDATE [{}] SET x = 1", "a".repeat(96_000))).unwrap();
+    fs::write(&input, format!("SELECT '$({})'", "a".repeat(48_000))).unwrap();
     let input_arg = input.display().to_string();
     let mut child = sqlh()
         .args(["-i", &input_arg, "-t", "1", "--max-output", "0"])
@@ -1174,7 +1175,7 @@ fn a_reader_that_reads_nothing_is_still_a_stall() {
     assert_eq!(status.code(), Some(7), "{stderr}");
     assert!(
         stderr.contains("the reader stopped reading for 1 s (-t)")
-            && stderr.contains("the run itself ended with exit 5"),
+            && stderr.contains("the run itself ended with exit 3"),
         "{stderr}"
     );
     assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
@@ -1609,7 +1610,8 @@ fn status_stream<'a>(format: &str, r: &'a Run) -> &'a str {
 // R08: --max-output caps the whole response, not only the body. A guard refusal that quotes
 // a 20,000-character identifier used to print about 20 KB under --max-output 4096 in every
 // format. The refusal is shortened in its variable part; the exit code, the advice and the
-// status (JSON: the outcome fields) are not.
+// status (JSON: the outcome fields) are not. The guard cuts the name itself now; each format's
+// `a_huge_refusal_is_shortened_to_the_budget` holds the fit.
 #[test]
 fn a_huge_refusal_stays_within_max_output_in_every_format() {
     let dir = scratch("r08_refusal");
@@ -2548,10 +2550,10 @@ fn the_guard_takes_memory_in_proportion_to_the_input() {
             "-- blocked: line 2: DELETE dbo.T would write; nothing was run.",
         ),
         (
-            "a refusal quoting a 10 MB name",
+            "a refusal of a 10 MB name",
             format!("EXEC {}a", "a.".repeat(4_999_990)),
             5,
-            "-- blocked: line 1: EXEC a.a.a.a.",
+            "-- blocked: line 1: EXEC a.a.a.a…[+9999974] isn't",
         ),
         // R18: the clauses the classifier remembers are capped, and a call's arguments are
         // read a bounded number of times.
@@ -2765,6 +2767,174 @@ fn odd_length_utf16_is_rejected() {
     let r = sqlh_args(&["-i", &file.display().to_string()]);
     assert_eq!(r.code, 3, "{}", r.stdout);
     assert!(r.stdout.contains("odd number of bytes"), "{}", r.stdout);
+}
+
+// NUL is valid UTF-8, so wide text with no usable BOM used to decode, and the guard refused it for
+// a false reason (`S starts the batch`), offering a flag that would send it to the server.
+#[test]
+fn wide_text_without_a_usable_bom_is_a_usage_error() {
+    const SQL: &str = "SELECT 1 AS a";
+    let units = || SQL.encode_utf16();
+    let le: Vec<u8> = units().flat_map(u16::to_le_bytes).collect();
+    let be: Vec<u8> = units().flat_map(u16::to_be_bytes).collect();
+    let chars = || SQL.chars().map(u32::from);
+    let le32: Vec<u8> = [0xFF, 0xFE, 0, 0]
+        .into_iter()
+        .chain(chars().flat_map(u32::to_le_bytes))
+        .collect();
+    let be32: Vec<u8> = [0, 0, 0xFE, 0xFF]
+        .into_iter()
+        .chain(chars().flat_map(u32::to_be_bytes))
+        .collect();
+    let dir = scratch("wide_without_bom");
+    let file = dir.join("wide.sql");
+    for input in [&le, &be, &le32, &be32] {
+        fs::write(&file, input).unwrap();
+        let r = sqlh_args(&[DEAD, &["-i", file.to_str().unwrap()]].concat());
+        assert_eq!(r.code, 3, "{input:?}: {}", r.stdout);
+        assert!(r.stdout.contains("without a BOM"), "{}", r.stdout);
+        assert!(!r.stdout.contains("--allow-write"), "{}", r.stdout);
+        let r = run_with_stdin(sqlh().args(DEAD), input);
+        assert_eq!(r.code, 3, "stdin {input:?}: {}", r.stdout);
+        assert!(r.stdout.contains("stdin: looks like"), "{}", r.stdout);
+    }
+}
+
+// The password sqlh logs in with never reaches SQL text, so no row, refusal or server error can
+// print it (DESIGN.md §4.3, §8).
+#[test]
+fn the_password_variable_is_never_substituted_from_the_environment() {
+    const CANARY: &str = "canary-not-a-password";
+    for sql in [
+        "SELECT '$(SQLCMDPASSWORD)' AS a",
+        "DELETE [$(SQLCMDPASSWORD)]",
+        "SELECT 1 AS a FROM [$(sqlcmdpassword)]",
+    ] {
+        let r = run(sqlh().env("SQLCMDPASSWORD", CANARY).args([
+            "-S",
+            "127.0.0.1,1",
+            "-U",
+            "nobody",
+            "-Q",
+            sql,
+        ]));
+        assert_eq!(r.code, 3, "{sql}: {}", r.stdout);
+        assert!(
+            r.stdout.contains("$(SQLCMDPASSWORD) isn't substituted"),
+            "{}",
+            r.stdout
+        );
+        assert!(!r.stdout.contains(CANARY) && !r.stderr.contains(CANARY));
+    }
+    // With -x the reference is the text, and with a value given on purpose it is that value.
+    let r = run(sqlh().env("SQLCMDPASSWORD", CANARY).args([
+        "-S",
+        "127.0.0.1,1",
+        "-U",
+        "nobody",
+        "-x",
+        "-Q",
+        "DELETE [$(SQLCMDPASSWORD)]",
+    ]));
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("DELETE [$(SQLCMDPASSWORD)] would write"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains(CANARY) && !r.stderr.contains(CANARY));
+    let r = run(sqlh().env("SQLCMDPASSWORD", CANARY).args([
+        "-S",
+        "127.0.0.1,1",
+        "-U",
+        "nobody",
+        "-v",
+        "SQLCMDPASSWORD=given",
+        "-Q",
+        "DELETE [$(SQLCMDPASSWORD)]",
+    ]));
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("DELETE [given] would write"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn a_batch_terminator_with_no_word_in_it_is_a_usage_error() {
+    for terminator in ["", " ", "G O"] {
+        let r = sqlh_args(&[DEAD, &["-c", terminator, "-Q", "SELECT 1"]].concat());
+        assert_eq!(r.code, 3, "{terminator:?}: {}", r.stdout);
+        assert!(r.stdout.contains("one word"), "{}", r.stdout);
+    }
+}
+
+// Each is refused before anything connects, so `DEAD` is never reached.
+#[test]
+fn a_refusal_is_short_and_shows_a_byte_order_mark() {
+    let dir = scratch("guard_shown");
+    let file = dir.join("input.sql");
+    let long = "x".repeat(5_000_000);
+    for (sql, starts) in [
+        (
+            format!("DELETE [{long}]"),
+            "-- blocked: line 1: DELETE [xxx",
+        ),
+        (format!("{long} 1"), "-- blocked: line 1: xxx"),
+    ] {
+        fs::write(&file, sql).unwrap();
+        let r = sqlh_args(&[DEAD, &["-i", file.to_str().unwrap()]].concat());
+        assert_eq!(r.code, 5, "{}", &r.stdout[..100]);
+        assert!(r.stdout.starts_with(starts), "{}", &r.stdout[..100]);
+        assert!(r.stdout.len() < 500, "{}", r.stdout.len());
+    }
+    const BOM: &str = "<U+FEFF>SELECT starts the batch: U+FEFF is a byte order mark, which SQL \
+                       Server doesn't read as whitespace, so it would run this as a stored \
+                       procedure; nothing was run. Remove the mark";
+    let r = sqlh_args(&[DEAD, &["-Q", "\u{FEFF}SELECT 1 AS a"]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert_eq!(
+        r.stdout.lines().next(),
+        Some(format!("-- blocked: line 1: {BOM}").as_str())
+    );
+    assert!(!r.stdout.contains('\u{FEFF}'), "{}", r.stdout);
+    // Two files' text run together: `decode` took the first BOM, and this one is at line 3.
+    fs::write(&file, "\u{FEFF}SELECT 1 AS a\nGO\n\u{FEFF}SELECT 1 AS a").unwrap();
+    let name = file.to_str().unwrap();
+    let r = sqlh_args(&[DEAD, &["-i", name]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.starts_with("-- blocked: line 3: <U+FEFF>SELECT"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains('\u{FEFF}'), "{}", r.stdout);
+}
+
+// A list's later names aren't left unread when an earlier one has a dot, and `#x` before a dot is
+// no temp table (the guard's own tests have every statement).
+#[test]
+fn a_write_past_a_dotted_temp_name_never_connects() {
+    for (sql, what) in [
+        ("DROP TABLE #a.b, dbo.t", "DROP TABLE #a.b"),
+        ("DROP TABLE IF EXISTS #a.b, dbo.t", "DROP TABLE #a.b"),
+        ("DROP TABLE #x.dbo.t", "DROP TABLE #x.dbo.t"),
+        ("DELETE #x.dbo.t", "DELETE #x.dbo.t"),
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert_eq!(
+            r.stdout.lines().next(),
+            Some(
+                format!(
+                    "-- blocked: line 1: {what} would write; nothing was run. Rerun with \
+                     --allow-write if the write is intended"
+                )
+                .as_str()
+            )
+        );
+    }
 }
 
 // plan-history.md 2.13, Windows shells and paths. The measurements are in
@@ -4627,6 +4797,27 @@ mod mcp {
             ("SELECT 1 --c\rWAITFOR DELAY '00:00:01'", WAITFOR),
             ("SELECT 1WAITFOR DELAY '00:00:01'", WAITFOR),
             ("SELECT 1 AS a\u{A0}WAITFOR DELAY '00:00:01'", WAITFOR),
+            (
+                "DROP TABLE #a.b, dbo.t",
+                "-- blocked: line 1: DROP TABLE #a.b would write; nothing was run. sqlh mcp is \
+                 read-only",
+            ),
+            (
+                "DROP TABLE #x.dbo.t",
+                "-- blocked: line 1: DROP TABLE #x.dbo.t would write; nothing was run. sqlh mcp is \
+                 read-only",
+            ),
+            (
+                "IF 1=0 RAISERROR('x', 1, 1) WITH LOG",
+                "-- blocked: line 1: RAISERROR ... WITH LOG writes to the error log, which a \
+                 rollback can't undo; nothing was run. Leave WITH LOG out; sqlh mcp is read-only",
+            ),
+            (
+                "\u{FEFF}SELECT 1 AS a",
+                "-- blocked: line 1: <U+FEFF>SELECT starts the batch: U+FEFF is a byte order mark, \
+                 which SQL Server doesn't read as whitespace, so it would run this as a stored \
+                 procedure; nothing was run. Remove the mark; sqlh mcp is read-only",
+            ),
         ];
         let lines: Vec<String> = (1..)
             .zip(&cases)
@@ -8496,6 +8687,149 @@ mod live {
         }
         let (plain, marked) = (errors[rows.len()], errors[rows.len() + 1]);
         assert_eq!(plain, marked, "{classification:?}");
+    }
+
+    // What the guard's readings of these rest on, each parsed and none run.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_parse_what_the_target_rules_go_by() {
+        let (p, db) = target();
+        const SYNTAX: &str = "102, 103, 105, 156, 195, 319, 321, 1018";
+        const MERGE_TAIL: &str = "USING (SELECT 1 AS a) AS s ON 1 = 0 WHEN MATCHED THEN DELETE;";
+        let parses: Vec<String> = [
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH LOG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH LOG\u{218}",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH LO\u{200D}G",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH \u{29F}OG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH NOWAIT\u{218}, LOG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH SETERROR\u{218}, LOG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH NOWAIT, NOWAIT, LOG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH LOG (SELECT 1 AS a)",
+            "WITH log AS (SELECT 1 AS a) SELECT a FROM log",
+            "WITH nowait AS (SELECT 1 AS a), log AS (SELECT 2 AS b) SELECT a FROM nowait",
+            "WITH log (a) AS (SELECT 1) SELECT a FROM log",
+            "ALTER TABLE #sw SW\u{218}ITCH TO dbo.sqlh_nope",
+            "ALTER TABLE #sw SWITCH PARTITION 1 TO dbo.sqlh_nope",
+            "SELECT 1 AS a FROM sys.objects AS o INNER MERGE\u{218} JOIN sys.schemas AS s ON 1 = 0",
+            "SELECT 1 AS a UNION SELECT 2 OPTION (MERGE\u{218} UNION)",
+            "LINENO 5",
+            "LINENO 5 SELECT 1 AS a",
+            "DELETE TOP (10) PERCENT FROM #t",
+            "UPDATE TOP (1) PERCENT #t SET a = 1",
+            "INSERT TOP (1) PERCENT INTO #t SELECT 1",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            ["JOIN\u{218}", "UNION\u{218}", "[JOIN]", "[UNION]"]
+                .map(|name| format!("IF 1=0 MERGE {name} {MERGE_TAIL}")),
+        )
+        .collect();
+        let errors: Vec<String> = [
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH [LOG]",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH L\u{FF2F}G",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH NOWAIT LOG",
+            "IF 1=0 RAISERROR(''x'', 1, 1) WITH OTHER, LOG",
+            "ALTER TABLE #sw SWITCH TO\u{218} dbo.sqlh_nope",
+            "SELECT 1 AS a FROM sys.objects AS o INNER MERGE JOIN\u{218} sys.schemas AS s ON 1 = 0",
+            "LINENO 5 sys.sp_who",
+            "SELECT 1 AS a; LINENO 5 sys.sp_who",
+            "LINENO 5; sys.sp_who",
+            "DROP TABLE #a.5a, dbo.sqlh_nope",
+            "SELECT 1 AS percent",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            ["JOIN", "UNION", "INTO JOIN"].map(|name| format!("IF 1=0 MERGE {name} {MERGE_TAIL}")),
+        )
+        .collect();
+        for (rows, parse) in [(&parses, true), (&errors, false)] {
+            for row in rows {
+                let sql = format!(
+                    "SELECT COUNT(*) AS syntax FROM sys.dm_exec_describe_first_result_set(N'{row}', \
+                     NULL, 0) AS r WHERE r.error_number IN ({SYNTAX})"
+                );
+                let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+                assert_eq!(r.code, 0, "{row}: {}{}", r.stdout, r.stderr);
+                let count = r.stdout.lines().nth(1).unwrap_or("");
+                assert_eq!(count == "0", parse, "{row}: {}", r.stdout);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_hint_or_a_scratch_write_the_guard_refused_now_runs() {
+        let (p, db) = target();
+        for (sql, expected) in [
+            (
+                "SELECT COUNT(*) AS n FROM sys.objects AS o JOIN sys.schemas AS s ON o.schema_id = \
+                 s.schema_id WHERE 1 = 0 OPTION (MERGE JOIN)",
+                "0",
+            ),
+            (
+                "SELECT COUNT(*) AS n FROM sys.objects AS o INNER MERGE JOIN sys.schemas AS s ON \
+                 o.schema_id = s.schema_id WHERE 1 = 0",
+                "0",
+            ),
+            ("SELECT 1 AS n UNION SELECT 1 OPTION (MERGE UNION)", "1"),
+            ("LINENO 5 SELECT 7 AS n", "7"),
+            (
+                "CREATE TABLE #t (a int); INSERT #t VALUES (1), (2), (3), (4); \
+                 DELETE TOP (50) PERCENT FROM #t; SELECT COUNT(*) AS n FROM #t",
+                "2",
+            ),
+            (
+                "CREATE TABLE #t (a int); CREATE TABLE #u (a int); INSERT #t VALUES (1); \
+                 ALTER TABLE #t SWITCH TO #u; SELECT COUNT(*) AS n FROM #u",
+                "1",
+            ),
+            ("CREATE TABLE #t (a int); DROP TABLE #t; SELECT 1 AS n", "1"),
+        ] {
+            let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+            assert_eq!(r.code, 0, "{sql}: {}{}", r.stdout, r.stderr);
+            assert_eq!(
+                r.stdout.lines().last(),
+                Some(expected),
+                "{sql}: {}",
+                r.stdout
+            );
+        }
+    }
+
+    // DESIGN.md §7: not only a deadlock or severity 20 ends the wrapper. An ordinary error of
+    // severity 16 can, and the invariant stops the run so that nothing runs outside it, whatever
+    // --continue-on-error says.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn an_ordinary_error_that_ends_the_wrapper_stops_the_run() {
+        let (p, db) = target();
+        let dir = OwnScratch::new("wrapper_ended");
+        let file = dir.0.join("input.sql");
+        for (first, number) in [
+            ("USE sqlh_nope", "error 911 "),
+            ("IF 1=0 USE sqlh_nope", "error 911 "),
+            ("SELECT CAST('x' AS int) AS a", "error 245 "),
+        ] {
+            fs::write(&file, format!("{first}\nGO\nSELECT 2 AS later\n")).unwrap();
+            let r = live(
+                &p,
+                &db,
+                &["--continue-on-error", "-i", file.to_str().unwrap()],
+            );
+            assert_eq!(r.code, 1, "{first}: {}{}", r.stdout, r.stderr);
+            assert!(r.stdout.contains(number), "{first}: {}", r.stdout);
+            assert!(
+                r.stdout.contains(
+                    "read-only guard: an error rolled back the wrapper transaction; stopping so \
+                     nothing runs outside it"
+                ),
+                "{first}: {}",
+                r.stdout
+            );
+            assert!(!r.stdout.contains("later"), "{first}: {}", r.stdout);
+        }
     }
 
     // What the marks do in a run, beyond the parse: the level really changes, and the plan does
