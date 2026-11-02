@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
+use crate::guard;
+
 /// The most SQL a run takes, before and after `$(var)` substitution (DESIGN.md §4.4).
 pub const MAX_INPUT_BYTES: usize = 10_000_000;
 
@@ -269,7 +271,14 @@ impl Lexer {
                 (b'\'', _) => self.close = Some(b'\''),
                 (b'"', _) => self.close = Some(b'"'),
                 (b'[', _) => self.close = Some(b']'),
-                _ => {}
+                // A literal ends where the guard ends it: `1e--` and `$--` are no comment to the
+                // servers (DESIGN.md §7), so a `GO` in a string after one is in the string.
+                _ => {
+                    if let Some(end) = guard::plain_token_end(line, i) {
+                        i = end;
+                        continue;
+                    }
+                }
             }
             i += 1;
         }
@@ -432,6 +441,57 @@ mod tests {
                 ("SELECT 1 --it's\r\n".into(), 1, 1),
                 ("SELECT 2 --'\n".into(), 3, 1)
             ]
+        );
+    }
+
+    // Each `--` here is what follows a literal, as the guard reads it and the servers do, so the
+    // `GO` is in the quoted name. Where it is a comment after all, what it hides opens nothing.
+    #[test]
+    fn a_sign_a_literal_takes_is_no_comment_when_finding_terminators() {
+        for literal in [
+            "1e", "1E", "1.e", "1.5e", ".5e", "$", "$ ", "$   ", "\\", "\\ ", "£", "£ ", "€",
+            "\u{FF04}",
+        ] {
+            let sql = format!("SELECT {literal}--1 AS [a\nGO\nb]");
+            assert_eq!(batches(&sql), vec![(sql.clone(), 1, 1)], "{literal:?}");
+            let sql = format!("SELECT {literal}--'\nGO\nb'");
+            assert_eq!(batches(&sql), vec![(sql.clone(), 1, 1)], "{literal:?}");
+        }
+        for head in [
+            "SELECT 1 --",
+            "SELECT 1e---",
+            "SELECT 1e+--",
+            "SELECT 1e --",
+            "SELECT 0x--",
+            "SELECT $---",
+            "SELECT $+--",
+            "SELECT $ ---",
+            "SELECT $ /*c*/ --",
+            // Names, which a digit, an `e` or a `$` inside doesn't make literals.
+            "SELECT a1e--",
+            "SELECT a$--",
+            "SELECT $action--",
+            "SELECT @a1e--",
+            "SELECT #a1e--",
+            "SELECT \u{E9}1e--",
+        ] {
+            let first = format!("{head}'\n");
+            let sql = format!("{first}GO\nSELECT 2");
+            assert_eq!(
+                batches(&sql),
+                vec![(first, 1, 1), ("SELECT 2".into(), 3, 1)],
+                "{head:?}"
+            );
+        }
+        // Split before substitution (DESIGN.md §4.3), so a literal a value makes isn't seen. That
+        // fails closed: the pieces reach the guard and the server, whose error says so.
+        assert_eq!(batches("SELECT $(v)-- 1 AS [a\nGO\nb]").len(), 2);
+        // A space beyond ASCII is one token's end, and takes nothing with it.
+        let first = "SELECT 1\u{A0}--'\n".to_string();
+        let sql = format!("{first}GO\nSELECT 2");
+        assert_eq!(
+            batches(&sql),
+            vec![(first, 1, 1), ("SELECT 2".into(), 3, 1)]
         );
     }
 

@@ -246,16 +246,36 @@ fn stands_for(c: char) -> Option<&'static [u8]> {
     })
 }
 
-/// What the parser reads `c` as in a word it doesn't reserve, or `None` if the word can't be a
-/// keyword then. Measured for every BMP code point in place of a letter and inside a word, on
-/// both servers: not a full-width form or a superscript (`SET NOEXEC` so spelled is error 195,
-/// though the `=` of the same collation takes both), and nothing else, so `UPDATE时间` and
-/// `NOEXEC` with a combining accent are names.
-fn word_letters(c: char) -> Option<&'static [u8]> {
+/// The servers read one of these in a word as the letter before it again, past whatever they ignore
+/// between the two: `SYM<c>ETRIC` is `SYMMETRIC` and `SHOWPLAN_A<U+029F><c>` is `SHOWPLAN_ALL`, so
+/// `c` takes the place of the second of two letters that match (DESIGN.md §7). First in a word, it
+/// is no letter at all.
+fn is_repeat_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{651}'
+            | '\u{3031}'
+            | '\u{309D}'
+            | '\u{30FC}'
+            | '\u{30FD}'
+            | '\u{FE7C}'
+            | '\u{FE7D}'
+            | '\u{FF70}'
+    )
+}
+
+/// What the parser reads `c` as in a word it doesn't reserve, where `before` is the last letter read
+/// so far, or `None` if the word can't be a keyword then. Measured for every BMP code point inside a
+/// word and in the places DESIGN.md §7 lists, on both servers: not a full-width form or a
+/// superscript (`SET NOEXEC` so spelled is error 195, though the `=` of the same collation takes
+/// both), and nothing else found, so `UPDATE时间` and `NOEXEC` with a combining accent are names.
+fn word_letters(c: char, before: Option<u8>) -> Option<&'static [u8]> {
     if c.is_ascii() {
         ascii_letter(c as u32)
     } else if ignored_in_a_word(c) {
         Some(&[])
+    } else if is_repeat_mark(c) {
+        before.and_then(|letter| ascii_letter(letter.into()))
     } else {
         stands_for(c)
     }
@@ -263,9 +283,10 @@ fn word_letters(c: char) -> Option<&'static [u8]> {
 
 /// What resolving an object's name, or the mode of `PHYSICAL_STATS`, reads `c` as. Wider than a
 /// word: it takes full-width forms, and a quoted name or a string can hold what a word can't, so
-/// everything else beyond ASCII is nothing. Only decision 30(d)'s rule goes by this, and nothing
-/// real has a name that spells that function's or `sys` once a letter is dropped from it.
-fn name_letters(c: char) -> Option<&'static [u8]> {
+/// everything else beyond ASCII is nothing. That takes in a repeat mark, which can't matter here: no
+/// name, mode or parameter this reads has two letters that match. Only what a match refuses goes by
+/// this, and nothing real has a name that spells one of those once a letter is dropped from it.
+fn name_letters(c: char, _before: Option<u8>) -> Option<&'static [u8]> {
     match c {
         c if c.is_ascii() => ascii_letter(c as u32),
         '\u{FF01}'..='\u{FF5E}' => ascii_letter(c as u32 - 0xFEE0),
@@ -277,7 +298,11 @@ fn name_letters(c: char) -> Option<&'static [u8]> {
 /// Whether `name` reads as `keyword` (upper case) in any case, with trailing spaces (`[sys ]` is
 /// `sys`), each character as `read` takes it. Only for what a match refuses or reports: a match
 /// that lets something through or turns a report off would make a new way past it.
-fn reads_as(name: &str, keyword: &str, read: fn(char) -> Option<&'static [u8]>) -> bool {
+fn reads_as(
+    name: &str,
+    keyword: &str,
+    read: fn(char, Option<u8>) -> Option<&'static [u8]>,
+) -> bool {
     let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case(keyword) {
         return true;
@@ -286,10 +311,12 @@ fn reads_as(name: &str, keyword: &str, read: fn(char) -> Option<&'static [u8]>) 
         return false;
     }
     let mut rest = keyword.as_bytes();
+    let mut before = None;
     for c in name.chars() {
-        let Some(letters) = read(c) else {
+        let Some(letters) = read(c, before) else {
             return false;
         };
+        before = letters.last().copied().or(before);
         for letter in letters {
             match rest.split_first() {
                 Some((first, tail)) if first.eq_ignore_ascii_case(letter) => rest = tail,
@@ -359,10 +386,12 @@ fn keyword<'b>(name: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> &'b str {
         return "";
     }
     let mut len = 0;
+    let mut before = None;
     for c in name.chars() {
-        let Some(letters) = word_letters(c) else {
+        let Some(letters) = word_letters(c, before) else {
             return "";
         };
+        before = letters.last().copied().or(before);
         for &letter in letters {
             let Some(slot) = buf.get_mut(len) else {
                 return "";
@@ -1466,7 +1495,7 @@ pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
                             && !equals
                             && lex.ahead(0).is_some_and(|next| {
                                 matches!(next.kind, Kind::Punct(',' | ')'))
-                                    || (next.kind == Kind::Word && in_list(TABLE_HINTS, next.name))
+                                    || TABLE_HINTS.iter().any(|hint| next.spells_word(hint))
                             }) =>
                     {
                         found.hint(token.name);
@@ -2373,6 +2402,38 @@ fn number_end(bytes: &[u8], i: usize) -> usize {
         i = digits_end(bytes, i);
     }
     i
+}
+
+/// Where the name, number, `money` literal or space beyond ASCII at `i` ends, for `script::split`,
+/// which only has to know whether a `--` after one is a comment. `None` for any other byte. These
+/// are `Lexer::read`'s arms: sharing one function cost a run 20% on ASCII text (218 ms against 182 ms
+/// on 9.4 MB), so `plain_tokens_end_where_the_lexer_ends_them` holds the two together instead.
+pub(crate) fn plain_token_end(line: &str, i: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    match *bytes.get(i)? {
+        b'@' | b'#' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => Some(word_end(line, i + 1)),
+        b'0'..=b'9' => Some(number_end(bytes, i)),
+        b'\\' => Some(money_end(bytes, i + 1)),
+        b'$' if bytes
+            .get(i + 1)
+            .is_some_and(|&n| word_char(n) && !n.is_ascii_digit()) =>
+        {
+            Some(word_end(line, i + 1))
+        }
+        b'$' => Some(money_end(bytes, i + 1)),
+        c if c >= 0x80 => {
+            let c = line.get(i..)?.chars().next()?;
+            let i = i + c.len_utf8();
+            Some(if is_space(c) {
+                i
+            } else if is_currency(c) {
+                money_end(bytes, i)
+            } else {
+                word_end(line, i)
+            })
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -3767,6 +3828,10 @@ mod tests {
              NULL, 'DETAILED')",
             // Nor can an expression, or a literal other than the two decision 30(d) names.
             "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DET' + 'AILED')",
+            // A binary literal does scan (it is `N'DETAILED'` in UTF-16), and the decision names
+            // no such literal: DESIGN.md §7, with the owner's question on the first argument's.
+            "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, \
+             0x440045005400410049004C0045004400)",
             "SELECT * FROM sys.dm_db_index_physical_stats(NULL + 1, NULL, NULL, NULL, 'DETAILED')",
             "SELECT * FROM sys.dm_db_index_physical_stats(CAST(NULL AS int), 1, 1, 1, 'DETAILED')",
             "SELECT * FROM sys.dm_db_index_physical_stats(DB_ID(N'typo'), 1, 1, 1, 'DETAILED')",
@@ -4605,6 +4670,137 @@ mod tests {
                     reused_session: false,
                 },
             );
+        }
+    }
+
+    // What `script::split` goes by, against what the guard reads, on every kind of token glued to
+    // every other. A string, a quoted name and a comment are `split`'s own to read.
+    #[test]
+    fn plain_tokens_end_where_the_lexer_ends_them() {
+        const PIECES: &[&str] = &[
+            "1",
+            "1e",
+            "1e-",
+            "1e+5",
+            "1.",
+            "1.5e",
+            ".5e",
+            "0x",
+            "0xFF",
+            "0xDELETE",
+            "1EXEC",
+            "$",
+            "$ ",
+            "$   ",
+            "$-",
+            "$+1",
+            "$ -1.5",
+            "$action",
+            "$1e",
+            "\\",
+            "\\ ",
+            "\\-1",
+            "\u{A3}",
+            "\u{A3} ",
+            "\u{A3}-",
+            "\u{20AC}1",
+            "\u{FF04}",
+            "a",
+            "a1e",
+            "_a",
+            "a$",
+            "@",
+            "@a",
+            "@@a",
+            "#",
+            "#a",
+            "##a",
+            "\u{E9}",
+            "\u{E9}1e",
+            "\u{65F6}",
+            "\u{1F600}",
+            "\u{A0}",
+            "\u{3000}",
+            "\u{200B}",
+            "\u{200D}",
+            "\u{FF70}",
+            "-",
+            "--",
+            "---",
+            "+",
+            " ",
+            "\t",
+            "\r",
+            "\n",
+            ",",
+            "(",
+            ")",
+            ".",
+            ";",
+            "=",
+            "*",
+            "/",
+            "/*c*/",
+            "'s'",
+            "N's'",
+            "[q]",
+            "\"q\"",
+            "N",
+            "n",
+        ];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut lines: Vec<String> = PIECES.iter().map(|&p| p.to_string()).collect();
+        for &a in PIECES {
+            for &b in PIECES {
+                lines.push(format!("{a}{b}"));
+            }
+        }
+        for _ in 0..20_000 {
+            let len = (next() % 8) as usize;
+            lines.push(
+                (0..len)
+                    .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for line in &lines {
+            let base = line.as_ptr() as usize;
+            let mut seen = 0;
+            for t in Lexer::new(line) {
+                let start = t.text.as_ptr() as usize - base;
+                let end = start + t.text.len();
+                match t.kind {
+                    Kind::Word | Kind::Var | Kind::Temp | Kind::Num => {
+                        assert_eq!(
+                            plain_token_end(line, start),
+                            Some(end),
+                            "{line:?} at {start}"
+                        );
+                    }
+                    Kind::Punct(_) => {
+                        assert_eq!(plain_token_end(line, start), None, "{line:?} at {start}");
+                    }
+                    Kind::Str | Kind::Quoted => {}
+                }
+                // A space beyond ASCII is a token of no kind, one character long.
+                for (at, c) in line[seen..start].char_indices() {
+                    if is_space(c) && !c.is_ascii() {
+                        let at = seen + at;
+                        assert_eq!(
+                            plain_token_end(line, at),
+                            Some(at + c.len_utf8()),
+                            "{line:?}"
+                        );
+                    }
+                }
+                seen = end;
+            }
         }
     }
 
@@ -6009,6 +6205,315 @@ mod tests {
         // Nor does a scratch target count where the word before it only folds to the keyword.
         blocked("ALTER TABLE\u{200D} #t ADD a int");
         blocked("DROP TABLE\u{200D} #t");
+    }
+
+    const REPEAT_MARKS: [char; 8] = [
+        '\u{651}', '\u{3031}', '\u{309D}', '\u{30FC}', '\u{30FD}', '\u{FE7C}', '\u{FE7D}',
+        '\u{FF70}',
+    ];
+
+    // Every word the guard compares by the servers' comparison (DESIGN.md §7). In the second of two
+    // letters that match a mark reads as the word, and in any other letter's place it doesn't:
+    // `CLASSIFICATION`, `SYMMETRIC`, `UNCOMMITTED`, `READUNCOMMITTED` and `SHOWPLAN_ALL` are the
+    // ones with such a pair.
+    #[test]
+    fn a_repeat_mark_stands_only_for_the_second_of_two_letters() {
+        const SPELLED: &[&str] = &[
+            "AUTOPILOT",
+            "CLASSIFICATION",
+            "CONVERSATION",
+            "COUNTER",
+            "DIALOG",
+            "DISABLE",
+            "ENABLE",
+            "GET",
+            "ISOLATION",
+            "LEVEL",
+            "MASTER",
+            "MERGE",
+            "MOVE",
+            "NEXT",
+            "NOEXEC",
+            "NOLOCK",
+            "READUNCOMMITTED",
+            "RECEIVE",
+            "SEND",
+            "SENSITIVITY",
+            "SHOWPLAN_ALL",
+            "SHOWPLAN_TEXT",
+            "SHOWPLAN_XML",
+            "SIGNATURE",
+            "SYMMETRIC",
+            "UNCOMMITTED",
+            "USING",
+            "VALUE",
+            "XACT_ABORT",
+        ];
+        let mut doubled = Vec::new();
+        for word in SPELLED {
+            for at in 0..word.len() {
+                let is_second = at > 0 && word.as_bytes()[at] == word.as_bytes()[at - 1];
+                if is_second && !doubled.contains(word) {
+                    doubled.push(*word);
+                }
+                for mark in REPEAT_MARKS {
+                    let spelled = format!("{}{mark}{}", &word[..at], &word[at + 1..]);
+                    assert_eq!(spells(&spelled, word), is_second, "{spelled:?}");
+                }
+            }
+        }
+        assert_eq!(
+            doubled,
+            [
+                "CLASSIFICATION",
+                "READUNCOMMITTED",
+                "SHOWPLAN_ALL",
+                "SYMMETRIC",
+                "UNCOMMITTED"
+            ]
+        );
+        // What this reads as nothing, none of which has such a pair.
+        for name in [
+            PHYSICAL_STATS,
+            "SYS",
+            "DETAILED",
+            "SAMPLED",
+            "@UPDATEUSAGE",
+            "@CONFIGVALUE",
+        ] {
+            let pair = name.as_bytes().windows(2).any(|p| p[0] == p[1]);
+            assert!(!pair, "{name}");
+        }
+
+        for mark in REPEAT_MARKS {
+            assert!(!ignored_in_a_word(mark), "{mark:?}");
+            assert_eq!(stands_for(mark), None, "{mark:?}");
+            // Each was parsed on both servers: the mark goes by the letter before it, past what
+            // they ignore on either side, in any case, and after a small capital.
+            for (name, keyword) in [
+                (format!("uncom{mark}it{mark}ed"), "UNCOMMITTED"),
+                (format!("SYM\u{200D}{mark}ETRIC"), "SYMMETRIC"),
+                (format!("SYM{mark}\u{200D}ETRIC"), "SYMMETRIC"),
+                (format!("SYM\u{218}{mark}ETRIC"), "SYMMETRIC"),
+                (format!("SYM{mark}\u{218}ETRIC"), "SYMMETRIC"),
+                (format!("SHOWPLAN_AL\u{200D}{mark}"), "SHOWPLAN_ALL"),
+                (format!("SHOWPLAN_AL\u{218}{mark}\u{200D}"), "SHOWPLAN_ALL"),
+                (format!("SHOWPLAN_A\u{29F}{mark}"), "SHOWPLAN_ALL"),
+                (format!("SHOWPLAN_A\u{200D}L{mark}"), "SHOWPLAN_ALL"),
+                (format!("S\u{29C}OWPLAN_AL{mark}"), "SHOWPLAN_ALL"),
+                (
+                    format!("READUNCOM\u{200D}{mark}IT{mark}\u{200D}ED"),
+                    "READUNCOMMITTED",
+                ),
+                (format!("CLAS\u{200D}{mark}IFICATION"), "CLASSIFICATION"),
+            ] {
+                assert!(spells(&name, keyword), "{name:?}");
+            }
+            // Each was those servers' error: first in a word, one letter too many, or a letter too
+            // many after a ligature.
+            for (name, keyword) in [
+                (format!("{mark}NOEXEC"), "NOEXEC"),
+                (format!("\u{200D}{mark}NOEXEC"), "NOEXEC"),
+                (format!("NOEXEC{mark}"), "NOEXEC"),
+                (format!("NO{mark}EXEC"), "NOEXEC"),
+                (format!("SHOWPLAN_ALL{mark}"), "SHOWPLAN_ALL"),
+                (format!("SHOWPLAN_AL{mark}{mark}"), "SHOWPLAN_ALL"),
+                (format!("SHOWPLAN_AL{mark}L"), "SHOWPLAN_ALL"),
+                (format!("SYM{mark}{mark}ETRIC"), "SYMMETRIC"),
+                (format!("SY{mark}METRIC"), "SYMMETRIC"),
+                (format!("CLA\u{DF}{mark}IFICATION"), "CLASSIFICATION"),
+                (format!("MA\u{FB06}{mark}ER"), "MASTER"),
+            ] {
+                assert!(!spells(&name, keyword), "{name:?}");
+            }
+
+            let mut buf = [0; KEYWORD_MAX];
+            assert_eq!(
+                keyword(&format!("readuncom{mark}itted"), &mut buf),
+                "READUNCOMMITTED"
+            );
+            // One letter past the buffer, from a mark too.
+            assert_eq!(
+                keyword(&format!("a{}", mark.to_string().repeat(16)), &mut buf),
+                ""
+            );
+            assert_eq!(keyword(&format!("{mark}send"), &mut buf), "");
+            // The first of two, or a word that has no such letter.
+            assert_eq!(keyword(&format!("Del{mark}ete"), &mut buf), "");
+            assert_eq!(keyword(&format!("COM{mark}IT"), &mut buf), "");
+        }
+    }
+
+    #[test]
+    fn a_repeat_mark_is_seen_by_each_rule_that_goes_by_the_comparison() {
+        let mcp = Policy {
+            reused_session: true,
+            ..READ_ONLY
+        };
+        let nolock = UncommittedReads {
+            nolock: true,
+            ..UncommittedReads::default()
+        };
+        let hint = UncommittedReads {
+            readuncommitted: true,
+            ..UncommittedReads::default()
+        };
+        let level = UncommittedReads {
+            isolation: true,
+            ..UncommittedReads::default()
+        };
+        for mark in REPEAT_MARKS {
+            // SQL Server 2025 reached this statement, and error 16108 said so.
+            let sql = format!(
+                "SELECT 1 a; ADD SENSITIVITY CLAS{mark}IFICATION TO t.c WITH (LABEL = 'a')"
+            );
+            assert_eq!(
+                blocked(&sql).reason,
+                "ADD SENSITIVITY CLASSIFICATION would write",
+                "{sql:?}"
+            );
+
+            let sql = format!("OPEN SYM{mark}ETRIC KEY k DECRYPTION BY PASSWORD = 'x'");
+            allowed(&sql);
+            let refused = check(&sql, mcp).expect_err(&sql);
+            assert!(refused.reason.starts_with("OPEN SYMMETRIC KEY"), "{sql:?}");
+
+            for (sql, expected) in [
+                (
+                    format!("SET TRANSACTION ISOLATION LEVEL READ UNCOM{mark}ITTED"),
+                    level,
+                ),
+                (
+                    format!("SET TRANSACTION ISOLATION LEVEL READ UNCOMMIT{mark}ED"),
+                    level,
+                ),
+                (
+                    format!("SET TRAN ISOLATION LEVEL READ UNCOM{mark}IT{mark}ED"),
+                    level,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects WITH (READUNCOM{mark}ITTED)"),
+                    hint,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects WITH (READUNCOMMIT{mark}ED)"),
+                    hint,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects (READUNCOM{mark}ITTED)"),
+                    hint,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects ([READUNCOM{mark}ITTED])"),
+                    hint,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects ([READUNCOMMIT{mark}ED])"),
+                    hint,
+                ),
+                // A hint after NOLOCK, with spaces, goes by the comparison like NOLOCK itself.
+                (
+                    format!("SELECT 1 FROM sys.objects WITH (NOLOCK FORCESE{mark}K)"),
+                    nolock,
+                ),
+                (
+                    format!("SELECT 1 FROM sys.objects WITH (NOLOCK KE{mark}PIDENTITY)"),
+                    nolock,
+                ),
+            ] {
+                assert_eq!(uncommitted_reads(&sql), expected, "{sql:?}");
+            }
+
+            for sql in [
+                format!("SET SHOWPLAN_AL{mark} ON"),
+                format!("SET SHOWPLAN_A\u{29F}{mark} ON"),
+                format!("SET SHOW\u{200D}PLAN_AL{mark} ON"),
+                format!("SET S\u{29C}OWPLAN_AL{mark} ON"),
+            ] {
+                assert!(sets_output_modes(&sql), "{sql:?}");
+                assert!(several_outputs(&sql), "{sql:?}");
+            }
+
+            // The whole word has to spell the keyword, so these stay names and reads.
+            allowed(&format!("SELECT 1 AS CLAS{mark}IFICATION"));
+            allowed(&format!("SELECT 1 AS SYM{mark}ETRIC"));
+            allowed(&format!("SELECT 1 AS UNCOM{mark}ITTED"));
+            allowed(&format!("ALTER TABLE #t ADD SENSITIVITY{mark} int"));
+            let sql = format!("OPEN SYM{mark}ETRIC");
+            assert_eq!(check(&sql, mcp), Ok(()), "a cursor: {sql:?}");
+            assert_eq!(
+                uncommitted_reads(&format!("SELECT READUNCOM{mark}ITTED FROM t")),
+                UncommittedReads::default()
+            );
+        }
+        // Real words that hold one.
+        allowed("SELECT \u{30B3}\u{30FC}\u{30D2}\u{30FC} FROM t");
+        allowed("SELECT \u{643}\u{651}\u{62A}\u{627}\u{628} AS a FROM t");
+    }
+
+    // A hint after NOLOCK isn't reserved either: `FORCESEEK<joiner>` parsed on both servers.
+    #[test]
+    fn a_hint_after_nolock_goes_by_the_comparison() {
+        let nolock = UncommittedReads {
+            nolock: true,
+            ..UncommittedReads::default()
+        };
+        for sql in [
+            "SELECT 1 FROM sys.objects WITH (NOLOCK FORCESEEK)",
+            "SELECT 1 FROM sys.objects WITH (NOLOCK FORCESEEK\u{200D})",
+            "SELECT 1 FROM sys.objects WITH (NOLOCK FORCESEEK\u{218})",
+        ] {
+            assert_eq!(uncommitted_reads(sql), nolock, "{sql:?}");
+        }
+        // A column of `OPENJSON` is followed by its type, however that is written.
+        for sql in [
+            "SELECT 1 FROM OPENJSON('[]') WITH (nolock int)",
+            "SELECT 1 FROM OPENJSON('[]') WITH (nolock nvarchar\u{200D})",
+        ] {
+            assert_eq!(
+                uncommitted_reads(sql),
+                UncommittedReads::default(),
+                "{sql:?}"
+            );
+        }
+    }
+
+    // The mode's parameter is nvarchar(20), in UTF-16 units: neither bytes of UTF-8 nor characters.
+    // Each `blocked` here scanned on both servers, on a call scoped to a table of its own.
+    #[test]
+    fn the_mode_is_cut_at_twenty_utf16_units() {
+        const SMILE: &str = "\u{1F600}";
+        for (text, units, kept) in [
+            ("abc", 2, "ab"),
+            ("abc", 3, "abc"),
+            ("abc", 4, "abc"),
+            ("", 0, ""),
+            ("\u{200D}a", 1, "\u{200D}"),
+            ("\u{200D}a", 2, "\u{200D}a"),
+            // A pair doesn't fit in one unit, and isn't split.
+            ("a\u{1F600}b", 1, "a"),
+            ("a\u{1F600}b", 2, "a"),
+            ("a\u{1F600}b", 3, "a\u{1F600}"),
+            ("a\u{1F600}b", 4, "a\u{1F600}b"),
+        ] {
+            assert_eq!(cut_to_units(text, units), kept, "{text:?} at {units}");
+        }
+        let call = |mode: &str| {
+            format!("SELECT * FROM sys.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,{mode})")
+        };
+        for mode in [
+            // 14 and 20 units, 26 and 44 bytes: a cut at 20 bytes would leave `DE`.
+            format!("N'DE{}TAILED'", "\u{200D}".repeat(6)),
+            format!("N'DE{}TAILED'", "\u{200D}".repeat(12)),
+            // 22 units, the last two of which are cut, in 16 characters.
+            format!("N'DETAILED{}zz'", SMILE.repeat(6)),
+        ] {
+            let sql = call(&mode);
+            let b = blocked(&sql);
+            assert!(b.reason.contains("'DETAILED'"), "{mode:?}: {}", b.reason);
+        }
+        // 21 units: the `D` goes, which is the servers' error 2561, so nothing would scan.
+        allowed(&call(&format!("N'DE{}TAILED'", "\u{200D}".repeat(13))));
     }
 
     #[test]

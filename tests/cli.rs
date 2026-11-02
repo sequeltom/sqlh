@@ -2206,6 +2206,11 @@ fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
             "SELECT 1 a; ADD SIGNATURE TO dbo.p BY CERTIFICATE c",
             "ADD SIGNATURE would write",
         ),
+        // A repeat mark, in place of the second of two letters.
+        (
+            "SELECT 1 a; ADD SENSITIVITY CLAS\u{30FC}IFICATION TO t.c WITH (LABEL = 'a')",
+            "ADD SENSITIVITY CLASSIFICATION would write",
+        ),
         // A name with leading dots or a temp procedure's is an implicit call to them.
         (".sqlh_nope", ".sqlh_nope starts the batch"),
         ("...sqlh_nope", "...sqlh_nope starts the batch"),
@@ -2229,6 +2234,7 @@ fn a_keyword_is_seen_past_a_lone_cr_a_glued_number_or_a_unicode_space() {
         "SELECT TOP 1 Id AS Dele\u{301}te FROM dbo.Users",
         "SELECT TOP 1 Id AS \u{FF33}\u{FF21}\u{FF36}\u{FF25} FROM dbo.Users",
         "SELECT TOP 1 Id AS SEND\u{65F6}\u{95F4} FROM dbo.Users",
+        "SELECT TOP 1 Id AS CLAS\u{30FC}IFICATION FROM dbo.Users",
     ] {
         assert_reached_connect(&sqlh_args(&[DEAD, &["-Q", sql]].concat()), sql);
     }
@@ -4608,6 +4614,10 @@ mod mcp {
             ),
             (
                 "OPEN SYMMETRIC\u{218} KEY k DECRYPTION BY PASSWORD = 'x'",
+                KEY,
+            ),
+            (
+                "OPEN SYM\u{30FC}ETRIC KEY k DECRYPTION BY PASSWORD = 'x'",
                 KEY,
             ),
             ("SELECT 1 --c\rSET AUTOPILOT ON", AUTOPILOT),
@@ -8348,6 +8358,202 @@ mod live {
         }
     }
 
+    // What the servers read a repeat mark as (`guard::is_repeat_mark`, DESIGN.md §7): the whole BMP
+    // in the second of two letters, where the marks are all that isn't the letter or its small
+    // capital, and what they do on either side of what is ignored. Only
+    // `sys.dm_exec_describe_first_result_set` parses these, so nothing runs.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_read_a_repeat_mark_as_the_letter_before_it() {
+        let (p, db) = target();
+        const MARKS: [u32; 8] = [
+            0x651, 0x3031, 0x309D, 0x30FC, 0x30FD, 0xFE7C, 0xFE7D, 0xFF70,
+        ];
+        const SYNTAX: &str = "102, 103, 105, 156, 195, 319, 321, 1018";
+        for (before, after, letters, a_pair) in [
+            ("SET SHOWPLAN_AL", " ON", &[0x4C, 0x6C, 0x29F][..], true),
+            (
+                "OPEN SYM",
+                "ETRIC KEY k DECRYPTION BY PASSWORD=''x''",
+                &[0x4D, 0x6D][..],
+                true,
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOM",
+                "ITTED",
+                &[0x4D, 0x6D][..],
+                true,
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMIT",
+                "ED",
+                &[0x54, 0x74][..],
+                true,
+            ),
+            ("SET NOEXE", " OFF", &[0x43, 0x63][..], false),
+        ] {
+            let sql = format!(
+                "WITH d AS (SELECT n FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+                 (11),(12),(13),(14),(15)) AS v (n)), nums AS (SELECT a.n + 16 * b.n + 256 * c.n \
+                 + 4096 * e.n AS i FROM d AS a, d AS b, d AS c, d AS e) SELECT i FROM nums WHERE \
+                 i NOT BETWEEN 55296 AND 57343 AND NOT EXISTS (SELECT 1 FROM \
+                 sys.dm_exec_describe_first_result_set(N'{before}' + NCHAR(i) + N'{after}', NULL, \
+                 0) AS r WHERE r.error_number IN ({SYNTAX})) ORDER BY i"
+            );
+            let r = live(&p, &db, &["--format", "csv", "--max-rows", "0", "-Q", &sql]);
+            assert_eq!(r.code, 0, "{before}: {}{}", r.stdout, r.stderr);
+            let parsed: Vec<u32> = r
+                .stdout
+                .lines()
+                .skip(1)
+                .map(|line| line.parse().expect("a number"))
+                .collect();
+            let mut expected = letters.to_vec();
+            if a_pair {
+                expected.extend(MARKS);
+            }
+            expected.sort_unstable();
+            assert_eq!(parsed, expected, "{before}");
+        }
+
+        // How many of the marks give a syntax error, one row for each statement in order; `~` is
+        // where the mark goes.
+        let rows: &[(&str, bool)] = &[
+            ("SET SHOWPLAN_AL\u{200D}~ ON", true),
+            ("SET SHOWPLAN_AL\u{218}~ ON", true),
+            ("SET SHOWPLAN_AL~\u{200D} ON", true),
+            ("SET SHOWPLAN_A\u{29F}~ ON", true),
+            ("SET S\u{29C}OWPLAN_AL~ ON", true),
+            ("SET SHOWPLAN_AL~~ ON", false),
+            ("SET SHOWPLAN_ALL~ ON", false),
+            ("SET SHOWPLAN_AL~L ON", false),
+            (
+                "OPEN SYM\u{200D}~ETRIC KEY k DECRYPTION BY PASSWORD=''x''",
+                true,
+            ),
+            (
+                "OPEN SYM~\u{218}ETRIC KEY k DECRYPTION BY PASSWORD=''x''",
+                true,
+            ),
+            ("OPEN SY~METRIC KEY k DECRYPTION BY PASSWORD=''x''", false),
+            ("OPEN MA\u{FB06}~ER KEY DECRYPTION BY PASSWORD=''x''", false),
+            ("SET ~NOEXEC OFF", false),
+            ("SET \u{200D}~NOEXEC OFF", false),
+            ("SET NOEXEC~ OFF", false),
+            (
+                "SELECT 1 AS a FROM sys.objects WITH (READUNCOM~ITTED)",
+                true,
+            ),
+            ("SELECT 1 AS a FROM sys.objects (READUNCOMMIT~ED)", true),
+            ("SELECT 1 AS a FROM sys.objects ([READUNCOM~ITTED])", true),
+            // Reserved words stay exact, which is what lets the guard read them so.
+            ("SELECT 1 AS a; COM~IT", false),
+            ("SELECT 1 AS a; ROL~BACK", false),
+            ("SELECT 1 AS a; KIL~ 1", false),
+            ("SELECT 1 AS a; DBC~ TRACESTATUS", false),
+            ("SELECT 1 AS a; AD~ SIGNATURE TO p BY CERTIFICATE c", false),
+            // Hints after NOLOCK aren't reserved.
+            (
+                "SELECT 1 AS a FROM sys.objects WITH (NOLOCK FORCESE~K)",
+                true,
+            ),
+            (
+                "SELECT 1 AS a FROM sys.objects WITH (NOLOCK KE~PIDENTITY)",
+                true,
+            ),
+        ];
+        // SQL Server 2019's statement: a mark reads as the word wherever the word reads.
+        let classification = [
+            "SELECT 1 AS a; ADD SENSITIVITY CLASSIFICATION TO t.c WITH (LABEL=''a'')",
+            "SELECT 1 AS a; ADD SENSITIVITY CLAS~IFICATION TO t.c WITH (LABEL=''a'')",
+        ];
+        let statements: Vec<&str> = rows.iter().map(|row| row.0).chain(classification).collect();
+        let values: Vec<String> = (1..)
+            .zip(&statements)
+            .map(|(id, statement)| format!("({id}, N'{statement}')"))
+            .collect();
+        let marks: Vec<String> = MARKS.iter().map(u32::to_string).collect();
+        let sql = format!(
+            "SELECT s.id, COUNT(x.err) AS errors FROM (VALUES {}) AS s (id, shape) CROSS JOIN \
+             (VALUES ({})) AS m (i) OUTER APPLY (SELECT TOP (1) r.error_number AS err FROM \
+             sys.dm_exec_describe_first_result_set(REPLACE(s.shape, N'~', NCHAR(m.i)), NULL, 0) \
+             AS r WHERE r.error_number IN ({SYNTAX})) AS x GROUP BY s.id ORDER BY s.id",
+            values.join(", "),
+            marks.join("), (")
+        );
+        let r = live(&p, &db, &["--format", "csv", "--max-rows", "0", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        let errors: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter(|line| line.contains(',') && !line.starts_with("id,"))
+            .filter_map(|line| line.split(',').nth(1))
+            .collect();
+        assert_eq!(errors.len(), statements.len(), "{}", r.stdout);
+        for ((statement, expected), errors) in rows.iter().zip(&errors) {
+            let wanted = if *expected { "0" } else { "8" };
+            assert_eq!(*errors, wanted, "{statement:?}");
+        }
+        let (plain, marked) = (errors[rows.len()], errors[rows.len() + 1]);
+        assert_eq!(plain, marked, "{classification:?}");
+    }
+
+    // What the marks do in a run, beyond the parse: the level really changes, and the plan does
+    // come in place of a statement's results. The note and the count of outputs go by them too.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_repeat_mark_takes_effect_and_is_reported() {
+        let (p, db) = target();
+        let sql = "SET TRANSACTION ISOLATION LEVEL READ UNCOM\u{30FC}ITTED; SELECT \
+                   transaction_isolation_level AS level FROM sys.dm_exec_sessions WHERE session_id \
+                   = @@SPID";
+        let r = live(&p, &db, &["-Q", sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.lines().any(|line| line == "1"), "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- note: some reads were uncommitted"),
+            "{}",
+            r.stdout
+        );
+
+        let dir = OwnScratch::new("repeat_mark_showplan");
+        let file = dir.0.join("input.sql");
+        fs::write(
+            &file,
+            "SET S\u{29C}OWPLAN_AL\u{30FC} ON\nGO\nSELECT 1 AS a\nGO\nSET SHOWPLAN_ALL OFF\n",
+        )
+        .unwrap();
+        let r = live(&p, &db, &["--format", "csv", "-i", file.to_str().unwrap()]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("StmtText"), "{}", r.stdout);
+
+        // Refused in a read-only run on any version, before the server has a say.
+        let sql = "SELECT 1 AS a; ADD SENSITIVITY CLAS\u{FF70}IFICATION TO dbo.sqlh_nope.c WITH \
+                   (LABEL = 'a')";
+        let r = live(&p, &db, &["-Q", sql]);
+        assert_eq!(r.code, 5, "{}{}", r.stdout, r.stderr);
+    }
+
+    // A `GO` in a quoted name after a literal whose sign looks like a comment stays in the name, as
+    // the guard and the servers read it (`script::split`, DESIGN.md §7).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_go_after_a_literals_sign_stays_in_the_batch() {
+        let (p, db) = target();
+        let dir = OwnScratch::new("go_after_a_sign");
+        let file = dir.0.join("input.sql");
+        for literal in ["1e", "$", "$ ", "\\", "\u{A3}"] {
+            fs::write(&file, format!("SELECT {literal}-- 1 AS [a\nGO\nb]")).unwrap();
+            let r = live(&p, &db, &["-i", file.to_str().unwrap()]);
+            assert_eq!(r.code, 0, "{literal:?}: {}{}", r.stdout, r.stderr);
+            assert!(
+                r.stdout.contains("ok: 1 batch"),
+                "{literal:?}: {}",
+                r.stdout
+            );
+        }
+    }
+
     // The spellings of the mode that decision 30(d)'s refusal goes by, on a call scoped to a table
     // of the run's own so that nothing is scanned but that: a `record_count` is only there when
     // the mode scanned. The servers take each as the mode that scans.
@@ -8355,22 +8561,33 @@ mod live {
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_servers_take_the_spellings_the_scan_refusal_goes_by() {
         let (p, _) = target();
-        for mode in [
-            "'DETAILED'",
-            "'DETAILED            zz'",
-            "N'DETAILED            zz'",
-            "'SAMPLED             zz'",
-            "N'DETA\u{26A}LED'",
-            "N'DE\u{218}TAILED'",
-            "'D\u{112}TAILED'",
-            "'DETA\u{131}LED'",
-            "'\u{FF24}ETAILED'",
-        ] {
-            let sql = format!(
+        let scoped = |mode: &str| {
+            format!(
                 "CREATE TABLE #t (a int); INSERT #t VALUES (1); SELECT record_count FROM \
                  sys.dm_db_index_physical_stats(DB_ID('tempdb'), OBJECT_ID('tempdb..#t'), NULL, \
                  NULL, {mode})"
-            );
+            )
+        };
+        let joined = |joiners: usize| format!("N'DE{}TAILED'", "\u{200D}".repeat(joiners));
+        for mode in [
+            "'DETAILED'".to_string(),
+            "'DETAILED            zz'".to_string(),
+            "N'DETAILED            zz'".to_string(),
+            "'SAMPLED             zz'".to_string(),
+            "N'DETA\u{26A}LED'".to_string(),
+            "N'DE\u{218}TAILED'".to_string(),
+            "'D\u{112}TAILED'".to_string(),
+            "'DETA\u{131}LED'".to_string(),
+            "'\u{FF24}ETAILED'".to_string(),
+            // nvarchar(20) in UTF-16 units: 14, 20, and 22 of which the servers cut the last two.
+            joined(6),
+            joined(12),
+            format!("N'DETAILED{}zz'", "\u{1F600}".repeat(6)),
+            // Not refused, DESIGN.md §7: `N'DETAILED'` and `N'SAMPLED'` as binary literals.
+            "0x440045005400410049004C0045004400".to_string(),
+            "0x530041004D0050004C0045004400".to_string(),
+        ] {
+            let sql = scoped(&mode);
             let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
             assert_eq!(r.code, 0, "{mode}: {}{}", r.stdout, r.stderr);
             assert!(
@@ -8379,6 +8596,16 @@ mod live {
                 r.stdout
             );
         }
+        // 21 units cut the `D` off, so the servers have no such mode. `N'LIMITED'` as a binary
+        // literal doesn't scan, so the rows above are the mode's doing.
+        let sql = scoped(&joined(13));
+        let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+        assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+        assert!(r.stderr.contains("error 2561"), "{}", r.stderr);
+        let sql = scoped("0x4C0049004D0049005400450044");
+        let r = live(&p, "tempdb", &["--format", "csv", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(!r.stdout.lines().any(|line| line == "1"), "{}", r.stdout);
     }
 
     // Nothing is lost on a line that starts with the terminator: past a lone CR the text is a
