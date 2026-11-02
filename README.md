@@ -130,7 +130,7 @@ Each tool also takes `profile` (needed when several are listed), `database`, `ma
 
 What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a limited context, working through a person's questions across several turns. This list is kept current: a feature is added here in the same change as its code ([AGENTS.md](AGENTS.md)). The tags say when it landed (see [docs/PLAN.md](docs/PLAN.md) and [docs/history/plan-history.md](docs/history/plan-history.md)); the spec is [docs/DESIGN.md](docs/DESIGN.md).
 
-**Tally: 43 built, 2 planned.**
+**Tally: 44 built, 2 planned.**
 
 ### Built
 
@@ -159,7 +159,8 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **A write policy per profile, and new profiles refuse writes.** `deny` (never), `flag` (needs `--allow-write`) or `allow`; `profiles add` makes new profiles `deny`, because an agent in trial 2 added `--allow-write` on its own. Under `deny`, a refusal says the profile doesn't allow writes rather than suggesting a flag that would fail. *(MVP; deny by default and its refusals since Phase 2.16)*
 - **No secrets in the transcript.** `-P` is rejected. Passwords live in Windows Credential Manager (or `SQLCMDPASSWORD`), and a stored password is only ever sent to its own server and login (or to a server that server hands the login to, as Always On read-only routing does), so a profile can't be repointed to harvest it. Each stored password remembers the server, login and encryption it was saved for, so a run that meets a profile mid-edit, or one an interrupted edit left behind, refuses rather than send it elsewhere. *(MVP; bound to its profile since Phase 3)*
 - **`-o` can't hurt the input.** It refuses to write onto an input file, however it is spelled, and replaces the destination whole or not at all. *(Phase 1)*
-- **Dirty reads only on request.** `--read-uncommitted` lets a read-only run read past writers' locks without waiting, and the output says the rows may be uncommitted. It is refused when writes are allowed, so no write is ever based on a dirty read. *(Phase 2.8)*
+- **Dirty reads only on request.** `--read-uncommitted` lets a read-only run read past writers' locks without waiting, and the output says the rows may be uncommitted. It is refused when writes are allowed, so the flag never puts a write on top of a dirty read. *(Phase 2.8)*
+- **SQL that reads dirty says so.** `NOLOCK`, `READUNCOMMITTED` or `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` in the SQL are allowed, and the output says the rows may be uncommitted, so an agent doesn't take them for committed data. A column or alias named nolock doesn't set it off. *(Phase 6, slice 1)*
 - **The error log and server settings are readable without writes.** `xp_readerrorlog` and `sp_readerrorlog` (with `sp_enumerrorlogs` to list the logs), `xp_instance_regread`, `xp_fixeddrives`, `xp_msver` and `sp_configure`'s listing are allowed in read-only runs and through MCP, so an agent can read the SQL Server error log during an investigation. Each is allowed by its exact name, so `xp_cmdshell` and registry writes stay blocked, and `sp_configure` with a value is refused with a pointer to `sys.configurations`. Whether the login may run each one stays the server's decision. Some of these tell the reader about the host (registry values, the service account, drives); a DBA who doesn't want that can revoke `EXECUTE` on `xp_instance_regread` from public. *(Phase 6, interim step)*
 - **A DBA can see what an agent's session may do.** The login's application name is `sqlh`, `sqlh mcp` or `sqlh (writes)`, so `sp_who2` or `sp_WhoIsActive` tells a read-only look from a run that can change things. It's a label the client sends, not proof. *(Phase 6, slice 1)*
 

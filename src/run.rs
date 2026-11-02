@@ -122,15 +122,37 @@ fn wrapper_lost_unreported(
 /// after `--lock-timeout` (error 1222), so it gives way to production work.
 const AGENT_DEFAULTS: &str = "SET DEADLOCK_PRIORITY LOW;";
 
+/// What a dirty read can do to the rows, in both of the notes below.
+const DIRTY_ROWS: &str = "rows may include uncommitted, duplicated or missing data";
+
 /// Said once, as a note, in a run whose reads were uncommitted (DESIGN.md §4.3).
 fn read_uncommitted_note(advice: output::Advice) -> String {
     let asked = match advice {
         output::Advice::Cli => "--read-uncommitted",
         output::Advice::Mcp => "the profile's read_uncommitted = true",
     };
-    format!(
-        "reads were uncommitted ({asked}): rows may include uncommitted, duplicated or missing data"
-    )
+    format!("reads were uncommitted ({asked}): {DIRTY_ROWS}")
+}
+
+/// The note for a run whose SQL itself reads uncommitted (decision 30(a), DESIGN.md §4.3), naming
+/// each thing that does, so the reader knows what to take out. The CLI and `sqlh mcp` word it
+/// alike, since it names no setting. `None` when nothing does.
+fn uncommitted_in_sql_note(reads: guard::UncommittedReads) -> Option<String> {
+    let sources = [
+        (reads.nolock, "NOLOCK"),
+        (reads.readuncommitted, "READUNCOMMITTED"),
+        (
+            reads.isolation,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        ),
+    ]
+    .iter()
+    .filter(|(found, _)| *found)
+    .map(|(_, name)| *name)
+    .collect::<Vec<_>>()
+    .join(", ");
+    (!sources.is_empty())
+        .then(|| format!("some reads were uncommitted ({sources} in the SQL): {DIRTY_ROWS}"))
 }
 
 /// The batch sent first on every connection: the SSMS options, the agent defaults, the lock
@@ -517,6 +539,9 @@ pub(crate) struct Prepared {
     report: Report,
     /// Where and why the guard refused the input, if it did.
     blocked: Option<(String, guard::Blocked)>,
+    /// What in the user's SQL reads uncommitted, for the run's note; nothing where no such note
+    /// is said (`prepare`).
+    uncommitted_reads: guard::UncommittedReads,
     /// `Request::database`.
     database: Option<String>,
     /// `Request::exact_count`.
@@ -607,6 +632,7 @@ pub(crate) fn prepare(
             policy,
             report: request.report,
             blocked: None,
+            uncommitted_reads: guard::UncommittedReads::default(),
             database: request.database,
             exact_count: request.exact_count,
         });
@@ -627,6 +653,15 @@ pub(crate) fn prepare(
     } else {
         None
     };
+    // Apart from the guard, which `--allow-write` skips: a write based on a NOLOCK read is the
+    // case the note matters most for. `--check` reads nothing, and a run under READ UNCOMMITTED
+    // already says so of every read, so neither needs the pass over the text.
+    let mut uncommitted_reads = guard::UncommittedReads::default();
+    if user && blocked.is_none() && !policy.check && !settings.read_uncommitted {
+        for batch in &batches {
+            uncommitted_reads.add(guard::uncommitted_reads(&batch.sql));
+        }
+    }
     Ok(Prepared {
         sources,
         sections: Vec::new(),
@@ -635,6 +670,7 @@ pub(crate) fn prepare(
         policy,
         report: request.report,
         blocked,
+        uncommitted_reads,
         database: request.database,
         exact_count: request.exact_count,
     })
@@ -1043,10 +1079,12 @@ pub(crate) async fn run_opened(
     let report = prepared.report != Report::Off;
     let wrap = policy.wrap();
     let read_uncommitted = settings.read_uncommitted && !policy.check;
+    // Said once, up front, where an output cut short by --max-output still has it.
     if read_uncommitted {
-        // Said once, up front, where an output cut short by --max-output still has it.
         out.note(&read_uncommitted_note(settings.limits.advice))
             .map_err(output_failure)?;
+    } else if let Some(note) = uncommitted_in_sql_note(prepared.uncommitted_reads) {
+        out.note(&note).map_err(output_failure)?;
     }
     if report {
         let profile = settings.profile.as_deref().unwrap_or("(none)");
@@ -1506,6 +1544,53 @@ mod tests {
             "reads were uncommitted (the profile's read_uncommitted = true): rows may include \
              uncommitted, duplicated or missing data"
         );
+        let none = guard::UncommittedReads::default();
+        assert_eq!(uncommitted_in_sql_note(none), None);
+        let dirty = "rows may include uncommitted, duplicated or missing data";
+        for (reads, sources) in [
+            (
+                guard::UncommittedReads {
+                    nolock: true,
+                    ..none
+                },
+                "NOLOCK",
+            ),
+            (
+                guard::UncommittedReads {
+                    readuncommitted: true,
+                    ..none
+                },
+                "READUNCOMMITTED",
+            ),
+            (
+                guard::UncommittedReads {
+                    isolation: true,
+                    ..none
+                },
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            ),
+            (
+                guard::UncommittedReads {
+                    nolock: true,
+                    readuncommitted: true,
+                    ..none
+                },
+                "NOLOCK, READUNCOMMITTED",
+            ),
+            (
+                guard::UncommittedReads {
+                    nolock: true,
+                    readuncommitted: true,
+                    isolation: true,
+                },
+                "NOLOCK, READUNCOMMITTED, SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            ),
+        ] {
+            assert_eq!(
+                uncommitted_in_sql_note(reads).unwrap(),
+                format!("some reads were uncommitted ({sources} in the SQL): {dirty}")
+            );
+        }
         let stop = "stopped counting the rows that are not shown, but the server didn't confirm \
                     the cancel, so the connection was closed; the rows shown are complete";
         for (advice, instead) in [

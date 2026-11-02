@@ -3268,6 +3268,157 @@ fn a_profile_with_a_bad_lock_setting_is_a_usage_error() {
     }
 }
 
+/// A run of `args` against a fake server on loopback (`mcp::hanging_sql_server`) that answers every
+/// batch with nothing: what the run says of its own, exactly. The login is synthetic, so the
+/// password in SQLCMDPASSWORD is no real one.
+fn against_a_fake(test: &str, args: &[&str]) -> Run {
+    let (port, _seen) = mcp::hanging_sql_server();
+    let config = scratch(test).join("profiles.toml");
+    fs::write(
+        &config,
+        format!(
+            "[profiles.fake]\nserver = \"127.0.0.1,{port}\"\nuser = \"fake\"\n\
+             encrypt = \"optional\"\nlogin_timeout = 5\n"
+        ),
+    )
+    .unwrap();
+    run(sqlh()
+        .args(["--profile", "fake"])
+        .args(args)
+        .env("SQLH_CONFIG", &config)
+        .env("SQLCMDPASSWORD", "fake"))
+}
+
+/// `text` up to its status line, the last.
+fn before_status(text: &str) -> &str {
+    text.strip_suffix(&format!("{}\n", last_line(text)))
+        .unwrap_or_else(|| panic!("no status line in {text}"))
+}
+
+fn some_reads_uncommitted(sources: &str) -> String {
+    format!(
+        "some reads were uncommitted ({sources} in the SQL): rows may include uncommitted, \
+         duplicated or missing data"
+    )
+}
+
+// Decision 30(a), DESIGN.md §4.3: SQL that reads uncommitted gets one note, worded for what is in
+// it, with or without the classifier, and none where the SQL reads nothing or a name only looks
+// like a hint. Never a refusal.
+#[test]
+fn sql_that_reads_uncommitted_says_so_once() {
+    let set = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED";
+    let check_note = "-- note: --check compiled each batch without running it. Missing tables \
+                      are only reported when a query runs (SQL Server defers their name \
+                      resolution)\n";
+    let note = |sources: &str| format!("-- note: {}\n", some_reads_uncommitted(sources));
+    let cases: [(&[&str], &str, String); 13] = [
+        (&[], "SELECT * FROM t WITH (NOLOCK)", note("NOLOCK")),
+        (&[], "SELECT * FROM t (nolock)", note("NOLOCK")),
+        (
+            &[],
+            "SELECT * FROM t WITH (READUNCOMMITTED)",
+            note("READUNCOMMITTED"),
+        ),
+        (&[], set, note(set)),
+        // Once, however often, and across batches.
+        (
+            &[],
+            "SELECT * FROM a WITH (NOLOCK), b (NOLOCK);\nSELECT * FROM c (NOLOCK)",
+            note("NOLOCK"),
+        ),
+        (
+            &[],
+            "SELECT * FROM a WITH (READUNCOMMITTED)\nGO\nSELECT * FROM b (NOLOCK)\nGO 3\n\
+             SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            format!(
+                "{}-- batch 1 (line 1)\n-- batch 2 (line 3, run 1 of 3)\n\
+                 -- batch 3 (line 3, run 2 of 3)\n-- batch 4 (line 3, run 3 of 3)\n\
+                 -- batch 5 (line 5)\n",
+                note(&format!("NOLOCK, READUNCOMMITTED, {set}"))
+            ),
+        ),
+        // --allow-write skips the classifier, not this.
+        (
+            &["--allow-write"],
+            "UPDATE dbo.t SET a = 1 FROM dbo.u WITH (NOLOCK)",
+            note("NOLOCK"),
+        ),
+        // Names.
+        (&[], "SELECT nolock FROM t nolock", String::new()),
+        (&[], "SELECT 'WITH (NOLOCK)' -- (NOLOCK)", String::new()),
+        // Nothing is read.
+        (
+            &["--check"],
+            "SELECT * FROM t WITH (NOLOCK)",
+            check_note.into(),
+        ),
+        (
+            &["--check", "--allow-write"],
+            "UPDATE dbo.t SET a = 1 FROM dbo.u (NOLOCK)",
+            check_note.into(),
+        ),
+        (
+            &["--allow-write"],
+            "CREATE VIEW dbo.v AS SELECT * FROM dbo.t WITH (NOLOCK)",
+            String::new(),
+        ),
+        // Every read is uncommitted, which says more than "some": one note, the setting's.
+        (
+            &["--read-uncommitted"],
+            "SELECT * FROM t WITH (NOLOCK)",
+            "-- note: reads were uncommitted (--read-uncommitted): rows may include uncommitted, \
+             duplicated or missing data\n"
+                .into(),
+        ),
+    ];
+    for (flags, sql, expected) in &cases {
+        let mut args = flags.to_vec();
+        args.extend(["-Q", sql]);
+        let r = against_a_fake("uncommitted_text", &args);
+        assert_eq!(r.code, 0, "{sql}: {}{}", r.stdout, r.stderr);
+        assert_eq!(before_status(&r.stdout), expected, "{flags:?} {sql}");
+        assert_eq!(r.stderr, "", "{sql}");
+    }
+}
+
+#[test]
+fn sql_that_reads_uncommitted_says_so_in_json_and_csv() {
+    let sql = "SELECT * FROM t WITH (NOLOCK)";
+    let note = some_reads_uncommitted("NOLOCK");
+
+    let r = against_a_fake("uncommitted_json", &["--format", "json", "-Q", sql]);
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+    assert_eq!(doc["notes"], serde_json::json!([note]));
+    assert_eq!(r.stderr, "");
+
+    // No notes member at all when there is no note.
+    let r = against_a_fake(
+        "uncommitted_json",
+        &["--format", "json", "-Q", "SELECT nolock FROM t nolock"],
+    );
+    let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+    assert_eq!(doc.get("notes"), None, "{}", r.stdout);
+
+    // csv's data is stdout, so the note goes to stderr, the metadata stream.
+    let r = against_a_fake("uncommitted_csv", &["--format", "csv", "-Q", sql]);
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    assert_eq!(r.stdout, "");
+    assert_eq!(before_status(&r.stderr), format!("-- note: {note}\n"));
+}
+
+// A refusal stops the run before anything is read, so it claims no read.
+#[test]
+fn a_refused_run_claims_no_uncommitted_read() {
+    let r = against_a_fake(
+        "uncommitted_refused",
+        &["-Q", "SELECT * FROM t WITH (NOLOCK); DELETE FROM dbo.t"],
+    );
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(!r.stdout.contains("uncommitted"), "{}", r.stdout);
+}
+
 // plan-history.md 2.8: `profiles add` saves both settings, a later `add` without them keeps them,
 // `--read-uncommitted=false` and `--lock-timeout 0` are values that replace them, and
 // `profiles list` shows what a run with each profile gets (10 and 0 when nothing is saved).
@@ -4692,7 +4843,7 @@ mod mcp {
     /// with the transaction's ENVCHANGE), but a batch whose text holds `hang`, which it never
     /// answers: it says so on the channel, and then the attention that cancels it, which it
     /// acknowledges. Its tokens are those of `db::fake_server` (MS-TDS 2.2.7).
-    fn hanging_sql_server() -> (u16, std::sync::mpsc::Receiver<&'static str>) {
+    pub(super) fn hanging_sql_server() -> (u16, std::sync::mpsc::Receiver<&'static str>) {
         use std::io::Write as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -7186,6 +7337,130 @@ mod live {
         assert!(
             dirty_rows < clean_rows && (clean_rows - dirty_rows) * 51 >= note_bytes - 51,
             "{clean_rows} rows fit without the note and {dirty_rows} with it ({note_bytes} bytes)"
+        );
+    }
+
+    // Decision 30(a), on real reads: each form the note names reads past another session's open
+    // insert (the row it returns is uncommitted), which is what makes the note true. An alias
+    // named nolock looks the same and reads committed: it waits, fails, and gets no note.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn sql_that_reads_uncommitted_reads_past_a_write_and_says_so() {
+        let (p, db) = target();
+        let probe = Probe::create(&p, &db);
+        let t = &probe.name;
+        let _blocker = hold_a_write(&p, &db, t);
+        let count = format!("SELECT COUNT(*) AS n FROM {t}");
+        let set = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED";
+        let note = |sources: &str| {
+            format!(
+                "-- note: some reads were uncommitted ({sources} in the SQL): rows may include \
+                 uncommitted, duplicated or missing data\n"
+            )
+        };
+        let row = "-- result 1\nn:int\n1\n-- 1 row\n";
+        for (sql, source, flags) in [
+            (format!("{count} WITH (NOLOCK)"), "NOLOCK", &[][..]),
+            (format!("{count} (NOLOCK)"), "NOLOCK", &[]),
+            (format!("{count} ([NOLOCK])"), "NOLOCK", &[]),
+            (format!("{count} AS a (NOLOCK)"), "NOLOCK", &[]),
+            (format!("{count} a (nolock)"), "NOLOCK", &[]),
+            (
+                format!("{count} WITH (READUNCOMMITTED)"),
+                "READUNCOMMITTED",
+                &[],
+            ),
+            (format!("{count} (READUNCOMMITTED)"), "READUNCOMMITTED", &[]),
+            (format!("{set}; {count}"), set, &[]),
+            (
+                format!("SET TRAN ISOLATION LEVEL READ UNCOMMITTED; {count}"),
+                set,
+                &[],
+            ),
+            (
+                format!("{count} WITH (NOLOCK)"),
+                "NOLOCK",
+                &["--allow-write"],
+            ),
+        ] {
+            let mut args = vec!["--lock-timeout", "2"];
+            args.extend(flags);
+            args.extend(["-Q", &sql]);
+            let r = live(&p, &db, &args);
+            assert_eq!(r.code, 0, "{sql}: {}", r.stdout);
+            assert_eq!(
+                r.stdout
+                    .strip_suffix(&format!("{}\n", last_line(&r.stdout))),
+                Some(format!("{}{row}", note(source)).as_str()),
+                "{sql}"
+            );
+        }
+
+        for sql in [format!("{count} nolock"), format!("{count} AS nolock")] {
+            let r = live(&p, &db, &["--lock-timeout", "1", "-Q", &sql]);
+            assert_eq!(r.code, 1, "{sql}: {}", r.stdout);
+            assert!(r.stdout.contains("\n-- error 1222 "), "{sql}: {}", r.stdout);
+            assert!(!r.stdout.contains("uncommitted"), "{sql}: {}", r.stdout);
+        }
+
+        let sql = format!("{count} WITH (NOLOCK)");
+        let r = live(&p, &db, &["--format", "json", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("a json document");
+        assert_eq!(
+            doc["notes"],
+            serde_json::json!([note("NOLOCK").trim_start_matches("-- note: ").trim_end()])
+        );
+        assert_eq!(
+            doc["batches"][0]["events"][0]["rows"][0],
+            serde_json::json!([1])
+        );
+        let r = live(&p, &db, &["--format", "csv", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(r.stderr.starts_with(&note("NOLOCK")), "{}", r.stderr);
+        assert!(!r.stdout.contains("uncommitted"), "{}", r.stdout);
+
+        // The setting's note alone, and --check's alone.
+        let r = live(&p, &db, &["--read-uncommitted", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with(
+                "-- note: reads were uncommitted (--read-uncommitted): rows may include \
+                 uncommitted, duplicated or missing data\n-- result 1\n"
+            ),
+            "{}",
+            r.stdout
+        );
+        assert_eq!(r.stdout.matches("uncommitted (").count(), 1, "{}", r.stdout);
+        let r = live(&p, &db, &["--check", "-Q", &sql]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(!r.stdout.contains("uncommitted"), "{}", r.stdout);
+    }
+
+    // The note counts against --max-output like any note; how many rows it costs is held
+    // exactly against the fake server (`the_note_about_the_sql_counts_against_the_output_cap`).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_note_about_the_sql_stays_within_the_output_cap() {
+        let (p, db) = target();
+        let sql = "SELECT TOP 1000 REPLICATE('x', 50) AS c FROM sys.all_objects WITH (NOLOCK)";
+        let r = live(
+            &p,
+            &db,
+            &["--max-output", "4096", "--max-rows", "0", "-Q", sql],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(response_bytes(&r) <= 4096, "{} bytes", response_bytes(&r));
+        assert!(
+            r.stdout
+                .starts_with("-- note: some reads were uncommitted (NOLOCK in the SQL): "),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("rows shown (--max-output)"),
+            "{}",
+            r.stdout
         );
     }
 
@@ -10966,6 +11241,51 @@ mod live {
         // batch), exit 1. Every write is refused before anything runs, exit 5, worded for MCP
         // (`sqlh mcp is read-only`, never --allow-write), in text and in JSON, and the test's
         // own table in the scratch database (the call's `database`) holds what it held before.
+        // Decision 30(a) through `query`: a NOLOCK read past another session's open insert says
+        // so, in the CLI's words since no setting is named; `check` claims no read. A call's own
+        // SET is undone by the next call's setup, so that call says nothing, on the same
+        // connection (the pool here holds one).
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn mcp_query_says_when_the_sql_reads_uncommitted() {
+            let (p, db) = target();
+            let probe = Probe::create(&p, &db);
+            let _blocker = hold_a_write(&p, &db, &probe.name);
+            let table = format!("[{db}].{}", probe.name);
+            let mut mcp = Mcp::on(&p);
+            let hint = format!("SELECT COUNT(*) AS n FROM {table} WITH (NOLOCK)");
+            let (error, text) = tool_text(&mcp.call(1, "query", json!({"sql": hint})));
+            assert!(!error, "{text}");
+            assert_eq!(
+                split_status(&text).0,
+                "-- note: some reads were uncommitted (NOLOCK in the SQL): rows may include \
+                 uncommitted, duplicated or missing data\n\
+                 -- result 1\nn:int\n1\n-- 1 row\n"
+            );
+
+            let (error, text) = tool_text(&mcp.call(2, "check", json!({"sql": hint})));
+            assert!(!error, "{text}");
+            assert!(!text.contains("uncommitted"), "{text}");
+
+            let level = "SELECT transaction_isolation_level AS level FROM sys.dm_exec_sessions \
+                         WHERE session_id = @@SPID";
+            let set = format!("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; {level}");
+            let (error, text) = tool_text(&mcp.call(3, "query", json!({"sql": set})));
+            assert!(!error, "{text}");
+            assert_eq!(
+                split_status(&text).0,
+                "-- note: some reads were uncommitted (SET TRANSACTION ISOLATION LEVEL READ \
+                 UNCOMMITTED in the SQL): rows may include uncommitted, duplicated or missing \
+                 data\n-- result 1\nlevel:smallint\n1\n-- 1 row\n"
+            );
+            let (error, text) = tool_text(&mcp.call(4, "query", json!({"sql": level})));
+            assert!(!error, "{text}");
+            assert_eq!(
+                split_status(&text).0,
+                "-- result 1\nlevel:smallint\n2\n-- 1 row\n"
+            );
+        }
+
         #[test]
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn mcp_query_answers_rows_and_errors_and_writes_nothing() {

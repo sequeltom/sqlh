@@ -228,6 +228,7 @@ Short names are used, because clients prefix them with the server name (Claude C
 | Result sets past the limit (`Advice::max_results`) | `N more result sets not shown (--max-results 20)` | `N more result sets not shown (at most 20 per call)`: no call or launch flag sets it |
 | The output budget's note | `output stopped at the --max-output limit of N bytes; the run continued...` | `output stopped at the server's --max-output limit of N bytes; the run continued...` (until `05032c0` it read `at the the server's`) |
 | The dirty-read note | `reads were uncommitted (--read-uncommitted): rows may include uncommitted, duplicated or missing data` | `reads were uncommitted (the profile's read_uncommitted = true): ...` |
+| The note for dirty reads in the SQL (DESIGN.md §4.3) | `some reads were uncommitted (NOLOCK in the SQL): rows may include uncommitted, duplicated or missing data` | the same: it names no setting |
 | `check`'s closing note | `--check compiled each batch without running it. Missing tables are only reported when a query runs (SQL Server defers their name resolution)` | `check compiled each batch without running it. ...` |
 
 **A failed connect's hint** (`db::Hints::Profile`, set for every listed profile at launch with the advice). sqlh mcp connects only through profiles, so its hints name the profile's keys, which the server's owner changes (with `sqlh profiles add`, or in the profiles file), never a connection flag:

@@ -632,6 +632,285 @@ pub fn several_outputs(sql: &str) -> bool {
     false
 }
 
+/// What in a batch's text asks to read uncommitted data (`uncommitted_reads`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UncommittedReads {
+    /// A table hint `NOLOCK`.
+    pub nolock: bool,
+    /// A table hint `READUNCOMMITTED`.
+    pub readuncommitted: bool,
+    /// `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED`.
+    pub isolation: bool,
+}
+
+impl UncommittedReads {
+    pub fn add(&mut self, other: UncommittedReads) {
+        self.nolock |= other.nolock;
+        self.readuncommitted |= other.readuncommitted;
+        self.isolation |= other.isolation;
+    }
+
+    /// Records the hint `name` spells, if it does.
+    fn hint(&mut self, name: &str) {
+        if name.eq_ignore_ascii_case("NOLOCK") {
+            self.nolock = true;
+        } else if name.eq_ignore_ascii_case("READUNCOMMITTED") {
+            self.readuncommitted = true;
+        }
+    }
+}
+
+/// The table hints, for what may follow `NOLOCK` in a `WITH (...)` written with spaces
+/// (`WITH (NOLOCK INDEX(1))`, deprecated but accepted). A column of `OPENJSON(...) WITH (nolock
+/// int)` is followed by its type instead.
+const TABLE_HINTS: &[&str] = &[
+    "FORCESCAN",
+    "FORCESEEK",
+    "HOLDLOCK",
+    "IGNORE_CONSTRAINTS",
+    "IGNORE_TRIGGERS",
+    "INDEX",
+    "KEEPDEFAULTS",
+    "KEEPIDENTITY",
+    "NOEXPAND",
+    "NOLOCK",
+    "NOWAIT",
+    "PAGLOCK",
+    "READCOMMITTED",
+    "READCOMMITTEDLOCK",
+    "READPAST",
+    "READUNCOMMITTED",
+    "REPEATABLEREAD",
+    "ROWLOCK",
+    "SERIALIZABLE",
+    "SNAPSHOT",
+    "SPATIAL_WINDOW_MAX_CELLS",
+    "TABLOCK",
+    "TABLOCKX",
+    "UPDLOCK",
+    "XLOCK",
+];
+
+/// Reserved words that can follow a table's name, so none of them is its alias. `FROM t WHERE
+/// (nolock) = 1` has no hint, nor has any statement that follows the table (`STATEMENT_START`).
+const NOT_AN_ALIAS: &[&str] = &[
+    "AND",
+    "BY",
+    "CASE",
+    "CROSS",
+    "EXCEPT",
+    "FOR",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "IN",
+    "INDEX",
+    "INNER",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "LEFT",
+    "LIKE",
+    "NOT",
+    "ON",
+    "OPTION",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OUTPUT",
+    "OVER",
+    "PIVOT",
+    "RIGHT",
+    "TABLESAMPLE",
+    "UNION",
+    "UNPIVOT",
+    "VALUES",
+    "WHERE",
+];
+
+fn is_reserved(name: &str) -> bool {
+    in_list(STATEMENT_START, name) || in_list(NOT_AN_ALIAS, name)
+}
+
+/// Where the scan of `uncommitted_reads` stands in naming a table. Only a table's name or alias
+/// can take a hint without `WITH`, and `name (x)` means something else everywhere else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableSource {
+    Off,
+    /// Past `FROM`, `JOIN`, `USING`, or a comma between tables: a table's name comes next.
+    Expected,
+    Name,
+    Dot,
+    As,
+    Alias,
+    /// Past what can take a bare hint (a parenthesis, a `WITH`, a table variable): an alias may
+    /// still come, and a comma still leads to the next table.
+    Past,
+}
+
+impl TableSource {
+    /// The state after `token` at the parenthesis depth of the table list, which isn't a
+    /// parenthesis or a word that starts a list.
+    fn after(self, token: Token<'_>) -> TableSource {
+        use TableSource::*;
+        match (self, token.kind) {
+            (Off, _) => Off,
+            (Dot, Kind::Word | Kind::Quoted) => Name,
+            (Expected, Kind::Word) if is_reserved(token.name) => Off,
+            (Expected, Kind::Word | Kind::Quoted | Kind::Temp) => Name,
+            // `FROM @t (NOLOCK)` is a syntax error (1018), so it never reads.
+            (Expected, Kind::Var) => Past,
+            (Name, Kind::Word) if token.is_word("AS") => As,
+            (Name, Kind::Word) if is_reserved(token.name) => Off,
+            (Name | As, Kind::Word | Kind::Quoted) => Alias,
+            (Past, Kind::Word) if !token.is_word("AS") && is_reserved(token.name) => Off,
+            (Past, Kind::Word | Kind::Quoted) => Past,
+            (Name | Dot, Kind::Punct('.')) => Dot,
+            (Name | Alias | Past, Kind::Punct(',')) => Expected,
+            _ => Off,
+        }
+    }
+}
+
+/// Whether a batch is the definition of a module: `CREATE [OR ALTER]` or `ALTER` of one. Such a
+/// statement must start its batch, and it stores its text without running it.
+fn defines_a_module(start: &Lexer<'_>) -> bool {
+    let modules = ["FUNCTION", "PROC", "PROCEDURE", "TRIGGER", "VIEW"];
+    let is_module = |n| start.word(n).is_some_and(|w| in_list(&modules, w));
+    if start.word_is(0, "ALTER") {
+        is_module(1)
+    } else if start.word_is(0, "CREATE") {
+        is_module(1) || (start.word_is(1, "OR") && start.word_is(2, "ALTER") && is_module(3))
+    } else {
+        false
+    }
+}
+
+/// What in `sql` asks to read uncommitted data, for the run's note (decision 30(a), DESIGN.md
+/// §4.3). Not a guard check: nothing is refused, and it runs with writes allowed too, where the
+/// classifier doesn't.
+///
+/// A false note says rows may be dirty that aren't, so a word counts only where the server takes
+/// it as a hint, as checked on SQL Server 2016 and 2025:
+/// - `WITH (...)`, a word of that list at its own depth. `INDEX = nolock` names an index, and an
+///   `OPENJSON` column is followed by its type.
+/// - `t (NOLOCK)` or `t a (NOLOCK)` with nothing else in the parentheses, the only form the
+///   server takes without `WITH`, after `FROM`, `JOIN`, `USING` or a comma that follows such a
+///   table. `t nolock` is an alias, and reads committed. After `APPLY`, `f(nolock)` is more often
+///   a function given a column, so that form isn't looked for there.
+/// - `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` (or `TRAN`).
+///
+/// The text is all it has: `FROM f(nolock)` with a column of an outer query as the argument
+/// counts, a table list that goes on past a derived table or an `ON` doesn't, and neither does
+/// dynamic SQL or a module's own hints. One pass over the text, with lookahead of a few tokens
+/// and only on rare tokens, like `several_outputs`, so it needs no budget.
+pub fn uncommitted_reads(sql: &str) -> UncommittedReads {
+    let mut found = UncommittedReads::default();
+    let mut lex = Lexer::new(sql);
+    if defines_a_module(&lex) {
+        return found;
+    }
+    let mut depth = 0usize;
+    let mut source = TableSource::Off;
+    let mut source_depth = 0usize;
+    // The depth inside the `WITH (` being read.
+    let mut hints: Option<usize> = None;
+    let mut after_with = false;
+    let mut after_equals = false;
+    while let Some(token) = lex.next() {
+        let with = std::mem::take(&mut after_with);
+        let equals = std::mem::replace(&mut after_equals, token.kind == Kind::Punct('='));
+        let in_table_list = depth == source_depth;
+        match token.kind {
+            Kind::Punct('(') => {
+                depth += 1;
+                if with && hints.is_none() {
+                    hints = Some(depth);
+                }
+                if !in_table_list {
+                    continue;
+                }
+                match source {
+                    TableSource::Expected => source_depth = depth,
+                    TableSource::Name | TableSource::Alias => {
+                        if let Some(hint) = lex.ahead(0)
+                            && matches!(hint.kind, Kind::Word | Kind::Quoted)
+                            && lex.kind(1) == Some(Kind::Punct(')'))
+                        {
+                            found.hint(hint.name);
+                        }
+                        source = TableSource::Past;
+                    }
+                    TableSource::Past if with => {}
+                    _ => source = TableSource::Off,
+                }
+            }
+            Kind::Punct(')') => {
+                if hints == Some(depth) {
+                    hints = None;
+                }
+                if in_table_list {
+                    source = TableSource::Off;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Kind::Word => {
+                let mut buf = [0; KEYWORD_MAX];
+                match keyword(token.name, &mut buf) {
+                    "FROM" | "JOIN" | "USING" => {
+                        source = TableSource::Expected;
+                        source_depth = depth;
+                        continue;
+                    }
+                    "WITH" => {
+                        after_with = true;
+                        if in_table_list {
+                            source = match source {
+                                TableSource::Name | TableSource::Alias | TableSource::Past => {
+                                    TableSource::Past
+                                }
+                                _ => TableSource::Off,
+                            };
+                        }
+                        continue;
+                    }
+                    "NOLOCK" | "READUNCOMMITTED"
+                        if hints == Some(depth)
+                            && !equals
+                            && lex.ahead(0).is_some_and(|next| {
+                                matches!(next.kind, Kind::Punct(',' | ')'))
+                                    || (next.kind == Kind::Word && in_list(TABLE_HINTS, next.name))
+                            }) =>
+                    {
+                        found.hint(token.name);
+                    }
+                    "SET"
+                        if lex
+                            .word(0)
+                            .is_some_and(|w| in_list(&["TRAN", "TRANSACTION"], w))
+                            && lex.word_is(1, "ISOLATION")
+                            && lex.word_is(2, "LEVEL")
+                            && lex.word_is(3, "READ")
+                            && lex.word_is(4, "UNCOMMITTED") =>
+                    {
+                        found.isolation = true;
+                    }
+                    _ => {}
+                }
+                if in_table_list {
+                    source = source.after(token);
+                }
+            }
+            _ => {
+                if in_table_list {
+                    source = source.after(token);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// The classifier reads the batch as a stream of tokens and keeps none of them: where it
 /// needs to look ahead it reads on from a copy of its position (a `Lexer`). What it holds
 /// therefore doesn't depend on how many tokens the input has (plan-history.md 2.14); only a
@@ -1951,6 +2230,245 @@ mod tests {
             "",
         ] {
             assert!(!several_outputs(sql), "{sql}");
+        }
+    }
+
+    // Decision 30(a). The forms were each run on SQL Server 2016 and 2025: what they accept as a
+    // hint counts, and what they read as a name doesn't.
+    #[test]
+    fn uncommitted_reads_finds_what_the_server_takes_as_a_hint() {
+        const NONE: UncommittedReads = UncommittedReads {
+            nolock: false,
+            readuncommitted: false,
+            isolation: false,
+        };
+        const NOLOCK: UncommittedReads = UncommittedReads {
+            nolock: true,
+            ..NONE
+        };
+        const HINT: UncommittedReads = UncommittedReads {
+            readuncommitted: true,
+            ..NONE
+        };
+        const SET: UncommittedReads = UncommittedReads {
+            isolation: true,
+            ..NONE
+        };
+        for (sql, expected) in [
+            // WITH, in any case and any place in its list.
+            ("SELECT * FROM t WITH (NOLOCK)", NOLOCK),
+            ("select * from t with(nolock)", NOLOCK),
+            ("SELECT * FROM t WITH (READUNCOMMITTED)", HINT),
+            ("SELECT * FROM dbo.t AS a WITH (INDEX(1), NOLOCK)", NOLOCK),
+            ("SELECT * FROM t WITH (NOLOCK, INDEX(1))", NOLOCK),
+            ("SELECT * FROM t WITH (NOLOCK INDEX(1))", NOLOCK),
+            ("SELECT * FROM t WITH (INDEX(1) NOLOCK)", NOLOCK),
+            ("SELECT * FROM t WITH /* c */ ( -- d\n NOLOCK )", NOLOCK),
+            ("SELECT * FROM a JOIN b WITH (NOLOCK) ON 1 = 1", NOLOCK),
+            ("SELECT * FROM t CROSS APPLY u WITH (NOLOCK)", NOLOCK),
+            ("IF EXISTS (SELECT 1 FROM t WITH (NOLOCK)) SELECT 1", NOLOCK),
+            ("DECLARE c CURSOR FOR SELECT a FROM t WITH (NOLOCK)", NOLOCK),
+            ("UPDATE #t SET a = 1 FROM u WITH (NOLOCK)", NOLOCK),
+            ("MERGE #t USING s WITH (NOLOCK) ON 1 = 0", NOLOCK),
+            // Without WITH: alone in its parentheses, on a table or its alias.
+            ("SELECT * FROM t (NOLOCK)", NOLOCK),
+            ("SELECT * FROM t(nolock)", NOLOCK),
+            ("SELECT * FROM t (READUNCOMMITTED)", HINT),
+            ("SELECT * FROM dbo.t (NOLOCK)", NOLOCK),
+            ("SELECT * FROM master..t (NOLOCK)", NOLOCK),
+            ("SELECT * FROM [dbo].[t] [a] (NOLOCK)", NOLOCK),
+            ("SELECT * FROM #t (NOLOCK)", NOLOCK),
+            ("SELECT * FROM t a (NOLOCK)", NOLOCK),
+            ("SELECT * FROM t AS a (NOLOCK)", NOLOCK),
+            ("SELECT * FROM t ([NOLOCK])", NOLOCK),
+            ("SELECT * FROM t (\"NOLOCK\")", NOLOCK),
+            ("SELECT * FROM nolock (NOLOCK)", NOLOCK),
+            ("SELECT * FROM t nolock (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a JOIN b (NOLOCK) ON 1 = 1", NOLOCK),
+            (
+                "SELECT * FROM a LEFT HASH JOIN b c (NOLOCK) ON 1 = 1",
+                NOLOCK,
+            ),
+            ("SELECT * FROM (a (NOLOCK) JOIN b ON 1 = 1)", NOLOCK),
+            ("SELECT * FROM (SELECT * FROM t (NOLOCK)) AS d", NOLOCK),
+            ("MERGE #t USING s (NOLOCK) ON 1 = 0", NOLOCK),
+            ("MERGE #t USING s a (NOLOCK) ON 1 = 0", NOLOCK),
+            // A comma goes on to the next table, past an alias or another's hint.
+            ("SELECT * FROM a, b (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a x, b y (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a (ROWLOCK), b (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a (ROWLOCK) x, b (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a (ROWLOCK) AS x, b (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a WITH (ROWLOCK), b (NOLOCK)", NOLOCK),
+            ("SELECT * FROM a x WITH (ROWLOCK), b (NOLOCK)", NOLOCK),
+            (
+                "DECLARE @a TABLE (i int); SELECT * FROM @a, b (NOLOCK)",
+                NOLOCK,
+            ),
+            // The level, however it is spaced.
+            ("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", SET),
+            ("set tran isolation level read uncommitted; select 1", SET),
+            (
+                "SET TRANSACTION /* a */ ISOLATION LEVEL READ -- b\n UNCOMMITTED",
+                SET,
+            ),
+            // All of them, however many times.
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; \
+                 SELECT * FROM a WITH (NOLOCK), b (NOLOCK), c WITH (READUNCOMMITTED)",
+                UncommittedReads {
+                    nolock: true,
+                    readuncommitted: true,
+                    isolation: true,
+                },
+            ),
+            // A name, a string or a comment.
+            ("SELECT nolock FROM t", NONE),
+            ("SELECT 1 AS nolock", NONE),
+            ("SELECT 1 AS readuncommitted", NONE),
+            ("SELECT t.nolock FROM t ORDER BY nolock", NONE),
+            ("SELECT [NOLOCK] FROM t", NONE),
+            ("SELECT 'WITH (NOLOCK)', N'(NOLOCK)' FROM t", NONE),
+            ("SELECT 1 -- FROM t WITH (NOLOCK)\nFROM t", NONE),
+            ("SELECT 1 /* FROM t (NOLOCK) */ FROM t", NONE),
+            (
+                "SELECT 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED'",
+                NONE,
+            ),
+            // An alias, which leaves the read committed.
+            ("SELECT * FROM t nolock", NONE),
+            ("SELECT * FROM t AS nolock", NONE),
+            ("SELECT * FROM nolock", NONE),
+            ("SELECT * FROM t nolock WHERE 1 = 1", NONE),
+            (
+                "SELECT * FROM a nolock JOIN b readuncommitted ON 1 = 1",
+                NONE,
+            ),
+            ("SELECT * FROM a nolock, b readuncommitted", NONE),
+            // A column in parentheses, where no table is being named.
+            ("SELECT (nolock) FROM t", NONE),
+            ("SELECT ISNULL(nolock, 0) FROM t", NONE),
+            ("SELECT COUNT(nolock), f (nolock) FROM t", NONE),
+            ("SELECT * FROM t WHERE (nolock) = 1", NONE),
+            ("SELECT * FROM t x WHERE (nolock) = 1", NONE),
+            ("SELECT * FROM t WHERE a IN (nolock)", NONE),
+            ("SELECT * FROM t GROUP BY (nolock)", NONE),
+            ("SELECT * FROM t ORDER BY a, (nolock)", NONE),
+            ("SELECT * FROM t x ORDER BY a, f (nolock)", NONE),
+            ("SELECT * FROM a JOIN b ON (nolock) = 1", NONE),
+            ("SELECT a FROM t UNION (SELECT nolock FROM u)", NONE),
+            ("SELECT * FROM t SELECT (nolock)", NONE),
+            ("SELECT * FROM t IF (nolock) = 1 PRINT 1", NONE),
+            ("SELECT * FROM t WHILE (nolock) = 1 PRINT 1", NONE),
+            ("SELECT * FROM t OPTION (nolock)", NONE),
+            ("SELECT * FROM t PIVOT (MAX(a) FOR b IN (nolock)) p", NONE),
+            ("SELECT * FROM t TABLESAMPLE (nolock)", NONE),
+            // A column list.
+            ("CREATE TABLE #t (nolock int)", NONE),
+            ("INSERT #t (nolock) SELECT 1", NONE),
+            ("INSERT INTO #t (nolock) VALUES (1)", NONE),
+            ("CREATE INDEX i ON #t (nolock)", NONE),
+            ("WITH c (nolock) AS (SELECT 1) SELECT nolock FROM c", NONE),
+            ("SELECT * FROM (VALUES (1)) v(nolock)", NONE),
+            ("SELECT * FROM (VALUES (1)) AS v (nolock)", NONE),
+            ("SELECT * FROM (SELECT 1 AS a) d (nolock)", NONE),
+            ("SELECT * FROM (SELECT 1 AS a) AS d (nolock)", NONE),
+            ("SELECT * FROM f(1) a (nolock)", NONE),
+            ("SELECT * FROM f(1) AS a (nolock)", NONE),
+            // A function's arguments: the server takes no list without WITH, and after APPLY the
+            // left side's column is the usual reading.
+            ("SELECT * FROM f(1, nolock)", NONE),
+            ("SELECT * FROM f(a, nolock)", NONE),
+            ("SELECT * FROM f(nolock, 1)", NONE),
+            ("SELECT * FROM t (ROWLOCK, NOLOCK)", NONE),
+            ("SELECT * FROM t CROSS APPLY f(nolock)", NONE),
+            ("SELECT * FROM t OUTER APPLY dbo.f(nolock) x", NONE),
+            // What else WITH ( opens.
+            ("SELECT * FROM t WITH (INDEX = nolock)", NONE),
+            ("SELECT * FROM t WITH (INDEX(nolock))", NONE),
+            ("SELECT * FROM t WITH (INDEX = (nolock))", NONE),
+            ("SELECT * FROM t WITH (FORCESEEK(nolock(a)))", NONE),
+            ("SELECT * FROM OPENJSON(@j) WITH (nolock int)", NONE),
+            (
+                "SELECT * FROM OPENJSON(@j) WITH (a int, nolock int '$.x')",
+                NONE,
+            ),
+            (
+                "SELECT * FROM OPENJSON(@j) WITH (nolock nvarchar(9), b int)",
+                NONE,
+            ),
+            ("CREATE INDEX i ON #t (a) WITH (nolock = ON)", NONE),
+            ("WITH XMLNAMESPACES ('u' AS nolock) SELECT 1", NONE),
+            ("EXEC sp_help WITH RESULT SETS ((nolock int))", NONE),
+            // A statement that only stores its text.
+            ("CREATE VIEW v AS SELECT * FROM t WITH (NOLOCK)", NONE),
+            ("create or alter view v as select * from t (nolock)", NONE),
+            (
+                "/* c */ CREATE PROC p AS SELECT * FROM t WITH (NOLOCK)",
+                NONE,
+            ),
+            (
+                "CREATE PROCEDURE p AS SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+                NONE,
+            ),
+            (
+                "ALTER FUNCTION f() RETURNS int AS BEGIN RETURN (SELECT 1 FROM t (NOLOCK)) END",
+                NONE,
+            ),
+            (
+                "ALTER TRIGGER r ON t AFTER UPDATE AS SELECT 1 FROM u WITH (NOLOCK)",
+                NONE,
+            ),
+            // Other levels and other SETs.
+            ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", NONE),
+            ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", NONE),
+            ("SET LOCK_TIMEOUT 0", NONE),
+            ("UPDATE #t SET uncommitted = 1", NONE),
+            // Unfinished input, which the server refuses.
+            ("SELECT * FROM t WITH (NOLOCK", NONE),
+            ("SELECT * FROM t (NOLOCK", NONE),
+            ("SELECT * FROM", NONE),
+            ("", NONE),
+            // Dynamic SQL is text the scan doesn't read.
+            ("EXEC ('SELECT * FROM t WITH (NOLOCK)')", NONE),
+        ] {
+            assert_eq!(uncommitted_reads(sql), expected, "{sql}");
+        }
+    }
+
+    // The limits DESIGN.md §4.3 states, held so that a change to them is a change to the contract.
+    #[test]
+    fn uncommitted_reads_goes_only_as_far_as_the_text_shows() {
+        // The server reads these as a table function given an outer column: the text can't tell.
+        assert!(uncommitted_reads("SELECT (SELECT 1 FROM f(nolock)) FROM t").nolock);
+        // The table list isn't followed past a derived table or an ON: these are missed.
+        assert!(!uncommitted_reads("SELECT * FROM (SELECT 1 AS x) a, b (NOLOCK)").nolock);
+        assert!(!uncommitted_reads("SELECT * FROM a JOIN b ON 1 = 1, c (NOLOCK)").nolock);
+        // A bare hint after APPLY is missed, for the sake of a function given a column.
+        assert!(!uncommitted_reads("SELECT * FROM a CROSS APPLY b (NOLOCK)").nolock);
+    }
+
+    // The scan has no budget, so the shapes that make it look ahead must stay linear; a quadratic
+    // read of these would take hours.
+    #[test]
+    fn uncommitted_reads_stays_linear_on_the_shapes_that_look_ahead() {
+        for piece in [
+            "WITH (NOLOCK ",
+            "FROM t (",
+            "FROM t (NOLOCK ",
+            "SET TRANSACTION ISOLATION LEVEL READ ",
+            "(",
+            ")",
+            ", ",
+        ] {
+            let sql = piece.repeat(200_000);
+            let started = std::time::Instant::now();
+            uncommitted_reads(&sql);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "{piece}: {:?}",
+                started.elapsed()
+            );
         }
     }
 

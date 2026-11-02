@@ -2003,6 +2003,162 @@ mod tests {
         );
     }
 
+    const SOME_DIRTY: &str = "-- note: some reads were uncommitted (NOLOCK in the SQL): rows may \
+                              include uncommitted, duplicated or missing data\n";
+
+    // Decision 30(a): a call whose SQL reads uncommitted says so once, ahead of its results,
+    // however many hints it has and across its batches; a call that doesn't, doesn't. The fake
+    // answers a batch that starts with SELECT with a row.
+    #[test]
+    fn in_mcp_a_call_says_when_its_sql_reads_uncommitted() {
+        let ok = "-- ok: 1 batch, N ms; ?/master, connect N ms\n";
+        let row = "-- result 1\nx:int\n1\n-- 1 row\n";
+        for (sql, expected) in [
+            (
+                "SELECT * FROM t WITH (NOLOCK)",
+                format!("{SOME_DIRTY}{row}{ok}"),
+            ),
+            (
+                "SELECT * FROM a WITH (NOLOCK), b (nolock) JOIN c (NOLOCK) ON 1 = 1",
+                format!("{SOME_DIRTY}{row}{ok}"),
+            ),
+            (
+                "SELECT * FROM t WITH (READUNCOMMITTED)",
+                format!(
+                    "-- note: some reads were uncommitted (READUNCOMMITTED in the SQL): rows may \
+                     include uncommitted, duplicated or missing data\n{row}{ok}"
+                ),
+            ),
+            ("SELECT nolock FROM t nolock", format!("{row}{ok}")),
+        ] {
+            let (exit, text) = mcp_text(Vec::new(), 30, request(sql), QueryOrigin::User, 30);
+            assert_eq!(exit, Exit::Ok, "{sql}: {text}");
+            assert_eq!(text, expected, "{sql}");
+        }
+
+        // Named from every batch, said once, ahead of the first.
+        let (exit, text) = mcp_text(
+            Vec::new(),
+            30,
+            request(
+                "SELECT 1\nGO\nSET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED\nGO 2\n\
+                 SELECT * FROM t (NOLOCK)",
+            ),
+            QueryOrigin::User,
+            30,
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert!(
+            text.starts_with(
+                "-- note: some reads were uncommitted (NOLOCK, SET TRANSACTION ISOLATION LEVEL \
+                 READ UNCOMMITTED in the SQL): rows may include uncommitted, duplicated or \
+                 missing data\n-- batch 1 (line 1)\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("uncommitted (").count(), 1, "{text}");
+    }
+
+    // `check` reads nothing, so it claims no read.
+    #[test]
+    fn in_mcp_check_claims_no_uncommitted_read() {
+        let check = Request {
+            check: true,
+            ..request("SELECT * FROM t WITH (NOLOCK)")
+        };
+        let (exit, text) = mcp_text(Vec::new(), 30, check, QueryOrigin::User, 30);
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            "-- note: check compiled each batch without running it. Missing tables are only \
+             reported when a query runs (SQL Server defers their name resolution)\n\
+             -- ok: 1 batch, N ms; ?/master, connect N ms\n"
+        );
+    }
+
+    // Every read of a session under the profile's READ UNCOMMITTED is uncommitted, which says more
+    // than "some": one note, the profile's.
+    #[test]
+    fn in_mcp_the_profiles_dirty_read_note_is_the_only_one() {
+        let fake = serve_pool(Vec::new());
+        let profile = Settings {
+            read_uncommitted: true,
+            ..mcp_settings(&fake, 30)
+        };
+        let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+        let called = block_on(call(
+            &engine,
+            "SELECT * FROM t WITH (NOLOCK)",
+            30,
+            &Cancel::new(),
+        ));
+        assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+        assert_eq!(
+            untimed(&called.text),
+            "-- note: reads were uncommitted (the profile's read_uncommitted = true): rows may \
+             include uncommitted, duplicated or missing data\n\
+             -- result 1\nx:int\n1\n-- 1 row\n\
+             -- ok: 1 batch, N ms; ?/master, connect N ms\n"
+        );
+    }
+
+    // sqlh's own SQL is not the caller's, whatever it says.
+    #[test]
+    fn sqlhs_own_sql_gets_no_note_about_the_sql() {
+        let (exit, text) = mcp_text(
+            Vec::new(),
+            30,
+            Request {
+                input: Input::Command {
+                    name: "fake",
+                    plan: run::Plan::Steps(vec![run::Step {
+                        sql: "SELECT * FROM t WITH (NOLOCK)".into(),
+                        sections: Vec::new(),
+                    }]),
+                },
+                ..request("")
+            },
+            QueryOrigin::Generated,
+            30,
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert!(!text.contains("uncommitted"), "{text}");
+    }
+
+    // The note spends the output budget as any note does: at a cap that holds this call's row
+    // and footer, and no more, the note leaves no room for the row.
+    #[test]
+    fn the_note_about_the_sql_counts_against_the_output_cap() {
+        let run_at = |max_output: u64, sql: &str| {
+            let fake = serve_pool(Vec::new());
+            let mut profile = mcp_settings(&fake, 30);
+            profile.limits.max_output = max_output;
+            let engine = Engine::new(vec![("fake".into(), profile)], DEFAULT_POOL, None);
+            let called = block_on(call(&engine, sql, 30, &Cancel::new()));
+            assert_eq!(called.exit, Exit::Ok, "{}", called.text);
+            untimed(&called.text)
+        };
+        let dirty = "SELECT * FROM t WITH (NOLOCK)";
+        let clean = "SELECT * FROM t";
+        // The smallest cap that shows the row without the note, by bisection (a call each), with
+        // room for the digits of the status line's times to differ from call to call.
+        let caps: Vec<u64> = (1..4096).collect();
+        let shows = |cap: u64| run_at(cap, clean).contains("\n1\n-- 1 row\n");
+        let fits = caps[caps.partition_point(|&cap| !shows(cap))] + 16;
+        let shown = run_at(fits, clean);
+        assert!(
+            shown.starts_with("-- result 1\nx:int\n1\n-- 1 row\n"),
+            "{shown}"
+        );
+        let cut = run_at(fits, dirty);
+        assert!(!cut.contains("\n1\n"), "{cut}");
+        // With room for the note as well, the row is back, under the note.
+        assert_eq!(
+            run_at(fits + SOME_DIRTY.len() as u64, dirty),
+            format!("{SOME_DIRTY}{shown}")
+        );
+    }
+
     // A count of hidden rows that sqlh stopped (`max_rows 1`, then two hidden rows and the
     // count's 250 ms) and the server never confirmed (exit 6, after the driver's 5 s): the way
     // to read every row is the call's exact_count. The result it was cut in gets no footer,
