@@ -334,15 +334,14 @@ fn spells(name: &str, keyword: &str) -> bool {
     name.len() <= NAME_MAX_BYTES && reads_as(name, keyword, word_letters)
 }
 
-/// Whether `name` could resolve to the object `object` (upper case), under some collation. Resolving
-/// follows the database's collation, and one server's databases can each have their own: 893
-/// one-character spellings of `PHYSICAL_STATS` and `SYS` resolve under `Latin1_General_100_CI_AI`,
-/// 118 under `SQL_Latin1_General_CP1_CI_AS` (DESIGN.md §7). So there is no table of what folds to
-/// what: a byte beyond ASCII stands for any number of the object's letters, none included. So does
-/// a control character, which a quoted name can hold and the sweep didn't try: unmeasured, and free
-/// to refuse. Other ASCII must spell the letters in order, in any case, so an ordinary name is
-/// compared as it always was. Only decision 30(d)'s refusal goes by this, and its call's shape is
-/// what keeps a real read out of it.
+/// Whether `name` could resolve to the object `object` (upper case). Resolving follows the database's
+/// collation, and one server's databases can each have their own: 893 one-character spellings of
+/// `PHYSICAL_STATS` and `SYS` resolve under `Latin1_General_100_CI_AI`, 118 under
+/// `SQL_Latin1_General_CP1_CI_AS` (DESIGN.md §7). So there is no table of what folds to what: a byte
+/// beyond ASCII stands for any number of the object's letters, none included. ASCII must spell the
+/// letters in order, in any case, so an ordinary name is compared as it always was; collations that
+/// fold ASCII itself (DESIGN.md §7) aren't covered. Only decision 30(d)'s refusal goes by this, and
+/// its call's shape is what keeps a real read out of it.
 ///
 /// Each run of ASCII is found once, its place only ever moving on, so a name costs its own length
 /// and at most the square of the object's, however the two are mixed.
@@ -350,7 +349,7 @@ fn names(name: &str, object: &str) -> bool {
     if name.len() > NAME_MAX_BYTES {
         return false;
     }
-    let stands_in = |byte: &u8| !byte.is_ascii() || byte.is_ascii_control();
+    let stands_in = |byte: &u8| !byte.is_ascii();
     let name = name.as_bytes();
     // Every word of a batch comes here, and almost all stop at this.
     if let (Some(first), Some(letter)) = (name.first(), object.as_bytes().first())
@@ -6948,9 +6947,6 @@ mod tests {
             ("s\u{FD}S  ", "SYS"),
             ("sys \u{200D}", "SYS"),
             ("sys \u{200D} ", "SYS"),
-            // A quoted name can hold a control character. Not measured.
-            ("sy\u{1}s", "SYS"),
-            ("sys\u{7F}", "SYS"),
             (NAME, PHYSICAL_STATS),
         ] {
             assert!(names(name, object), "{name:?} as {object}");
@@ -6969,6 +6965,11 @@ mod tests {
             ("Sales", "SYS"),
             ("Sales\u{E9}", "SYS"),
             ("Syst\u{E8}me", "SYS"),
+            // Measured: a control character resolves in neither collation's database.
+            ("sy\u{1}s", "SYS"),
+            ("sys\u{7F}", "SYS"),
+            // The first letters are the first letters.
+            ("db_index_physical_stats", PHYSICAL_STATS),
             // A letter out of its order.
             ("\u{E9}ss\u{E9}", PHYSICAL_STATS),
             ("stats_\u{E9}dm", PHYSICAL_STATS),
@@ -6994,7 +6995,7 @@ mod tests {
             for c in name.chars() {
                 let mut next = vec![false; letters.len() + 1];
                 for i in (0..states.len()).filter(|&i| states[i]) {
-                    if !c.is_ascii() || c.is_ascii_control() {
+                    if !c.is_ascii() {
                         next[i..].fill(true);
                     } else if c == ' ' {
                         next[i] |= i == letters.len();
@@ -7067,7 +7068,6 @@ mod tests {
             "sys.dm_db_index_physical_\u{FB06}ats",
             "sys.[DM_DB_\u{130}NDEX_PHYSICAL_STATS]",
             "[\u{1D42C}ys].dm_db_index_physical_stats",
-            "[sy\u{1}s].dm_db_index_physical_stats",
             // A database in front, which reaches it from any database on the server.
             "sqlh_scratch.s\u{FD}s.dm_db_index_physical_stats",
             "[some db].[s\u{FD}s].[dm_db_index_physical_stats]",
@@ -7086,6 +7086,11 @@ mod tests {
             "SELECT * FROM s\u{FD}s.dm_db_index_operational_stats(NULL,NULL,NULL,NULL,'DETAILED')",
             "SELECT * FROM s\u{FD}s.dm_db_index_usage_stats(NULL,NULL,NULL,NULL,'DETAILED')",
             "SELECT * FROM sys.dm_db_\u{ED}ndice_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            // The server answers these with 208: `sys` isn't their schema, whatever came before.
+            "SELECT * FROM sys.objects o, dbo.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys.objects o CROSS APPLY dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
+            "SELECT * FROM sys..dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
             // Another schema, with ASCII letters of its own.
             "SELECT * FROM Sales_\u{E9}.dm_db_index_physical_stats(NULL,NULL,NULL,NULL,'DETAILED')",
             "SELECT * FROM [Syst\u{E8}me].[dm_db_\u{ED}ndex_physical_stats](NULL,NULL,NULL,NULL,'DETAILED')",
