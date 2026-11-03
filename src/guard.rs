@@ -477,8 +477,8 @@ fn keyword<'b>(name: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> &'b str {
 /// A word blocked like those of `BLOCKED` that writes nothing, so its refusal says what it does
 /// instead: on SQL Server 2025 this function can send its text to an outside endpoint, which no
 /// rollback calls back (decision 55, DESIGN.md §7). The servers reach it by this bare word alone, in
-/// any case, so it goes by `Token::is_word`: each BMP code point in each place in it is their error
-/// 195 or 102.
+/// any case, so it goes by `Token::is_word`: no BMP code point in any place in it reaches the
+/// function, each being one of their errors.
 const SENDS_TEXT_OUT: &str = "AI_GENERATE_EMBEDDINGS";
 
 /// Words that block outright in read-only mode.
@@ -6356,6 +6356,10 @@ mod tests {
                 format!("DECLARE @v vector(3) = {spelled}{CALL}"),
                 format!("SELECT 1 AS a WHERE {spelled}{CALL} IS NULL"),
                 format!("USE sqlh_test; SELECT {spelled}{CALL}"),
+                format!("SELECT ISNULL({spelled}{CALL}, NULL)"),
+                format!("SELECT v FROM (SELECT {spelled}{CALL} AS v) AS t"),
+                format!("WITH c AS (SELECT {spelled}{CALL} AS v) SELECT v FROM c"),
+                format!("INSERT TOP ({spelled}{CALL}) #t SELECT 1"),
                 // No call in these: it costs a column of that name its bare spelling, as the other
                 // unreserved words of the list do.
                 format!("SELECT {spelled} FROM t"),
