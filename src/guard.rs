@@ -421,6 +421,17 @@ fn after_run<'l>(letters: &'l [u8], run: &[u8]) -> Option<&'l [u8]> {
     start.eq_ignore_ascii_case(run).then_some(rest)
 }
 
+/// How a listed procedure's name is qualified (`Guard::local_system_qualifier`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Qualifier {
+    /// Bare, `sys.`, `master.sys.`, `master.dbo.` or `master..`, its schema in lower case.
+    Local,
+    /// One of those with `sys` or `dbo` in another case.
+    Cased,
+    /// Any other: another schema, database or server.
+    Other,
+}
+
 /// The entry of `list` (upper case) that `name` spells in any case.
 fn find_entry<'l>(list: &[&'l str], name: &str) -> Option<&'l str> {
     list.iter()
@@ -2459,7 +2470,8 @@ impl<'a> Guard<'a> {
                 self.as_written(),
             ));
         }
-        if !self.local_system_qualifier(start) {
+        let qualifier = self.local_system_qualifier(start);
+        if qualifier == Qualifier::Other {
             // The policy, not a claim about what the name resolves to: it may well be the
             // system procedure, but another schema, database or linked server can name a
             // different one.
@@ -2471,6 +2483,22 @@ impl<'a> Guard<'a> {
                     self.name_at(start)
                 ),
                 format!("Call it as sys.{}", shown(last.map_or("", |t| t.text))),
+                self.as_written(),
+            ));
+        }
+        // In a case-sensitive database `SP_WHO` and `SYS.sp_who` aren't the system procedure:
+        // a user's procedure or schema so spelled ran in a read-only run, and the exact spelling
+        // reached the system one beside a user's `dbo.sp_who` (both servers, decision 62). The
+        // guard runs before connecting, so it can't know the database's collation.
+        if qualifier == Qualifier::Cased || name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(Blocked::write_or(
+                line,
+                format!(
+                    "{what} {}: only the lowercase spelling is taken as the system procedure (in \
+                     a case-sensitive database another case can name a different one)",
+                    self.name_at(start)
+                ),
+                format!("Write it as {}", name.to_ascii_lowercase()),
                 self.as_written(),
             ));
         }
@@ -2512,8 +2540,9 @@ impl<'a> Guard<'a> {
 
     /// Only these qualifications reach the real system procedure: none, `sys.`, `master.sys.`,
     /// `master.dbo.` and `master..`. Others can name a user procedure that shares the name, or
-    /// a procedure on a linked server.
-    fn local_system_qualifier(&self, start: &Lexer<'a>) -> bool {
+    /// a procedure on a linked server. `sys` and `dbo` in another case are `Cased`: a schema of
+    /// the database, compared by its collation; `master` is a database, compared by the server's.
+    fn local_system_qualifier(&self, start: &Lexer<'a>) -> Qualifier {
         // The parts of the name, the last of which is the procedure itself. Only the first
         // three can matter, so the rest are counted and not kept.
         let mut head = [""; 3];
@@ -2537,11 +2566,20 @@ impl<'a> Guard<'a> {
             }
         }
         // Without the procedure name: [], ["SYS"] or ["MASTER", "SYS" | "DBO" | ""].
-        match count.saturating_sub(1) {
-            0 => true,
-            1 => head[0].eq_ignore_ascii_case("SYS"),
-            2 => head[0].eq_ignore_ascii_case("MASTER") && in_list(&["SYS", "DBO", ""], head[1]),
-            _ => false,
+        let schema = match count.saturating_sub(1) {
+            0 => return Qualifier::Local,
+            1 if head[0].eq_ignore_ascii_case("SYS") => head[0],
+            2 if head[0].eq_ignore_ascii_case("MASTER")
+                && in_list(&["SYS", "DBO", ""], head[1]) =>
+            {
+                head[1]
+            }
+            _ => return Qualifier::Other,
+        };
+        if schema.bytes().any(|b| b.is_ascii_uppercase()) {
+            Qualifier::Cased
+        } else {
+            Qualifier::Local
         }
     }
 
@@ -7119,13 +7157,47 @@ mod tests {
                 );
             }
         }
+        // A procedure only in its lowercase spelling, and `sys` and `dbo` with it (decision 62);
+        // `master` and the keyword in any case.
         for proc in PROCS {
-            for spelled in [proc.to_ascii_lowercase(), alternating(proc)] {
-                allowed(&format!("EXEC {spelled}"));
-                allowed(&format!("exec Sys.{spelled}"));
-                allowed(&format!("EXEC [master].[dbo].[{spelled}]"));
-                // An implicit call is the same word as the batch's first.
-                allowed(&spelled);
+            let lower = proc.to_ascii_lowercase();
+            allowed(&format!("EXEC {lower}"));
+            allowed(&format!("exec sys.{lower}"));
+            allowed(&format!("EXEC [MASTER].[dbo].[{lower}]"));
+            allowed(&format!("EXEC Master.sys.{lower}"));
+            allowed(&format!("EXEC mAsTeR..{lower}"));
+            // An implicit call is the same word as the batch's first.
+            allowed(&lower);
+            let other = alternating(proc);
+            for (sql, shown) in [
+                (format!("EXEC {other}"), other.clone()),
+                (format!("exec Sys.{lower}"), format!("Sys.{lower}")),
+                (
+                    format!("EXEC [master].[DBO].[{lower}]"),
+                    format!("[master].[DBO].[{lower}]"),
+                ),
+                (
+                    format!("EXEC master.SYS.{other}"),
+                    format!("master.SYS.{other}"),
+                ),
+                (other.clone(), other.clone()),
+            ] {
+                let b = blocked(&sql);
+                assert!(
+                    b.reason.ends_with(&format!(
+                        "{shown}: only the lowercase spelling is taken as the system procedure (in \
+                         a case-sensitive database another case can name a different one)"
+                    )),
+                    "{sql}: {}",
+                    b.reason
+                );
+                assert_eq!(
+                    b.advice,
+                    format!(
+                        "Write it as {lower}, or rerun with --allow-write to run it as written"
+                    ),
+                    "{sql}"
+                );
             }
         }
         for command in DBCC_READ {
@@ -7196,7 +7268,11 @@ mod tests {
         allowed(&format!("SELECT [{long}], '{long}' FROM {long}"));
         // Past the keyword buffer, but a name the procedure list has.
         allowed("exec sp_describe_undeclared_parameters N'select 1'");
-        allowed("EXEC SP_DESCRIBE_UNDECLARED_PARAMETERS N'select 1'");
+        assert!(
+            blocked("EXEC SP_DESCRIBE_UNDECLARED_PARAMETERS N'select 1'")
+                .reason
+                .contains("only the lowercase spelling")
+        );
         // Words that begin like a keyword, and are longer than one, are not that keyword.
         allowed("SELECT INSERTXXXXXXXXXXXXXXXXX, UPDATEUPDATEUPDATEUPDATE, DROPPED, INTOO FROM t");
         allowed("SELECT OPENDATASOURCES, OPENDATASOURCEXX, SENDER, CREATED FROM t");

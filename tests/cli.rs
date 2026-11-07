@@ -2418,6 +2418,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             format!("{QUOTE_IT}, or rerun with --allow-write to run it as written"),
             format!("{QUOTE_IT}; {DENIED}"),
         ),
+        // Decision 62.
+        (
+            "EXEC SP_WHO2",
+            "EXEC SP_WHO2: only the lowercase spelling is taken as the system procedure (in a \
+             case-sensitive database another case can name a different one)",
+            "Write it as sp_who2, or rerun with --allow-write to run it as written".into(),
+            format!("Write it as sp_who2; {DENIED}"),
+        ),
         // Decision 61.
         (
             "WITH #c AS (SELECT * FROM dbo.T) DELETE FROM #c",
@@ -3236,6 +3244,26 @@ fn a_numbered_raiserror_never_connects_unless_writes_are_allowed() {
     for args in [
         &["--allow-write", "-Q", sql][..],
         &["-Q", "RAISERROR('%s', 16, 1, N'x')"],
+    ] {
+        let r = sqlh_args(&[DEAD, args].concat());
+        assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+// Decision 62: a listed procedure in another case never connects, and in its own spelling does.
+#[test]
+fn a_listed_procedure_in_another_case_never_connects() {
+    const REFUSAL: &str = "-- blocked: line 1: a procedure call Sp_Who: only the lowercase \
+                           spelling is taken as the system procedure (in a case-sensitive database \
+                           another case can name a different one); nothing was run. Write it as \
+                           sp_who, or rerun with --allow-write to run it as written";
+    let r = sqlh_args(&[DEAD, &["-Q", "Sp_Who"]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL);
+    for args in [
+        &["--allow-write", "-Q", "Sp_Who"][..],
+        &["-Q", "sp_who"],
+        &["-Q", "EXEC MASTER.dbo.sp_who"],
     ] {
         let r = sqlh_args(&[DEAD, args].concat());
         assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
@@ -5201,6 +5229,13 @@ mod mcp {
                  one, can write to the error log, which a rollback can't undo; nothing was run. \
                  Quote the message instead, as in RAISERROR('%s', 16, 1, @msg); sqlh mcp is \
                  read-only",
+            ),
+            (
+                "EXEC SYS.sp_readerrorlog",
+                "-- blocked: line 1: EXEC SYS.sp_readerrorlog: only the lowercase spelling is \
+                 taken as the system procedure (in a case-sensitive database another case can \
+                 name a different one); nothing was run. Write it as sp_readerrorlog; sqlh mcp \
+                 is read-only",
             ),
             (
                 "UPDATE #d SET a = 2 FROM (SELECT a FROM dbo.T) AS [#d]",
