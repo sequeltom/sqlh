@@ -1969,9 +1969,13 @@ impl<'a> Guard<'a> {
         // The token before this one: a call of `READS_A_URL` is its name and a `(`, and comparing
         // the name there alone keeps the comparison off every other word.
         let mut before: Option<Token<'a>> = None;
+        // Whether `before` is a `)` that closed a `TOP (` clause: `DELETE TOP (1) #t` names its
+        // target there.
+        let mut closed_top = false;
         while let Some(token) = lex.next() {
             let call_on = stats_call.read(&token);
             let named = before.replace(token);
+            let after_top = std::mem::take(&mut closed_top);
             match token.kind {
                 Kind::Punct('(') => {
                     depth += 1;
@@ -1999,11 +2003,35 @@ impl<'a> Guard<'a> {
                 Kind::Punct(')') => {
                     if open.last().is_some_and(|top| top.depth == depth)
                         && let Some(top) = open.pop()
-                        && let Err(blocked) = self.finish_write(top.write, top.line, &lex)
                     {
-                        hold(&mut held, top.at, blocked);
+                        closed_top = true;
+                        if let Err(blocked) = self.finish_write(top.write, top.line, &lex) {
+                            hold(&mut held, top.at, blocked);
+                        }
                     }
                     depth = depth.saturating_sub(1);
+                }
+                // A write to `#t` is to scratch, but an alias or a CTE can be named so, and a
+                // write through it reaches the table behind it (decision 61).
+                // A quoted name that starts with ASCII other than `#` can't read as a temp table's
+                // (`reads_as_temp`), so most quoted names cost one byte's look.
+                Kind::Temp | Kind::Quoted
+                    if held.is_none()
+                        && (token.kind == Kind::Temp
+                            || token
+                                .name
+                                .as_bytes()
+                                .first()
+                                .is_some_and(|&b| b == b'#' || !b.is_ascii())) =>
+                {
+                    if let Some(blocked) =
+                        temp_alias(&token, named.as_ref(), after_top, &lex, self.as_written())
+                    {
+                        if open.is_empty() {
+                            return Err(blocked);
+                        }
+                        hold(&mut held, lex.pos, blocked);
+                    }
                 }
                 // Once something is held, a later keyword can't come first.
                 Kind::Word if held.is_none() => {
@@ -2716,6 +2744,146 @@ fn temp_written_otherwise<'a>(target: &Lexer<'a>) -> Option<&'a str> {
 /// statement.
 fn is_merge_hint(after: &Lexer<'_>) -> bool {
     after.word_is(0, "JOIN") || after.word_is(0, "UNION")
+}
+
+/// Whether `token` can be read as a temp table's name: bare, or quoted with a `#` or `＃` that only
+/// characters beyond ASCII come before. In SQL_Latin1_General_CP1_CI_AS, `#` and `＃` are the
+/// characters equal to `#`, and 19,179 beyond ASCII vanish before a name, but none in ASCII, nor a
+/// leading space (both servers, DESIGN.md §7); this reads every one beyond ASCII as vanishing, so
+/// `[é#o]` counts and `[Änderung]` doesn't.
+fn reads_as_temp(token: &Token<'_>) -> bool {
+    if token.kind == Kind::Temp {
+        return true;
+    }
+    for c in token.name.chars() {
+        match c {
+            '#' | '\u{FF03}' => return true,
+            c if c.is_ascii() => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `before` is a word a real temp table's name (or a label's) follows, each reserved and
+/// so spelled exactly. None of them comes just before an alias or a CTE's name.
+fn precedes_a_temp_table(before: &Token<'_>) -> bool {
+    // By length first, with no copy into `keyword`'s buffer: this runs at every temp table's name.
+    let words: &[&str] = match before.name.len() {
+        2 => &["ON", "TO"],
+        4 => &["FROM", "GOTO", "INTO", "JOIN"],
+        5 => &["TABLE"],
+        6 => &["DELETE", "EXISTS", "INSERT", "UPDATE"],
+        7 => &["PERCENT"],
+        10 => &["REFERENCES"],
+        15 => &["IDENTITY_INSERT"],
+        _ => return false,
+    };
+    words.iter().any(|w| before.name.eq_ignore_ascii_case(w))
+}
+
+enum TempPlace {
+    /// Where a temp table goes: after a word `precedes_a_temp_table` takes, a `TOP (` clause, a
+    /// `(` or a `.`. An alias or a CTE's name never follows these.
+    Table,
+    /// After a `,`: a table in a list, unless a CTE's `AS (` follows.
+    AfterComma,
+    /// Anywhere else, where an alias or a CTE's name can be, unless a `.` or a `:` follows.
+    Other,
+}
+
+/// Where the temp-like name just read stands, by the token `before` it.
+fn temp_place(before: Option<&Token<'_>>, after_top: bool) -> TempPlace {
+    let Some(before) = before else {
+        return TempPlace::Other;
+    };
+    match before.kind {
+        Kind::Punct('.' | '(') => TempPlace::Table,
+        Kind::Punct(')') if after_top => TempPlace::Table,
+        Kind::Punct(',') => TempPlace::AfterComma,
+        Kind::Word if precedes_a_temp_table(before) => TempPlace::Table,
+        _ => TempPlace::Other,
+    }
+}
+
+/// The refusal of `token`, a name just read after `before` (`lex` is just past it), if it reads
+/// as a temp table's name and stands where only an alias or a CTE's name can: not after what
+/// `temp_place` calls a table's place, and not before a `.` (a qualifier) or a `:` (a label), which
+/// an alias or a CTE's name never is; after a `,`, only before a CTE's `AS (` or column list.
+/// Nothing is carried from token to token: state in the main pass cost it 3% to 8% on text with
+/// no such name (measured).
+fn temp_alias(
+    token: &Token<'_>,
+    before: Option<&Token<'_>>,
+    after_top: bool,
+    lex: &Lexer<'_>,
+    as_written: &str,
+) -> Option<Blocked> {
+    // The first byte past the name and any ASCII whitespace settles the common cases with no
+    // token read: `#a.x`, a label, and in a list anything that can't start `AS (` or a column
+    // list. A comment, or a byte beyond ASCII, leaves it to the next token. The whitespace is read
+    // again by the lexer, so this stays linear.
+    let next = lex.sql.as_bytes()[lex.pos..]
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+    if matches!(next, Some(b'.' | b':')) || !reads_as_temp(token) {
+        return None;
+    }
+    let undecided = |b: Option<u8>| b.is_some_and(|b| !b.is_ascii() || matches!(b, b'/' | b'-'));
+    match temp_place(before, after_top) {
+        TempPlace::Table => return None,
+        TempPlace::AfterComma => {
+            let may_define = undecided(next) || matches!(next, Some(b'A' | b'a' | b'('));
+            if !(may_define && defines_a_cte(lex)) {
+                return None;
+            }
+        }
+        TempPlace::Other => {
+            if undecided(next)
+                && lex
+                    .kind(0)
+                    .is_some_and(|k| matches!(k, Kind::Punct('.' | ':')))
+            {
+                return None;
+            }
+        }
+    }
+    Some(Blocked::write_or(
+        token.line,
+        format!(
+            "{} here isn't a temp table but an alias or a common table expression's name, \
+             through which a write would reach the table behind it",
+            shown(token.text)
+        ),
+        "Name it without the #".into(),
+        as_written,
+    ))
+}
+
+/// Whether `after`, just past a name, goes on as a CTE's definition does: `AS (`, or a list of
+/// column names and `AS (`. Unlike `names_a_cte`, the `(` after `AS` is required, so `FROM #a,
+/// #b AS b` isn't one.
+fn defines_a_cte(after: &Lexer<'_>) -> bool {
+    let mut at = after.clone();
+    match at.next() {
+        Some(t) if t.is_word("AS") => return at.kind(0) == Some(Kind::Punct('(')),
+        Some(t) if t.kind == Kind::Punct('(') => {}
+        _ => return false,
+    }
+    while at
+        .next()
+        .is_some_and(|t| matches!(t.kind, Kind::Word | Kind::Quoted | Kind::Temp))
+    {
+        match at.next().map(|t| t.kind) {
+            Some(Kind::Punct(',')) => {}
+            Some(Kind::Punct(')')) => {
+                return at.word_is(0, "AS") && at.kind(1) == Some(Kind::Punct('('));
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Whether the `RAISERROR` just read has a string literal as its first argument, read in one pass
@@ -3646,6 +3814,157 @@ mod tests {
             "SELECT text FROM sys.messages WHERE message_id = 14152",
         ] {
             allowed(sql);
+        }
+    }
+
+    #[test]
+    fn a_temp_like_name_is_refused_where_it_can_only_be_an_alias_or_a_cte() {
+        for (sql, shown, line) in [
+            ("WITH #c AS (SELECT * FROM dbo.T) DELETE FROM #c", "#c", 1),
+            (
+                "WITH #c (a) AS (SELECT a FROM dbo.T) DELETE FROM #c",
+                "#c",
+                1,
+            ),
+            (
+                "WITH [#c] AS (SELECT * FROM dbo.T) DELETE FROM #c",
+                "[#c]",
+                1,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS a), #d AS (SELECT * FROM dbo.T) DELETE FROM #d",
+                "#d",
+                1,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS a), [#d] (a, b) AS (SELECT a, b FROM dbo.T) DELETE #d",
+                "[#d]",
+                1,
+            ),
+            (
+                "UPDATE #d SET a = 2 FROM (SELECT a FROM dbo.T) AS #d",
+                "#d",
+                1,
+            ),
+            ("UPDATE #d SET a = 2 FROM (SELECT a FROM dbo.T) #d", "#d", 1),
+            ("UPDATE #o SET a = 1 FROM dbo.Orders AS #o", "#o", 1),
+            ("UPDATE #o SET a = 1 FROM dbo.Orders #o", "#o", 1),
+            ("UPDATE #o SET a = 1 FROM dbo.Orders ##o", "##o", 1),
+            ("UPDATE #o SET a = 1 FROM dbo.Orders AS [#o]", "[#o]", 1),
+            ("UPDATE #o SET a = 1 FROM dbo.Orders AS \"#o\"", "\"#o\"", 1),
+            // Each binds a bare `#o` on both servers: the comparison pads, ignores and folds.
+            ("UPDATE #o SET a = 1 FROM dbo.Orders [#o ]", "[#o ]", 1),
+            (
+                "UPDATE #o SET a = 1 FROM dbo.Orders AS [\u{200D}#o]",
+                "[\u{200D}#o]",
+                1,
+            ),
+            (
+                "UPDATE #o SET a = 1 FROM dbo.Orders AS [\u{FF03}o]",
+                "[\u{FF03}o]",
+                1,
+            ),
+            (
+                "UPDATE #o SET a = 1 FROM dbo.Orders AS [\u{3400}\u{FF03}o]",
+                "[\u{3400}\u{FF03}o]",
+                1,
+            ),
+            ("DELETE #o FROM dbo.Orders #o", "#o", 1),
+            ("DELETE #o FROM #t JOIN dbo.Orders #o ON 1 = 1", "#o", 1),
+            ("DELETE TOP (1) #o FROM dbo.Orders AS #o", "#o", 1),
+            (
+                "UPDATE #x SET a = 1 FROM dbo.T AS t CROSS APPLY (SELECT a FROM dbo.U) #x",
+                "#x",
+                1,
+            ),
+            ("UPDATE #j SET a = 1 FROM OPENJSON(N'[]') #j", "#j", 1),
+            ("SELECT * FROM #t #o", "#o", 1),
+            ("SELECT * FROM dbo.T AS #o", "#o", 1),
+            ("SELECT * FROM dbo.T /*c*/ #o -- c", "#o", 1),
+            // A column's alias too: there's no telling it from a table's without a parse.
+            ("SELECT 1 AS #a", "#a", 1),
+            ("SELECT a #b FROM t", "#b", 1),
+            (
+                "SELECT 1 AS a\nUPDATE #o SET a = 1 FROM dbo.Orders AS #o",
+                "#o",
+                2,
+            ),
+            // The servers' error 102: `[IDENTITY_INSERT]` is a name, not the keyword.
+            ("SET [IDENTITY_INSERT] #t ON", "#t", 1),
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason,
+                format!(
+                    "{shown} here isn't a temp table but an alias or a common table expression's \
+                     name, through which a write would reach the table behind it"
+                ),
+                "{sql}"
+            );
+            assert_eq!(b.line, line, "{sql}");
+            assert_eq!(
+                b.advice,
+                "Name it without the #, or rerun with --allow-write to run it as written"
+            );
+        }
+        for sql in [
+            "SELECT a FROM #t",
+            "SELECT #t.a FROM #t",
+            "SELECT * FROM #a JOIN #b ON #a.x = #b.y",
+            "SELECT * FROM #a, #b",
+            "SELECT * FROM #a, #b AS b",
+            "SELECT * FROM #a, #b (NOLOCK)",
+            "SELECT * FROM #a AS a WHERE a.x = 1",
+            "SELECT * FROM [#t]",
+            "SELECT * FROM tempdb..#t",
+            "SELECT * FROM tempdb.dbo.#t",
+            "INSERT INTO #t SELECT 1",
+            "INSERT #t SELECT 1",
+            "INSERT #t (a) VALUES (1)",
+            "SELECT 1 AS a INTO #t",
+            "UPDATE #t SET a = 1",
+            "UPDATE #t SET #t.a = s.a FROM #t JOIN dbo.S AS s ON s.a = #t.a",
+            "DELETE FROM #t",
+            "DELETE #t",
+            "DELETE #t OUTPUT deleted.a INTO #u",
+            "DELETE TOP (1) #t",
+            "DELETE TOP (10) PERCENT #t",
+            "UPDATE TOP (1) #t SET a = 1",
+            "INSERT TOP (1) #t SELECT 1",
+            "CREATE TABLE #t (a int, b int REFERENCES #u (b))",
+            "CREATE INDEX i ON #t (a)",
+            "DROP TABLE #a, #b",
+            "DROP TABLE IF EXISTS #t",
+            "TRUNCATE TABLE #t",
+            "ALTER TABLE #t SWITCH TO #u",
+            "SET IDENTITY_INSERT #t ON",
+            "WITH c AS (SELECT a FROM #t) SELECT a FROM c",
+            "WITH c (a, #b) AS (SELECT 1, 2) SELECT a FROM c",
+            "INSERT INTO #t SELECT a FROM (SELECT 1 AS a) AS d",
+            "SELECT 1 AS x\n#a: SELECT 2 AS y\nGOTO #a",
+            "SELECT [\u{C4}nderung] FROM t AS [\u{9867}\u{5BA2}]",
+            "SELECT 1 AS [Gr\u{F6}\u{DF}e], 2 AS [a#b]",
+            "SELECT OBJECT_ID(N'tempdb..#t') AS id",
+        ] {
+            allowed(sql);
+        }
+        // The shapes that look ahead from a name stay within the budget of 3 units a byte.
+        let n = 100_000;
+        for (unit, most) in [
+            ("FROM #a, #b AS b ", 1.2),
+            ("FROM #a, #b (x) ", 1.6),
+            ("SELECT #a /**/ .x ", 1.6),
+            ("SELECT #a\u{A0}.x ", 1.6),
+            ("FROM #a, #b, ", 1.2),
+        ] {
+            let sql = format!("SELECT 1 AS a {}", unit.repeat(n));
+            assert_eq!(
+                check(&sql, READ_ONLY).map_err(|b| b.reason),
+                Ok(()),
+                "{unit:?}"
+            );
+            let cost = work_of(&sql) as f64 / sql.len() as f64;
+            assert!(cost < most, "{unit:?}: {cost}");
         }
     }
 
@@ -5243,7 +5562,6 @@ mod tests {
             // The servers' errors (102, 156, 1067 on both): nothing they could leave.
             "SET [AUTOPILOT] ON",
             "SET \"AUTOPILOT\" ON",
-            "SET [IDENTITY_INSERT] #t ON",
             "SET NOCOUNT, AUTOPILOT ON",
             "OPEN [SYMMETRIC] KEY k DECRYPTION BY CERTIFICATE c",
             "OPEN SYMMETRIC [KEY] k DECRYPTION BY CERTIFICATE c",

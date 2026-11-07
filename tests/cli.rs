@@ -2418,6 +2418,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             format!("{QUOTE_IT}, or rerun with --allow-write to run it as written"),
             format!("{QUOTE_IT}; {DENIED}"),
         ),
+        // Decision 61.
+        (
+            "WITH #c AS (SELECT * FROM dbo.T) DELETE FROM #c",
+            "#c here isn't a temp table but an alias or a common table expression's name, \
+             through which a write would reach the table behind it",
+            "Name it without the #, or rerun with --allow-write to run it as written".into(),
+            format!("Name it without the #; {DENIED}"),
+        ),
     ];
     let with = |profile: &str, sql: &str, extra: &[&str]| {
         run(sqlh()
@@ -3228,6 +3236,30 @@ fn a_numbered_raiserror_never_connects_unless_writes_are_allowed() {
     for args in [
         &["--allow-write", "-Q", sql][..],
         &["-Q", "RAISERROR('%s', 16, 1, N'x')"],
+    ] {
+        let r = sqlh_args(&[DEAD, args].concat());
+        assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+// Decision 61: a write through an alias named like a temp table never connects, and one to the
+// temp table does.
+#[test]
+fn a_write_through_an_alias_named_like_a_temp_table_never_connects() {
+    const REFUSAL: &str = "-- blocked: line 1: #o here isn't a temp table but an alias or a \
+                           common table expression's name, through which a write would reach the \
+                           table behind it; nothing was run. Name it without the #, or rerun with \
+                           --allow-write to run it as written";
+    let sql = "UPDATE #o SET a = 1 FROM dbo.Orders AS #o";
+    let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL);
+    for args in [
+        &["--allow-write", "-Q", sql][..],
+        &[
+            "-Q",
+            "UPDATE #o SET a = 1 FROM #o JOIN dbo.Orders AS o ON o.a = #o.a",
+        ],
     ] {
         let r = sqlh_args(&[DEAD, args].concat());
         assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
@@ -5169,6 +5201,12 @@ mod mcp {
                  one, can write to the error log, which a rollback can't undo; nothing was run. \
                  Quote the message instead, as in RAISERROR('%s', 16, 1, @msg); sqlh mcp is \
                  read-only",
+            ),
+            (
+                "UPDATE #d SET a = 2 FROM (SELECT a FROM dbo.T) AS [#d]",
+                "-- blocked: line 1: [#d] here isn't a temp table but an alias or a common table \
+                 expression's name, through which a write would reach the table behind it; \
+                 nothing was run. Name it without the #; sqlh mcp is read-only",
             ),
         ];
         let lines: Vec<String> = (1..)
@@ -9374,6 +9412,59 @@ mod live {
             assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
             assert_eq!(r.stdout.lines().next(), Some(RAISED), "{}", r.stdout);
         }
+    }
+
+    // What decision 61's reading of a temp-like name rests on, compiled only: a bare `#o` binds to
+    // an alias or a CTE so named, bare or quoted, padded, after a character the comparison ignores,
+    // or with a full-width `#`, and not to one with a leading space (4104). By the collation, `#` and
+    // `＃` are what equal `#`, and no ASCII character vanishes before a name.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_bind_a_temp_name_to_the_aliases_the_guard_refuses() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        for (alias, error) in [
+            ("#o", "NULL"),
+            ("[#o]", "NULL"),
+            ("[#O]", "NULL"),
+            ("[#o ]", "NULL"),
+            ("[\u{200D}#o]", "NULL"),
+            ("[\u{3400}#o]", "NULL"),
+            ("[\u{FF03}o]", "NULL"),
+            ("[#o\u{218}]", "NULL"),
+            ("[ #o]", "4104"),
+        ] {
+            for shape in [
+                format!("SELECT #o.name FROM sys.objects AS {alias}"),
+                format!("SELECT #o.name FROM sys.objects {alias}"),
+                format!("SELECT #o.name FROM (SELECT name FROM sys.objects) AS {alias}"),
+                format!("WITH {alias} AS (SELECT name FROM sys.objects) SELECT name FROM #o"),
+            ] {
+                let sql = format!(
+                    "SELECT CONVERT(varchar(11), MIN(error_number)) AS e FROM \
+                     sys.dm_exec_describe_first_result_set(N'{}', NULL, 0)",
+                    shape.replace('\'', "''")
+                );
+                let got = value(&*server, &sql);
+                // A CTE that doesn't bind is a missing table (208), where an alias is 4104.
+                let expected = match (error, shape.starts_with("WITH")) {
+                    ("4104", true) => "208",
+                    (e, _) => e,
+                };
+                assert_eq!(got, expected, "{shape:?}");
+            }
+        }
+        let sweep = value(
+            &*server,
+            "WITH d AS (SELECT n FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),\
+             (12),(13),(14),(15)) AS v (n)), c AS (SELECT a.n * 4096 + b.n * 256 + e.n * 16 + f.n \
+             AS n FROM d AS a CROSS JOIN d AS b CROSS JOIN d AS e CROSS JOIN d AS f WHERE a.n * \
+             4096 + b.n * 256 + e.n * 16 + f.n NOT BETWEEN 55296 AND 57343) SELECT CONCAT(\
+             (SELECT COUNT(*) FROM c WHERE n BETWEEN 1 AND 127 AND NCHAR(n) + N'#o' = N'#o'), ' ', \
+             (SELECT COUNT(*) FROM c WHERE n > 0 AND NCHAR(n) + N'o' = N'#o'), ' ', \
+             (SELECT COUNT(*) FROM c WHERE n IN (35, 65283) AND NCHAR(n) + N'o' = N'#o')) AS s",
+        );
+        assert_eq!(sweep, "0 2 2");
     }
 
     // What the guard's readings of these rest on, each parsed and none run.
