@@ -2542,8 +2542,9 @@ impl<'a> Guard<'a> {
 
     /// Only these qualifications reach the real system procedure: none, `sys.`, `master.sys.`,
     /// `master.dbo.` and `master..`. Others can name a user procedure that shares the name, or
-    /// a procedure on a linked server. `sys` and `dbo` in another case are `Cased`: a schema of
-    /// the database, compared by its collation; `master` is a database, compared by the server's.
+    /// a procedure on a linked server. `master`, `sys` and `dbo` in another case are `Cased`: a
+    /// schema compares by its database's collation, and a database by the server's, so on a
+    /// case-sensitive server `MASTER` can be another database (R54).
     fn local_system_qualifier(&self, start: &Lexer<'a>) -> Qualifier {
         // The parts of the name, the last of which is the procedure itself. Only the first
         // three can matter, so the rest are counted and not kept.
@@ -2568,17 +2569,21 @@ impl<'a> Guard<'a> {
             }
         }
         // Without the procedure name: [], ["SYS"] or ["MASTER", "SYS" | "DBO" | ""].
-        let schema = match count.saturating_sub(1) {
+        let (database, schema) = match count.saturating_sub(1) {
             0 => return Qualifier::Local,
-            1 if head[0].eq_ignore_ascii_case("SYS") => head[0],
+            1 if head[0].eq_ignore_ascii_case("SYS") => ("", head[0]),
             2 if head[0].eq_ignore_ascii_case("MASTER")
                 && in_list(&["SYS", "DBO", ""], head[1]) =>
             {
-                head[1]
+                (head[0], head[1])
             }
             _ => return Qualifier::Other,
         };
-        if schema.bytes().any(|b| b.is_ascii_uppercase()) {
+        if database
+            .bytes()
+            .chain(schema.bytes())
+            .any(|b| b.is_ascii_uppercase())
+        {
             Qualifier::Cased
         } else {
             Qualifier::Local
@@ -7172,21 +7177,34 @@ mod tests {
                 );
             }
         }
-        // A procedure only in its lowercase spelling, and `sys` and `dbo` with it (decision 62);
-        // `master` and the keyword in any case.
+        // A procedure only in its lowercase spelling, with `master`, `sys` and `dbo` (decision 62,
+        // amended by R54); the keyword in any case.
         for proc in PROCS {
             let lower = proc.to_ascii_lowercase();
             allowed(&format!("EXEC {lower}"));
             allowed(&format!("exec sys.{lower}"));
-            allowed(&format!("EXEC [MASTER].[dbo].[{lower}]"));
-            allowed(&format!("EXEC Master.sys.{lower}"));
-            allowed(&format!("EXEC mAsTeR..{lower}"));
+            allowed(&format!("EXEC [master].[dbo].[{lower}]"));
+            allowed(&format!("EXEC master.sys.{lower}"));
+            allowed(&format!("EXEC master..{lower}"));
             // An implicit call is the same word as the batch's first.
             allowed(&lower);
             let other = alternating(proc);
             for (sql, shown) in [
                 (format!("EXEC {other}"), other.clone()),
                 (format!("exec Sys.{lower}"), format!("Sys.{lower}")),
+                (
+                    format!("EXEC MASTER.dbo.{lower}"),
+                    format!("MASTER.dbo.{lower}"),
+                ),
+                (
+                    format!("EXEC [MASTER].[dbo].[{lower}]"),
+                    format!("[MASTER].[dbo].[{lower}]"),
+                ),
+                (
+                    format!("EXEC Master.sys.{lower}"),
+                    format!("Master.sys.{lower}"),
+                ),
+                (format!("EXEC mAsTeR..{lower}"), format!("mAsTeR..{lower}")),
                 (
                     format!("EXEC [master].[DBO].[{lower}]"),
                     format!("[master].[DBO].[{lower}]"),

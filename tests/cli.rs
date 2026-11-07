@@ -3272,10 +3272,23 @@ fn a_listed_procedure_in_another_case_never_connects() {
     let r = sqlh_args(&[DEAD, &["-Q", "Sp_Who"]].concat());
     assert_eq!(r.code, 5, "{}", r.stdout);
     assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL);
+    // R54: `master` too, since a database compares by the server's collation.
+    for sql in [
+        "EXEC MASTER.dbo.xp_readerrorlog",
+        "EXEC [MASTER].[dbo].[xp_readerrorlog]",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert!(
+            r.stdout.contains("Write it as xp_readerrorlog"),
+            "{sql}: {}",
+            r.stdout
+        );
+    }
     for args in [
         &["--allow-write", "-Q", "Sp_Who"][..],
         &["-Q", "sp_who"],
-        &["-Q", "EXEC MASTER.dbo.sp_who"],
+        &["-Q", "EXEC master.dbo.sp_who"],
     ] {
         let r = sqlh_args(&[DEAD, args].concat());
         assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
