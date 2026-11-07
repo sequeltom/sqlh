@@ -2123,7 +2123,9 @@ impl<'a> Guard<'a> {
             }
             "DROP" => {
                 if !lex.word_is(0, "TABLE") {
-                    return Err(self.blocked(line, "DROP"));
+                    // Named as ALTER and CREATE are (decision 67): `DROP DATABASE` and `DROP INDEX`
+                    // tell an agent more than a bare `DROP`.
+                    return Err(self.blocked(line, &ddl_statement("DROP", lex)));
                 }
                 let mut j = lex.after(1);
                 if j.word_is(0, "IF") && j.word_is(1, "EXISTS") {
@@ -4652,6 +4654,19 @@ mod tests {
                 "ALTER DATABASE Sales SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
                 "ALTER DATABASE",
             ),
+            // `DROP` as `ALTER` and `CREATE` are (decision 67); J33 had the bare `DROP`.
+            ("J33", "DROP DATABASE Sales", "DROP DATABASE"),
+            ("", "drop index ix on dbo.T", "DROP INDEX"),
+            ("", "DROP VIEW dbo.v", "DROP VIEW"),
+            ("", "DROP EVENT SESSION s ON SERVER", "DROP EVENT SESSION"),
+            (
+                "",
+                "DROP /* a */ DATABASE\nSCOPED CREDENTIAL c",
+                "DROP DATABASE SCOPED CREDENTIAL",
+            ),
+            // Not a statement the list names: the bare verb.
+            ("", "DROP SIGNATURE FROM dbo.p BY CERTIFICATE c", "DROP"),
+            ("", "DROP", "DROP"),
         ] {
             assert_eq!(
                 worded(sql),
@@ -5632,7 +5647,7 @@ mod tests {
                 "ALTER MASTER KEY REGENERATE",
                 "ALTER MASTER KEY would write",
             ),
-            ("DROP MASTER KEY", "DROP would write"),
+            ("DROP MASTER KEY", "DROP MASTER KEY would write"),
             (
                 "CREATE SYMMETRIC KEY k WITH ALGORITHM = AES_256",
                 "CREATE SYMMETRIC KEY would write",
