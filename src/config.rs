@@ -346,15 +346,26 @@ fn load_at(
     locked: bool,
     move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
 ) -> Result<Config, String> {
+    load_waiting(path, old, locked, LOCK_WAIT, move_password)
+}
+
+/// `load_at`, with `wait` for each lock the move takes (a test's is short).
+fn load_waiting(
+    path: &Path,
+    old: Option<&OldFiles>,
+    locked: bool,
+    wait: Duration,
+    move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
+) -> Result<Config, String> {
     if let Some(old) = old
         && old.due(path)
     {
         let _lock = if locked {
             None
         } else {
-            Some(files::lock(path, LOCK_WAIT).map_err(|e| e.to_string())?)
+            Some(files::lock(path, wait).map_err(|e| e.to_string())?)
         };
-        bring_across(path, old, move_password)?;
+        bring_across(path, old, wait, move_password)?;
     }
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text).map_err(|e| format!("{}:{e}", path.display())),
@@ -366,20 +377,55 @@ fn load_at(
 /// The moves to the file at `new` (DESIGN.md §8). The caller holds the profiles lock. Twice at
 /// most for `%APPDATA%`: under a packaged app, removing the app's own copy uncovers the real
 /// file behind it, so one run takes both (measured 2026-11-01, PLAN.md decision 53).
+///
+/// Each earlier file is read and removed under its own edit lock as well, which its editor
+/// holds: an earlier sqlh, or this one through `SQLH_CONFIG`. Without it the move could read a
+/// file mid-edit and remove it, and lose the edit (R51). The order is the new file's, then
+/// `%APPDATA%\sqlh`'s, then `%APPDATA%\sqlharness`'s, and an editor holds one only; a lock held
+/// past `wait` is the usual error, with nothing copied or removed.
 fn bring_across(
     new: &Path,
     old: &OldFiles,
+    wait: Duration,
     move_password: &dyn Fn(&Profile) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    if !new.exists() {
-        migrate_from_sqlharness(&old.appdata, &old.sqlharness, move_password)?;
+    let lock = |path: &Path| files::lock(path, wait).map_err(|e| e.to_string());
+    if !new.exists() && old.sqlharness.exists() {
+        {
+            let _appdata = lock(&old.appdata)?;
+            let _sqlharness = lock(&old.sqlharness)?;
+            migrate_from_sqlharness(&old.appdata, &old.sqlharness, move_password)?;
+        }
+        tidy(&old.sqlharness);
     }
     for _ in 0..2 {
         if old.appdata.exists() {
-            absorb(new, &old.appdata)?;
+            {
+                let _appdata = lock(&old.appdata)?;
+                if old.appdata.exists() {
+                    absorb(new, &old.appdata)?;
+                }
+            }
+            tidy(&old.appdata);
         }
     }
     Ok(())
+}
+
+/// Removes an earlier file's lock and its folder, if they are all that's left, once the move
+/// has let go of the lock. One another sqlh holds can't be removed (a sharing violation), so
+/// this never takes a lock from under an editor; an editor that comes after finds no file and
+/// writes a new one, which the next run brings across.
+fn tidy(old: &Path) {
+    if old.exists() {
+        return;
+    }
+    let mut lock = old.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(lock);
+    if let Some(dir) = old.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 /// Moves the profiles in `old` into the file at `new`, then removes `old`. With no file at
@@ -434,14 +480,7 @@ fn absorb(new: &Path, old: &Path) -> Result<(), String> {
             old.display(),
             new.display()
         )
-    })?;
-    let mut lock = old.as_os_str().to_owned();
-    lock.push(".lock");
-    let _ = std::fs::remove_file(lock);
-    if let Some(dir) = old.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
-    Ok(())
+    })
 }
 
 /// Writes `text` to a new file beside `new`, never over an earlier one.
@@ -465,7 +504,8 @@ fn migration_due(new: &Path, old: &Path) -> bool {
 /// `%APPDATA%\sqlharness\profiles.toml` to `%APPDATA%\sqlh\profiles.toml`, from where `absorb`
 /// takes it, and each SQL login's stored password from `sqlharness:<profile>` to
 /// `sqlh:<profile>`, bound to that profile's identity (R20). The caller holds the profiles
-/// lock, so no edit or other migration runs meanwhile, and this checks again that the move is
+/// lock and both files' own (`bring_across`), so no edit or other migration runs meanwhile, and
+/// this checks again that the move is
 /// due: it runs only while the new file doesn't exist and the old one does (R21), and never
 /// for a `SQLH_CONFIG` file.
 /// The passwords move first and the file last, and each step can be repeated, so a move cut
@@ -496,11 +536,9 @@ fn migrate_from_sqlharness(
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     files::replace(new, text.as_bytes()).map_err(|e| format!("{}: {e}", new.display()))?;
-    // The copy is in place; the old file, and its folder if that leaves it empty, can go.
+    // The copy is in place, so the old file can go; its folder goes once its lock is let go
+    // (`tidy`).
     let _ = std::fs::remove_file(old);
-    if let Some(dir) = old.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
     Ok(())
 }
 
@@ -1714,6 +1752,103 @@ mod tests {
             let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
             assert!(config.find("dev").is_some());
             assert!(!old.appdata.exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// An edit of an earlier file as its own editor makes it (an earlier sqlh, or this one
+        /// through `SQLH_CONFIG`): under that file's lock only.
+        fn edit_old(old: &Path, change: Change) {
+            let mut config = parse(&std::fs::read_to_string(old).unwrap()).unwrap();
+            change(&mut config);
+            save_at(old, &config).unwrap();
+        }
+
+        // R51: while an editor of an earlier file holds its lock, the move copies and removes
+        // nothing and says so within its wait, with the new file there or not; once the editor
+        // is done, what it did is what arrives.
+        #[test]
+        fn a_move_leaves_an_earlier_file_alone_while_its_editor_holds_it() {
+            const OTHER: &str = "[profiles.other]\nserver = \"o\"\nauth = \"windows\"\n";
+            for (what, change, kept) in EDITS {
+                for new_there in [false, true] {
+                    let (dir, new, old) = appdata_folder(&format!("held-{what}-{new_there}"));
+                    std::fs::write(&old.appdata, OLD).unwrap();
+                    if new_there {
+                        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+                        std::fs::write(&new, OTHER).unwrap();
+                    }
+                    let held = files::lock(&old.appdata, LOCK_WAIT).unwrap();
+                    let short = Duration::from_millis(100);
+                    let error = load_waiting(&new, Some(&old), false, short, &no_password_moves)
+                        .unwrap_err();
+                    assert!(error.contains("another sqlh is editing"), "{what}: {error}");
+                    assert_eq!(
+                        std::fs::read_to_string(&old.appdata).unwrap(),
+                        OLD,
+                        "{what}"
+                    );
+                    assert_eq!(new.exists(), new_there, "{what}");
+                    if new_there {
+                        assert_eq!(std::fs::read_to_string(&new).unwrap(), OTHER, "{what}");
+                    }
+                    edit_old(&old.appdata, change);
+                    drop(held);
+                    let config = load_at(&new, Some(&old), false, &no_password_moves).unwrap();
+                    assert!(kept(&config), "{what}, new file there: {new_there}");
+                    assert_eq!(config.find("other").is_some(), new_there, "{what}");
+                    assert!(!old.appdata.parent().unwrap().exists(), "{what}: tidied");
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        // R51, from before the rename: the move to `%APPDATA%\sqlh` takes `%APPDATA%\sqlharness`'s
+        // lock too, and a held one leaves both files as they were.
+        #[test]
+        fn a_move_from_before_the_rename_waits_for_that_files_editor() {
+            for (what, change, kept) in EDITS {
+                let (dir, new, old) = folder(&format!("held-rename-{what}"));
+                let places = places(&old);
+                let held = files::lock(&old, LOCK_WAIT).unwrap();
+                let error = load_waiting(
+                    &new,
+                    Some(&places),
+                    false,
+                    Duration::from_millis(100),
+                    &|_| panic!("moved while held"),
+                )
+                .unwrap_err();
+                assert!(error.contains("another sqlh is editing"), "{what}: {error}");
+                assert!(
+                    old.exists() && !places.appdata.exists() && !new.exists(),
+                    "{what}"
+                );
+                edit_old(&old, change);
+                drop(held);
+                let config = load_at(&new, Some(&places), false, &|_| Ok(())).unwrap();
+                assert!(kept(&config), "{what}");
+                assert!(!old.parent().unwrap().exists(), "{what}: tidied");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        // R51: a move that meets a held lock within its wait waits for it, then takes the edit.
+        #[test]
+        fn a_move_waits_for_the_editor_of_an_earlier_file_and_takes_its_edit() {
+            let (dir, new, old) = appdata_folder("held-wait");
+            std::fs::write(&old.appdata, OLD).unwrap();
+            let held = files::lock(&old.appdata, LOCK_WAIT).unwrap();
+            std::thread::scope(|scope| {
+                let mover =
+                    scope.spawn(|| load_at(&new, Some(&old), false, &no_password_moves).unwrap());
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!mover.is_finished(), "the move didn't wait");
+                assert!(!new.exists());
+                edit_old(&old.appdata, remove_dev);
+                drop(held);
+                assert!(dev_gone(&mover.join().unwrap()));
+            });
+            assert!(dev_gone(&saved(&new)));
             let _ = std::fs::remove_dir_all(dir);
         }
 
