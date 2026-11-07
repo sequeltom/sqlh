@@ -680,11 +680,15 @@ impl Session {
         match &options.auth {
             Auth::Integrated => {
                 context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-                context.server_spn =
-                    spn_if_lookup_is_slow(&options.server, SPN_LOOKUP_BUDGET, cancel, |host| {
-                        canonicalize_hostname(&host);
-                    })
-                    .await?;
+                // A read-only intent expects a routing redirect, and a fixed SPN would carry over
+                // to the routed host unchanged (R52): the driver builds one for each hop itself.
+                if !options.read_only_intent {
+                    context.server_spn =
+                        spn_if_lookup_is_slow(&options.server, SPN_LOOKUP_BUDGET, cancel, |host| {
+                            canonicalize_hostname(&host);
+                        })
+                        .await?;
+                }
             }
             Auth::Sql { user, password } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::Password;
@@ -1439,7 +1443,10 @@ const SPN_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
 ///
 /// In time, the driver is left to it: its own lookup repeats a recent answer, and it builds the
 /// SPN for each hop, which a fixed one would get wrong after a routing redirect. Past the budget,
-/// the SPN names the host as given, which is what the driver falls back to when the lookup fails.
+/// the SPN is the one the driver would build when its lookup fails: the host as given, and the
+/// port the driver dials. A named instance without a port gets none (`host_and_spn`), and a
+/// read-only intent isn't looked up here (`Session::connect`): for both the driver does its own,
+/// unbounded lookup, as before (R52).
 async fn spn_if_lookup_is_slow(
     server: &str,
     budget: Duration,
@@ -1455,23 +1462,47 @@ async fn spn_if_lookup_is_slow(
     }
 }
 
-/// Whether `work` is still running after `budget`. Its thread is left behind if so: a lookup
-/// can't be cancelled, ends by itself, and process exit doesn't wait for it, as it would for
+/// How many lookups may run at once in this process. A lookup past its budget is left running,
+/// so in `sqlh mcp`, under DNS trouble and repeated cancels, they would pile up without a cap
+/// (R53); a slot is held until the lookup itself ends.
+const LOOKUP_THREADS: usize = 4;
+
+static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LOOKUP_THREADS);
+
+/// Whether `work` is still running after `budget`, or couldn't start within it: waiting for one of
+/// `LOOKUP_THREADS` comes out of the same budget, and dropping the future stops that wait. The
+/// thread is left behind if it outlasts the budget, holding its slot: a lookup can't be
+/// cancelled, ends by itself, and process exit doesn't wait for it, as it would for
 /// `spawn_blocking` when the runtime drops.
 async fn outlasts(budget: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    outlasts_within(&LOOKUPS, budget, work).await
+}
+
+async fn outlasts_within(
+    slots: &'static tokio::sync::Semaphore,
+    budget: Duration,
+    work: impl FnOnce() + Send + 'static,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slots.acquire()).await else {
+        return true;
+    };
     let (done, finished) = tokio::sync::oneshot::channel::<()>();
     let started = std::thread::Builder::new().spawn(move || {
         work();
+        drop(slot);
         let _ = done.send(());
     });
-    started.is_err() || tokio::time::timeout(budget, finished).await.is_err()
+    started.is_err() || tokio::time::timeout_at(deadline, finished).await.is_err()
 }
 
-/// A TCP `-S`'s host and its SPN, read the way the driver's parser does
-/// (`datasource_parser.rs`): a port replaces an instance, and no port is 1433. `None` for a pipe,
-/// shared memory, LocalDB, the DAC or a bad port, whose SPN stays the driver's. An instance's
-/// port comes from SQL Browser only later, so its SPN names the instance (`client_context.rs`,
-/// `server_spn`).
+/// A TCP `-S`'s host and the SPN the driver's Windows path would build for it when its lookup
+/// fails, read the way the driver's parser does (`datasource_parser.rs`): a port replaces an
+/// instance, and no port is 1433. The driver builds `MSSQLSvc/<host>:<port>` from the host and
+/// port it dials (`sspi_context.rs`, `make_spn_canonicalized(server, None, port)`), never from an
+/// instance's name, and an instance's port comes from SQL Browser only once it connects; so a
+/// named instance without a port gets `None` (R52), as do a pipe, shared memory, LocalDB, the DAC
+/// and a bad port, whose SPN stays the driver's.
 fn host_and_spn(server: &str) -> Option<(String, String)> {
     let source = data_source(server);
     let (protocol, rest) = split_protocol(&source);
@@ -1495,11 +1526,12 @@ fn host_and_spn(server: &str) -> Option<(String, String)> {
     if host.is_empty() {
         return None;
     }
-    let spn = match port {
-        Some(port) => make_spn(host, None, port),
-        None => make_spn(host, instance, 1433),
+    let port = match (port, instance) {
+        (Some(port), _) => port,
+        (None, None) => 1433,
+        (None, Some(_)) => return None,
     };
-    Some((host.to_owned(), spn))
+    Some((host.to_owned(), make_spn(host, None, port)))
 }
 
 /// Refuses a Named Pipes request to another machine, with a message for a usage error
@@ -1754,7 +1786,8 @@ mod tests {
     use super::{
         Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
         PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
-        host_and_spn, split_protocol, spn_if_lookup_is_slow, tcp_form, tls_hint, wait_for_output,
+        host_and_spn, outlasts_within, split_protocol, spn_if_lookup_is_slow, tcp_form, tls_hint,
+        wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
@@ -2138,7 +2171,6 @@ mod tests {
             ("192.0.2.1,1500", "192.0.2.1", "MSSQLSvc/192.0.2.1:1500"),
             ("tcp:db01,1500", "db01", "MSSQLSvc/db01:1500"),
             ("TCP:db01", "db01", "MSSQLSvc/db01:1433"),
-            (r"db01\SALES", "db01", "MSSQLSvc/db01:SALES"),
             // A port replaces the instance, in either order.
             (r"db01\SALES,1500", "db01", "MSSQLSvc/db01:1500"),
             (r"db01,1500\SALES", "db01", "MSSQLSvc/db01:1500"),
@@ -2161,9 +2193,67 @@ mod tests {
             r"(localdb)\MSSQLLocalDB",
             "db01,notaport",
             "",
+            // A named instance's port is SQL Browser's, known only once the driver connects, and
+            // the driver's SPN names that port, never the instance (R52).
+            r"db01\SALES",
+            r"tcp:db01\SALES",
+            r"192.0.2.1\SALES",
         ] {
             assert_eq!(host_and_spn(server), None, "{server}");
         }
+    }
+
+    // R53: the threads left behind by lookups past their budget are capped, each holds its slot
+    // until it ends, and a wait for a slot ends with the budget or as soon as it is dropped.
+    #[test]
+    fn lookups_past_their_budget_are_capped_and_hold_their_slot_until_they_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        runtime().block_on(async {
+            let mut releases = Vec::new();
+            for _ in 0..8 {
+                let (release, held) = std::sync::mpsc::channel::<()>();
+                releases.push(release);
+                let slow = outlasts_within(&SLOTS, Duration::from_millis(20), move || {
+                    let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+                    MOST.fetch_max(now, Ordering::SeqCst);
+                    let _ = held.recv_timeout(Duration::from_secs(30));
+                    RUNNING.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+                assert!(slow);
+            }
+            assert_eq!(SLOTS.available_permits(), 0);
+            let started = Instant::now();
+            assert!(
+                outlasts_within(&SLOTS, Duration::from_millis(20), || panic!("past the cap")).await
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                started.elapsed()
+            );
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(20),
+                outlasts_within(&SLOTS, Duration::from_secs(60), || panic!("past the cap")),
+            )
+            .await;
+            assert!(dropped.is_err());
+            drop(releases);
+            let freed = Instant::now();
+            while SLOTS.available_permits() < 2 {
+                assert!(
+                    freed.elapsed() < Duration::from_secs(10),
+                    "a slot was never given back"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(RUNNING.load(Ordering::SeqCst), 0);
+            assert!(!outlasts_within(&SLOTS, Duration::from_secs(10), || {}).await);
+        });
+        assert_eq!(MOST.load(Ordering::SeqCst), 2);
     }
 
     // notes/connect-latency.md, Windows authentication: a slow lookup gets an SPN so the driver
@@ -2201,7 +2291,7 @@ mod tests {
         let cancel = Cancel::new();
         let spn = runtime()
             .block_on(spn_if_lookup_is_slow(
-                r"db01\SALES",
+                "db01,1500",
                 Duration::from_secs(60),
                 &cancel,
                 move |host| seen.send(host).unwrap(),
