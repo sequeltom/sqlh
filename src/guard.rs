@@ -396,6 +396,25 @@ fn names(name: &str, object: &str) -> bool {
     }
 }
 
+/// Whether at least half of `object`'s letters are in `name` as characters known to read as a
+/// letter: ASCII, a full-width form, a small capital or a ligature. `names` alone lets a name
+/// beyond ASCII stand for any object, which a call's shape kept out of decision 30(d)'s refusal;
+/// a call of `READS_A_URL` has no such shape, so without this every call of `<U+8868>.<U+95A2>(1)`
+/// would be refused. A full-width spelling of the whole name resolves (`OBJECT_ID`, measured on
+/// SQL Server 2025 in `SQL_Latin1_General_CP1_CI_AS`), so it counts.
+fn mostly_spelled(name: &str, object: &str) -> bool {
+    let known: usize = name
+        .trim_end_matches(' ')
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii() => 1,
+            '\u{FF01}'..='\u{FF5E}' => 1,
+            c => stands_for(c).map_or(0, <[u8]>::len),
+        })
+        .sum();
+    known * 2 >= object.len()
+}
+
 /// `letters` past `run`, if they start with it in any case.
 fn after_run<'l>(letters: &'l [u8], run: &[u8]) -> Option<&'l [u8]> {
     let (start, rest) = letters.split_at_checked(run.len())?;
@@ -480,6 +499,13 @@ fn keyword<'b>(name: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> &'b str {
 /// any case, so it goes by `Token::is_word`: no BMP code point in any place in it reaches the
 /// function, each being one of their errors.
 const SENDS_TEXT_OUT: &str = "AI_GENERATE_EMBEDDINGS";
+
+/// A system function whose one argument is a URL it reads from (`OpenRowset(TABLE
+/// LEDGER_DIGESTS_FROM_URL, @path)`), so a query's text can leave in the URL, with nothing a DBA
+/// set up in its way (decision 56, DESIGN.md §7). Bare, `master..`, `sqlh_test.sys.` and
+/// `[sys].[...]` all resolve to it, so its call goes by the last part of the name, by `names` and
+/// `mostly_spelled`; a column of that name, with no `(` after it, passes.
+const READS_A_URL: &str = "FN_LEDGER_RETRIEVE_DIGESTS_FROM_URL";
 
 /// Words that block outright in read-only mode.
 const BLOCKED: &[&str] = &[
@@ -1885,6 +1911,18 @@ impl<'a> Guard<'a> {
         }
     }
 
+    /// The refusal of a call of `READS_A_URL` on `line`. It writes nothing, so the reason says what
+    /// it does instead, as decision 55's does.
+    fn reads_a_url(&self, line: u32) -> Blocked {
+        Blocked::unknown(
+            line,
+            "sys.fn_ledger_retrieve_digests_from_url is not allowed in read-only mode: it reads \
+             from a URL the query names, which can carry text off the server"
+                .into(),
+            self.as_written(),
+        )
+    }
+
     /// Under `--check`, input must not touch NOEXEC: `SET NOEXEC OFF` would let the rest of
     /// the batch, and every later batch, run for real.
     fn check_compile_only(&self) -> Result<(), Blocked> {
@@ -1928,8 +1966,12 @@ impl<'a> Guard<'a> {
         // refusal is the earliest keyword's, as it is when each target is looked up at once.
         let mut held: Option<(usize, Blocked)> = None;
         let mut stats_call = StatsCallSeen::default();
+        // The token before this one: a call of `READS_A_URL` is its name and a `(`, and comparing
+        // the name there alone keeps the comparison off every other word.
+        let mut before: Option<Token<'a>> = None;
         while let Some(token) = lex.next() {
             let call_on = stats_call.read(&token);
+            let named = before.replace(token);
             match token.kind {
                 Kind::Punct('(') => {
                     depth += 1;
@@ -1937,6 +1979,17 @@ impl<'a> Guard<'a> {
                         && held.is_none()
                         && let Err(blocked) = check_physical_stats(line, &lex)
                     {
+                        if open.is_empty() {
+                            return Err(blocked);
+                        }
+                        hold(&mut held, lex.pos, blocked);
+                    }
+                    if let Some(name) = named
+                        && held.is_none()
+                        && name.spells_name(READS_A_URL)
+                        && mostly_spelled(name.name, READS_A_URL)
+                    {
+                        let blocked = self.reads_a_url(name.line);
                         if open.is_empty() {
                             return Err(blocked);
                         }
@@ -6468,6 +6521,115 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_call_of_the_function_that_reads_a_url_is_refused_by_any_name_of_it() {
+        const REASON: &str = "sys.fn_ledger_retrieve_digests_from_url is not allowed in read-only \
+                              mode: it reads from a URL the query names, which can carry text off \
+                              the server";
+        const ARG: &str = "(N'https://example.invalid/x')";
+        let writes = Policy {
+            writes: true,
+            ..READ_ONLY
+        };
+        for name in [
+            "sys.fn_ledger_retrieve_digests_from_url",
+            "fn_ledger_retrieve_digests_from_url",
+            "SYS.FN_LEDGER_RETRIEVE_DIGESTS_FROM_URL",
+            "master.sys.fn_ledger_retrieve_digests_from_url",
+            "master..fn_ledger_retrieve_digests_from_url",
+            "[sqlh_test].[sys].[fn_ledger_retrieve_digests_from_url]",
+            "\"sys\".\"fn_ledger_retrieve_digests_from_url\"",
+            "[fn_ledger_retrieve_digests_from_url ]",
+            "::fn_ledger_retrieve_digests_from_url",
+            // By `names`: a byte beyond ASCII for any of its letters, as the collation may resolve it.
+            "sys.fn_ledger_retr\u{EE}eve_digests_from_url",
+            "sys.fn_ledger\u{200D}_retrieve_digests_from_url",
+            "sys.fn_ledger_retr\u{26A}eve_digests_from_url",
+            "sys.fn_ledger_retrieve_dige\u{FB06}s_from_url",
+            "sys.\u{FF46}n_ledger_retrieve_digests_from_url",
+            // Full-width, the whole name, which resolves.
+            "sys.\u{FF46}\u{FF4E}\u{FF3F}\u{FF4C}\u{FF45}\u{FF44}\u{FF47}\u{FF45}\u{FF52}\u{FF3F}\
+             \u{FF52}\u{FF45}\u{FF54}\u{FF52}\u{FF49}\u{FF45}\u{FF56}\u{FF45}\u{FF3F}\u{FF44}\
+             \u{FF49}\u{FF47}\u{FF45}\u{FF53}\u{FF54}\u{FF53}\u{FF3F}\u{FF46}\u{FF52}\u{FF4F}\
+             \u{FF4D}\u{FF3F}\u{FF55}\u{FF52}\u{FF4C}",
+            // Half its letters known, the rest beyond ASCII.
+            "sys.fn_ledger_retrieve\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\
+             \u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}",
+            // A function of the user's of that name loses its call too.
+            "dbo.fn_ledger_retrieve_digests_from_url",
+        ] {
+            for sql in [
+                format!("SELECT * FROM {name}{ARG}"),
+                format!("SELECT * FROM {name} /*c*/ --c\n{ARG}"),
+                format!("SELECT * FROM {name}(@p)"),
+                format!("SELECT * FROM sys.objects CROSS APPLY {name}(name) AS u"),
+                format!("SELECT (SELECT COUNT(*) FROM {name}{ARG}) AS n"),
+                format!("WITH c AS (SELECT * FROM {name}{ARG}) SELECT * FROM c"),
+                format!("IF EXISTS (SELECT * FROM {name}{ARG}) SELECT 1"),
+                format!("INSERT TOP ((SELECT COUNT(*) FROM {name}{ARG})) #t SELECT 1"),
+            ] {
+                let b = blocked(&sql);
+                assert_eq!(b.reason, REASON, "{sql:?}");
+                assert_eq!(
+                    b.advice, "Rerun with --allow-write to run it as written",
+                    "{sql:?}"
+                );
+                assert!(b.lifted_by_write, "{sql:?}");
+                assert!(check(&sql, writes).is_ok(), "{sql:?}");
+            }
+        }
+        assert_eq!(
+            blocked("SELECT 1 AS a\n\nFROM sys.fn_ledger_retrieve_digests_from_url\n(@p)").line,
+            3
+        );
+        // The earlier refusal is the one given.
+        assert!(
+            blocked("DELETE dbo.t; SELECT * FROM fn_ledger_retrieve_digests_from_url(@p)")
+                .reason
+                .starts_with("DELETE dbo.t")
+        );
+        let under_check = Policy {
+            compile_only: true,
+            ..READ_ONLY
+        };
+        let b = check(
+            "SELECT * FROM sys.fn_ledger_retrieve_digests_from_url(@p)",
+            under_check,
+        )
+        .unwrap_err();
+        assert_eq!(
+            b.advice,
+            "Rerun with --allow-write to compile it as written"
+        );
+        assert_eq!(b.advice_for(Some(&WritesOff::Mcp)), "sqlh mcp is read-only");
+
+        for sql in [
+            // No call: a column, an alias, a table.
+            "SELECT fn_ledger_retrieve_digests_from_url FROM t",
+            "SELECT t.[fn_ledger_retrieve_digests_from_url], 1 AS fn_ledger_retrieve_digests_from_url FROM t",
+            "SELECT * FROM dbo.fn_ledger_retrieve_digests_from_url",
+            "SELECT * FROM dbo.fn_ledger_retrieve_digests_from_url AS f WHERE f.a IN (1)",
+            // Text.
+            "SELECT 'sys.fn_ledger_retrieve_digests_from_url(N''x'')' AS a",
+            "SELECT 1 -- sys.fn_ledger_retrieve_digests_from_url(@p)",
+            "SELECT 1 /* sys.fn_ledger_retrieve_digests_from_url(@p) */",
+            // Other names.
+            "SELECT * FROM sys.fn_ledger_retrieve_digests_from_urls(@p)",
+            "SELECT * FROM sys.fn_ledger_retrieve_digests(@p)",
+            "SELECT * FROM sys.fn_ledger_retrieve_digests_from_url_x(@p)",
+            "SELECT * FROM sys.xfn_ledger_retrieve_digests_from_url(@p)",
+            "SELECT * FROM sys.fn_trace_gettable(N'C:\\t.trc', DEFAULT)",
+            // Names mostly beyond ASCII, which `names` alone takes for any object.
+            "SELECT * FROM \u{8868}.\u{95A2}\u{6570}(1)",
+            "SELECT \u{E9}.\u{E9}(1), [\u{E9}                  ](1)",
+            "SELECT * FROM sys.\u{E9}_from_url(@p)",
+            "SELECT * FROM sys.fn_ledger_retr\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\
+             \u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}(@p)",
+        ] {
+            allowed(sql);
+        }
     }
 
     #[test]

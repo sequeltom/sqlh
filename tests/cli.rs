@@ -2394,6 +2394,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             AS_WRITTEN.into(),
             DENIED_ALONE.into(),
         ),
+        // Decision 56, the same.
+        (
+            "SELECT * FROM sys.fn_ledger_retrieve_digests_from_url(N'https://example.invalid/x')",
+            "sys.fn_ledger_retrieve_digests_from_url is not allowed in read-only mode: it reads \
+             from a URL the query names, which can carry text off the server",
+            AS_WRITTEN.into(),
+            DENIED_ALONE.into(),
+        ),
     ];
     let with = |profile: &str, sql: &str, extra: &[&str]| {
         run(sqlh()
@@ -3117,6 +3125,52 @@ fn ai_generate_embeddings_never_connects_unless_writes_are_allowed() {
     ] {
         let r = sqlh_args(&[DEAD, command].concat());
         assert_eq!(r.code, 2, "{command:?}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+// Decision 56: a call of the function that reads a URL is refused before anything connects, by
+// any name that resolves to it, and `--allow-write` takes it to the server.
+#[test]
+fn the_function_that_reads_a_url_never_connects_unless_writes_are_allowed() {
+    const REFUSAL: &str = "-- blocked: line 1: sys.fn_ledger_retrieve_digests_from_url is not \
+                           allowed in read-only mode: it reads from a URL the query names, which \
+                           can carry text off the server; nothing was run. Rerun with \
+                           --allow-write to run it as written";
+    for sql in [
+        "SELECT * FROM sys.fn_ledger_retrieve_digests_from_url(N'https://example.invalid/x')",
+        "SELECT * FROM fn_ledger_retrieve_digests_from_url /*c*/ (@p)",
+        "SELECT * FROM master..FN_LEDGER_RETRIEVE_DIGESTS_FROM_URL(@p)",
+        "SELECT * FROM [sys].[fn_ledger_retrieve_digests_from_url](@p)",
+        "SELECT * FROM sys.objects CROSS APPLY sys.fn_ledger_retrieve_digests_from_url(name) AS u",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 5, "{sql}: {}", r.stdout);
+        assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL, "{sql}");
+        let r = sqlh_args(&[DEAD, &["--allow-write", "-Q", sql]].concat());
+        assert_eq!(r.code, 2, "{sql}: {}{}", r.stdout, r.stderr);
+    }
+    // What a variable makes is what the guard reads.
+    let r = sqlh_args(
+        &[
+            DEAD,
+            &[
+                "-v",
+                "f=fn_ledger_retrieve_digests_from_url",
+                "-Q",
+                "SELECT * FROM sys.$(f)(@p)",
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    // A column of that name, the name as text, a name mostly beyond ASCII: to the closed port.
+    for sql in [
+        "SELECT fn_ledger_retrieve_digests_from_url FROM dbo.t",
+        "SELECT 'sys.fn_ledger_retrieve_digests_from_url(@p)' AS a",
+        "SELECT * FROM \u{8868}.\u{95A2}\u{6570}(1)",
+    ] {
+        let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+        assert_eq!(r.code, 2, "{sql}: {}{}", r.stdout, r.stderr);
     }
 }
 
@@ -5036,6 +5090,12 @@ mod mcp {
                 "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it \
                  can send its text to an outside endpoint (if it is a column name, write it as \
                  [ai_generate_embeddings]); nothing was run. sqlh mcp is read-only",
+            ),
+            (
+                "SELECT * FROM master..fn_ledger_retrieve_digests_from_url(@p)",
+                "-- blocked: line 1: sys.fn_ledger_retrieve_digests_from_url is not allowed in \
+                 read-only mode: it reads from a URL the query names, which can carry text off \
+                 the server; nothing was run. sqlh mcp is read-only",
             ),
         ];
         let lines: Vec<String> = (1..)
@@ -9112,6 +9172,51 @@ mod live {
             assert!(r.stdout.contains(NAME), "{command:?}: {}", r.stdout);
         }
         let r = live(&p, &db, &["deps", view.as_str()]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    }
+
+    // The names decision 56's refusal goes by (DESIGN.md §7), resolved with `OBJECT_ID` alone, so
+    // the function is never called. SQL Server 2016 has no such function.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_resolve_the_function_that_reads_a_url_by_the_names_the_guard_goes_by() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        let has_it = server_major(&*server) >= 16;
+        let full_width: String = "fn_ledger_retrieve_digests_from_url"
+            .chars()
+            .filter_map(|c| char::from_u32(c as u32 + 0xFEE0))
+            .collect();
+        for (name, resolves) in [
+            ("sys.fn_ledger_retrieve_digests_from_url".to_owned(), true),
+            ("fn_ledger_retrieve_digests_from_url".into(), true),
+            ("master..fn_ledger_retrieve_digests_from_url".into(), true),
+            ("SYS.FN_LEDGER_RETRIEVE_DIGESTS_FROM_URL".into(), true),
+            (
+                "sys.fn_ledger\u{200D}_retrieve_digests_from_url".into(),
+                true,
+            ),
+            ("sys.fn_ledger_retr\u{26A}eve_digests_from_url".into(), true),
+            ("sys.fn_ledger_retrieve_dige\u{FB06}s_from_url".into(), true),
+            (format!("sys.{full_width}"), true),
+            ("dbo.fn_ledger_retrieve_digests_from_url".into(), false),
+        ] {
+            let sql = format!(
+                "SELECT CASE WHEN OBJECT_ID(N'{name}') IS NULL THEN 0 ELSE 1 END AS resolves"
+            );
+            let expected = if has_it && resolves { "1" } else { "0" };
+            assert_eq!(value(&*server, &sql), expected, "{name}");
+        }
+        // A column of that name is no call, and is read.
+        let r = live(
+            &p,
+            &db,
+            &[
+                "-Q",
+                "SELECT fn_ledger_retrieve_digests_from_url FROM (SELECT 1 AS \
+                 fn_ledger_retrieve_digests_from_url) AS t",
+            ],
+        );
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
     }
 
