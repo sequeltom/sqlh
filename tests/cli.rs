@@ -3063,6 +3063,18 @@ fn an_accented_spelling_of_the_scan_never_connects() {
     }
 }
 
+// Decision 64: `--allow-write` lifts decision 30(d)'s refusal, which doesn't offer it: the scan gets
+// as far as the connect.
+#[test]
+fn allow_write_lets_the_scan_of_every_index_run() {
+    let sql = "SELECT * FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'DETAILED')";
+    let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(!r.stdout.contains("--allow-write"), "{}", r.stdout);
+    let r = sqlh_args(&[DEAD, &["--allow-write", "-Q", sql]].concat());
+    assert_eq!(r.code, 2, "{}{}", r.stdout, r.stderr);
+}
+
 // Decision 55: a read-only run never connects, so the call can't reach a server; `--allow-write`
 // gets it as far as the connect, as it does `OPENROWSET`.
 #[test]
