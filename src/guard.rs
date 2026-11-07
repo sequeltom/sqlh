@@ -2163,6 +2163,19 @@ impl<'a> Guard<'a> {
                     " if the write is intended",
                 ));
             }
+            // A model named inside a call (decision 57): `AI_GENERATE_EMBEDDINGS`, refused above,
+            // was its one read-only use, and `VECTOR_DISTANCE(N'x' USE MODEL m)` ended its session
+            // with a stack dump on SQL Server 2025 RTM (DESIGN.md §7). At depth 0, `USE model` is
+            // the statement that switches to the model database.
+            "USE" if depth > 0 && lex.spells(0, "MODEL") => {
+                return Err(Blocked::unknown(
+                    line,
+                    "USE MODEL is not allowed in read-only mode: it names an external model, \
+                     which can send text to an outside endpoint"
+                        .into(),
+                    self.as_written(),
+                ));
+            }
             word if BLOCKED.contains(&word) => {
                 return Err(Blocked::write(
                     line,
@@ -6466,8 +6479,9 @@ mod tests {
             "SELECT t.[AI_GENERATE_EMBEDDINGS] FROM t",
             "SELECT \"AI_GENERATE_EMBEDDINGS\" FROM t",
             "SELECT 1 AS [AI_GENERATE_EMBEDDINGS]",
-            "SELECT [AI_GENERATE_EMBEDDINGS](N'x' USE MODEL m)",
-            "SELECT \"AI_GENERATE_EMBEDDINGS\"(N'x' USE MODEL m)",
+            // With `USE MODEL` these are decision 57's.
+            "SELECT [AI_GENERATE_EMBEDDINGS](N'x', m)",
+            "SELECT \"AI_GENERATE_EMBEDDINGS\"(N'x', m)",
             "SELECT [sys].[AI_GENERATE_EMBEDDINGS](N'x', m)",
             // Text, not a call.
             "SELECT 'AI_GENERATE_EMBEDDINGS(N''x'' USE MODEL m)' AS a",
@@ -6488,22 +6502,23 @@ mod tests {
             "SELECT @AI_GENERATE_EMBEDDINGS AS a",
             "SELECT a FROM #AI_GENERATE_EMBEDDINGS",
             // The servers don't read this word by a collation (error 195): what the comparison
-            // skips or reads as a letter makes another name here.
-            "SELECT AI_GENERATE_EMBEDDINGS\u{218}(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE\u{218}_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENE\u{200D}RATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE_EMBED\u{FEFF}DINGS(N'x' USE MODEL m)",
-            "SELECT \u{218}AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT A\u{26A}_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_\u{262}ENERATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GE\u{274}ERATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENE\u{280}ATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE_EM\u{299}EDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE_EMBED\u{3031}INGS(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE_EMBED\u{30FC}INGS(N'x' USE MODEL m)",
-            "SELECT \u{FF21}I_GENERATE_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_GENERATE\u{301}_EMBEDDINGS(N'x' USE MODEL m)",
-            "SELECT AI_G\u{C9}NERATE_EMBEDDINGS(N'x' USE MODEL m)",
+            // skips or reads as a letter makes another name here (the comma form: with `USE MODEL`
+            // each is decision 57's too).
+            "SELECT AI_GENERATE_EMBEDDINGS\u{218}(N'x', m)",
+            "SELECT AI_GENERATE\u{218}_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GENE\u{200D}RATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GENERATE_EMBED\u{FEFF}DINGS(N'x', m)",
+            "SELECT \u{218}AI_GENERATE_EMBEDDINGS(N'x', m)",
+            "SELECT A\u{26A}_GENERATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_\u{262}ENERATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GE\u{274}ERATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GENE\u{280}ATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GENERATE_EM\u{299}EDDINGS(N'x', m)",
+            "SELECT AI_GENERATE_EMBED\u{3031}INGS(N'x', m)",
+            "SELECT AI_GENERATE_EMBED\u{30FC}INGS(N'x', m)",
+            "SELECT \u{FF21}I_GENERATE_EMBEDDINGS(N'x', m)",
+            "SELECT AI_GENERATE\u{301}_EMBEDDINGS(N'x', m)",
+            "SELECT AI_G\u{C9}NERATE_EMBEDDINGS(N'x', m)",
         ] {
             allowed(sql);
         }
@@ -6627,6 +6642,55 @@ mod tests {
             "SELECT * FROM sys.\u{E9}_from_url(@p)",
             "SELECT * FROM sys.fn_ledger_retr\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\
              \u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}\u{E9}(@p)",
+        ] {
+            allowed(sql);
+        }
+    }
+
+    #[test]
+    fn use_model_inside_a_call_is_refused() {
+        const REASON: &str = "USE MODEL is not allowed in read-only mode: it names an external \
+                              model, which can send text to an outside endpoint";
+        let writes = Policy {
+            writes: true,
+            ..READ_ONLY
+        };
+        for sql in [
+            "SELECT VECTOR_DISTANCE(N'x' USE MODEL m) AS d",
+            "SELECT VECTOR_DISTANCE(N'x' use model m) AS d",
+            "SELECT VECTOR_DISTANCE(N'x' USE /*c*/ MODEL m) AS d",
+            "SELECT VECTOR_DISTANCE(N'x' USE\r\nMODEL m) AS d",
+            "SELECT VECTOR_DISTANCE(N'x' USE MO\u{200D}DEL m) AS d",
+            "SELECT ISNULL(VECTOR_DISTANCE(N'x' USE MODEL m), 0) AS d",
+            "SELECT * FROM t WHERE f(c USE MODEL m) > 0",
+            "INSERT TOP ((SELECT COUNT(*) FROM t WHERE f(c USE MODEL m) > 0)) #t SELECT 1",
+        ] {
+            let b = blocked(sql);
+            assert_eq!(b.reason, REASON, "{sql:?}");
+            assert_eq!(
+                b.advice, "Rerun with --allow-write to run it as written",
+                "{sql:?}"
+            );
+            assert!(check(sql, writes).is_ok(), "{sql:?}");
+        }
+        // Decision 55's refusal comes first in its own call.
+        assert!(
+            blocked("SELECT AI_GENERATE_EMBEDDINGS(N'x' USE MODEL m)")
+                .reason
+                .starts_with("AI_GENERATE_EMBEDDINGS")
+        );
+        for sql in [
+            // The statement, and the database of that name.
+            "USE model",
+            "USE model; SELECT 1",
+            "SELECT 1; USE MODEL",
+            "IF 1 = 1 USE model",
+            "SELECT name FROM model.sys.objects",
+            // Other words after USE in parentheses, and MODEL quoted, the servers' error 102.
+            "SELECT * FROM t OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+            "SELECT * FROM t OPTION (USE PLAN N'<x/>')",
+            "SELECT f(c USE [MODEL] m)",
+            "SELECT 'f(c USE MODEL m)' AS a -- f(c USE MODEL m)",
         ] {
             allowed(sql);
         }

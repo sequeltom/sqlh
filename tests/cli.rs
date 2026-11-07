@@ -2394,7 +2394,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
             AS_WRITTEN.into(),
             DENIED_ALONE.into(),
         ),
-        // Decision 56, the same.
+        // Decisions 56 and 57, the same.
+        (
+            "SELECT VECTOR_DISTANCE(N'x' USE MODEL m) AS d",
+            "USE MODEL is not allowed in read-only mode: it names an external model, which can \
+             send text to an outside endpoint",
+            AS_WRITTEN.into(),
+            DENIED_ALONE.into(),
+        ),
         (
             "SELECT * FROM sys.fn_ledger_retrieve_digests_from_url(N'https://example.invalid/x')",
             "sys.fn_ledger_retrieve_digests_from_url is not allowed in read-only mode: it reads \
@@ -3171,6 +3178,29 @@ fn the_function_that_reads_a_url_never_connects_unless_writes_are_allowed() {
     ] {
         let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
         assert_eq!(r.code, 2, "{sql}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+// Decision 57: `USE MODEL` inside a call never connects, and `USE model`, the statement, does.
+#[test]
+fn use_model_inside_a_call_never_connects_unless_writes_are_allowed() {
+    const REFUSAL: &str = "-- blocked: line 1: USE MODEL is not allowed in read-only mode: it \
+                           names an external model, which can send text to an outside endpoint; \
+                           nothing was run. Rerun with --allow-write to run it as written";
+    let sql = "SELECT VECTOR_DISTANCE(N'x' USE MODEL m) AS d";
+    let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL);
+    for args in [
+        &["--allow-write", "-Q", sql][..],
+        &["-Q", "USE model; SELECT 1 AS a"],
+        &[
+            "-Q",
+            "SELECT * FROM t OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+        ],
+    ] {
+        let r = sqlh_args(&[DEAD, args].concat());
+        assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
     }
 }
 
@@ -5090,6 +5120,12 @@ mod mcp {
                 "-- blocked: line 1: AI_GENERATE_EMBEDDINGS is not allowed in read-only mode: it \
                  can send its text to an outside endpoint (if it is a column name, write it as \
                  [ai_generate_embeddings]); nothing was run. sqlh mcp is read-only",
+            ),
+            (
+                "SELECT VECTOR_DISTANCE(N'x' use /*c*/ model m) AS d",
+                "-- blocked: line 1: USE MODEL is not allowed in read-only mode: it names an \
+                 external model, which can send text to an outside endpoint; nothing was run. \
+                 sqlh mcp is read-only",
             ),
             (
                 "SELECT * FROM master..fn_ledger_retrieve_digests_from_url(@p)",
@@ -7656,8 +7692,12 @@ mod live {
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_stalled_reader_cannot_hang_the_run() {
         let (p, db) = target();
-        let sql = "SELECT TOP (200000) a.object_id, a.name FROM sys.all_objects AS a \
-                   CROSS JOIN sys.all_objects AS b";
+        // Rows made in memory: the output has to fill the queue and the pipe within -t, and a
+        // cross join of sys.all_objects on a server just started didn't (exit 4, 2026-11-07).
+        let sql = "WITH d AS (SELECT n FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+                   (11),(12),(13),(14),(15)) AS v (n)) SELECT TOP (200000) a.n + 16 * b.n + 256 * \
+                   c.n + 4096 * e.n + 65536 * f.n AS object_id, REPLICATE('x', 40) AS name FROM d \
+                   AS a, d AS b, d AS c, d AS e, d AS f";
         for limits in [
             &["--max-rows", "0", "--max-output", "0"][..],
             &["--max-rows", "0", "--max-output", "200000"],
@@ -8496,7 +8536,10 @@ mod live {
     }
 
     // The note counts against --max-output like any note: the same rows, the same cap, fewer
-    // rows fit when the run read uncommitted, and the cap still holds.
+    // rows fit when the run read uncommitted, and the cap still holds. `--exact-count` keeps the
+    // two runs' closing lines alike: the 250 ms count promises no number of rows, and a run whose
+    // count stopped (at 300 of 1,000 on a server just started, 2026-11-07, and now and then under
+    // a full parallel run before) has a line more, and room for fewer rows.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_read_uncommitted_note_counts_against_the_output_cap() {
@@ -8507,7 +8550,15 @@ mod live {
         let clean = live(
             &p,
             &db,
-            &["--max-output", "4096", "--max-rows", "0", "-Q", sql],
+            &[
+                "--max-output",
+                "4096",
+                "--max-rows",
+                "0",
+                "--exact-count",
+                "-Q",
+                sql,
+            ],
         );
         let dirty = live(
             &p,
@@ -8517,6 +8568,7 @@ mod live {
                 "4096",
                 "--max-rows",
                 "0",
+                "--exact-count",
                 "--read-uncommitted",
                 "-Q",
                 sql,
@@ -9220,6 +9272,38 @@ mod live {
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
     }
 
+    // What decision 57's refusal reads as `USE MODEL`, inside `AI_GENERATE_EMBEDDINGS`, the one
+    // documented call that takes it, with a model that doesn't exist (error 15151), so each is
+    // only compiled. Never `VECTOR_DISTANCE`'s, which ended its session on 2025 RTM. Older
+    // servers have no such function, and stop at `USE` (156). And `USE model`, the statement, runs.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_servers_read_use_model_as_the_guard_does() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        let has_it = server_major(&*server) >= 17;
+        for (model, here) in [
+            ("USE MODEL", "15151"),
+            ("use model", "15151"),
+            ("USE /*c*/ MODEL", "15151"),
+            ("USE\r\nMODEL", "15151"),
+            ("USE MO\u{200D}DEL", "15151"),
+            ("USE [MODEL]", "102"),
+            ("USE \"MODEL\"", "102"),
+        ] {
+            let sql = format!(
+                "SELECT error_number FROM sys.dm_exec_describe_first_result_set(N'SELECT \
+                 AI_GENERATE_EMBEDDINGS(N''x'' {model} no_such_model_sqlh)', NULL, 0) AS r \
+                 WHERE r.error_number IS NOT NULL"
+            );
+            let expected = if has_it { here } else { "156" };
+            assert_eq!(value(&*server, &sql), expected, "{model:?}");
+        }
+        let r = live(&p, &db, &["-Q", "USE model; SELECT DB_NAME() AS d"]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("\nmodel\n"), "{}", r.stdout);
+    }
+
     // What the guard's readings of these rest on, each parsed and none run.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
@@ -9674,6 +9758,8 @@ mod live {
 
     // The note counts against --max-output like any note; how many rows it costs is held
     // exactly against the fake server (`the_note_about_the_sql_counts_against_the_output_cap`).
+    // `--exact-count`, since the 250 ms count of the hidden rows promises no number of them: on
+    // servers just started it stopped at 600 and 300 of the 1,000 (2026-11-07).
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_note_about_the_sql_stays_within_the_output_cap() {
@@ -9682,7 +9768,15 @@ mod live {
         let r = live(
             &p,
             &db,
-            &["--max-output", "4096", "--max-rows", "0", "-Q", sql],
+            &[
+                "--max-output",
+                "4096",
+                "--max-rows",
+                "0",
+                "--exact-count",
+                "-Q",
+                sql,
+            ],
         );
         assert_eq!(r.code, 0, "{}", r.stdout);
         assert!(response_bytes(&r) <= 4096, "{} bytes", response_bytes(&r));
