@@ -2323,6 +2323,7 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
                          flushed too; aggregate by plan_id, execution_type and \
                          runtime_stats_interval_id";
     const STATS_REWRITE: &str = "Name the database and object, or use 'LIMITED'";
+    const QUOTE_IT: &str = "Quote the message instead, as in RAISERROR('%s', 16, 1, @msg)";
     let cases: Vec<(&str, &str, String, String)> = vec![
         (
             "EXEC sp_WhoIsActive",
@@ -2408,6 +2409,14 @@ fn refusals_say_what_they_are_and_what_lifts_them() {
              from a URL the query names, which can carry text off the server",
             AS_WRITTEN.into(),
             DENIED_ALONE.into(),
+        ),
+        // Decision 59.
+        (
+            "RAISERROR(14152, 10, 1)",
+            "RAISERROR with a message number, or a variable that can hold one, can write to the \
+             error log, which a rollback can't undo",
+            format!("{QUOTE_IT}, or rerun with --allow-write to run it as written"),
+            format!("{QUOTE_IT}; {DENIED}"),
         ),
     ];
     let with = |profile: &str, sql: &str, extra: &[&str]| {
@@ -3198,6 +3207,27 @@ fn use_model_inside_a_call_never_connects_unless_writes_are_allowed() {
             "-Q",
             "SELECT * FROM t OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
         ],
+    ] {
+        let r = sqlh_args(&[DEAD, args].concat());
+        assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
+    }
+}
+
+// Decision 59: a numbered RAISERROR never connects, and a quoted message does.
+#[test]
+fn a_numbered_raiserror_never_connects_unless_writes_are_allowed() {
+    const REFUSAL: &str = "-- blocked: line 1: RAISERROR with a message number, or a variable \
+                           that can hold one, can write to the error log, which a rollback can't \
+                           undo; nothing was run. Quote the message instead, as in \
+                           RAISERROR('%s', 16, 1, @msg), or rerun with --allow-write to run it as \
+                           written";
+    let sql = "RAISERROR(14152, 10, 1)";
+    let r = sqlh_args(&[DEAD, &["-Q", sql]].concat());
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert_eq!(r.stdout.lines().next().unwrap_or(""), REFUSAL);
+    for args in [
+        &["--allow-write", "-Q", sql][..],
+        &["-Q", "RAISERROR('%s', 16, 1, N'x')"],
     ] {
         let r = sqlh_args(&[DEAD, args].concat());
         assert_eq!(r.code, 2, "{args:?}: {}{}", r.stdout, r.stderr);
@@ -5132,6 +5162,13 @@ mod mcp {
                 "-- blocked: line 1: sys.fn_ledger_retrieve_digests_from_url is not allowed in \
                  read-only mode: it reads from a URL the query names, which can carry text off \
                  the server; nothing was run. sqlh mcp is read-only",
+            ),
+            (
+                "IF 1=0 RAISERROR(@n, 16, 1)",
+                "-- blocked: line 1: RAISERROR with a message number, or a variable that can hold \
+                 one, can write to the error log, which a rollback can't undo; nothing was run. \
+                 Quote the message instead, as in RAISERROR('%s', 16, 1, @msg); sqlh mcp is \
+                 read-only",
             ),
         ];
         let lines: Vec<String> = (1..)
@@ -9302,6 +9339,41 @@ mod live {
         let r = live(&p, &db, &["-Q", "USE model; SELECT DB_NAME() AS d"]);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert!(r.stdout.contains("\nmodel\n"), "{}", r.stdout);
+    }
+
+    // Decision 59's premise and its advice: event-logged messages any login can raise exist, and
+    // the quoted form raises what the variable form does. Nothing event-logged is raised.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn the_quoted_raiserror_the_refusal_advises_raises_what_the_variable_form_does() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        let logged = value(
+            &*server,
+            "SELECT COUNT(*) AS n FROM sys.messages WHERE language_id = 1033 AND \
+             is_event_logged = 1 AND message_id >= 13000 AND severity <= 18",
+        );
+        assert!(logged.parse::<u32>().is_ok_and(|n| n > 0), "{logged}");
+        const DECLARE: &str = "DECLARE @msg nvarchar(100) = N'sqlh decision 59';";
+        let variable = live(
+            &p,
+            &db,
+            &[
+                "--allow-write",
+                "-Q",
+                &format!("{DECLARE} RAISERROR(@msg, 16, 1)"),
+            ],
+        );
+        let quoted = live(
+            &p,
+            &db,
+            &["-Q", &format!("{DECLARE} RAISERROR('%s', 16, 1, @msg)")],
+        );
+        const RAISED: &str = "-- error 50000 (severity 16, state 1, line 1): sqlh decision 59";
+        for r in [&variable, &quoted] {
+            assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
+            assert_eq!(r.stdout.lines().next(), Some(RAISED), "{}", r.stdout);
+        }
     }
 
     // What the guard's readings of these rest on, each parsed and none run.

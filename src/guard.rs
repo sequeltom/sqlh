@@ -2142,6 +2142,20 @@ impl<'a> Guard<'a> {
             // Neither makes a MERGE, whose target can't be a reserved word: these are the join and
             // union hints (`INNER MERGE JOIN`, `OPTION (MERGE UNION)`).
             "MERGE" if is_merge_hint(lex) => {}
+            // A message number is looked up in sys.messages, where 669 are event-logged: raised at
+            // any severity up to 18, which needs no WITH LOG, it reaches the logs below, where an
+            // Agent alert on its number or severity can page an operator or run a job (decision
+            // 59). A variable can hold a number; only a quoted message is raised as 50000, unlogged.
+            "RAISERROR" if !quotes_its_message(lex) => {
+                return Err(Blocked::write_or(
+                    line,
+                    "RAISERROR with a message number, or a variable that can hold one, can write \
+                     to the error log, which a rollback can't undo"
+                        .into(),
+                    "Quote the message instead, as in RAISERROR('%s', 16, 1, @msg)".into(),
+                    self.as_written(),
+                ));
+            }
             // What reaches the server's log and the Windows application log stays there, and at
             // severity 20 and above it also ends the connection (DESIGN.md §7).
             "WITH" if with_log(lex) => {
@@ -2702,6 +2716,14 @@ fn temp_written_otherwise<'a>(target: &Lexer<'a>) -> Option<&'a str> {
 /// statement.
 fn is_merge_hint(after: &Lexer<'_>) -> bool {
     after.word_is(0, "JOIN") || after.word_is(0, "UNION")
+}
+
+/// Whether the `RAISERROR` just read has a string literal as its first argument, read in one pass
+/// (`Lexer::kind(1)` would read the `(` again).
+fn quotes_its_message(after: &Lexer<'_>) -> bool {
+    let mut at = after.clone();
+    at.next().is_some_and(|t| t.kind == Kind::Punct('('))
+        && at.next().is_some_and(|t| t.kind == Kind::Str)
 }
 
 /// Whether the options after a `WITH` just read include `LOG`, which only RAISERROR takes. Its
@@ -3510,7 +3532,7 @@ mod tests {
             "RAISERROR('x', 1, 1) WITH LOG",
             "raiserror('x', 1, 1) with log",
             "IF 1=0 RAISERROR('x', 1, 1) WITH LOG",
-            "RAISERROR(50000, 1, 1) WITH LOG, NOWAIT",
+            "RAISERROR(N'x', 1, 1) WITH LOG, NOWAIT",
             "RAISERROR('x', 1, 1) WITH NOWAIT, LOG",
             "RAISERROR('x', 1, 1) WITH SETERROR, LOG, NOWAIT",
             "RAISERROR('x', 1, 1) WITH NOWAIT, NOWAIT, SETERROR, LOG",
@@ -3552,6 +3574,76 @@ mod tests {
             "SELECT a FROM t GROUP BY a WITH ROLLUP",
             "SELECT 1 AS [WITH], 2 AS log",
             "SELECT 1 AS [WITH] -- WITH LOG",
+        ] {
+            allowed(sql);
+        }
+    }
+
+    #[test]
+    fn raiserror_raises_only_a_quoted_message() {
+        for (sql, line) in [
+            ("RAISERROR(14152, 10, 1)", 1),
+            ("raiserror(14152, 10, 1)", 1),
+            ("RAISERROR (50001, 16, 1)", 1),
+            ("RAISERROR /*c*/ ( -- c\n 14152, 10, 1)", 1),
+            ("RAISERROR(@n, 16, 1)", 1),
+            // A variable holding the text is refused too: the guard doesn't read its type.
+            ("RAISERROR(@msg, 16, 1)", 1),
+            ("RAISERROR(@@ERROR, 16, 1)", 1),
+            ("RAISERROR(+14152, 10, 1)", 1),
+            ("RAISERROR(-1, 10, 1)", 1),
+            ("RAISERROR((14152), 10, 1)", 1),
+            ("RAISERROR(('x'), 10, 1)", 1),
+            ("RAISERROR(0x3796, 10, 1)", 1),
+            ("RAISERROR($14152, 10, 1)", 1),
+            // The form SQL Server 2012 dropped.
+            ("RAISERROR 14152 'x'", 1),
+            ("RAISERROR", 1),
+            ("RAISERROR(", 1),
+            ("IF 1=0 RAISERROR(14152, 10, 1)", 1),
+            (
+                "BEGIN TRY SELECT 1 END TRY BEGIN CATCH RAISERROR(@n, 16, 1) END CATCH",
+                1,
+            ),
+            ("SELECT 1 AS a\nRAISERROR(14152, 10, 1) WITH LOG", 2),
+        ] {
+            let b = blocked(sql);
+            assert_eq!(
+                b.reason,
+                "RAISERROR with a message number, or a variable that can hold one, can write to \
+                 the error log, which a rollback can't undo",
+                "{sql}"
+            );
+            assert_eq!(b.line, line, "{sql}");
+            assert_eq!(
+                b.advice,
+                "Quote the message instead, as in RAISERROR('%s', 16, 1, @msg), or rerun with \
+                 --allow-write to run it as written"
+            );
+            assert!(b.lifted_by_write);
+        }
+        let under_check = Policy {
+            compile_only: true,
+            ..READ_ONLY
+        };
+        assert_eq!(
+            check("RAISERROR(14152, 10, 1)", under_check)
+                .unwrap_err()
+                .advice,
+            "Quote the message instead, as in RAISERROR('%s', 16, 1, @msg), or rerun with \
+             --allow-write to compile it as written"
+        );
+        for sql in [
+            "RAISERROR('x', 16, 1)",
+            "RAISERROR(N'x', 16, 1)",
+            "raiserror(n'x', 16, 1)",
+            "RAISERROR('%s', 16, 1, @msg)",
+            "RAISERROR('%d', 10, 1, 14152)",
+            "RAISERROR('14152', 10, 1)",
+            "RAISERROR ( /*c*/ 'x', 10, 1) WITH NOWAIT",
+            "SELECT 1 AS [RAISERROR]",
+            "THROW 51000, 'x', 1",
+            "SELECT text FROM sys.messages WHERE message_id = 14152",
         ] {
             allowed(sql);
         }
