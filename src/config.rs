@@ -1912,6 +1912,7 @@ mod tests {
                 },
             )
         };
+        let _serial = credman::serial();
         credman::write(name, &bound(&elsewhere), "new").unwrap();
         let refused = resolve();
         credman::write(name, &bound(&saved), "old").unwrap();

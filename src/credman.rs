@@ -60,7 +60,7 @@ pub fn write(profile: &str, binding: &Binding, password: &str) -> std::io::Resul
         &target(profile),
         &binding.user,
         &comment(binding.identity.as_deref()),
-        password,
+        password.as_bytes(),
     )
 }
 
@@ -110,9 +110,43 @@ pub fn move_legacy(profile: &str, identity: &str) -> std::io::Result<bool> {
     let Some((Some(password), user, _)) = imp::read(&legacy, true)? else {
         return Ok(false);
     };
-    imp::write(&target(profile), &user, &comment(Some(identity)), &password)?;
+    imp::write(
+        &target(profile),
+        &user,
+        &comment(Some(identity)),
+        password.as_bytes(),
+    )?;
     imp::delete(&legacy)?;
     Ok(true)
+}
+
+/// Held by every test that touches the real Credential Manager. A read right after a write
+/// or delete can miss it while another client is changing credentials, and a write can be
+/// lost (measured across processes, scratch probe, 2026-11-08: PLAN.md §4), which made
+/// `credman_round_trip` fail about one run in eight when these tests ran in parallel.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A password read back from Credential Manager, taken out of `bytes` without a copy. One that
+/// isn't UTF-8 is refused, and `from_utf8`'s error hands its bytes back to `bytes`, which
+/// wipes them when dropped (F14).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn password_from(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> std::io::Result<Secret> {
+    match String::from_utf8(std::mem::take(&mut **bytes)) {
+        Ok(password) => Ok(Secret::new(password)),
+        Err(error) => {
+            **bytes = error.into_bytes();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the stored password is not UTF-8",
+            ))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -130,11 +164,11 @@ mod imp {
         s.encode_utf16().chain(Some(0)).collect()
     }
 
-    pub fn write(target: &str, user: &str, comment: &str, password: &str) -> io::Result<()> {
+    pub fn write(target: &str, user: &str, comment: &str, password: &[u8]) -> io::Result<()> {
         let mut target = wide(target);
         let mut user = wide(user);
         let mut comment = wide(comment);
-        let mut blob = password.as_bytes().to_vec();
+        let mut blob = password.to_vec();
         let credential = CREDENTIALW {
             Flags: 0,
             Type: CRED_TYPE_GENERIC,
@@ -184,14 +218,21 @@ mod imp {
         }
         // SAFETY: CredReadW succeeded, so `credential` is valid: its blob holds
         // CredentialBlobSize bytes (the pointer may be null when the size is 0), and its user
-        // name and comment are NUL-terminated or null. Everything is copied before CredFree.
+        // name and comment are NUL-terminated or null. The block is ours until CredFree, so
+        // the blob may be written. Everything is copied before CredFree.
         let (bytes, user, comment) = unsafe {
             let c = &*credential;
-            let bytes = if !password || c.CredentialBlobSize == 0 || c.CredentialBlob.is_null() {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec()
-            };
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            if c.CredentialBlobSize != 0 && !c.CredentialBlob.is_null() {
+                let blob =
+                    std::slice::from_raw_parts_mut(c.CredentialBlob, c.CredentialBlobSize as usize);
+                if password {
+                    // One allocation of the blob's size, so no reallocation leaves a copy.
+                    *bytes = blob.to_vec();
+                }
+                // CredFree releases the block without zeroing it (F14).
+                wipe(blob);
+            }
             let user = from_wide(c.UserName);
             let comment = from_wide(c.Comment);
             CredFree(credential as *const _);
@@ -200,15 +241,8 @@ mod imp {
         if !password {
             return Ok(Some((None, user, comment)));
         }
-        // `from_utf8` takes the bytes over without copying them; the `Secret` wipes them.
-        String::from_utf8(bytes)
-            .map(|s| Some((Some(super::Secret::new(s)), user, comment)))
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the stored password is not UTF-8",
-                )
-            })
+        let mut bytes = bytes;
+        super::password_from(&mut bytes).map(|s| Some((Some(s), user, comment)))
     }
 
     /// A NUL-terminated UTF-16 string from the system, or "" for null.
@@ -254,7 +288,7 @@ mod imp {
 mod imp {
     use std::io;
 
-    pub fn write(_target: &str, _user: &str, _comment: &str, _password: &str) -> io::Result<()> {
+    pub fn write(_target: &str, _user: &str, _comment: &str, _password: &[u8]) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Credential Manager needs Windows",
@@ -286,6 +320,7 @@ mod tests {
             user: "someone".into(),
             identity: Some("0123456789abcdef".into()),
         };
+        let _serial = super::serial();
         super::write(name, &bound, "pässwörd").unwrap();
         assert!(super::exists(name).unwrap());
         assert_eq!(super::binding(name).unwrap().as_ref(), Some(&bound));
@@ -312,8 +347,15 @@ mod tests {
     fn credman_moves_a_legacy_credential() {
         let name = "__sqlh_selftest_legacy";
         let legacy = super::legacy_target(name);
+        let _serial = super::serial();
         let _ = super::delete(name);
-        super::imp::write(&legacy, "someone", super::COMMENT, "old-pässwörd").unwrap();
+        super::imp::write(
+            &legacy,
+            "someone",
+            super::COMMENT,
+            "old-pässwörd".as_bytes(),
+        )
+        .unwrap();
         assert!(super::move_legacy(name, "feedface").unwrap());
         let stored = super::read(name).unwrap().unwrap();
         assert_eq!(stored.password.as_str(), "old-pässwörd");
@@ -330,7 +372,7 @@ mod tests {
         );
         // Nothing left to move; and the old file's password replaces one under the new name.
         assert!(!super::move_legacy(name, "feedface").unwrap());
-        super::imp::write(&legacy, "someone", super::COMMENT, "older").unwrap();
+        super::imp::write(&legacy, "someone", super::COMMENT, b"older").unwrap();
         assert!(super::move_legacy(name, "feedface").unwrap());
         assert_eq!(
             super::read(name).unwrap().unwrap().password.as_str(),
@@ -338,6 +380,41 @@ mod tests {
         );
         assert!(super::imp::read(&legacy, false).unwrap().is_none());
         assert!(super::delete(name).unwrap());
+    }
+
+    /// A stored password that isn't UTF-8, as another tool (`cmdkey`) could leave it, against
+    /// the real Credential Manager (cleans up): cargo test -- --ignored credman
+    #[test]
+    #[ignore]
+    fn credman_refuses_a_password_that_is_not_utf8() {
+        let name = "__sqlh_selftest_not_utf8";
+        let _serial = super::serial();
+        super::imp::write(&super::target(name), "someone", super::COMMENT, b"p\xffss").unwrap();
+        let refused = super::read(name).err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(refused.to_string(), "the stored password is not UTF-8");
+        assert!(super::exists(name).unwrap(), "the binding is still read");
+        assert!(super::delete(name).unwrap());
+    }
+
+    // F14: a refused password's bytes go back to the wiping buffer, and an accepted one is
+    // taken out of it, not copied, so no copy outlives a wipe.
+    #[test]
+    fn a_password_is_taken_from_the_wiping_buffer_or_left_in_it() {
+        let mut bytes = zeroize::Zeroizing::new(b"p\xffss".to_vec());
+        // Not `expect_err`, which would print the password it got.
+        let Err(refused) = super::password_from(&mut bytes) else {
+            panic!("accepted");
+        };
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(bytes.as_slice(), b"p\xffss");
+
+        let mut bytes = zeroize::Zeroizing::new("pässwörd".as_bytes().to_vec());
+        let at = bytes.as_ptr();
+        let password = super::password_from(&mut bytes).unwrap();
+        assert_eq!(password.as_str(), "pässwörd");
+        assert_eq!(password.as_ptr(), at, "the same allocation");
+        assert_eq!((bytes.len(), bytes.capacity()), (0, 0));
     }
 
     #[test]
