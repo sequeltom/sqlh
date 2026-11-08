@@ -1,6 +1,6 @@
-//! The version sqlh reports (decision 44, DESIGN.md §4), and the Windows version resource that
-//! Explorer's Properties > Details shows: file and product version, name, description and
-//! copyright.
+//! The version sqlh reports (decision 44, DESIGN.md §4), the Windows version resource that
+//! Explorer's Properties > Details shows (file and product version, name, description and
+//! copyright), and the exe's icon, `assets/sqlh.ico` (drawn by `scripts/make-icon.py`).
 //!
 //! The version is `SQLH_VERSION` when the release workflow sets it (`0.1.0`, or
 //! `0.1.0-dev.<run>`), otherwise `Cargo.toml`'s with `-local`, so a build made anywhere else
@@ -9,7 +9,8 @@
 //! The resource is written here as a compiled .res file, which the MSVC linker takes as an
 //! input like an object file, so neither the resource compiler (rc.exe) nor a crate is needed.
 //! Formats: RESOURCEHEADER and VS_VERSIONINFO, with VS_FIXEDFILEINFO, StringFileInfo and
-//! VarFileInfo (Win32 documentation, "Resource file formats" and "Version information").
+//! VarFileInfo (Win32 documentation, "Resource file formats" and "Version information"); the
+//! icon as RT_ICON images and the RT_GROUP_ICON directory that names them ("Icons").
 
 use std::env;
 use std::path::PathBuf;
@@ -43,6 +44,7 @@ fn main() {
     };
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/build_version.rs");
+    println!("cargo:rerun-if-changed=assets/sqlh.ico");
     println!("cargo:rerun-if-env-changed=SQLH_VERSION");
     println!("cargo:rerun-if-env-changed=SQLH_BUILD");
     println!("cargo:rustc-env=SQLH_BUILT_VERSION={version}");
@@ -78,7 +80,8 @@ fn main() {
             Err(_) => 0,
         },
     ];
-    let res = resource_file(&version_info(&version, numbers));
+    let ico = std::fs::read("assets/sqlh.ico").expect("assets/sqlh.ico is read");
+    let res = resource_file(&icon_resources(&ico), &version_info(&version, numbers));
     let path = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("sqlh.res");
     std::fs::write(&path, res).expect("the version resource is written");
     println!("cargo:rustc-link-arg-bins={}", path.display());
@@ -153,9 +156,43 @@ fn block(key: &str, kind: u16, value_length: u16, value: &[u8], children: &[Vec<
     out
 }
 
-/// A .res file: the empty entry every 32-bit .res file starts with, then the version resource
-/// (type RT_VERSION 16, name 1, US English), its data padded to 4 bytes.
-fn resource_file(data: &[u8]) -> Vec<u8> {
+/// An icon's resources from its .ico file: each image as an RT_ICON (3), named 1 up, and the
+/// RT_GROUP_ICON (14) directory, the .ico's own with each image's file offset replaced by the
+/// name of its RT_ICON. The .ico is ours and committed, so a malformed one ends the build.
+fn icon_resources(ico: &[u8]) -> Vec<(u16, u16, u16, Vec<u8>)> {
+    let u16_at = |at: usize| u16::from_le_bytes([ico[at], ico[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes([ico[at], ico[at + 1], ico[at + 2], ico[at + 3]]);
+    assert!(
+        ico.len() >= 6 && u16_at(0) == 0 && u16_at(2) == 1,
+        "assets/sqlh.ico isn't an icon file"
+    );
+    let count = u16_at(4);
+    let mut group = ico[..6].to_vec();
+    let mut resources = Vec::new();
+    for n in 0..count {
+        let entry = 6 + 16 * usize::from(n);
+        assert!(ico.len() >= entry + 16, "assets/sqlh.ico is cut short");
+        let size = u32_at(entry + 8) as usize;
+        let offset = u32_at(entry + 12) as usize;
+        let image = ico
+            .get(offset..offset + size)
+            .expect("assets/sqlh.ico's images are within it");
+        let name = n + 1;
+        // GRPICONDIRENTRY: the ICONDIRENTRY's first 12 bytes, then the RT_ICON's name.
+        group.extend(&ico[entry..entry + 12]);
+        group.extend(name.to_le_bytes());
+        // MOVEABLE | DISCARDABLE, as rc.exe marks an icon image.
+        resources.push((3, name, 0x1010, image.to_vec()));
+    }
+    // MOVEABLE | PURE | DISCARDABLE, as rc.exe marks an icon directory.
+    resources.push((14, 1, 0x1030, group));
+    resources
+}
+
+/// A .res file: the empty entry every 32-bit .res file starts with, the icon's resources, then
+/// the version resource (type RT_VERSION 16, name 1), each in US English, its data padded to 4
+/// bytes.
+fn resource_file(icon: &[(u16, u16, u16, Vec<u8>)], version: &[u8]) -> Vec<u8> {
     let header = |size: u32, kind: u16, name: u16, flags: u16, language: u16| {
         let mut h = Vec::with_capacity(32);
         h.extend(size.to_le_bytes()); // DataSize
@@ -172,12 +209,18 @@ fn resource_file(data: &[u8]) -> Vec<u8> {
         h.extend(0u32.to_le_bytes()); // Characteristics
         h
     };
-    let size = u32::try_from(data.len()).expect("a small resource");
     let mut out = header(0, 0, 0, 0, 0);
+    let mut add = |kind: u16, name: u16, flags: u16, data: &[u8]| {
+        let size = u32::try_from(data.len()).expect("a small resource");
+        out.extend(header(size, kind, name, flags, 0x0409));
+        out.extend(data);
+        align(&mut out);
+    };
+    for (kind, name, flags, data) in icon {
+        add(*kind, *name, *flags, data);
+    }
     // MOVEABLE | PURE, as rc.exe marks a version resource.
-    out.extend(header(size, 16, 1, 0x0030, 0x0409));
-    out.extend(data);
-    align(&mut out);
+    add(16, 1, 0x0030, version);
     out
 }
 

@@ -35,8 +35,9 @@ Don't trade these away.
 ## Layout
 
 ```
-build.rs         the version (SQLH_VERSION, else Cargo.toml's with -local) and the Windows
-                 version resource, written as a .res file the linker takes (decision 44);
+build.rs         the version (SQLH_VERSION, else Cargo.toml's with -local), the Windows
+                 version resource and the icon (assets/sqlh.ico, drawn by scripts/make-icon.py),
+                 written as a .res file the linker takes (decision 44);
                  src/build_version.rs checks SQLH_VERSION (R47), shared with the lib's tests
 src/main.rs      the binary: calls sqlh::main; everything else is the library (src/lib.rs)
 src/app.rs       the command: arguments, output and its closing lines (Closing), -o publication,
@@ -111,7 +112,7 @@ archive/         git-ignored, never pushed: archive/reviews/ holds the external 
 
 Planned, not built: an md format in `src/output/`. The workflows run on GitHub from the first push, 2026-10-15 (plan-history.md 3.5, 3.6).
 
-The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and links it as a .res file, with no rc.exe and no crate (DESIGN.md §4). A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only.
+The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build time if set (the release workflow sets it, and `SQLH_BUILD`, its run number), else `Cargo.toml`'s with `-local`. `build.rs` also writes the Windows version resource and the icon and links them as a .res file, with no rc.exe and no crate (DESIGN.md §4). To change the icon, edit and run `python -I scripts/make-icon.py` (Pillow), then commit the new `assets/sqlh.ico`; the build reads only the .ico. A release tag must match `Cargo.toml`, so bump the version there before tagging: semver, and before 1.0 the minor for a release that changes the output contract or flags, the patch for fixes only.
 
 ## Commands
 

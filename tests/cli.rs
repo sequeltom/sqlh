@@ -2053,6 +2053,76 @@ fn the_exe_carries_its_version_in_its_windows_properties() {
     );
 }
 
+// The exe's icon is assets/sqlh.ico: each image, read back from the exe's resources, is the
+// .ico's byte for byte, under the RT_GROUP_ICON that names them, and Windows draws the icon
+// from them at 16 and 256 pixels, both stored as PNG (build.rs, DESIGN.md §4).
+#[cfg(windows)]
+#[test]
+fn the_exe_carries_its_icon() {
+    let exe = env!("CARGO_BIN_EXE_sqlh").replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\r\n\
+         Add-Type -Namespace W -Name R -MemberDefinition @'\r\n\
+[DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string f, IntPtr h, uint flags);\r\n\
+[DllImport(\"kernel32.dll\")] public static extern IntPtr FindResourceW(IntPtr m, IntPtr name, IntPtr type);\r\n\
+[DllImport(\"kernel32.dll\")] public static extern IntPtr LoadResource(IntPtr m, IntPtr r);\r\n\
+[DllImport(\"kernel32.dll\")] public static extern IntPtr LockResource(IntPtr g);\r\n\
+[DllImport(\"kernel32.dll\")] public static extern uint SizeofResource(IntPtr m, IntPtr r);\r\n\
+[DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern uint PrivateExtractIconsW(string f, int i, int cx, int cy, IntPtr[] h, uint[] id, uint n, uint flags);\r\n\
+[DllImport(\"user32.dll\")] public static extern bool DestroyIcon(IntPtr h);\r\n\
+'@\r\n\
+         Add-Type -AssemblyName System.Drawing\r\n\
+         $exe = '{exe}'\r\n\
+         # LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE: resources only, nothing runs.\r\n\
+         $m = [W.R]::LoadLibraryExW($exe, [IntPtr]::Zero, 0x22)\r\n\
+         function Res($type, $name) {{\r\n\
+           $r = [W.R]::FindResourceW($m, [IntPtr]$name, [IntPtr]$type)\r\n\
+           if ($r -eq [IntPtr]::Zero) {{ return $null }}\r\n\
+           $n = [W.R]::SizeofResource($m, $r); $b = New-Object byte[] $n\r\n\
+           [Runtime.InteropServices.Marshal]::Copy([W.R]::LockResource([W.R]::LoadResource($m, $r)), $b, 0, $n); ,$b\r\n\
+         }}\r\n\
+         $ico = [IO.File]::ReadAllBytes('assets\\sqlh.ico')\r\n\
+         $count = [BitConverter]::ToUInt16($ico, 4)\r\n\
+         $group = Res 14 1\r\n\
+         \"group $($group.Length -eq 6 + 14 * $count)\"\r\n\
+         for ($i = 0; $i -lt $count; $i++) {{\r\n\
+           $e = 6 + 16 * $i\r\n\
+           $size = [BitConverter]::ToUInt32($ico, $e + 8); $at = [BitConverter]::ToUInt32($ico, $e + 12)\r\n\
+           $want = [byte[]]$ico[$at..($at + $size - 1)]\r\n\
+           $got = Res 3 ($i + 1)\r\n\
+           $named = [BitConverter]::ToUInt16($group, 6 + 14 * $i + 12)\r\n\
+           $px = if ($ico[$e] -eq 0) {{ 256 }} else {{ $ico[$e] }}\r\n\
+           \"$px $($null -ne $got -and [Linq.Enumerable]::SequenceEqual($got, $want)) $($named -eq $i + 1)\"\r\n\
+         }}\r\n\
+         foreach ($s in 16, 256) {{\r\n\
+           $h = New-Object IntPtr[] 1; $id = New-Object uint32[] 1\r\n\
+           $n = [W.R]::PrivateExtractIconsW($exe, 0, $s, $s, $h, $id, 1, 0)\r\n\
+           $b = [Drawing.Icon]::FromHandle($h[0]).ToBitmap()\r\n\
+           # The tile's navy, a quarter in from the top, where the cylinder isn't.\r\n\
+           $c = $b.GetPixel([int]($s / 8), [int]($s / 2))\r\n\
+           \"drawn $s $n $($b.Width) $($c.B -gt $c.R + 40)\"\r\n\
+           [void][W.R]::DestroyIcon($h[0])\r\n\
+         }}"
+    );
+    let r = Shell::PowerShell51.run(&script, Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    assert_eq!(
+        r.stdout.lines().collect::<Vec<_>>(),
+        [
+            "group True",
+            "16 True True",
+            "24 True True",
+            "32 True True",
+            "48 True True",
+            "256 True True",
+            "drawn 16 1 16 True",
+            "drawn 256 1 256 True",
+        ],
+        "{}",
+        r.stderr
+    );
+}
+
 // R06: a blocked statement's own text can't start a metadata line through a Unicode line
 // break (U+0085, U+2028, U+2029) either. The run is refused before it connects, so no server
 // is needed. json is left out: its strings may hold these characters, and it has no
