@@ -1416,29 +1416,33 @@ mod tests {
             started.elapsed()
         };
 
-        // A sink held for 50 ms, then let go all at once: one wait, not ten paced writes, so a
-        // loaded machine (a sleep of 5 ms stretched past 80) can't run the writes into the
-        // bound. That happened once, with cargo unpacking a crate alongside (2026-11-08).
-        let hold = Duration::from_millis(50);
+        // With the sink held in its first write the flush is pending, however late it is first
+        // polled; let go, it ends with every line written, within its bound. No clock is
+        // raced: a lower bound on the flush's time once failed when the test thread was
+        // delayed before the flush began (R58).
         let slow = Sunk::new(None);
         for n in 0..5 {
             slow.log.lines.try_send(format!("line {n}")).unwrap();
         }
-        let release = slow._release.clone();
-        let releaser = thread::spawn(move || {
-            thread::sleep(hold);
+        slow.entered.recv().unwrap();
+        let took = runtime.block_on(async {
+            let mut flushing = std::pin::pin!(flush_log(Some(&slow.log)));
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(flushing.as_mut().poll(cx))).await;
+            assert!(first.is_pending(), "the flush ended with the sink held");
+            let released = Instant::now();
             // Two writes a line.
             for _ in 0..10 {
-                let _ = release.send(());
+                let _ = slow._release.send(());
             }
+            flushing.await;
+            released.elapsed()
         });
-        let took = flush(Some(&slow.log));
-        releaser.join().unwrap();
         assert_eq!(
             Sunk::text(&slow.written),
             "line 0\nline 1\nline 2\nline 3\nline 4\n"
         );
-        assert!(took >= hold && took < SIDE_WAIT, "{took:?}");
+        assert!(took < SIDE_WAIT, "{took:?}");
 
         let stalled = Sunk::new(None);
         stalled.log.lines.try_send("stuck".into()).unwrap();
