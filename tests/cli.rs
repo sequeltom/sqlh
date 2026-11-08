@@ -2893,6 +2893,44 @@ fn wide_text_without_a_usable_bom_is_a_usage_error() {
     }
 }
 
+// F13 (plan-history.md §1): Git Bash's mintty gives a program a pipe named `msys-<hex>-pty<n>-...`,
+// which Rust's `IsTerminal` takes for a terminal but which has no console mode, so echo can't be
+// turned off. `profiles add` must refuse to prompt there, and read nothing. PowerShell makes the
+// pipe, so no unsafe code is needed here; it offers a line that must never be read.
+#[cfg(windows)]
+#[test]
+fn a_mintty_terminal_gets_no_password_prompt() {
+    let dir = scratch("mintty_prompt");
+    let config = dir.join("profiles.toml");
+    let out = dir.join("out.txt");
+    let pipe = format!("msys-{:016x}-pty0-from-master", std::process::id());
+    let script = format!(
+        "$server = [IO.Pipes.NamedPipeServerStream]::new('{pipe}', [IO.Pipes.PipeDirection]::Out); \
+         $p = Start-Process cmd.exe -ArgumentList '/d', '/c', '\"\"{exe}\" profiles add probe -S \
+         127.0.0.1,1 -U someone < \\\\.\\pipe\\{pipe} > \"{out}\" 2>&1\"' -NoNewWindow -PassThru; \
+         $h = $p.Handle; $server.WaitForConnection(); \
+         try {{ $w = [IO.StreamWriter]::new($server); $w.AutoFlush = $true; \
+         $w.Write(\"not-a-password-canary`r`n\") }} catch {{ }}; \
+         if (-not $p.WaitForExit(60000)) {{ $p.Kill(); exit 99 }}; exit $p.ExitCode",
+        exe = env!("CARGO_BIN_EXE_sqlh"),
+        out = out.display(),
+    );
+    let mut command = Command::new("powershell.exe");
+    isolated(&mut command)
+        .env("SQLH_CONFIG", &config)
+        .args(["-NoProfile", "-Command", &script]);
+    let r = run(&mut command);
+    let text = fs::read_to_string(&out).unwrap_or_default();
+    assert_eq!(r.code, 3, "{text}{}{}", r.stdout, r.stderr);
+    assert!(
+        text.contains("can't hide the password in this terminal")
+            && text.contains("prefix it with winpty"),
+        "{text}"
+    );
+    assert!(!text.contains("canary"), "{text}");
+    assert!(!config.exists(), "a profile was saved");
+}
+
 // Windows PowerShell 5.1, as --help says to set it up, sends two BOMs before piped SQL when the
 // command's output is captured; sqlh drops each at the start and reaches the server, where the
 // second used to be refused as `<U+FEFF>SELECT starts the batch` (found at release, 2026-11-08).
