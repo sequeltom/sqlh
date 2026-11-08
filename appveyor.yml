@@ -1,0 +1,46 @@
+# Release certification on AppVeyor's build VMs (decision 75; PLAN.md §4, AppVeyor): the
+# release's own signed exe and the tests built with it, run against SQL Server versions the
+# owner's servers don't cover (2017, 2019, 2022, and a second 2025), as named instances found
+# through SQL Browser, with Windows authentication. Nothing is compiled here: GitHub's release
+# workflow builds both, and scripts/appveyor-live.ps1 downloads them from that commit's run.
+#
+# It runs only for a build started by hand ("New build", or a rebuild), never for a push: a
+# tag push would race the release run it needs. The servers are AppVeyor's, local to each
+# throwaway VM, and the tests log in as the build account through Windows authentication.
+# The one secret is SQLH_GITHUB_TOKEN, set in the project's settings (Environment, a secure
+# variable), never in this file: a fine-grained GitHub token for this repository alone with
+# Actions: read, which can download workflow artifacts and nothing else.
+version: '{build}'
+
+environment:
+  matrix:
+    # Image names and instances from AppVeyor's "Windows images software" and "Services and
+    # databases" pages (2026-11-08). SQL Server 2016 there is SP1, below sqlh's SP3 floor
+    # (decision 49), so it isn't used.
+    - APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2026   # Windows Server 2019
+      SQLH_CI_INSTANCES: SQL2025 SQL2022
+    - APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2019   # Windows Server 2019
+      SQLH_CI_INSTANCES: SQL2019
+    # Windows Server 2016 as the machine sqlh runs on: evidence for the candidate client floor
+    # (AGENTS.md, Hard constraints), not a release gate, so its failure doesn't fail the build.
+    - APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017   # Windows Server 2016
+      SQLH_CI_INSTANCES: SQL2017
+
+matrix:
+  fast_finish: false
+  allow_failures:
+    - APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+
+skip_branch_with_pr: true
+
+init:
+  - ps: |
+      if ($env:APPVEYOR_FORCED_BUILD -ne 'True' -and $env:APPVEYOR_RE_BUILD -ne 'True') {
+        Write-Host 'Not a build started by hand: nothing to run.'
+        Exit-AppveyorBuild
+      }
+
+build: off
+
+test_script:
+  - ps: .\scripts\appveyor-live.ps1

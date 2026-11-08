@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const DEAD: &[&str] = &["-S", "127.0.0.1,1", "-l", "1"];
@@ -22,8 +23,38 @@ struct Run {
     stderr: String,
 }
 
+/// A path cargo fixed when it built these tests, unless `var` names another. A release
+/// certification run (decision 75, scripts/appveyor-live.ps1) runs the test binary the
+/// release workflow built, on another machine, against the release's signed exe: there the
+/// build's paths don't exist.
+fn overridable(cell: &'static OnceLock<PathBuf>, var: &str, built: &str) -> &'static Path {
+    cell.get_or_init(|| match std::env::var_os(var) {
+        Some(given) if !given.is_empty() => PathBuf::from(given),
+        _ => PathBuf::from(built),
+    })
+}
+
+/// The sqlh under test: cargo's build, or `SQLH_TEST_EXE`.
+fn exe() -> &'static Path {
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    overridable(&EXE, "SQLH_TEST_EXE", env!("CARGO_BIN_EXE_sqlh"))
+}
+
+/// The repository, for the files the tests read (the smoke script, its golden output, the
+/// icon): cargo's, or `SQLH_TEST_ROOT`.
+fn root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    overridable(&ROOT, "SQLH_TEST_ROOT", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Where the tests make their files: cargo's target/tmp, or `SQLH_TEST_TMPDIR`.
+fn tmp() -> &'static Path {
+    static TMP: OnceLock<PathBuf> = OnceLock::new();
+    overridable(&TMP, "SQLH_TEST_TMPDIR", env!("CARGO_TARGET_TMPDIR"))
+}
+
 fn sqlh() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+    let mut command = Command::new(exe());
     isolated(&mut command).stdin(Stdio::null());
     command
 }
@@ -32,7 +63,7 @@ fn sqlh() -> Command {
 /// variables.
 fn isolated(command: &mut Command) -> &mut Command {
     // A profiles file that doesn't exist: no profiles, and the real one is never touched.
-    let no_profiles = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-profiles.toml");
+    let no_profiles = tmp().join("no-such-profiles.toml");
     command.env("SQLH_CONFIG", no_profiles);
     for var in [
         "SQLH_PROFILE",
@@ -311,9 +342,7 @@ fn run_closed(command: &mut Command, stdout_closed: bool, stderr_closed: bool) -
 
 /// A fresh directory for one test, under target/tmp.
 fn scratch(test: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("cli")
-        .join(test);
+    let dir = tmp().join("cli").join(test);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("scratch dir");
     dir
@@ -425,7 +454,8 @@ fn a_bounded_run_kills_a_child_that_never_ends() {
     // left holding the pipes, and the readers end at once rather than at their fallback.
     let mut shell = Command::new("cmd.exe");
     isolated(&mut shell)
-        .args(["/d", "/c", env!("CARGO_BIN_EXE_sqlh")])
+        .args(["/d", "/c"])
+        .arg(exe())
         .args(DEAD)
         .stdin(late_eof());
     let b = run_bounded(&mut shell, limit);
@@ -2000,7 +2030,7 @@ fn a_build_outside_the_release_workflow_is_marked_local() {
 #[cfg(windows)]
 #[test]
 fn the_exe_carries_its_version_in_its_windows_properties() {
-    let exe = env!("CARGO_BIN_EXE_sqlh").replace('\'', "''");
+    let exe = exe().display().to_string().replace('\'', "''");
     let script = format!(
         "$v = (Get-Item -LiteralPath '{exe}').VersionInfo\r\n\
          '{{0}}.{{1}}.{{2}}.{{3}}' -f $v.FileMajorPart, $v.FileMinorPart, $v.FileBuildPart, \
@@ -2011,7 +2041,7 @@ fn the_exe_carries_its_version_in_its_windows_properties() {
          $v.CompanyName; $v.LegalCopyright; $v.OriginalFilename; $v.InternalName; \
          $v.IsPreRelease"
     );
-    let r = Shell::PowerShell51.run(&script, Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
+    let r = Shell::PowerShell51.run(&script, root(), &[]);
     assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
     let numbers = format!(
         "{}.{}.{}.{}",
@@ -2059,7 +2089,7 @@ fn the_exe_carries_its_version_in_its_windows_properties() {
 #[cfg(windows)]
 #[test]
 fn the_exe_carries_its_icon() {
-    let exe = env!("CARGO_BIN_EXE_sqlh").replace('\'', "''");
+    let exe = exe().display().to_string().replace('\'', "''");
     let script = format!(
         "$ErrorActionPreference = 'Stop'\r\n\
          Add-Type -Namespace W -Name R -MemberDefinition @'\r\n\
@@ -2104,7 +2134,7 @@ fn the_exe_carries_its_icon() {
            [void][W.R]::DestroyIcon($h[0])\r\n\
          }}"
     );
-    let r = Shell::PowerShell51.run(&script, Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
+    let r = Shell::PowerShell51.run(&script, root(), &[]);
     assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
     assert_eq!(
         r.stdout.lines().collect::<Vec<_>>(),
@@ -2986,7 +3016,7 @@ fn a_mintty_terminal_gets_no_password_prompt() {
          try {{ $w = [IO.StreamWriter]::new($server); $w.AutoFlush = $true; \
          $w.Write(\"not-a-password-canary`r`n\") }} catch {{ }}; \
          if (-not $p.WaitForExit(60000)) {{ $p.Kill(); exit 99 }}; exit $p.ExitCode",
-        exe = env!("CARGO_BIN_EXE_sqlh"),
+        exe = exe().display(),
         out = out.display(),
     );
     let mut command = Command::new("powershell.exe");
@@ -3033,7 +3063,7 @@ fn piped_sql_with_a_run_of_boms_reaches_the_server() {
         let script = format!(
             "$OutputEncoding = [Text.Encoding]::UTF8; $r = 'SELECT 1 AS a' | & '{}' -S 127.0.0.1,1 \
              -l 1; $r; exit $LASTEXITCODE",
-            env!("CARGO_BIN_EXE_sqlh")
+            exe().display()
         );
         let mut command = Command::new("powershell.exe");
         isolated(&mut command).args(["-NoProfile", "-Command", &script]);
@@ -3981,7 +4011,7 @@ impl Shell {
                 command
             }
         };
-        let sqlh_dir = Path::new(env!("CARGO_BIN_EXE_sqlh")).parent().unwrap();
+        let sqlh_dir = exe().parent().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         // Isolated from the machine's profiles and SQLCMD* variables, as `sqlh()` is.
         for var in [
@@ -4148,7 +4178,7 @@ fn the_documented_q_form_reaches_sqlh_intact_in_every_shell() {
 #[cfg(windows)]
 #[test]
 fn sqlh_leaves_the_console_code_page_alone() {
-    let exe = env!("CARGO_BIN_EXE_sqlh");
+    let exe = exe().display().to_string();
     let dir = scratch("console_code_page");
     let result = dir.join("code-page.txt");
     // `chcp` sets both code pages; reading the output one needs the API, here through
@@ -7679,7 +7709,7 @@ mod live {
 
     /// Like `sqlh()`, but with the real profiles file so the test profile resolves.
     fn live(profile: &str, database: &str, args: &[&str]) -> Run {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command
             .stdin(Stdio::null())
             .args(["--profile", profile, "-d", database])
@@ -7726,7 +7756,7 @@ mod live {
             live(&self.profile, &self.database, &["-Q", sql])
         }
         fn write(&self, sql: &str) -> Run {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command
                 .args(["--profile", &self.profile, "-d", &self.database])
                 .args(["--allow-write", "-i", "-"]);
@@ -7987,7 +8017,7 @@ mod live {
             &["--max-rows", "0", "--max-output", "0"][..],
             &["--max-rows", "0", "--max-output", "200000"],
         ] {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            let mut child = Command::new(exe())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -8055,7 +8085,7 @@ mod live {
             ),
         ];
         for (sql, shown) in cases {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command.stdin(Stdio::null()).args([
                 "--profile",
                 &p,
@@ -8080,7 +8110,7 @@ mod live {
         // With no --max-cell, the output budget is the limit: a value of 40,000,000 characters
         // can't fit in 1,000,000 bytes, so the row is withheld as it was before, and what the
         // run held is still a few megabytes, not 80 MB of text and the same again to write it.
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command.stdin(Stdio::null()).args([
             "--profile",
             &p,
@@ -8101,7 +8131,7 @@ mod live {
         assert!(peak < 40 << 20, "peak working set {} MB", peak >> 20);
         // The same in json, which builds its rows in a buffer of its own.
         let sql = "SELECT REPLICATE(CAST('x' AS varchar(max)), 60000000) AS big";
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command.stdin(Stdio::null()).args([
             "--profile",
             &p,
@@ -8136,7 +8166,7 @@ mod live {
         let (p, db) = target();
         let sql = "SELECT n, REPLICATE(CAST('x' AS varchar(max)), CASE WHEN n = 1 THEN 10 \
                    ELSE 40000000 END) AS v FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n)";
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command.stdin(Stdio::null()).args([
             "--profile",
             &p,
@@ -8212,7 +8242,7 @@ mod live {
             ("CPU-bound", cpu, false),
         ] {
             let script = format!("{ident}\nGO\n{work}");
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8278,7 +8308,7 @@ mod live {
         use std::io::BufRead;
         let (p, db) = target();
         let mut child = spawn_in_group(
-            Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            Command::new(exe())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -8332,7 +8362,7 @@ mod live {
         let sql = "SELECT TOP (200000) a.object_id, a.name FROM sys.all_objects AS a \
                    CROSS JOIN sys.all_objects AS b";
         let mut child = spawn_in_group(
-            Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            Command::new(exe())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -8373,7 +8403,7 @@ mod live {
     fn an_unread_stderr_cannot_hold_up_a_verbose_run() {
         let (p, db) = target();
         for format in ["text", "json"] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command.stdin(Stdio::null()).args([
                 "--profile",
                 &p,
@@ -8487,9 +8517,12 @@ mod live {
 
         // With no -d the run starts in the profile's database, whatever that is: the one the
         // same session reports for itself.
-        let r = run(Command::new(env!("CARGO_BIN_EXE_sqlh"))
-            .stdin(Stdio::null())
-            .args(["--profile", &p, "-Q", "SELECT DB_NAME() AS db"]));
+        let r = run(Command::new(exe()).stdin(Stdio::null()).args([
+            "--profile",
+            &p,
+            "-Q",
+            "SELECT DB_NAME() AS db",
+        ]));
         assert_eq!(r.code, 0, "{}", r.stdout);
         let (_, _, database, _) = split_tail(last_line(&r.stdout));
         assert!(
@@ -8508,7 +8541,7 @@ mod live {
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn ctrl_break_cancels_the_final_delivery_of_a_completed_run() {
         let (p, db) = target();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command.stdin(Stdio::null()).args([
             "--profile",
             &p,
@@ -8662,7 +8695,7 @@ mod live {
 
     /// A sqlh run started in the background.
     fn spawn_live(profile: &str, database: &str, args: &[&str]) -> std::process::Child {
-        Command::new(env!("CARGO_BIN_EXE_sqlh"))
+        Command::new(exe())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -11043,7 +11076,7 @@ mod live {
         use std::io::BufRead;
         let (p, _) = target();
         let mut child = spawn_in_group(
-            Command::new(env!("CARGO_BIN_EXE_sqlh"))
+            Command::new(exe())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -11103,7 +11136,7 @@ mod live {
     /// tests use it.
     #[cfg(debug_assertions)]
     fn live_with(profile: &str, database: &str, env: &[(&str, &str)], args: &[&str]) -> Run {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command
             .stdin(Stdio::null())
             .args(["--profile", profile, "-d", database])
@@ -11250,7 +11283,7 @@ mod live {
         sql: &str,
     ) -> (Run, Duration) {
         let bound = Duration::from_secs(1) + GRACE + SETUP;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command
             .stdin(Stdio::null())
             .args(["--profile", p, "-d", db])
@@ -11501,8 +11534,9 @@ mod live {
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn the_smoke_script_matches_its_golden_output() {
         let (p, db) = target();
-        let smoke = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/smoke.sql");
-        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let smoke = root().join("tests/smoke.sql");
+        let smoke = smoke.to_str().expect("a UTF-8 path");
+        let golden = root().join("tests/golden");
         let bless = std::env::var_os("SQLH_BLESS").is_some();
 
         let r = live(&p, &db, &["-i", smoke, "--continue-on-error"]);
@@ -12844,7 +12878,7 @@ mod live {
 
         /// sqlh as the reader: the test profile's server, this login, `args`.
         fn run(&self, args: &[&str]) -> Run {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command
                 .stdin(Stdio::null())
                 .env("SQLCMDPASSWORD", &self.password)
@@ -13583,7 +13617,7 @@ mod live {
         ];
         let mut input = lines.join("\n");
         input.push('\n');
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+        let mut command = Command::new(exe());
         command.args(["mcp", "--profile", &p, "--pool", "1"]);
         let r = run_with_stdin(&mut command, input.as_bytes());
         assert_eq!(r.code, 0, "{}", r.stderr);
@@ -13694,7 +13728,7 @@ mod live {
             /// profiles: one connection, so the calls queue on one session, and a server limit
             /// of 30 s for the timeout advice to name.
             fn on(profile: &str) -> Mcp {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+                let mut command = Command::new(exe());
                 command.args(["mcp", "--profile", profile]).args(MCP_FLAGS);
                 Mcp::start(&mut command)
             }
@@ -14025,7 +14059,7 @@ mod live {
             let command = live_with(&p, &db, &env, &["--allow-write", "tables"]);
             assert_eq!(command.code, 0, "{}", command.stdout);
 
-            let mut test = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut test = Command::new(exe());
             test.stdin(Stdio::null())
                 .args(["profiles", "test", &p])
                 .env(env[0].0, env[0].1);
@@ -14820,7 +14854,7 @@ mod live {
             )
             .expect("the scratch profiles file");
 
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sqlh"));
+            let mut command = Command::new(exe());
             command
                 .env("SQLH_CONFIG", &config)
                 .env("SQLCMDPASSWORD", &reader.password)

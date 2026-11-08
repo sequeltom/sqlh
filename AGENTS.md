@@ -94,7 +94,11 @@ scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --
                  size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
 .github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
                  read-only; sign, the only job with the Azure token, which never runs the exe;
-                 verify, read-only; publish, the draft release; plan-history.md 3.6, R22)
+                 verify, read-only; publish, the draft release; plan-history.md 3.6, R22);
+                 build also uploads the tests' binary for AppVeyor (decision 75)
+appveyor.yml, scripts/appveyor-live.ps1  release certification on AppVeyor, started by hand:
+                 the release run's signed exe and tests against AppVeyor's SQL Servers, Windows
+                 auth, nothing compiled (decision 75; PLAN.md §4, AppVeyor)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
 README.md        human-facing intro, build, quick start, safety note, the running list of agent features
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
@@ -176,6 +180,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - The guard, splitter, renderer and formatter get table-driven unit tests next to the code.
   - Every new output shape gets an exact-output test (see `output/text.rs`).
   - Process-level behavior (exit codes, files, crashes) gets a test in `tests/cli.rs`, isolated from the machine's profiles and `SQLCMD*` variables.
+  - `tests/cli.rs` reaches the exe, the repository's files and its scratch folder only through `exe()`, `root()` and `tmp()`, never `env!("CARGO_BIN_EXE_sqlh")`, `CARGO_MANIFEST_DIR` or `CARGO_TARGET_TMPDIR` directly: AppVeyor runs the release's test binary on another machine against the signed exe, through `SQLH_TEST_EXE`, `SQLH_TEST_ROOT` and `SQLH_TEST_TMPDIR` (decision 75).
   - Live tests are `#[ignore]`d, so skipping shows; asked for without `SQLH_TEST_PROFILE`, they fail. Before writing, they check the scratch database's `dbo.sqlh_scratch` marker, then write only to tables of their own, which they drop; the one exception is `sqlh_test`'s compatibility level, which a test may set and must restore (owner decision 21, PLAN.md §6). Every live test holds the scratch lock (a file in `%TEMP%`, held across processes): shared through `target()`, or exclusive through `target_alone()` for a test that changes database-level state or reads the whole catalog (`find --text` lost a deadlock to other tests' DDL). Once per test process, before the first hold, `hold_scratch` puts back a level a killed run left. A fixture arms its idempotent cleanup (`Cleanup`, `DROP ... IF EXISTS`) before the write that makes the object, never after (R24).
   - A live test's files go in a directory of its own process (`OwnScratch`, `{test}_{pid}`, removed when dropped), never a fixed name: the debug and release test binaries share `target/tmp`, and the shared scratch lock lets their live tests run at once.
   - `WAITFOR` is refused in every read-only run, so in every `sqlh mcp` call: a live test that needs a call to wait (a timeout, a cancel) reads a table of its own behind a write another session holds (`Blocked`, `live::mcp_tools`), a lock wait that costs the server no CPU; a CPU-bound wait would slow the timing tests running alongside.

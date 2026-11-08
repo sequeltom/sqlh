@@ -7,7 +7,8 @@
 #
 # Four jobs, so that no code from the build (dependencies, build scripts, the exe itself) runs
 # where the signing identity or write access can be reached (R22):
-#   build    read-only; builds and checks, runs the unsigned exe, uploads it with the notices
+#   build    read-only; builds and checks, runs the unsigned exe, uploads it with the notices,
+#            and uploads the tests' binary for AppVeyor's certification run (decision 75)
 #   sign     the only job that can request the Azure token; signs, verifies the signature and
 #            packages the exe as data, never running it
 #   verify   read-only; runs the signed exe and checks the sums
@@ -85,6 +86,29 @@ jobs:
         if ($reported -notmatch "^sqlh $([regex]::Escape($env:SQLH_VERSION)) ") {
           throw "the exe reports '$reported', not $env:SQLH_VERSION"
         }
+
+    # The process and live tests' binary, built by Check alongside the exe with the same
+    # version, for a release certification run on AppVeyor against the signed exe (decision
+    # 75, scripts/appveyor-live.ps1). A workflow artifact, never a release asset. --no-run
+    # builds nothing here; it names the file Check built.
+    - name: Stage tests
+      shell: pwsh
+      run: |
+        $bin = @(cargo test --locked --release --test cli --no-run --message-format=json |
+          ForEach-Object { $_ | ConvertFrom-Json } |
+          Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'cli' -and $_.executable } |
+          ForEach-Object executable)
+        if ($bin.Count -ne 1) { throw "expected one test binary, found: $($bin -join ', ')" }
+        New-Item -ItemType Directory -Force tests-bin | Out-Null
+        Copy-Item $bin[0] tests-bin/sqlh-live-tests.exe
+
+    - name: Upload tests
+      uses: actions/upload-artifact@v7
+      with:
+        name: sqlh-live-tests
+        path: tests-bin/
+        if-no-files-found: error
+        retention-days: 30
 
     - name: Third-party notices
       shell: pwsh
