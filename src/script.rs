@@ -56,8 +56,20 @@ pub fn source_line(batch_line: u32, line_map: &[u32], line_in_batch: u32) -> u32
 }
 
 /// Decodes input bytes: UTF-8 (BOM optional) or UTF-16 with a BOM. Anything else is an
-/// error rather than a lossy guess that would silently corrupt string literals.
+/// error rather than a lossy guess that would silently corrupt string literals. More BOMs
+/// right after the first are dropped too: Windows PowerShell 5.1 writes two before piped text
+/// when the native command's output is captured (`$r = $sql | sqlh ...`), and one even with an
+/// `$OutputEncoding` that has none (notes/windows-shells.md). One anywhere else stays, for the
+/// guard to refuse and show.
 pub fn decode(bytes: Vec<u8>, name: &str) -> Result<String, String> {
+    decode_once(bytes, name).map(|mut text| {
+        let marks = text.len() - text.trim_start_matches('\u{FEFF}').len();
+        text.drain(..marks);
+        text
+    })
+}
+
+fn decode_once(bytes: Vec<u8>, name: &str) -> Result<String, String> {
     let utf16 = |body: &[u8], from: fn([u8; 2]) -> u16| {
         let (units, rest) = body.as_chunks::<2>();
         if !rest.is_empty() {
@@ -993,6 +1005,33 @@ mod tests {
             decode(b"SELECT \xE9".to_vec(), "x")
                 .unwrap_err()
                 .contains("byte 7")
+        );
+    }
+
+    // Windows PowerShell 5.1 sends two UTF-8 BOMs before piped text whose command's output it
+    // captures, and one with a BOM-less $OutputEncoding (measured 2026-11-08): each run of them
+    // at the start is the encoding's, in any of the three. One later in the text isn't.
+    #[test]
+    fn a_run_of_boms_at_the_start_is_dropped_and_one_later_kept() {
+        for bytes in [
+            &b"\xEF\xBB\xBF\xEF\xBB\xBFSELECT 1\r\n"[..],
+            b"\xEF\xBB\xBF\xEF\xBB\xBF\xEF\xBB\xBFSELECT 1\r\n",
+            b"\xFF\xFE\xFF\xFES\x00E\x00L\x00E\x00C\x00T\x00 \x001\x00\r\x00\n\x00",
+            b"\xFE\xFF\xFE\xFF\x00S\x00E\x00L\x00E\x00C\x00T\x00 \x001\x00\r\x00\n",
+        ] {
+            assert_eq!(
+                decode(bytes.to_vec(), "x").unwrap(),
+                "SELECT 1\r\n",
+                "{bytes:?}"
+            );
+        }
+        assert_eq!(
+            decode(b"SELECT 1;\xEF\xBB\xBFSELECT 2".to_vec(), "x").unwrap(),
+            "SELECT 1;\u{FEFF}SELECT 2"
+        );
+        assert_eq!(
+            decode(b"\xEF\xBB\xBFSELECT 1\n\xEF\xBB\xBFSELECT 2".to_vec(), "x").unwrap(),
+            "SELECT 1\n\u{FEFF}SELECT 2"
         );
     }
 }

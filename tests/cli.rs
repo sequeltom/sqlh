@@ -2893,6 +2893,44 @@ fn wide_text_without_a_usable_bom_is_a_usage_error() {
     }
 }
 
+// Windows PowerShell 5.1, as --help says to set it up, sends two BOMs before piped SQL when the
+// command's output is captured; sqlh drops each at the start and reaches the server, where the
+// second used to be refused as `<U+FEFF>SELECT starts the batch` (found at release, 2026-11-08).
+#[test]
+fn piped_sql_with_a_run_of_boms_reaches_the_server() {
+    for input in [
+        &b"\xEF\xBB\xBF\xEF\xBB\xBFSELECT 1 AS a\r\n"[..],
+        b"\xEF\xBB\xBFSELECT 1 AS a\r\n",
+    ] {
+        let r = run_with_stdin(sqlh().args(DEAD), input);
+        assert_eq!(r.code, 2, "{input:?}: {}", r.stdout);
+    }
+    // A mark that starts a later batch isn't the encoding's: still refused, and shown.
+    let r = run_with_stdin(
+        sqlh().args(DEAD),
+        b"\xEF\xBB\xBFSELECT 1 AS a\r\nGO\r\n\xEF\xBB\xBFSELECT 2 AS b\r\n",
+    );
+    assert_eq!(r.code, 5, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("<U+FEFF>SELECT starts the batch"),
+        "{}",
+        r.stdout
+    );
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$OutputEncoding = [Text.Encoding]::UTF8; $r = 'SELECT 1 AS a' | & '{}' -S 127.0.0.1,1 \
+             -l 1; $r; exit $LASTEXITCODE",
+            env!("CARGO_BIN_EXE_sqlh")
+        );
+        let mut command = Command::new("powershell.exe");
+        isolated(&mut command).args(["-NoProfile", "-Command", &script]);
+        let r = run(&mut command);
+        assert_eq!(r.code, 2, "{}{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("cannot connect"), "{}", r.stdout);
+    }
+}
+
 // The password sqlh logs in with never reaches SQL text, so no row, refusal or server error can
 // print it (DESIGN.md §4.3, §8).
 #[test]

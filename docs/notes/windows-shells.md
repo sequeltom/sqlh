@@ -165,6 +165,7 @@ What sqlh gets on stdin, for the string `SELECT N'Café …'` (e acute, ellipsis
 | Windows PowerShell 5.1, default `$OutputEncoding` (US-ASCII) | `é` and `…` both `3F` (`?`), then `0D 0A` | runs it with `?`: **silent** |
 | Windows PowerShell 5.1, `Get-Content file.sql \| sqlh` (UTF-8 file, no BOM) | the file is read as ANSI (`Ã©`), then each character is `?` | runs it with `??`: **silent** |
 | Windows PowerShell 5.1, `$OutputEncoding = [Text.Encoding]::UTF8` | `EF BB BF`, then UTF-8 | ok (the BOM is accepted) |
+| The same, with the command's output captured (`$r = ... \| sqlh`, `... \| sqlh \| Out-File`; measured 2026-11-08 at release) | `EF BB BF EF BB BF`, then UTF-8; with `[Text.UTF8Encoding]::new($false)`, one `EF BB BF` | ok since 2026-11-08 (`decode` drops every BOM at the start); before, the second was refused as `<U+FEFF>SELECT starts the batch`, exit 5 |
 | Windows PowerShell 5.1, `$OutputEncoding = [Text.UTF8Encoding]::new($false)` | UTF-8 | ok |
 | Windows PowerShell 5.1, `$OutputEncoding = [Console]::OutputEncoding` (OEM 437) | `é` is `82`, `…` is `2E` (`.`) | `é`: refused, not valid UTF-8; `…` alone: **silent** |
 | PowerShell 7, default | UTF-8, no BOM | ok |
