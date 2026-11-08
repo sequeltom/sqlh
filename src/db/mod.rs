@@ -1455,14 +1455,24 @@ fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
 /// `tcp:`. The host may be an IPv6 address: 0.4.0 splits `np:` off one (`split_protocol`).
 ///
 /// Local pipes stay: `np:` with `.`, `(local)`, `localhost`, `127.0.0.1`, `::1` or this
-/// computer's name (`COMPUTERNAME`), a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared
-/// memory, which the driver only allows locally), `admin:` (a TCP connection) and LocalDB. Text
-/// the driver would reject before opening anything, such as `np:` with no host, is left to it.
+/// computer's name, a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared memory, which
+/// the driver only allows locally), `admin:` (a TCP connection) and LocalDB. Text the driver
+/// would reject before opening anything, such as `np:` with no host, is left to it.
 ///
 /// The message starts with the server text, so a caller can say where it came from:
 /// `-S np:db01: Named Pipes ...`.
 pub fn check_server(server: &str) -> Result<(), String> {
-    check(server, std::env::var("COMPUTERNAME").ok().as_deref())
+    check(server, this_computer().as_deref())
+}
+
+/// This computer's name as the driver reads it to decide that a pipe is local, and opens
+/// `\\.\pipe\...` for it (owner decision 73): the DNS host name, which the environment can't
+/// change. `COMPUTERNAME`, the NetBIOS name (15 characters at most, and set by any parent
+/// process), only when the driver has none, which takes `GetComputerNameExW` failing: the
+/// driver then opens `\\<that name>\pipe\...` over SMB, which reaches this machine unless the
+/// environment was edited to name another.
+fn this_computer() -> Option<String> {
+    mssql_tds::connection::this_computer_name().or_else(|| std::env::var("COMPUTERNAME").ok())
 }
 
 fn check(server: &str, computer: Option<&str>) -> Result<(), String> {
@@ -2137,6 +2147,28 @@ mod tests {
             "np:db01: Named Pipes to a remote server aren't supported, because their open \
              can't be timed out or cancelled; connect over TCP: -S db01"
         );
+    }
+
+    // Decision 73: this computer's name is the driver's, the one its pipe open takes as local,
+    // not the environment's `COMPUTERNAME`; where the two differ (a DNS host name longer than 15
+    // characters, or an edited environment), `np:` with the environment's is refused.
+    #[test]
+    fn this_computers_name_is_the_one_the_driver_takes_as_local() {
+        let name = mssql_tds::connection::this_computer_name().expect("a computer name");
+        assert_eq!(super::this_computer().as_deref(), Some(name.as_str()));
+        assert_eq!(super::check_server(&format!("np:{name}")), Ok(()));
+        assert_eq!(
+            super::check_server(&format!("np:{}", name.to_lowercase())),
+            Ok(())
+        );
+        assert_eq!(
+            super::check_server(&format!(r"np:{name}\SQLEXPRESS")),
+            Ok(())
+        );
+        let environment = std::env::var("COMPUTERNAME").unwrap_or_default();
+        if !environment.is_empty() && !environment.eq_ignore_ascii_case(&name) {
+            assert!(super::check_server(&format!("np:{environment}")).is_err());
+        }
     }
 
     #[test]

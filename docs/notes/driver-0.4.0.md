@@ -620,7 +620,7 @@ On a local branch, `driver-0.4.0`, once §7's decisions are taken.
 
 ## 10. As built and measured (step 2, 2026-11-08)
 
-On the local branch `driver-0.4.0`. Decisions taken: §7.1 is PLAN.md decision 70 (0.1.0 ships on 0.4.0 and takes no later driver), §7.2 is decision 71 (vector version 2, set explicitly; the owner chose the driver's default over the recommended version 1). §7.3 is decision 72 (the owner chose to build §6.1's provider now, in place of keeping the pre-lookup; built below); §7.4–§7.5 are still to be put to the owner.
+On the local branch `driver-0.4.0`. Decisions taken: §7.1 is PLAN.md decision 70 (0.1.0 ships on 0.4.0 and takes no later driver), §7.2 is decision 71 (vector version 2, set explicitly; the owner chose the driver's default over the recommended version 1). §7.3 is decision 72 (the owner chose to build §6.1's provider now, in place of keeping the pre-lookup; built below); §7.4 is decision 73 (the local-pipe check takes the driver's `this_computer_name()`, with `COMPUTERNAME` only when it has none; built in `db::this_computer`, with a unit test that the driver's name is the one used and that a differing `COMPUTERNAME` is refused; on this workstation the two names are the same, and `np:<this computer>` reaches the driver's local pipe); §7.5 is still to be put to the owner.
 
 **Built:**
 - `1352077`: the bump alone, `Cargo.toml` and `Cargo.lock` (block2 0.6.2, objc2 0.6.5, objc2-encode 4.1.0 added, macOS only). No source change; `scripts/check.ps1` passed.
