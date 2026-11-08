@@ -223,8 +223,9 @@ pub(crate) fn run_command(opts: Opts, origin: QueryOrigin, started: Instant) -> 
         started,
     ));
     // The run, its delivery and its publication are over; what the runtime still runs (a
-    // name lookup the driver left on a blocking thread after a cancel) is abandoned, not
-    // waited for, so a signal's grace bounds the exit (DESIGN.md §4.3).
+    // name lookup the driver left on a blocking thread after a cancel, or Windows auth's SPN
+    // wait, at most 500 ms, `db::spn`) is abandoned, not waited for, so a signal's grace bounds
+    // the exit (DESIGN.md §4.3).
     runtime.shutdown_background();
     exit
 }

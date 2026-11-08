@@ -171,8 +171,9 @@ pub(crate) fn run(opts: McpOpts) -> Exit {
     let local = tokio::task::LocalSet::new();
     let exit = local.block_on(&runtime, serve(engine, launch, opts.verbose));
     // `serve` has bounded the end; what the runtime still runs (a name lookup the driver left
-    // on a blocking thread, a call still settling after a console event) is abandoned, not
-    // waited for, as dropping the runtime would.
+    // on a blocking thread, Windows auth's SPN wait, at most 500 ms, `db::spn`, a call still
+    // settling after a console event) is abandoned, not waited for, as dropping the runtime
+    // would.
     drop(local);
     runtime.shutdown_background();
     exit

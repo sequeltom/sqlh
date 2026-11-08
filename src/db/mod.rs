@@ -2,6 +2,7 @@
 //! driver can be upgraded or swapped here without touching the rest of the tool.
 
 pub mod phases;
+mod spn;
 mod stream;
 mod types;
 mod value;
@@ -27,7 +28,7 @@ use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting, TdsRes
 use mssql_tds::datatypes::row_writer::DiscardRowWriter;
 use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage};
 use mssql_tds::message::login_options::ApplicationIntent;
-use mssql_tds::security::{canonicalize_hostname, make_spn};
+use mssql_tds::security::SecurityContextProvider;
 
 pub use value::Value;
 
@@ -676,21 +677,26 @@ enum Row {
 
 impl Session {
     pub async fn connect(options: &ConnectOptions, cancel: &Cancel) -> Result<Session, DbError> {
+        Self::connect_with(options, cancel, spn::HopSpn::system()).await
+    }
+
+    /// `connect`, with Windows auth's SPN provider given: the tests' seam.
+    async fn connect_with(
+        options: &ConnectOptions,
+        cancel: &Cancel,
+        spn: Arc<dyn SecurityContextProvider>,
+    ) -> Result<Session, DbError> {
         let mut context = ClientContext::default();
         context.application_name = options.application_name.into();
         context.database = options.database.clone().unwrap_or_default();
         match &options.auth {
             Auth::Integrated => {
                 context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-                // A read-only intent expects a routing redirect, and a fixed SPN would carry over
-                // to the routed host unchanged (R52): the driver builds one for each hop itself.
-                if !options.read_only_intent {
-                    context.server_spn =
-                        spn_if_lookup_is_slow(&options.server, SPN_LOOKUP_BUDGET, cancel, |host| {
-                            canonicalize_hostname(&host);
-                        })
-                        .await?;
-                }
+                // The driver calls this for each login hop, after its TCP connect, prelogin and
+                // TLS, with the host and port it dials (SQL Browser's port, each routed host), so
+                // the SPN is that hop's (decision 72; DESIGN.md §4.2, `-E`). `server_spn` stays
+                // unset: its one value would go to every hop (R52).
+                context.security_context_provider = Some(spn);
             }
             Auth::Sql { user, password } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::Password;
@@ -752,8 +758,9 @@ impl Session {
         // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
         // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
-        // a login that never finished leaves nothing to clean up. Only a blocking call, such as
-        // opening a pipe, outlasts a cancel.
+        // a login that never finished leaves nothing to clean up. Only a blocking call outlasts a
+        // cancel: opening a pipe, or Windows auth's SPN wait (at most 500 ms, on a thread of the
+        // driver's blocking pool, `db::spn`), which is left to end by itself.
         let mut client = tokio::select! {
             client = connecting => client.map_err(|e| connect_error(e, options))?,
             () = cancel.cancelled() => {
@@ -1438,110 +1445,6 @@ fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
     (None, server)
 }
 
-/// How long Windows auth's name lookup gets before sqlh stops waiting for it. A name server
-/// answers well inside this; what it cuts is a lookup that falls through to NetBIOS, about 5 s
-/// for an address with no PTR record (notes/connect-latency.md, Windows authentication).
-const SPN_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
-
-/// The SPN sqlh gives the driver for a TCP `-S`, or `None` to let the driver build its own.
-/// The driver's lookup has no bound of its own (upstream-issues.md U9). Since mssql-tds 0.4.0 it
-/// runs on tokio's blocking pool, inside the login deadline (`-l` + 1 s) and the cancel, but for
-/// an address with no PTR record it still takes about 5 s of that deadline, which fails a login
-/// at `-l 3` or less. So the same lookup runs here first, on its own thread, within 500 ms.
-///
-/// In time, the driver is left to it: its own lookup repeats a recent answer, and it builds the
-/// SPN for each hop, which a fixed one would get wrong after a routing redirect. Past the budget,
-/// the SPN is the one the driver would build when its lookup fails: the host as given, and the
-/// port the driver dials. A named instance without a port gets none (`host_and_spn`), and a
-/// read-only intent isn't looked up here (`Session::connect`): for both the driver does its own
-/// lookup, bounded only by the login deadline and outside `LOOKUP_THREADS` (R52).
-async fn spn_if_lookup_is_slow(
-    server: &str,
-    budget: Duration,
-    cancel: &Cancel,
-    lookup: impl FnOnce(String) + Send + 'static,
-) -> Result<Option<String>, DbError> {
-    let Some((host, spn)) = host_and_spn(server) else {
-        return Ok(None);
-    };
-    tokio::select! {
-        slow = outlasts(budget, move || lookup(host)) => Ok(slow.then_some(spn)),
-        () = cancel.cancelled() => Err(DbError::Cancelled("cancelled while connecting".into())),
-    }
-}
-
-/// How many lookups may run at once in this process. A lookup past its budget is left running,
-/// so in `sqlh mcp`, under DNS trouble and repeated cancels, they would pile up without a cap
-/// (R53); a slot is held until the lookup itself ends.
-const LOOKUP_THREADS: usize = 4;
-
-static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LOOKUP_THREADS);
-
-/// Whether `work` is still running after `budget`, or couldn't start within it: waiting for one of
-/// `LOOKUP_THREADS` comes out of the same budget, and dropping the future stops that wait. The
-/// thread is left behind if it outlasts the budget, holding its slot: a lookup can't be
-/// cancelled, ends by itself, and process exit doesn't wait for it, as it would for
-/// `spawn_blocking` when the runtime drops.
-async fn outlasts(budget: Duration, work: impl FnOnce() + Send + 'static) -> bool {
-    outlasts_within(&LOOKUPS, budget, work).await
-}
-
-async fn outlasts_within(
-    slots: &'static tokio::sync::Semaphore,
-    budget: Duration,
-    work: impl FnOnce() + Send + 'static,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + budget;
-    let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slots.acquire()).await else {
-        return true;
-    };
-    let (done, finished) = tokio::sync::oneshot::channel::<()>();
-    let started = std::thread::Builder::new().spawn(move || {
-        work();
-        drop(slot);
-        let _ = done.send(());
-    });
-    started.is_err() || tokio::time::timeout_at(deadline, finished).await.is_err()
-}
-
-/// A TCP `-S`'s host and the SPN the driver's Windows path would build for it when its lookup
-/// fails, read the way the driver's parser does (`datasource_parser.rs`): a port replaces an
-/// instance, and no port is 1433. The driver builds `MSSQLSvc/<host>:<port>` from the host and
-/// port it dials (`sspi_context.rs`, `make_spn_canonicalized(server, None, port)`), never from an
-/// instance's name, and an instance's port comes from SQL Browser only once it connects; so a
-/// named instance without a port gets `None` (R52), as do a pipe, shared memory, LocalDB, the DAC
-/// and a bad port, whose SPN stays the driver's.
-fn host_and_spn(server: &str) -> Option<(String, String)> {
-    let source = data_source(server);
-    let (protocol, rest) = split_protocol(&source);
-    if matches!(protocol, Some("np" | "lpc" | "admin"))
-        || rest.starts_with(r"\\")
-        || rest.to_ascii_lowercase().starts_with("(localdb)")
-    {
-        return None;
-    }
-    let (rest, port) = match rest.split_once(',') {
-        Some((rest, parameter)) => {
-            let port = parameter.split('\\').next().unwrap_or_default().trim();
-            (rest.trim_end(), Some(port.parse::<u16>().ok()?))
-        }
-        None => (rest, None),
-    };
-    let (host, instance) = match rest.split_once('\\') {
-        Some((host, instance)) => (host.trim_end(), Some(instance.trim())),
-        None => (rest, None),
-    };
-    if host.is_empty() {
-        return None;
-    }
-    let port = match (port, instance) {
-        (Some(port), _) => port,
-        (None, None) => 1433,
-        (None, Some(_)) => return None,
-    };
-    Some((host.to_owned(), make_spn(host, None, port)))
-}
-
 /// Refuses a Named Pipes request to another machine, with a message for a usage error
 /// (DESIGN.md §4.2). The driver opens a pipe with a synchronous `CreateFileW` on its runtime
 /// thread, so for an unreachable host a run is stuck for about 21 s while SMB gives up, past
@@ -1794,8 +1697,7 @@ mod tests {
     use super::{
         Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
         PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
-        host_and_spn, outlasts_within, split_protocol, spn_if_lookup_is_slow, tcp_form, tls_hint,
-        wait_for_output,
+        split_protocol, tcp_form, tls_hint, wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
@@ -2181,187 +2083,6 @@ mod tests {
         ] {
             assert_eq!(split_protocol(server), (protocol, rest), "{server}");
         }
-    }
-
-    #[test]
-    fn a_tcp_server_gets_the_spn_the_driver_would_fall_back_to() {
-        for (server, host, spn) in [
-            ("192.0.2.1", "192.0.2.1", "MSSQLSvc/192.0.2.1:1433"),
-            ("192.0.2.1,1500", "192.0.2.1", "MSSQLSvc/192.0.2.1:1500"),
-            ("tcp:db01,1500", "db01", "MSSQLSvc/db01:1500"),
-            ("TCP:db01", "db01", "MSSQLSvc/db01:1433"),
-            // A port replaces the instance, in either order.
-            (r"db01\SALES,1500", "db01", "MSSQLSvc/db01:1500"),
-            (r"db01,1500\SALES", "db01", "MSSQLSvc/db01:1500"),
-            ("db01 , 1500", "db01", "MSSQLSvc/db01:1500"),
-            ("2001:db8::1", "2001:db8::1", "MSSQLSvc/2001:db8::1:1433"),
-            (
-                "2001:db8::1,1500",
-                "2001:db8::1",
-                "MSSQLSvc/2001:db8::1:1500",
-            ),
-            (
-                "tcp:2001:db8::5,1500",
-                "2001:db8::5",
-                "MSSQLSvc/2001:db8::5:1500",
-            ),
-        ] {
-            let expected = Some((host.to_owned(), spn.to_owned()));
-            assert_eq!(host_and_spn(server), expected, "{server}");
-        }
-        for server in [
-            "np:db01",
-            "lpc:db01",
-            "admin:db01",
-            r"\\db01\pipe\sql\query",
-            r"(localdb)\MSSQLLocalDB",
-            "db01,notaport",
-            "",
-            // A named instance's port is SQL Browser's, known only once the driver connects, and
-            // the driver's SPN names that port, never the instance (R52).
-            r"db01\SALES",
-            r"tcp:db01\SALES",
-            r"192.0.2.1\SALES",
-            r"2001:db8::5\SALES",
-            "np:2001:db8::5",
-        ] {
-            assert_eq!(host_and_spn(server), None, "{server}");
-        }
-    }
-
-    // R53: the threads left behind by lookups past their budget are capped, each holds its slot
-    // until it ends, and a wait for a slot ends with the budget or as soon as it is dropped.
-    #[test]
-    fn lookups_past_their_budget_are_capped_and_hold_their_slot_until_they_end() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        static RUNNING: AtomicUsize = AtomicUsize::new(0);
-        static MOST: AtomicUsize = AtomicUsize::new(0);
-        runtime().block_on(async {
-            let mut releases = Vec::new();
-            for _ in 0..8 {
-                let (release, held) = std::sync::mpsc::channel::<()>();
-                releases.push(release);
-                let slow = outlasts_within(&SLOTS, Duration::from_millis(20), move || {
-                    let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
-                    MOST.fetch_max(now, Ordering::SeqCst);
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                    RUNNING.fetch_sub(1, Ordering::SeqCst);
-                })
-                .await;
-                assert!(slow);
-            }
-            assert_eq!(SLOTS.available_permits(), 0);
-            let started = Instant::now();
-            assert!(
-                outlasts_within(&SLOTS, Duration::from_millis(20), || panic!("past the cap")).await
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "{:?}",
-                started.elapsed()
-            );
-            let dropped = tokio::time::timeout(
-                Duration::from_millis(20),
-                outlasts_within(&SLOTS, Duration::from_secs(60), || panic!("past the cap")),
-            )
-            .await;
-            assert!(dropped.is_err());
-            drop(releases);
-            let freed = Instant::now();
-            while SLOTS.available_permits() < 2 {
-                assert!(
-                    freed.elapsed() < Duration::from_secs(10),
-                    "a slot was never given back"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert_eq!(RUNNING.load(Ordering::SeqCst), 0);
-            assert!(!outlasts_within(&SLOTS, Duration::from_secs(10), || {}).await);
-        });
-        assert_eq!(MOST.load(Ordering::SeqCst), 2);
-    }
-
-    // notes/connect-latency.md, Windows authentication: a slow lookup gets an SPN so the driver
-    // skips its own, and holds neither the runtime nor a cancel while it runs.
-    #[test]
-    fn a_slow_lookup_gives_the_driver_an_spn_and_blocks_nothing() {
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let cancel = Cancel::new();
-        let (spn, ticks) = runtime().block_on(async {
-            let lookup = spn_if_lookup_is_slow(
-                "192.0.2.1,1500",
-                Duration::from_millis(50),
-                &cancel,
-                move |_| {
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                },
-            );
-            tokio::pin!(lookup);
-            let mut ticks = 0;
-            loop {
-                tokio::select! {
-                    spn = &mut lookup => break (spn, ticks),
-                    () = tokio::time::sleep(Duration::from_millis(5)) => ticks += 1,
-                }
-            }
-        });
-        drop(release);
-        assert_eq!(spn.unwrap().as_deref(), Some("MSSQLSvc/192.0.2.1:1500"));
-        assert!(ticks > 0, "the lookup held the runtime");
-    }
-
-    #[test]
-    fn a_lookup_in_time_leaves_the_spn_to_the_driver() {
-        let (seen, host) = std::sync::mpsc::channel();
-        let cancel = Cancel::new();
-        let spn = runtime()
-            .block_on(spn_if_lookup_is_slow(
-                "db01,1500",
-                Duration::from_secs(60),
-                &cancel,
-                move |host| seen.send(host).unwrap(),
-            ))
-            .unwrap();
-        assert_eq!(spn, None);
-        assert_eq!(host.recv().unwrap(), "db01");
-    }
-
-    #[test]
-    fn a_pipe_is_not_looked_up() {
-        let cancel = Cancel::new();
-        let spn = runtime()
-            .block_on(spn_if_lookup_is_slow(
-                "np:db01",
-                Duration::from_secs(60),
-                &cancel,
-                |_| panic!("looked up"),
-            ))
-            .unwrap();
-        assert_eq!(spn, None);
-    }
-
-    #[test]
-    fn a_cancel_ends_the_wait_for_a_lookup() {
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let root = Cancel::new();
-        let cancel = root.child();
-        let started = Instant::now();
-        let result = runtime().block_on(async {
-            let lookup =
-                spn_if_lookup_is_slow("192.0.2.1", Duration::from_secs(60), &cancel, move |_| {
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                });
-            tokio::pin!(lookup);
-            tokio::select! {
-                result = &mut lookup => return result,
-                () = tokio::time::sleep(Duration::from_millis(10)) => root.cancel(),
-            }
-            lookup.await
-        });
-        drop(release);
-        assert!(matches!(result, Err(DbError::Cancelled(_))), "{result:?}");
-        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     // DESIGN.md §4.2: a Named Pipes request to another machine is refused, with the TCP form
@@ -3843,7 +3564,12 @@ pub(crate) mod fake_server {
     /// with `reply`, then reads until the client goes. The payload is `None` until a LOGIN7
     /// has arrived.
     fn serve_login(reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        serve_login_on("127.0.0.1", reply)
+    }
+
+    /// `serve_login` on another loopback address, such as a route's target.
+    fn serve_login_on(ip: &str, reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
+        let listener = TcpListener::bind((ip, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(None));
         let kept = seen.clone();
@@ -4212,6 +3938,291 @@ pub(crate) mod fake_server {
         assert_eq!(login_database(&login).as_deref(), Some("sales"));
         let features = login_features(&login);
         assert!(!features.contains(&0x01), "{features:02x?}");
+    }
+
+    // Decision 72: Windows auth's SPN provider (`db::spn`), through a real connect. The fake
+    // prelogin offers no encryption, so there is no TLS, and a LOGIN7 with a token from the
+    // recorder's mock context is answered with a plain LOGINACK, which the driver takes; real
+    // SSPI is a live check (driver-0.4.0.md §10).
+
+    use super::spn::tests::{Hop, NOT_LOOPBACK, TOKEN, answering, held, recorder};
+    use super::spn::{HopSpn, Slots};
+    use mssql_tds::security::SecurityContextProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The hops a recording provider saw.
+    type Hops = Arc<Mutex<Vec<Hop>>>;
+
+    fn integrated(server: String) -> ConnectOptions {
+        ConnectOptions {
+            auth: Auth::Integrated,
+            ..options(server)
+        }
+    }
+
+    /// The production provider's rule and slots, with `create` recording each hop, and a lookup
+    /// that counts its calls (no fake is looked up: every one is on a loopback address).
+    fn recording() -> (Arc<dyn SecurityContextProvider>, Hops, Arc<AtomicUsize>) {
+        static SLOTS: Slots = Slots::new(4);
+        let (create, seen) = recorder();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = HopSpn::with(
+            Duration::from_secs(10),
+            &SLOTS,
+            answering("looked-up.example", Arc::clone(&calls)),
+            NOT_LOOPBACK,
+            create,
+        );
+        (Arc::new(provider), seen, calls)
+    }
+
+    fn connect_as(
+        options: &ConnectOptions,
+        spn: Arc<dyn SecurityContextProvider>,
+    ) -> Result<Session, DbError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Session::connect_with(options, &Cancel::new(), spn))
+    }
+
+    /// LOGIN7's fIntSecurity (OptionFlags2, byte 25, 0x80) and its SSPI data (ibSSPI and cbSSPI
+    /// at 78..82 of the OffsetLength block, MS-TDS 2.2.6.4).
+    fn login_sspi(login: &[u8]) -> Option<&[u8]> {
+        let int_security = login.get(25).is_some_and(|b| b & 0x80 != 0);
+        let field = |i: usize| {
+            login
+                .get(i..i + 2)
+                .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        let (offset, length) = (field(78)?, field(80)?);
+        int_security.then(|| login.get(offset..offset + length))?
+    }
+
+    fn hop(server: &str, port: u16) -> Hop {
+        Hop {
+            server: server.into(),
+            port,
+            spn: Some(format!("MSSQLSvc/{server}:{port}")),
+            loopback: true,
+            bindings: None,
+            package: "Negotiate",
+        }
+    }
+
+    // The provider gets the host and port the driver dials, sets that hop's SPN, and its
+    // context's token is what the LOGIN7 carries. A port replaces an instance, so no SQL
+    // Browser is asked and the SPN names the port.
+    #[test]
+    fn windows_auth_gives_the_provider_the_dialled_host_and_port() {
+        for server in ["127.0.0.1,{port}", r"127.0.0.1\SQLHNOBROWSER,{port}"] {
+            let (port, seen_login) = serve_login(login_reply());
+            let (provider, seen, calls) = recording();
+            let server = server.replace("{port}", &port.to_string());
+            let session = connect_as(&integrated(server.clone()), provider);
+            assert!(session.is_ok(), "{server}: {:?}", session.err());
+            assert_eq!(*seen.lock().unwrap(), [hop("127.0.0.1", port)], "{server}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let login = seen_login.lock().unwrap().clone().expect("a LOGIN7");
+            assert_eq!(login_sspi(&login), Some(TOKEN), "{server}");
+        }
+    }
+
+    // R52, closed: each routed hop gets its own SPN, its host's and port's, with a read-only
+    // intent too (the pre-lookup left those to the driver), and through an acknowledged
+    // Enhanced Routing route, whose hop the driver builds from a cloned context.
+    #[test]
+    fn each_routed_hop_gets_its_own_spn() {
+        type Route = fn(u16) -> Vec<u8>;
+        let plain: Route = |target| login_reply_with(env_routing(target, "127.0.0.2"), true);
+        let enhanced: Route = |target| {
+            let route = env_route(21, target, "127.0.0.2", Some("sales"));
+            login_reply_with([feature_ext_ack(0x0f, &[1]), route].concat(), true)
+        };
+        for (route, read_only) in [(plain, false), (plain, true), (enhanced, false)] {
+            let (target, routed) = serve_login_on("127.0.0.2", login_reply());
+            let (gateway, _) = serve_login(route(target));
+            let (provider, seen, _) = recording();
+            let options = ConnectOptions {
+                read_only_intent: read_only,
+                ..integrated(format!("127.0.0.1,{gateway}"))
+            };
+            let session = connect_as(&options, provider);
+            assert!(session.is_ok(), "{:?}", session.err());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [hop("127.0.0.1", gateway), hop("127.0.0.2", target)],
+                "read-only {read_only}"
+            );
+            let login = routed.lock().unwrap().clone().expect("the routed LOGIN7");
+            assert_eq!(login_sspi(&login), Some(TOKEN));
+        }
+    }
+
+    /// A one-shot SQL Browser on `ip`:1434 (SSRP's fixed port, MS-SQLR) that names `tcp_port`
+    /// for `instance`, replying from the address and port asked, as the driver requires. It
+    /// returns once its thread is waiting for the request: the driver waits 1 s for the answer,
+    /// and a thread not yet started on a busy machine could miss that.
+    fn serve_browser(ip: &str, instance: &str, tcp_port: u16) {
+        let socket = std::net::UdpSocket::bind((ip, 1434)).unwrap_or_else(|e| {
+            panic!(
+                "{ip}:1434 can't be bound ({e}): another test process using this address, or a \
+                 SQL Server Browser holding the port exclusively"
+            )
+        });
+        let answer = format!(
+            "ServerName;FAKE;InstanceName;{instance};IsClustered;No;Version;17.0.0.0;tcp;{tcp_port};;"
+        );
+        let (ready, waiting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut asked = [0u8; 512];
+            let _ = ready.send(());
+            let Ok((_, from)) = socket.recv_from(&mut asked) else {
+                return;
+            };
+            let mut reply = vec![0x05];
+            reply.extend(u16::try_from(answer.len()).unwrap().to_le_bytes());
+            reply.extend(answer.as_bytes());
+            let _ = socket.send_to(&reply, from);
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fake SQL Browser started");
+    }
+
+    // R52, closed: a named instance without a port gets SQL Browser's port in its SPN, which
+    // the pre-lookup couldn't know before the connect. SQL Browser's port is fixed, so the
+    // address is this process's own (127.a.b.3, from the process id, never 127.0.0.x), and the
+    // instance's name is unique, since the driver caches what Browser said for the process.
+    #[test]
+    fn a_named_instance_gives_the_provider_sql_browsers_port() {
+        let pid = std::process::id();
+        let ip = format!("127.{}.{}.3", 1 + pid % 250, 1 + (pid / 250) % 250);
+        let (port, seen_login) = serve_login_on(&ip, login_reply());
+        serve_browser(&ip, "SQLHBROWSER72", port);
+        let (provider, seen, _) = recording();
+        let session = connect_as(&integrated(format!(r"{ip}\SQLHBROWSER72")), provider);
+        assert!(session.is_ok(), "{:?}", session.err());
+        assert_eq!(*seen.lock().unwrap(), [hop(&ip, port)]);
+        assert!(
+            seen_login.lock().unwrap().is_some(),
+            "the LOGIN7 reached the instance"
+        );
+    }
+
+    // The driver's own error from creating its context ends the connect with the Windows auth
+    // hint, before any LOGIN7.
+    #[test]
+    fn the_drivers_security_error_ends_the_connect_before_the_login() {
+        static SLOTS: Slots = Slots::new(4);
+        let (port, seen_login) = serve_login(login_reply());
+        let failing = HopSpn::with(
+            Duration::from_secs(10),
+            &SLOTS,
+            answering("x", Arc::new(AtomicUsize::new(0))),
+            NOT_LOOPBACK,
+            Arc::new(|_: &_, _: &str, _: u16| {
+                Err(mssql_tds::security::SecurityError::TargetUnknown(
+                    "MSSQLSvc/x:1".into(),
+                ))
+            }),
+        );
+        let outcome = connect_as(&integrated(format!("127.0.0.1,{port}")), Arc::new(failing));
+        assert!(
+            matches!(&outcome, Err(DbError::Connect(words))
+                if words.contains("Windows auth failed; check Kerberos/SPN setup")),
+            "{:?}",
+            outcome.err()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(seen_login.lock().unwrap().is_none(), "no LOGIN7");
+    }
+
+    /// The provider with every host looked up, by a lookup held until the `Sender` drops.
+    fn waiting(
+        budget: Duration,
+    ) -> (
+        Arc<dyn SecurityContextProvider>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        static SLOTS: Slots = Slots::new(4);
+        let (lookup, release, _) = held();
+        let (create, _) = recorder();
+        let provider = HopSpn::with(budget, &SLOTS, lookup, |_| true, create);
+        (Arc::new(provider), release)
+    }
+
+    // A cancel during the SPN wait ends the connect at once, as `Session::connect` races it;
+    // the wait is left to end by itself on the driver's thread. The runtime ends as sqlh's do,
+    // `shutdown_background`, since dropping it would wait for that thread.
+    #[test]
+    fn a_cancel_during_the_spn_wait_ends_the_connect() {
+        let (port, _) = serve_login(login_reply());
+        let (provider, release) = waiting(Duration::from_secs(10));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let outcome = runtime.block_on(async {
+            let root = Cancel::new();
+            let cancel = root.child();
+            let options = integrated(format!("127.0.0.1,{port}"));
+            let connecting = Session::connect_with(&options, &cancel, provider);
+            tokio::pin!(connecting);
+            tokio::select! {
+                outcome = &mut connecting => return outcome,
+                () = tokio::time::sleep(Duration::from_millis(100)) => root.cancel(),
+            }
+            connecting.await
+        });
+        runtime.shutdown_background();
+        drop(release);
+        assert!(
+            matches!(&outcome, Err(DbError::Cancelled(words)) if words == "cancelled while connecting"),
+            "{:?}",
+            outcome.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    // The SPN wait holds no runtime thread: the runtime keeps running other tasks through it,
+    // and past the budget the login goes on with the fallback SPN.
+    #[test]
+    fn a_slow_spn_wait_holds_no_runtime_thread() {
+        let (port, seen_login) = serve_login(login_reply());
+        let (provider, release) = waiting(Duration::from_millis(300));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (outcome, ticks) = runtime.block_on(async {
+            let cancel = Cancel::new();
+            let options = integrated(format!("127.0.0.1,{port}"));
+            let connecting = Session::connect_with(&options, &cancel, provider);
+            tokio::pin!(connecting);
+            let mut ticks = 0;
+            loop {
+                tokio::select! {
+                    outcome = &mut connecting => break (outcome, ticks),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => ticks += 1,
+                }
+            }
+        });
+        runtime.shutdown_background();
+        drop(release);
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+        assert!(
+            ticks >= 10,
+            "the runtime ticked {ticks} times during a 300 ms wait"
+        );
+        let login = seen_login.lock().unwrap().clone().expect("a LOGIN7");
+        assert_eq!(login_sspi(&login), Some(TOKEN));
     }
 }
 

@@ -79,7 +79,9 @@ src/guard.rs     read-only classifier (own T-SQL lexer, streamed, linear lookahe
 src/db/          the only mssql-tds user: connect (a failed connect's hints name flags, or in sqlh mcp
                  the profile's keys: Hints), run a batch into a BatchSink, the bounded count of
                  hidden rows (Counting), value/type rendering;
-                 stream.rs reads large (PLP) values in chunks and cuts them as they arrive
+                 stream.rs reads large (PLP) values in chunks and cuts them as they arrive;
+                 spn.rs is Windows auth's SPN per login hop, the driver's SecurityContextProvider
+                 (decision 72): a bounded, capped lookup on a thread of its own
 src/output/      Output trait + Tally (shared limits/counts), Advice (CLI or sqlh mcp wording of
                  what a result advises and of the limits it names); text.rs (default), json.rs,
                  csv.rs; delivery.rs (the writer thread and its bounded queue)
