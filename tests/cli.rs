@@ -13221,6 +13221,80 @@ mod live {
         }
     }
 
+    // Decision 71: under vector feature version 2 a float32 vector prints as it did under
+    // version 1, in every format (SQL Server 2025). A float16 one needs the database's
+    // PREVIEW_FEATURES, which sqlh_test leaves off (turning it on is a database-level change
+    // outside decision 21), so the server refuses the type and its rendering is checked by the
+    // unit tests in `db::value`; with the setting on, this checks it here too. SQL Server 2016
+    // has no vector type.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_vector_prints_its_elements_at_their_own_precision() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        let float32 = "SELECT CAST('[0.1,2,-3.5,1e-8]' AS vector(4)) AS v";
+        let float16 = "SELECT CAST('[0.1,2,-3.5,65504]' AS vector(4, float16)) AS v";
+        if server_major(&*server) < 17 {
+            let r = live(&p, &db, &["-Q", float32]);
+            assert_eq!(r.code, 1, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(
+                    "-- error 243 (severity 16, state 1, line 1): Type vector is not a \
+                               defined system type."
+                ),
+                "{}",
+                r.stdout
+            );
+            return;
+        }
+        let shown = |sql: &str, elements: &str| {
+            let r = live(&p, &db, &["-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(
+                r.stdout
+                    .starts_with(&format!("-- result 1\nv:vector\n{elements}\n-- 1 row\n")),
+                "{}",
+                r.stdout
+            );
+            let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(&format!(
+                    r#""columns":[{{"name":"v","type":"vector","nullable":true}}],"rows":[["{elements}"]]"#
+                )),
+                "{}",
+                r.stdout
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            assert!(
+                r.stdout.starts_with(&format!("v\n\"{elements}\"\n")),
+                "{}",
+                r.stdout
+            );
+        };
+        shown(float32, "[0.1,2,-3.5,1e-8]");
+        let preview = value(
+            &*server,
+            "SELECT CAST(value AS int) AS on_ FROM sys.database_scoped_configurations \
+             WHERE name = N'PREVIEW_FEATURES'",
+        );
+        if preview == "1" {
+            shown(float16, "[0.1,2,-3.5,65504]");
+        } else {
+            let r = live(&p, &db, &["-Q", float16]);
+            assert_eq!(r.code, 1, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(
+                    "-- error 195 (severity 15, state 1, line 1): 'float16' is not a recognized \
+                     vector base type."
+                ),
+                "{}",
+                r.stdout
+            );
+        }
+    }
+
     // Decision 30(d): what the refusal offers runs. TOP (1) reads the first index it reaches and
     // stops, so the call over every database costs the test server next to nothing, where the
     // same call counted in full took over 45 s on a cold 2016 instance.

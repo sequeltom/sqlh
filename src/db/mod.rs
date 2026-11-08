@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::secret::Secret;
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::{
+    ClientContext, TdsAuthenticationMethod, VectorVersion,
+};
 use mssql_tds::connection::tds_client::{
     BatchErrorMode, CursorColumn, CursorPoll, ExecuteOptions, ResultSet, StatementResult, TdsClient,
 };
@@ -737,6 +739,11 @@ impl Session {
         // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
         // keeps sqlcmd's rule: one address after another unless -M.
         context.multi_subnet_failover = Some(options.multi_subnet_failover);
+        // Version 2, the driver's default since 0.4.0, set here so that a later default can't
+        // change the output unseen (owner decision 71): SQL Server 2025 then sends float16
+        // vectors natively, which `value` writes at their own precision, and float32 ones as
+        // under version 1.
+        context.vector_version = VectorVersion::V2;
 
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
@@ -3759,6 +3766,14 @@ pub(crate) mod fake_server {
     /// ibExtension (bytes 56..58) points at a DWORD holding the FeatureExt block's offset; the
     /// block is `id u8 | data length u32 LE | data`, repeated, ended by 0xFF.
     fn login_features(login: &[u8]) -> Vec<u8> {
+        login_feature_data(login)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// `login_features` with each feature's data.
+    fn login_feature_data(login: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let at = |i: usize, n: usize| login.get(i..i + n);
         let Some(&[a, b]) = at(56, 2) else {
             return Vec::new();
@@ -3767,7 +3782,7 @@ pub(crate) mod fake_server {
             return Vec::new();
         };
         let mut i = u32::from_le_bytes([c, d, e, f]) as usize;
-        let mut ids = Vec::new();
+        let mut features = Vec::new();
         while let Some(&[id]) = at(i, 1) {
             if id == 0xff {
                 break;
@@ -3775,10 +3790,11 @@ pub(crate) mod fake_server {
             let Some(&[g, h, j, k]) = at(i + 1, 4) else {
                 break;
             };
-            ids.push(id);
-            i += 5 + u32::from_le_bytes([g, h, j, k]) as usize;
+            let length = u32::from_le_bytes([g, h, j, k]) as usize;
+            features.push((id, at(i + 5, length).unwrap_or_default().to_vec()));
+            i += 5 + length;
         }
-        ids
+        features
     }
 
     /// LOGINACK alone (the first token of `login_reply`), for login replies built by hand.
@@ -3886,6 +3902,24 @@ pub(crate) mod fake_server {
         );
     }
 
+    // Decision 71: the login asks for vector feature version 2 (FeatureExt 0x0E, one data byte),
+    // set by sqlh, so a later driver default can't change how vectors arrive unseen; and it
+    // never asks for data classification (0x09), which would change every login and put a new
+    // token in results (driver-0.4.0.md §3.2).
+    #[test]
+    fn the_login_asks_for_vector_version_2_and_no_data_classification() {
+        let (port, seen) = serve_login(login_reply());
+        connect(format!("127.0.0.1,{port}")).expect("connected");
+        let login = seen.lock().unwrap().clone().expect("a LOGIN7");
+        let features = login_feature_data(&login);
+        let vector: Vec<_> = features.iter().filter(|(id, _)| *id == 0x0e).collect();
+        assert_eq!(vector, [&(0x0e, vec![2])], "{features:02x?}");
+        assert!(
+            features.iter().all(|(id, _)| *id != 0x09),
+            "{features:02x?}"
+        );
+    }
+
     // Decision 30(c): the name the caller chose is the one the login sends (ibAppName, bytes
     // 48..52 of LOGIN7's OffsetLength block), spelled as the contract spells it.
     #[test]
@@ -3907,6 +3941,112 @@ pub(crate) mod fake_server {
             let login = seen.lock().unwrap().clone().expect("a LOGIN7");
             assert_eq!(login_text(&login, 48).as_deref(), Some(sent));
         }
+    }
+
+    /// Keeps a result's columns and values, which `Sink` drops.
+    #[derive(Default)]
+    struct Kept {
+        columns: Vec<(String, String, bool)>,
+        rows: Vec<Vec<Value>>,
+    }
+
+    impl BatchSink for Kept {
+        fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+            self.columns = columns
+                .iter()
+                .map(|c| (c.name.clone(), c.type_name.clone(), c.nullable))
+                .collect();
+            Ok(())
+        }
+        fn wants_values(&self) -> bool {
+            true
+        }
+        fn cell_limit(&self) -> usize {
+            100
+        }
+        fn row(&mut self, values: &[Value]) -> io::Result<()> {
+            self.rows.push(values.to_vec());
+            Ok(())
+        }
+        fn skipped_row(&mut self) {}
+        fn counting_stopped(&mut self, _: Stop) {}
+        fn end_rows(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn end_rows_incomplete(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn rows_affected(&mut self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn message(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Decision 71, through the driver's decoder: a float32 and a float16 vector column as SQL
+    // Server sends them natively under vector feature version 2 (TYPE_INFO 0xF5 with a u16
+    // length and the base type as its scale, 0x00 float32 and 0x01 float16; each value a u16
+    // length, the 8-byte header `A9 01 dimensions base 00 00 00`, then the elements), and a NULL
+    // row. Both columns are `vector`, and each element is printed at its own precision.
+    #[test]
+    fn native_float32_and_float16_vectors_reach_the_sink_as_sqlh_prints_them() {
+        let float32: Vec<u8> = [0.1f32, 2.0, -3.5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let float16: Vec<u8> = [0.1f32, 2.0, -3.5, 65504.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let column = |name: u8, base: u8, elements: &[u8]| {
+            let length = u16::try_from(8 + elements.len()).unwrap();
+            let mut c = vec![0, 0, 0, 0, 1, 0, 0xf5];
+            c.extend(length.to_le_bytes());
+            c.extend([base, 1, name, 0]);
+            c
+        };
+        let value = |base: u8, dimensions: u16, elements: &[u8]| {
+            let mut v = u16::try_from(8 + elements.len())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            v.extend([0xa9, 1]);
+            v.extend(dimensions.to_le_bytes());
+            v.extend([base, 0, 0, 0]);
+            v.extend(elements);
+            v
+        };
+        let mut reply = vec![0x81, 2, 0];
+        reply.extend(column(b'v', 0, &float32));
+        reply.extend(column(b'w', 1, &float16));
+        reply.push(0xd1);
+        reply.extend(value(0, 3, &float32));
+        reply.extend(value(1, 4, &float16));
+        reply.extend([0xd1, 0xff, 0xff, 0xff, 0xff]);
+        reply.extend(done(2));
+        let ran = run_once(
+            serve(Script::Reply(reply)),
+            "SELECT v, w".into(),
+            Counting::EXACT,
+            Kept::default(),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        let vector = |name: &str| (name.to_owned(), "vector".to_owned(), true);
+        assert_eq!(ran.sink.columns, [vector("v"), vector("w")]);
+        assert_eq!(
+            ran.sink.rows,
+            [
+                vec![
+                    Value::Text("[0.1,2,-3.5]".into()),
+                    Value::Text("[0.1,2,-3.5,65504]".into())
+                ],
+                vec![Value::Null, Value::Null],
+            ]
+        );
     }
 
     // driver-0.4.0.md §3.3: mssql-tds 0.4.0 rewrote the UTF-16 encoder every batch's text goes

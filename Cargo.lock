@@ -922,6 +922,7 @@ dependencies = [
 name = "sqlh"
 version = "0.1.0"
 dependencies = [
+ "half",
  "lexopt",
  "log",
  "mssql-tds",

@@ -337,7 +337,7 @@ The output is not in the order of the server's bytes ("wire order"). It is in th
 | uniqueidentifier | Uppercase canonical form, same as SSMS. |
 | binary, varbinary, image, rowversion | `0x` followed by uppercase hex. |
 | sql_variant | The value of its base type. |
-| vector (2025) | JSON array text, which is what down-level clients receive. |
+| vector (2025) | JSON array text, the form down-level clients receive: `[0.1,2,-3.5]`. sqlh asks for vector feature version 2 (owner decision 71, mssql-tds 0.4.0's default, set explicitly). A float32 element is written as `real` is. A float16 element (SQL Server 2025's half-precision vectors, `vector(n, float16)`, a preview feature) arrives natively only when the server acknowledges version 2, and is then written in the shortest form that reads back as the same float16, so `0.1` stays `0.1` rather than its widened `0.099975586`, and a whole number whole (`65504`); the header's type is `vector` for both. A server that acknowledges only version 1 sends float16 in its down-level form, which sqlh shows as the server wrote it, under the type the server gives it. Which version SQL Server 2025 acknowledges is not yet observed: the test servers keep `PREVIEW_FEATURES` off, so they refuse the type (driver-0.4.0.md §10). |
 | geography, geometry, hierarchyid, CLR UDTs | `0x` hex. The help text suggests `.ToString()` or `.STAsText()` in the query. |
 
 ### 5.2 json

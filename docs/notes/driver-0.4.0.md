@@ -613,3 +613,41 @@ On a local branch, `driver-0.4.0`, once §7's decisions are taken.
    - The brief covers `main..driver-0.4.0` and this note: the refusal change (connect and cancellation), the vector pin (the output contract), the TLS fixtures and the documentation changes.
    - Include the record of §8's measurements.
    - Before any release, every change since the last review is covered by one.
+
+## 10. As built and measured (step 2, 2026-11-08)
+
+On the local branch `driver-0.4.0`. Decisions taken: §7.1 is PLAN.md decision 70 (0.1.0 ships on 0.4.0 and takes no later driver), §7.2 is decision 71 (vector version 2, set explicitly; the owner chose the driver's default over the recommended version 1). §7.3–§7.5 are still to be put to the owner.
+
+**Built:**
+- `1352077`: the bump alone, `Cargo.toml` and `Cargo.lock` (block2 0.6.2, objc2 0.6.5, objc2-encode 4.1.0 added, macOS only). No source change; `scripts/check.ps1` passed.
+- `15a0e87`: §9 items 2, 4, 5, 6 and 7. `split_protocol` takes 0.4.0's rule and `data_source` puts `tcp:` before a remote IPv6 address, so `np:<IPv6>[\INST]` and the IPv6 UNC spellings are refused (exit 3) and an IPv6 named instance stays on TCP. The TLS fixtures take the `TlsHandshakeError` shape, with one 0.3.0 case kept. `a_batch_reaches_the_server_unit_for_unit_across_packets` covers the encoder: the fake's packets were checked at 4,096 bytes, 2,033 units of SQL in the first, so a pair is cut for an odd `k`.
+- Decision 71: `Session::connect` sets `VectorVersion::V2`; `the_login_asks_for_vector_version_2_and_no_data_classification` pins the 0x0E byte at 2 and 0x09 absent, and fails with V1 set. `value::push_half` writes a float16 element in the shortest decimal that reads back as the same float16, in `{:?}`'s form, and a whole number whole. It works in integers: a first version formatted each candidate to a precision (`{:.*e}`) and parsed it back, which brought Rust's exact float formatter into the exe, +25,600 bytes; the integer one costs 4,608. Checked against every finite float16 (round trip, no shorter decimal, the form `float` gives), with `half` 2.7.1 as a dev-dependency reference (from f32 only: its `from_f64` rounds twice). Live test `a_vector_prints_its_elements_at_their_own_precision`. `native_float32_and_float16_vectors_reach_the_sink_as_sqlh_prints_them` feeds both column types and a NULL row through the driver's decoder (§9 item 3's fake-server test). Before commit, an independent review (three lenses, each finding put to a skeptic) confirmed one P3, fixed here: the docs said float16 arrives natively unconditionally, where it does so only once the server acknowledges version 2 (the driver accepts 1), and the fake-server test was missing. It refuted three: the first version's float16 rendering cost about 0.8 µs an element against 0.1 µs for float32 (measured; no output was wrong; the integer version that replaced it after the review, for size, wasn't timed), float32's existing allocation per element (unchanged code), and the DESIGN.md row's wording.
+
+**Size (§8 item 14):** 2,999,808 bytes on 0.3.0; 3,099,648 with the bare bump; 3,099,136 at `15a0e87`; 3,103,744 with decision 71 (41,984 bytes of the 3 MiB budget left). `cargo bloat --release --crates`: mssql_tds 863.8 → 923.7 KiB, tokio 108.2 → 127.8 KiB, std 482.9 → 493.3 KiB, sqlh 623.5 → 618.0 KiB. The largest growths are the connect paths with their stage spans (`create_base_stream` +27 KiB, `handler_factory::execute` +21 KiB, `connect_with_transport_context` +18 KiB, `query_browser` +16 KiB). About 29 KiB is the data-classification parser, which sqlh never requests. Imports: the same ten in-box DLLs. `cargo about generate`: accepted, no macOS crate in the notices. windows-sys 0.59 gains `Win32_Security` and `Win32_System_Threading` only.
+
+**Live checks (§8), against `test` (SQL Server 2025, 17.0.5035) and `test2016` (2016 SP3 GDR):**
+
+1. `scripts/check.ps1 -Live` at `15a0e87` passed on both servers: 495 unit tests, 126 debug and 120 release process tests, 86 debug and 79 release live tests each.
+2. Connect failures, each beside 0.3.0 (a `main` build) measured the same way: refused `127.0.0.1,1` 2.03 s, exit 2; unroutable `192.0.2.1 -l 2` 2.01 s with a SQL login and 2.51 s with Windows auth on both drivers (the extra 0.5 s is sqlh's own SPN pre-lookup, which postdates driver-0.3.0.md §8's 2.11 s); `localhost,1` 4.08 s exit 2, and with `-l 2` exit 4 at 3.01 s; `2001:db8::5 -l 2` 2.01 s, `timed out after 2000ms` (now sent as `tcp:2001:db8::5`); `np:192.0.2.1` exit 3. `-M`: `192.0.2.1 -l 2` exit 2 at 2.51 s with the `-M` wording; `localhost,1` exit 2 at 2.1 s, `All parallel connection attempts failed`; `db01\SALES` refused, exit 2. `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage` change nothing. A failed SQL login: error 18456 with its hint, exit 2. Ctrl+Break during a connect, with and without `-M`: the process test `ctrl_break_cancels_a_connect`.
+3. U9 (§1.1), Windows auth by the 2025 server's address, which has no PTR record:
+   - `-E -S <address> -l 1`: connects in 0.56 s (0.64 s on 0.3.0): sqlh's pre-lookup, unchanged.
+   - `-E -K ReadOnly -S <address> -l 2`: exit 4 at 3.02 s. On 0.3.0, 5.14 s: its deadline passed during the lookup and fired only once the lookup ended.
+   - `-l 15`: connects in about 5.1 s on both.
+   - Ctrl+C 1.5 s into that lookup: exit 6 after 0.32 s (also at 3.5 s in). On 0.3.0, exit 6 only after 3.52 s, when the lookup ended.
+   - Not tried: `sqlh mcp` with a `-K ReadOnly` Windows-auth profile (none exists).
+   - A trap found on the way: Ctrl+C sent to a sqlh started from Git Bash never arrives, so the console-event checks run from PowerShell.
+4. TLS (§1.3): `-E -Nm` without `-C` reads `TLS handshake failed for '<address>': InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)` with the untrusted-root hint, exit 2. The name is the `-S` host. `-Ns -C` reads `TLS handshake failed for '<host>': peer closed connection during TLS handshake` with R46's strict hint. Hints and exit codes are 0.3.0's.
+5. IPv6 pipes (§1.2), from PowerShell, since Git Bash collapses a leading `\\`:
+   - On the bare bump, `np:\\2001:db8::5\pipe\sql\query` and `tcp:\\fe80::1\pipe\sql\query` with `-l 2` each ended after 21.0 s with `The specified network name is no longer available (os error 64)`. That is U1's stall, past `-l`, so the gap was real.
+   - `np:2001:db8::5\SALES` ended at the SQL Browser lookup, 1.1 s.
+   - With the fix, all three are exit 3 in 14 ms. `2001:db8::5\SALES` asks SQL Browser and ends in 1.1 s.
+   - The test server has no IPv6 address, so `tcp:<IPv6>,1433` wasn't connected.
+6. SQL Browser with a named instance: not run (no named instance).
+7. `db::phases`, three `--features timing --verbose` connects: tcp 5–6, prelogin 2–16, tls 17–34, login 126–175 ms, totals 154–231 ms, in line with 0.3.0.
+8. Vectors on 2025: `CAST('[0.1,2,-3.5,1e-8]' AS vector(4))` gives `[0.1,2,-3.5,1e-8]` in text, json and csv on 0.4.0 with version 2, as on 0.3.0. float16 is refused with error 195, `'float16' is not a recognized vector base type`, since `sqlh_test` has PREVIEW_FEATURES off; turning it on is the owner's call. On 2016: error 243, `Type vector is not a defined system type`. The error log had no `SQLDump` line before or after.
+9. The encoder: from a UTF-8 file with `-i`, k = 0–3 ASCII letters, then 3,000 U+1F600, 600 ASCII and 500 × `é日本U+10FFFF`. Each server's `DATALENGTH` and `SHA2_256` matched the values computed locally from the UTF-16 LE bytes, on both servers.
+10. The engine and cancellation: `live::mcp_tools` and the `-t`, lock-timeout, deadlock and count tests in item 1; `db::spike::spike_reset` passed on both servers.
+11. U10: 2,000 iterations return `c`, and 5,000 fail with `Too many Done tokens with has_more=true without ColMetadata`, exit 10, on both servers. U11 (2025, `--check`): 1,000 statements give exit 1 and 1,000 errors; 1,001 give exit 10 and none. Both are as upstream-issues.md records.
+12. Memory and `image`: the live tests in item 1.
+13. LocalDB: not installed on the workstation; not run.
+14. The exe: above.

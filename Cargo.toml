@@ -50,3 +50,7 @@ opt-level = "z"
 # dependency since sqlh mcp (above), so this entry is redundant; a dev-dependency never reaches
 # the exe.
 serde_json = "1"
+# The float16 reference for the vector tests (decision 71): already in the tree through
+# mssql-tds, which widens float16 with it, at the same version and features; a dev-dependency
+# never reaches the exe.
+half = "=2.7.1"
