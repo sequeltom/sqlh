@@ -1415,17 +1415,29 @@ mod tests {
             started.elapsed()
         };
 
-        // 5 ms a write, two writes a line.
-        let slow = Sunk::new(Some(Duration::from_millis(5)));
+        // A sink held for 50 ms, then let go all at once: one wait, not ten paced writes, so a
+        // loaded machine (a sleep of 5 ms stretched past 80) can't run the writes into the
+        // bound. That happened once, with cargo unpacking a crate alongside (2026-11-08).
+        let hold = Duration::from_millis(50);
+        let slow = Sunk::new(None);
         for n in 0..5 {
             slow.log.lines.try_send(format!("line {n}")).unwrap();
         }
+        let release = slow._release.clone();
+        let releaser = thread::spawn(move || {
+            thread::sleep(hold);
+            // Two writes a line.
+            for _ in 0..10 {
+                let _ = release.send(());
+            }
+        });
         let took = flush(Some(&slow.log));
+        releaser.join().unwrap();
         assert_eq!(
             Sunk::text(&slow.written),
             "line 0\nline 1\nline 2\nline 3\nline 4\n"
         );
-        assert!(took < SIDE_WAIT / 2, "{took:?}");
+        assert!(took >= hold && took < SIDE_WAIT, "{took:?}");
 
         let stalled = Sunk::new(None);
         stalled.log.lines.try_send("stuck".into()).unwrap();
