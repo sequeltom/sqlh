@@ -6,7 +6,7 @@
 .DESCRIPTION
     Runs, in order, and stops at the first failure with a non-zero exit code:
       1. Cargo.lock is current: cargo metadata --locked
-      2. cargo fmt --check
+      2. cargo fmt --check, then scripts/appveyor-live.tests.ps1 (mocked; no service touched)
       3. cargo clippy --all-targets -- -D warnings, without and with --features timing
       4. cargo test (unit and process-level tests; no server needed)
       5. cargo build --release
@@ -69,6 +69,12 @@ function Fail([string]$message) {
 
 Step 'Cargo.lock is current' { cargo metadata --locked --format-version 1 | Out-Null }
 Step 'cargo fmt --check' { cargo fmt --check }
+# appveyor-live.ps1's instance loop against mocks, in Windows PowerShell 5.1 as AppVeyor runs
+# it (R59): failures collected by stage, stops tried, no instance started after a failed stop.
+Step 'AppVeyor script (mocked)' {
+    $out = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/appveyor-live.tests.ps1 2>&1
+    if ($LASTEXITCODE) { $out | Write-Host } else { $out | Select-Object -Last 1 | Write-Host }
+}
 Step 'cargo clippy' { cargo clippy --locked --all-targets -- -D warnings }
 Step 'cargo clippy --features timing' { cargo clippy --locked --all-targets --features timing -- -D warnings }
 Step 'cargo test' { cargo test --locked }

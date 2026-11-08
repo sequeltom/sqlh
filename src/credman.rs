@@ -121,9 +121,10 @@ pub fn move_legacy(profile: &str, identity: &str) -> std::io::Result<bool> {
 }
 
 /// Held by every test that touches the real Credential Manager. A read right after a write
-/// or delete can miss it while another client is changing credentials, and a write can be
-/// lost (measured across processes, scratch probe, 2026-11-08: PLAN.md §4), which made
-/// `credman_round_trip` fail about one run in eight when these tests ran in parallel.
+/// or delete can miss it while another client is changing credentials (observed across
+/// processes, 2026-11-08; once a credential stayed unreadable for the 2 s watched, cause
+/// unconfirmed: PLAN.md §4, R60), which made `credman_round_trip` fail about one run in eight
+/// when these tests ran in parallel. It orders the tests of one test binary only.
 #[cfg(test)]
 pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());

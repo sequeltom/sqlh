@@ -9,7 +9,8 @@
 # throwaway VM, and the tests log in as the build account through Windows authentication.
 # The one secret is SQLH_GITHUB_TOKEN, set in the project's settings (Environment, a secure
 # variable), never in this file: a fine-grained GitHub token for this repository alone with
-# Actions: read, which can download workflow artifacts and nothing else.
+# Actions: read, which can download workflow artifacts and read runs and their logs, but not
+# change code or releases (decision 75).
 version: '{build}'
 
 environment:

@@ -96,7 +96,8 @@ scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --
                  read-only; sign, the only job with the Azure token, which never runs the exe;
                  verify, read-only; publish, the draft release; plan-history.md 3.6, R22);
                  build also uploads the tests' binary for AppVeyor (decision 75)
-appveyor.yml, scripts/appveyor-live.ps1  release certification on AppVeyor, started by hand:
+appveyor.yml, scripts/appveyor-live.ps1 (and .tests.ps1, its mocked instance loop, run by
+                 check.ps1)  release certification on AppVeyor, started by hand:
                  the release run's signed exe and tests against AppVeyor's SQL Servers, Windows
                  auth, nothing compiled (decision 75; PLAN.md §4, AppVeyor)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
@@ -210,4 +211,4 @@ Keep this section short: where the work stands and what comes next. Review and f
 - **Planned, not started** (PLAN.md): `definition` paging and `info`'s dial name, AG role and time zone (MCP client feedback); setting the default profile; the md format; Azure SQL support and testing, whose scope is an owner decision.
 - **Direction:** the CLI is the center, MCP a second front end (decision 46). Hosted MCP for remote connectors is planned with Entra pass-through only (decision 47; a shared read-only login is its backup, not built), and builds MCP's own exe first. The CLI is optimized for local, offline and small models (24 GB of VRAM or less): what they must read comes first, and there is no daemon behind it (decision 48).
 - **Open:** the items carried over from finished work (PLAN.md §4, "Carried over from finished work"), among them the agent timeout trial and the flake `a_fast_narrow_result_is_bounded_by_t_in_every_mode`; the first-release checklist (PLAN.md §7), SmartScreen and antivirus among it; the driver items still unverified in [docs/notes/m0-driver-spike.md](docs/notes/m0-driver-spike.md).
-- **Reviews:** the 0.4.0 driver integration, per-hop SPN design, IPv6 refusal and float16 rule are accepted; R58 (P3, a test timing race) is fixed and self-verified, for the next brief. Records and limits are in PLAN.md §4; the branch is merged (`f0e2465`), and the remaining release gates are in §7. The last finding is R58, so the next is R59.
+- **Reviews:** R58 is independently closed; credential wiping, the icon and relocated tests are accepted. The post-0.4.0 review's R59 (AppVeyor failure handling, P2) and R60/R61 (evidence/coverage wording) are fixed and self-verified, for the next brief. Records and limits are in PLAN.md §4; remaining release gates are in §7. The last finding is R61, so the next is R62.
