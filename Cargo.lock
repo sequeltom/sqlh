@@ -78,6 +78,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,13 +483,14 @@ dependencies = [
 
 [[package]]
 name = "mssql-tds"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7a53513324677e601ca5b91e477840329ec6c244875fd55b155e5a8e8af7805"
+checksum = "812c3993a5f6d98e14da9d8ab0bf9f9f536e49c18240f34af9bae301e4d35ae8"
 dependencies = [
  "async-trait",
  "bigdecimal",
  "bitflags",
+ "block2",
  "byteorder",
  "bytes",
  "core-foundation",
@@ -575,6 +585,21 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "objc2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
 name = "oid-registry"
@@ -897,6 +922,7 @@ dependencies = [
 name = "sqlh"
 version = "0.1.0"
 dependencies = [
+ "half",
  "lexopt",
  "log",
  "mssql-tds",

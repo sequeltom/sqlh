@@ -8,7 +8,9 @@
 //!
 //! Only the time each step ended is kept. Never print or store the events' text: at debug
 //! level the driver dumps TDS packets before encryption, and the login packet carries the
-//! password. The texts matched below are mssql-tds 0.3.0's (unchanged from 0.2.0); recheck them when bumping it.
+//! password. The texts matched below are mssql-tds 0.4.0's (unchanged since 0.2.0); recheck them
+//! when bumping it. They reach `log` through tracing's bridge, which goes silent for the life of
+//! the process once any tracing dispatcher is set (driver-0.4.0.md §4.3).
 
 use std::time::{Duration, Instant};
 

@@ -41,7 +41,7 @@ Status: **go** (2026-10-09). The build, size, import and live-server checks pass
 - `datetimeoffset` arrives as UTC plus an offset. We add the offset to show local time, the way SSMS does. Verified live.
 - `SqlXml::as_string()` and `SqlJson::as_string()` call `unwrap()` on decoding. We decode lossily ourselves, because with `panic = "abort"` a bad value would kill the process.
 - Money comes as two mixed-endian i32 halves. The crate's own conversion goes through `f64`, so we rebuild the exact i64 ourselves.
-- **TLS failures on the direct Schannel path** arrive as `ImplementationError("Schannel TLS handshake failed: ... SEC_E_UNTRUSTED_ROOT ...")`, not as `TlsError`. Our connection hints therefore match on SSPI status names in the text.
+- **TLS failures on the direct Schannel path** arrive as `ImplementationError("Schannel TLS handshake failed: ... SEC_E_UNTRUSTED_ROOT ...")`, not as `TlsError`. Our connection hints therefore match on SSPI status names in the text. (mssql-tds 0.4.0, 2026-11-08: they arrive as `TlsHandshakeError`, displayed `TLS handshake failed for '<host>': InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT ...`; the hints still match the text, driver-0.4.0.md §1.3.)
 - **`CONNECTIONPROPERTY('encrypt_option')` doesn't exist** and returns NULL. Encryption comes from the client side (`TdsClient::is_encrypted`).
 - **`SET NOEXEC ON` (`--check`)** reports syntax errors and unknown columns, but not missing tables, because of deferred name resolution.
 - Type names for headers come from `TdsDataType` plus `type_info.length`. Nullable wire types (`IntN`, `FltN`, `MoneyN`, `DateTimeN`) are resolved by length. `vector` has no dimension in the header yet.

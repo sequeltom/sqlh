@@ -797,6 +797,10 @@ fn remote_named_pipes_are_refused_before_anything_connects() {
         (r"NP:db01\SALES", r"db01\SALES"),
         (r"\\192.0.2.1\pipe\sql\query", "192.0.2.1"),
         (r"tcp:\\db01\pipe\MSSQL$SALES\sql\query", r"db01\SALES"),
+        // mssql-tds 0.4.0 splits `np:` off an IPv6 address and opens the pipe
+        // (driver-0.4.0.md §1.2).
+        (r"np:2001:db8::5\SALES", r"2001:db8::5\SALES"),
+        (r"np:\\2001:db8::5\pipe\sql\query", "2001:db8::5"),
     ] {
         let r = sqlh_args(&["-S", server, "-l", "30", "-Q", "SELECT 1"]);
         assert_eq!(r.code, 3, "{server}: {}", r.stdout);
@@ -13214,6 +13218,80 @@ mod live {
             let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
             assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
             assert!(r.stdout.starts_with(csv), "{}", r.stdout);
+        }
+    }
+
+    // Decision 71: under vector feature version 2 a float32 vector prints as it did under
+    // version 1, in every format (SQL Server 2025). A float16 one needs the database's
+    // PREVIEW_FEATURES, which sqlh_test leaves off (turning it on is a database-level change
+    // outside decision 21), so the server refuses the type and its rendering is checked by the
+    // unit tests in `db::value`; with the setting on, this checks it here too. SQL Server 2016
+    // has no vector type.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn a_vector_prints_its_elements_at_their_own_precision() {
+        let (p, db) = target();
+        let server = Live::server(&p, &db);
+        let float32 = "SELECT CAST('[0.1,2,-3.5,1e-8]' AS vector(4)) AS v";
+        let float16 = "SELECT CAST('[0.1,2,-3.5,65504]' AS vector(4, float16)) AS v";
+        if server_major(&*server) < 17 {
+            let r = live(&p, &db, &["-Q", float32]);
+            assert_eq!(r.code, 1, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(
+                    "-- error 243 (severity 16, state 1, line 1): Type vector is not a \
+                               defined system type."
+                ),
+                "{}",
+                r.stdout
+            );
+            return;
+        }
+        let shown = |sql: &str, elements: &str| {
+            let r = live(&p, &db, &["-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(
+                r.stdout
+                    .starts_with(&format!("-- result 1\nv:vector\n{elements}\n-- 1 row\n")),
+                "{}",
+                r.stdout
+            );
+            let r = live(&p, &db, &["--format", "json", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(&format!(
+                    r#""columns":[{{"name":"v","type":"vector","nullable":true}}],"rows":[["{elements}"]]"#
+                )),
+                "{}",
+                r.stdout
+            );
+            let r = live(&p, &db, &["--format", "csv", "-Q", sql]);
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            assert!(
+                r.stdout.starts_with(&format!("v\n\"{elements}\"\n")),
+                "{}",
+                r.stdout
+            );
+        };
+        shown(float32, "[0.1,2,-3.5,1e-8]");
+        let preview = value(
+            &*server,
+            "SELECT CAST(value AS int) AS on_ FROM sys.database_scoped_configurations \
+             WHERE name = N'PREVIEW_FEATURES'",
+        );
+        if preview == "1" {
+            shown(float16, "[0.1,2,-3.5,65504]");
+        } else {
+            let r = live(&p, &db, &["-Q", float16]);
+            assert_eq!(r.code, 1, "{}", r.stdout);
+            assert!(
+                r.stdout.contains(
+                    "-- error 195 (severity 15, state 1, line 1): 'float16' is not a recognized \
+                     vector base type."
+                ),
+                "{}",
+                r.stdout
+            );
         }
     }
 

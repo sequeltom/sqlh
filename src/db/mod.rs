@@ -2,6 +2,7 @@
 //! driver can be upgraded or swapped here without touching the rest of the tool.
 
 pub mod phases;
+mod spn;
 mod stream;
 mod types;
 mod value;
@@ -16,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use crate::secret::Secret;
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::{
+    ClientContext, TdsAuthenticationMethod, VectorVersion,
+};
 use mssql_tds::connection::tds_client::{
     BatchErrorMode, CursorColumn, CursorPoll, ExecuteOptions, ResultSet, StatementResult, TdsClient,
 };
@@ -25,7 +28,7 @@ use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting, TdsRes
 use mssql_tds::datatypes::row_writer::DiscardRowWriter;
 use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage};
 use mssql_tds::message::login_options::ApplicationIntent;
-use mssql_tds::security::{canonicalize_hostname, make_spn};
+use mssql_tds::security::SecurityContextProvider;
 
 pub use value::Value;
 
@@ -442,9 +445,9 @@ fn fire(root: &Mutex<Option<CancelHandle>>, cause: &AtomicU8, which: u8) {
 }
 
 /// sqlh's own `-t` for one batch (R15): a monotonic deadline from the moment the batch is
-/// sent, enforced here and not by the driver, whose `timeout_secs` adds up only the time its
-/// transport reads wait and so never expires for data that is already in the buffer, or for
-/// work sqlh does between reads (DESIGN.md §4.4).
+/// sent, enforced here and not by the driver, whose `timeout_secs` counts only the request's send
+/// and the time its transport reads wait (0.4.0), and so never expires for data that is already
+/// in the buffer, or for work sqlh does between reads (DESIGN.md §4.4).
 ///
 /// It is enforced three ways, because each covers what the others cannot: a timer task fires
 /// the cancel while the batch waits for the server or for the reader; `tick` and `slice` look
@@ -674,21 +677,26 @@ enum Row {
 
 impl Session {
     pub async fn connect(options: &ConnectOptions, cancel: &Cancel) -> Result<Session, DbError> {
+        Self::connect_with(options, cancel, spn::HopSpn::system()).await
+    }
+
+    /// `connect`, with Windows auth's SPN provider given: the tests' seam.
+    async fn connect_with(
+        options: &ConnectOptions,
+        cancel: &Cancel,
+        spn: Arc<dyn SecurityContextProvider>,
+    ) -> Result<Session, DbError> {
         let mut context = ClientContext::default();
         context.application_name = options.application_name.into();
         context.database = options.database.clone().unwrap_or_default();
         match &options.auth {
             Auth::Integrated => {
                 context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-                // A read-only intent expects a routing redirect, and a fixed SPN would carry over
-                // to the routed host unchanged (R52): the driver builds one for each hop itself.
-                if !options.read_only_intent {
-                    context.server_spn =
-                        spn_if_lookup_is_slow(&options.server, SPN_LOOKUP_BUDGET, cancel, |host| {
-                            canonicalize_hostname(&host);
-                        })
-                        .await?;
-                }
+                // The driver calls this for each login hop, after its TCP connect, prelogin and
+                // TLS, with the host and port it dials (SQL Browser's port, each routed host), so
+                // the SPN is that hop's (decision 72; DESIGN.md §4.2, `-E`). `server_spn` stays
+                // unset: its one value would go to every hop (R52).
+                context.security_context_provider = Some(spn);
             }
             Auth::Sql { user, password } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::Password;
@@ -732,21 +740,27 @@ impl Session {
         } else {
             ApplicationIntent::ReadWrite
         };
-        // Always explicit (owner decision 40): mssql-tds 0.3.0's `None` takes the driver's own
+        // Always explicit (owner decision 40): mssql-tds's `None` (0.3.0, 0.4.0) takes its own
         // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
         // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
         // keeps sqlcmd's rule: one address after another unless -M.
         context.multi_subnet_failover = Some(options.multi_subnet_failover);
+        // Version 2, the driver's default since 0.4.0, set here so that a later default can't
+        // change the output unseen (owner decision 71): SQL Server 2025 then sends float16
+        // vectors natively, which `value` writes at their own precision, and float32 ones as
+        // under version 1.
+        context.vector_version = VectorVersion::V2;
 
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
         let connecting = provider.create_client(context, &source, Some(&cancel.handle));
-        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 and 0.3.0
+        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 to 0.4.0
         // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
         // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
-        // a login that never finished leaves nothing to clean up. Only a blocking call, such as
-        // opening a pipe, outlasts a cancel.
+        // a login that never finished leaves nothing to clean up. Only a blocking call outlasts a
+        // cancel: opening a pipe, or Windows auth's SPN wait (at most 500 ms, on a thread of the
+        // driver's blocking pool, `db::spn`), which is left to end by itself.
         let mut client = tokio::select! {
             client = connecting => client.map_err(|e| connect_error(e, options))?,
             () = cancel.cancelled() => {
@@ -1385,23 +1399,23 @@ fn runtime_error(error: TdsError) -> DbError {
 /// remote name gets `tcp:`, and `check_server` has already refused an explicit remote pipe.
 ///
 /// Local names keep the driver's order (shared memory, TCP, a local pipe), which never reaches
-/// SMB. A protocol, a pipe path or LocalDB passes through as written. An IPv6 address can't
-/// take `tcp:`, because the driver reads its colons as part of the name; without a port it
-/// would get the pipe fallback too (an unreachable address held a run for 23 s), so it gets the
-/// default port, 1433, and a port makes the driver use TCP only. Other text with a colon, such
-/// as `db01:1433`, is no name a host answers to, and the driver fails on it at once.
+/// SMB. A protocol, a pipe path or LocalDB passes through as written. An IPv6 address gets
+/// `tcp:` like a name, with or without a port or an instance: the driver (0.4.0) splits a
+/// protocol off at the first colon, and an address's first group is never one. Other text with a
+/// colon, such as `db01:1433`, is no name a host answers to, and the driver fails on it at once.
 fn data_source(server: &str) -> Cow<'_, str> {
     let server = server.trim();
+    if split_protocol(server).0.is_some() {
+        return Cow::Borrowed(server);
+    }
     let host = server.split(['\\', '/', ',']).next().unwrap_or_default();
     let local = [".", "(local)", "(localdb)", "localhost", "127.0.0.1", "::1"]
         .iter()
         .any(|name| host.eq_ignore_ascii_case(name));
     if local || host.is_empty() {
         Cow::Borrowed(server)
-    } else if !server.contains(':') {
+    } else if !host.contains(':') || looks_like_ipv6(host) {
         Cow::Owned(format!("tcp:{server}"))
-    } else if looks_like_ipv6(server) && !server.contains([',', '\\']) {
-        Cow::Owned(format!("{server},1433"))
     } else {
         Cow::Borrowed(server)
     }
@@ -1410,128 +1424,25 @@ fn data_source(server: &str) -> Cow<'_, str> {
 /// The protocols a data source can name, as the driver's parser accepts them.
 const PROTOCOLS: [&str; 4] = ["tcp", "np", "lpc", "admin"];
 
-/// The driver's test for an IPv6 address: `::`, or more than one colon.
-fn looks_like_ipv6(server: &str) -> bool {
-    server.contains("::") || server.matches(':').count() > 1
+/// Whether a host is an IPv6 address rather than text with a stray colon: `::`, or more than
+/// one colon.
+fn looks_like_ipv6(host: &str) -> bool {
+    host.contains("::") || host.matches(':').count() > 1
 }
 
-/// Splits a protocol prefix from the rest, the way the driver does
-/// (`datasource_parser.rs`, `parse_protocol`): at the first colon, unless the text looks like
-/// an IPv6 address, and only for `tcp`, `np`, `lpc` or `admin`, in any case. Anything else,
-/// such as `http:db01`, stays part of the name. The protocol comes back in lowercase.
+/// Splits a protocol prefix from the rest, the way the driver does (0.4.0,
+/// `datasource_parser.rs`, `parse_protocol`): at the first colon, for `tcp`, `np`, `lpc` or
+/// `admin` in any case, whatever follows, so `np:::1` is a pipe to `::1` and `np:2001:db8::5\SALES`
+/// a pipe to that address (driver-0.4.0.md §1.2). Anything else, such as `http:db01` or an IPv6
+/// address's first group, stays part of the name. The protocol comes back in lowercase.
 fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
-    if let Some(colon) = server.find(':')
-        && !looks_like_ipv6(server)
-    {
+    if let Some(colon) = server.find(':') {
         let name = server[..colon].trim();
         if let Some(protocol) = PROTOCOLS.iter().find(|p| name.eq_ignore_ascii_case(p)) {
             return (Some(protocol), server[colon + 1..].trim_start());
         }
     }
     (None, server)
-}
-
-/// How long Windows auth's name lookup gets before sqlh stops waiting for it. A name server
-/// answers well inside this; what it cuts is a lookup that falls through to NetBIOS, about 5 s
-/// for an address with no PTR record (notes/connect-latency.md, Windows authentication).
-const SPN_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
-
-/// The SPN sqlh gives the driver for a TCP `-S`, or `None` to let the driver build its own.
-/// The driver's lookup is a blocking call on the runtime thread (upstream-issues.md U9): it runs
-/// before any timer can fire, so `-l` can't bound it, a cancel can't reach it, and `sqlh mcp`'s
-/// other calls wait. So the same lookup runs here first, on its own thread.
-///
-/// In time, the driver is left to it: its own lookup repeats a recent answer, and it builds the
-/// SPN for each hop, which a fixed one would get wrong after a routing redirect. Past the budget,
-/// the SPN is the one the driver would build when its lookup fails: the host as given, and the
-/// port the driver dials. A named instance without a port gets none (`host_and_spn`), and a
-/// read-only intent isn't looked up here (`Session::connect`): for both the driver does its own,
-/// unbounded lookup, as before (R52).
-async fn spn_if_lookup_is_slow(
-    server: &str,
-    budget: Duration,
-    cancel: &Cancel,
-    lookup: impl FnOnce(String) + Send + 'static,
-) -> Result<Option<String>, DbError> {
-    let Some((host, spn)) = host_and_spn(server) else {
-        return Ok(None);
-    };
-    tokio::select! {
-        slow = outlasts(budget, move || lookup(host)) => Ok(slow.then_some(spn)),
-        () = cancel.cancelled() => Err(DbError::Cancelled("cancelled while connecting".into())),
-    }
-}
-
-/// How many lookups may run at once in this process. A lookup past its budget is left running,
-/// so in `sqlh mcp`, under DNS trouble and repeated cancels, they would pile up without a cap
-/// (R53); a slot is held until the lookup itself ends.
-const LOOKUP_THREADS: usize = 4;
-
-static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LOOKUP_THREADS);
-
-/// Whether `work` is still running after `budget`, or couldn't start within it: waiting for one of
-/// `LOOKUP_THREADS` comes out of the same budget, and dropping the future stops that wait. The
-/// thread is left behind if it outlasts the budget, holding its slot: a lookup can't be
-/// cancelled, ends by itself, and process exit doesn't wait for it, as it would for
-/// `spawn_blocking` when the runtime drops.
-async fn outlasts(budget: Duration, work: impl FnOnce() + Send + 'static) -> bool {
-    outlasts_within(&LOOKUPS, budget, work).await
-}
-
-async fn outlasts_within(
-    slots: &'static tokio::sync::Semaphore,
-    budget: Duration,
-    work: impl FnOnce() + Send + 'static,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + budget;
-    let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slots.acquire()).await else {
-        return true;
-    };
-    let (done, finished) = tokio::sync::oneshot::channel::<()>();
-    let started = std::thread::Builder::new().spawn(move || {
-        work();
-        drop(slot);
-        let _ = done.send(());
-    });
-    started.is_err() || tokio::time::timeout_at(deadline, finished).await.is_err()
-}
-
-/// A TCP `-S`'s host and the SPN the driver's Windows path would build for it when its lookup
-/// fails, read the way the driver's parser does (`datasource_parser.rs`): a port replaces an
-/// instance, and no port is 1433. The driver builds `MSSQLSvc/<host>:<port>` from the host and
-/// port it dials (`sspi_context.rs`, `make_spn_canonicalized(server, None, port)`), never from an
-/// instance's name, and an instance's port comes from SQL Browser only once it connects; so a
-/// named instance without a port gets `None` (R52), as do a pipe, shared memory, LocalDB, the DAC
-/// and a bad port, whose SPN stays the driver's.
-fn host_and_spn(server: &str) -> Option<(String, String)> {
-    let source = data_source(server);
-    let (protocol, rest) = split_protocol(&source);
-    if matches!(protocol, Some("np" | "lpc" | "admin"))
-        || rest.starts_with(r"\\")
-        || rest.to_ascii_lowercase().starts_with("(localdb)")
-    {
-        return None;
-    }
-    let (rest, port) = match rest.split_once(',') {
-        Some((rest, parameter)) => {
-            let port = parameter.split('\\').next().unwrap_or_default().trim();
-            (rest.trim_end(), Some(port.parse::<u16>().ok()?))
-        }
-        None => (rest, None),
-    };
-    let (host, instance) = match rest.split_once('\\') {
-        Some((host, instance)) => (host.trim_end(), Some(instance.trim())),
-        None => (rest, None),
-    };
-    if host.is_empty() {
-        return None;
-    }
-    let port = match (port, instance) {
-        (Some(port), _) => port,
-        (None, None) => 1433,
-        (None, Some(_)) => return None,
-    };
-    Some((host.to_owned(), make_spn(host, None, port)))
 }
 
 /// Refuses a Named Pipes request to another machine, with a message for a usage error
@@ -1541,17 +1452,27 @@ fn host_and_spn(server: &str) -> Option<(String, String)> {
 /// pipe is refused before anything connects, whether the server came from `-S`, `SQLCMDSERVER`
 /// or a profile, and whether it is `np:host`, `np:host\instance`, or a UNC pipe path
 /// (`\\host\pipe\sql\query`) with any prefix: the driver reads a UNC path as a pipe even after
-/// `tcp:`.
+/// `tcp:`. The host may be an IPv6 address: 0.4.0 splits `np:` off one (`split_protocol`).
 ///
 /// Local pipes stay: `np:` with `.`, `(local)`, `localhost`, `127.0.0.1`, `::1` or this
-/// computer's name (`COMPUTERNAME`), a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared
-/// memory, which the driver only allows locally), `admin:` (a TCP connection) and LocalDB. Text
-/// the driver would reject before opening anything, such as `np:` with no host, is left to it.
+/// computer's name, a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared memory, which
+/// the driver only allows locally), `admin:` (a TCP connection) and LocalDB. Text the driver
+/// would reject before opening anything, such as `np:` with no host, is left to it.
 ///
 /// The message starts with the server text, so a caller can say where it came from:
 /// `-S np:db01: Named Pipes ...`.
 pub fn check_server(server: &str) -> Result<(), String> {
-    check(server, std::env::var("COMPUTERNAME").ok().as_deref())
+    check(server, this_computer().as_deref())
+}
+
+/// This computer's name as the driver reads it to decide that a pipe is local, and opens
+/// `\\.\pipe\...` for it (owner decision 73): the DNS host name, which the environment can't
+/// change. `COMPUTERNAME`, the NetBIOS name (15 characters at most, and set by any parent
+/// process), only when the driver has none, which takes `GetComputerNameExW` failing: the
+/// driver then opens `\\<that name>\pipe\...` over SMB, which reaches this machine unless the
+/// environment was edited to name another.
+fn this_computer() -> Option<String> {
+    mssql_tds::connection::this_computer_name().or_else(|| std::env::var("COMPUTERNAME").ok())
 }
 
 fn check(server: &str, computer: Option<&str>) -> Result<(), String> {
@@ -1625,7 +1546,7 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     let target = format!("{} ({auth}, encrypt {encrypt})", options.server);
     let (detail, hint) = match &error {
-        // Under -M, mssql-tds 0.3.0's race of every address ends at the TCP limit, -l, with
+        // Under -M, mssql-tds's race of every address (0.3.0, 0.4.0) ends at the TCP limit, -l, with
         // its own "Connection timeout: ..." (parallel_connect.rs). That is no address
         // answering, as an unreachable one is without -M (exit 2), not a login that didn't
         // finish (found in review, 2026-10-31).
@@ -1708,8 +1629,8 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
         ),
         _ => (error.to_string(), ""),
     };
-    // The direct Schannel path reports TLS failures as generic errors carrying SSPI status
-    // names, so match the text too.
+    // The direct Schannel path's errors carry SSPI status names in their text, which say more
+    // than the variant: 0.4.0 reports them as `TlsHandshakeError`, 0.3.0 as generic errors.
     let tls = tls_hint(&detail, hints);
     let certificate = tls.is_some()
         || matches!(
@@ -1786,8 +1707,7 @@ mod tests {
     use super::{
         Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
         PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
-        host_and_spn, outlasts_within, split_protocol, spn_if_lookup_is_slow, tcp_form, tls_hint,
-        wait_for_output,
+        split_protocol, tcp_form, tls_hint, wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
@@ -2119,12 +2039,17 @@ mod tests {
             ("127.0.0.1", "127.0.0.1"),
             ("::1", "::1"),
             (r"(localdb)\MSSQLLocalDB", r"(localdb)\MSSQLLocalDB"),
-            // IPv6 takes no `tcp:` prefix, but without a port it gets one: otherwise the
-            // driver would go on to open a pipe to the address.
-            ("2001:db8::5", "2001:db8::5,1433"),
-            (" fe80::1%12 ", "fe80::1%12,1433"),
-            ("2001:db8::5,1433", "2001:db8::5,1433"),
-            (r"2001:db8::5\SQLEXPRESS", r"2001:db8::5\SQLEXPRESS"),
+            // IPv6 takes `tcp:` like a name, so an instance stays on TCP too, and a port is
+            // never added (driver-0.4.0.md §1.2).
+            ("2001:db8::5", "tcp:2001:db8::5"),
+            (" fe80::1%12 ", "tcp:fe80::1%12"),
+            ("2001:db8::5,1433", "tcp:2001:db8::5,1433"),
+            (r"2001:db8::5\SQLEXPRESS", r"tcp:2001:db8::5\SQLEXPRESS"),
+            ("tcp:2001:db8::5", "tcp:2001:db8::5"),
+            // Other protocols before an address pass as written: no port, no second prefix.
+            ("admin:fe80::1", "admin:fe80::1"),
+            ("lpc:::1", "lpc:::1"),
+            ("np:::1", "np:::1"),
             // A pipe path names its protocol; other text with a colon is left to the driver.
             (r"\\db01\pipe\sql\query", r"\\db01\pipe\sql\query"),
             ("db01:1433", "db01:1433"),
@@ -2153,189 +2078,21 @@ mod tests {
             ("http:myserver", None, "http:myserver"),
             (":db01", None, ":db01"),
             (r"\\db01\pipe\sql\query", None, r"\\db01\pipe\sql\query"),
-            // An IPv6 address has colons of its own, so nothing is split off, even after what
-            // looks like a protocol.
+            // An address's first group is no protocol, but a protocol before an address is
+            // split off whatever follows (0.4.0's rule; 0.3.0 split nothing from these).
             ("::1", None, "::1"),
             ("2001:db8::1,1433", None, "2001:db8::1,1433"),
-            ("np:::1", None, "np:::1"),
-            ("tcp:2001:db8:0:0:0:0:0:5", None, "tcp:2001:db8:0:0:0:0:0:5"),
+            ("np:::1", Some("np"), "::1"),
+            (
+                "tcp:2001:db8:0:0:0:0:0:5",
+                Some("tcp"),
+                "2001:db8:0:0:0:0:0:5",
+            ),
+            (r"np:2001:db8::5\SALES", Some("np"), r"2001:db8::5\SALES"),
+            ("ADMIN:fe80::1", Some("admin"), "fe80::1"),
         ] {
             assert_eq!(split_protocol(server), (protocol, rest), "{server}");
         }
-    }
-
-    #[test]
-    fn a_tcp_server_gets_the_spn_the_driver_would_fall_back_to() {
-        for (server, host, spn) in [
-            ("192.0.2.1", "192.0.2.1", "MSSQLSvc/192.0.2.1:1433"),
-            ("192.0.2.1,1500", "192.0.2.1", "MSSQLSvc/192.0.2.1:1500"),
-            ("tcp:db01,1500", "db01", "MSSQLSvc/db01:1500"),
-            ("TCP:db01", "db01", "MSSQLSvc/db01:1433"),
-            // A port replaces the instance, in either order.
-            (r"db01\SALES,1500", "db01", "MSSQLSvc/db01:1500"),
-            (r"db01,1500\SALES", "db01", "MSSQLSvc/db01:1500"),
-            ("db01 , 1500", "db01", "MSSQLSvc/db01:1500"),
-            ("2001:db8::1", "2001:db8::1", "MSSQLSvc/2001:db8::1:1433"),
-            (
-                "2001:db8::1,1500",
-                "2001:db8::1",
-                "MSSQLSvc/2001:db8::1:1500",
-            ),
-        ] {
-            let expected = Some((host.to_owned(), spn.to_owned()));
-            assert_eq!(host_and_spn(server), expected, "{server}");
-        }
-        for server in [
-            "np:db01",
-            "lpc:db01",
-            "admin:db01",
-            r"\\db01\pipe\sql\query",
-            r"(localdb)\MSSQLLocalDB",
-            "db01,notaport",
-            "",
-            // A named instance's port is SQL Browser's, known only once the driver connects, and
-            // the driver's SPN names that port, never the instance (R52).
-            r"db01\SALES",
-            r"tcp:db01\SALES",
-            r"192.0.2.1\SALES",
-        ] {
-            assert_eq!(host_and_spn(server), None, "{server}");
-        }
-    }
-
-    // R53: the threads left behind by lookups past their budget are capped, each holds its slot
-    // until it ends, and a wait for a slot ends with the budget or as soon as it is dropped.
-    #[test]
-    fn lookups_past_their_budget_are_capped_and_hold_their_slot_until_they_end() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        static RUNNING: AtomicUsize = AtomicUsize::new(0);
-        static MOST: AtomicUsize = AtomicUsize::new(0);
-        runtime().block_on(async {
-            let mut releases = Vec::new();
-            for _ in 0..8 {
-                let (release, held) = std::sync::mpsc::channel::<()>();
-                releases.push(release);
-                let slow = outlasts_within(&SLOTS, Duration::from_millis(20), move || {
-                    let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
-                    MOST.fetch_max(now, Ordering::SeqCst);
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                    RUNNING.fetch_sub(1, Ordering::SeqCst);
-                })
-                .await;
-                assert!(slow);
-            }
-            assert_eq!(SLOTS.available_permits(), 0);
-            let started = Instant::now();
-            assert!(
-                outlasts_within(&SLOTS, Duration::from_millis(20), || panic!("past the cap")).await
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "{:?}",
-                started.elapsed()
-            );
-            let dropped = tokio::time::timeout(
-                Duration::from_millis(20),
-                outlasts_within(&SLOTS, Duration::from_secs(60), || panic!("past the cap")),
-            )
-            .await;
-            assert!(dropped.is_err());
-            drop(releases);
-            let freed = Instant::now();
-            while SLOTS.available_permits() < 2 {
-                assert!(
-                    freed.elapsed() < Duration::from_secs(10),
-                    "a slot was never given back"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert_eq!(RUNNING.load(Ordering::SeqCst), 0);
-            assert!(!outlasts_within(&SLOTS, Duration::from_secs(10), || {}).await);
-        });
-        assert_eq!(MOST.load(Ordering::SeqCst), 2);
-    }
-
-    // notes/connect-latency.md, Windows authentication: a slow lookup gets an SPN so the driver
-    // skips its own, and holds neither the runtime nor a cancel while it runs.
-    #[test]
-    fn a_slow_lookup_gives_the_driver_an_spn_and_blocks_nothing() {
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let cancel = Cancel::new();
-        let (spn, ticks) = runtime().block_on(async {
-            let lookup = spn_if_lookup_is_slow(
-                "192.0.2.1,1500",
-                Duration::from_millis(50),
-                &cancel,
-                move |_| {
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                },
-            );
-            tokio::pin!(lookup);
-            let mut ticks = 0;
-            loop {
-                tokio::select! {
-                    spn = &mut lookup => break (spn, ticks),
-                    () = tokio::time::sleep(Duration::from_millis(5)) => ticks += 1,
-                }
-            }
-        });
-        drop(release);
-        assert_eq!(spn.unwrap().as_deref(), Some("MSSQLSvc/192.0.2.1:1500"));
-        assert!(ticks > 0, "the lookup held the runtime");
-    }
-
-    #[test]
-    fn a_lookup_in_time_leaves_the_spn_to_the_driver() {
-        let (seen, host) = std::sync::mpsc::channel();
-        let cancel = Cancel::new();
-        let spn = runtime()
-            .block_on(spn_if_lookup_is_slow(
-                "db01,1500",
-                Duration::from_secs(60),
-                &cancel,
-                move |host| seen.send(host).unwrap(),
-            ))
-            .unwrap();
-        assert_eq!(spn, None);
-        assert_eq!(host.recv().unwrap(), "db01");
-    }
-
-    #[test]
-    fn a_pipe_is_not_looked_up() {
-        let cancel = Cancel::new();
-        let spn = runtime()
-            .block_on(spn_if_lookup_is_slow(
-                "np:db01",
-                Duration::from_secs(60),
-                &cancel,
-                |_| panic!("looked up"),
-            ))
-            .unwrap();
-        assert_eq!(spn, None);
-    }
-
-    #[test]
-    fn a_cancel_ends_the_wait_for_a_lookup() {
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let root = Cancel::new();
-        let cancel = root.child();
-        let started = Instant::now();
-        let result = runtime().block_on(async {
-            let lookup =
-                spn_if_lookup_is_slow("192.0.2.1", Duration::from_secs(60), &cancel, move |_| {
-                    let _ = held.recv_timeout(Duration::from_secs(30));
-                });
-            tokio::pin!(lookup);
-            tokio::select! {
-                result = &mut lookup => return result,
-                () = tokio::time::sleep(Duration::from_millis(10)) => root.cancel(),
-            }
-            lookup.await
-        });
-        drop(release);
-        assert!(matches!(result, Err(DbError::Cancelled(_))), "{result:?}");
-        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     // DESIGN.md §4.2: a Named Pipes request to another machine is refused, with the TCP form
@@ -2362,6 +2119,17 @@ mod tests {
             (r"\\DB01\PIPE\mssql$Sales\SQL\QUERY", r"DB01\Sales"),
             (r"\\db01\pipe\custom\app", "db01"),
             (r"\\db01", "db01"),
+            // An IPv6 address after `np:`, or in a UNC path after any prefix: 0.4.0 opens a pipe
+            // to it, where 0.3.0 read the whole text as a name (driver-0.4.0.md §1.2).
+            ("np:2001:db8::5", "2001:db8::5"),
+            (r"np:2001:db8::5\SALES", r"2001:db8::5\SALES"),
+            ("np:fe80::1%12,1433", "fe80::1%12,1433"),
+            (r"np:\\2001:db8::5\pipe\sql\query", "2001:db8::5"),
+            (r"tcp:\\fe80::1\pipe\sql\query", "fe80::1"),
+            (
+                r"\\2001:db8::5\pipe\MSSQL$SALES\sql\query",
+                r"2001:db8::5\SALES",
+            ),
         ] {
             let message = check(server, Some("BUILDBOX")).unwrap_err();
             assert!(
@@ -2381,6 +2149,28 @@ mod tests {
         );
     }
 
+    // Decision 73: this computer's name is the driver's, the one its pipe open takes as local,
+    // not the environment's `COMPUTERNAME`; where the two differ (a DNS host name longer than 15
+    // characters, or an edited environment), `np:` with the environment's is refused.
+    #[test]
+    fn this_computers_name_is_the_one_the_driver_takes_as_local() {
+        let name = mssql_tds::connection::this_computer_name().expect("a computer name");
+        assert_eq!(super::this_computer().as_deref(), Some(name.as_str()));
+        assert_eq!(super::check_server(&format!("np:{name}")), Ok(()));
+        assert_eq!(
+            super::check_server(&format!("np:{}", name.to_lowercase())),
+            Ok(())
+        );
+        assert_eq!(
+            super::check_server(&format!(r"np:{name}\SQLEXPRESS")),
+            Ok(())
+        );
+        let environment = std::env::var("COMPUTERNAME").unwrap_or_default();
+        if !environment.is_empty() && !environment.eq_ignore_ascii_case(&name) {
+            assert!(super::check_server(&format!("np:{environment}")).is_err());
+        }
+    }
+
     #[test]
     fn local_pipes_and_other_servers_are_accepted() {
         for server in [
@@ -2393,6 +2183,9 @@ mod tests {
             "admin:db01",
             "2001:db8::5",
             "2001:db8::5,1433",
+            r"2001:db8::5\SALES",
+            "tcp:2001:db8::5",
+            "admin:fe80::1",
             "db01:1433",
             // Local pipes, by every name for this computer.
             "np:.",
@@ -2446,10 +2239,20 @@ mod tests {
 
     #[test]
     fn tls_hints_from_schannel_status() {
-        let untrusted = "Unexpected Implementation Error: Schannel TLS handshake failed: \
-                         InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)";
+        // mssql-tds 0.4.0's text (`TlsHandshakeError`), and 0.3.0's (driver-0.4.0.md §1.3).
+        let untrusted = "TLS handshake failed for 'db01': InitializeSecurityContextW failed: \
+                         SEC_E_UNTRUSTED_ROOT (status=0x80090325)";
+        let untrusted_030 = "Unexpected Implementation Error: Schannel TLS handshake failed: \
+                             InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT \
+                             (status=0x80090325)";
         let flags = |detail| tls_hint(detail, Hints::Flags);
         assert!(flags(untrusted).unwrap().contains("pass -C"));
+        assert!(flags(untrusted_030).unwrap().contains("pass -C"));
+        assert!(
+            flags("TLS handshake failed for 'db01': AcquireCredentialsHandleW(UNISP_NAME) failed")
+                .unwrap()
+                .contains("-No")
+        );
         assert!(
             flags("SEC_E_WRONG_PRINCIPAL")
                 .unwrap()
@@ -2515,8 +2318,16 @@ mod tests {
             DbError::Connect(words) => words,
             other => panic!("{other:?}"),
         };
-        // The direct Schannel path's form, matched by its text (`tls_hint`).
-        let untrusted = || {
+        // The direct Schannel path's form in mssql-tds 0.4.0; its status name is matched by its
+        // text (`tls_hint`).
+        let untrusted = || TdsError::TlsHandshakeError {
+            source: Box::new(std::io::Error::other(
+                "InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)",
+            )),
+            expected_host: "db01".into(),
+        };
+        // 0.3.0's form, a generic error that only the text marks as a certificate failure.
+        let untrusted_030 = || {
             TdsError::ImplementationError(
                 "Schannel TLS handshake failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)".into(),
             )
@@ -2527,6 +2338,7 @@ mod tests {
             options.hints = hints;
             for error in [
                 untrusted(),
+                untrusted_030(),
                 TdsError::CertificateMismatch,
                 TdsError::NoServerCertificate,
             ] {
@@ -2545,6 +2357,15 @@ mod tests {
         assert!(words(&options, untrusted()).ends_with("or use -Nm, where -C applies"));
         options.encrypt = super::Encrypt::Mandatory;
         assert!(words(&options, untrusted()).contains("pass -C"));
+        assert!(words(&options, untrusted_030()).contains("pass -C"));
+        assert!(
+            words(&options, untrusted()).contains(
+                "): TLS handshake failed for 'db01': InitializeSecurityContextW failed: \
+                 SEC_E_UNTRUSTED_ROOT (status=0x80090325); this machine doesn't trust"
+            ),
+            "{}",
+            words(&options, untrusted())
+        );
         // A failure that isn't the certificate's keeps its own hint under strict.
         options.encrypt = super::Encrypt::Strict;
         assert!(words(&options, TdsError::ConnectionClosed("x".into())).ends_with("try host,port"));
@@ -3698,6 +3519,14 @@ pub(crate) mod fake_server {
     /// ibExtension (bytes 56..58) points at a DWORD holding the FeatureExt block's offset; the
     /// block is `id u8 | data length u32 LE | data`, repeated, ended by 0xFF.
     fn login_features(login: &[u8]) -> Vec<u8> {
+        login_feature_data(login)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// `login_features` with each feature's data.
+    fn login_feature_data(login: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let at = |i: usize, n: usize| login.get(i..i + n);
         let Some(&[a, b]) = at(56, 2) else {
             return Vec::new();
@@ -3706,7 +3535,7 @@ pub(crate) mod fake_server {
             return Vec::new();
         };
         let mut i = u32::from_le_bytes([c, d, e, f]) as usize;
-        let mut ids = Vec::new();
+        let mut features = Vec::new();
         while let Some(&[id]) = at(i, 1) {
             if id == 0xff {
                 break;
@@ -3714,10 +3543,11 @@ pub(crate) mod fake_server {
             let Some(&[g, h, j, k]) = at(i + 1, 4) else {
                 break;
             };
-            ids.push(id);
-            i += 5 + u32::from_le_bytes([g, h, j, k]) as usize;
+            let length = u32::from_le_bytes([g, h, j, k]) as usize;
+            features.push((id, at(i + 5, length).unwrap_or_default().to_vec()));
+            i += 5 + length;
         }
-        ids
+        features
     }
 
     /// LOGINACK alone (the first token of `login_reply`), for login replies built by hand.
@@ -3766,7 +3596,12 @@ pub(crate) mod fake_server {
     /// with `reply`, then reads until the client goes. The payload is `None` until a LOGIN7
     /// has arrived.
     fn serve_login(reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        serve_login_on("127.0.0.1", reply)
+    }
+
+    /// `serve_login` on another loopback address, such as a route's target.
+    fn serve_login_on(ip: &str, reply: Vec<u8>) -> (u16, Arc<Mutex<Option<Vec<u8>>>>) {
+        let listener = TcpListener::bind((ip, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(None));
         let kept = seen.clone();
@@ -3801,7 +3636,7 @@ pub(crate) mod fake_server {
     // recovery (FeatureExt 0x01), so the driver can't log in again behind sqlh's back, and
     // multi-subnet failover is set by sqlh itself (off without -M), never the driver's default.
     // The login does ask for DNS caching (0x0B) and Enhanced Routing (0x0F), which mssql-tds
-    // 0.3.0 always advertises (decisions 42 and 43).
+    // always advertises (0.3.0, 0.4.0; decisions 42 and 43).
     #[test]
     fn the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own() {
         let (port, seen) = serve_login(login_reply());
@@ -3821,6 +3656,24 @@ pub(crate) mod fake_server {
         assert!(!features.contains(&0x01), "{features:02x?}");
         assert!(
             features.contains(&0x0b) && features.contains(&0x0f),
+            "{features:02x?}"
+        );
+    }
+
+    // Decision 71: the login asks for vector feature version 2 (FeatureExt 0x0E, one data byte),
+    // set by sqlh, so a later driver default can't change how vectors arrive unseen; and it
+    // never asks for data classification (0x09), which would change every login and put a new
+    // token in results (driver-0.4.0.md §3.2).
+    #[test]
+    fn the_login_asks_for_vector_version_2_and_no_data_classification() {
+        let (port, seen) = serve_login(login_reply());
+        connect(format!("127.0.0.1,{port}")).expect("connected");
+        let login = seen.lock().unwrap().clone().expect("a LOGIN7");
+        let features = login_feature_data(&login);
+        let vector: Vec<_> = features.iter().filter(|(id, _)| *id == 0x0e).collect();
+        assert_eq!(vector, [&(0x0e, vec![2])], "{features:02x?}");
+        assert!(
+            features.iter().all(|(id, _)| *id != 0x09),
             "{features:02x?}"
         );
     }
@@ -3845,6 +3698,158 @@ pub(crate) mod fake_server {
                 .expect("connected");
             let login = seen.lock().unwrap().clone().expect("a LOGIN7");
             assert_eq!(login_text(&login, 48).as_deref(), Some(sent));
+        }
+    }
+
+    /// Keeps a result's columns and values, which `Sink` drops.
+    #[derive(Default)]
+    struct Kept {
+        columns: Vec<(String, String, bool)>,
+        rows: Vec<Vec<Value>>,
+    }
+
+    impl BatchSink for Kept {
+        fn columns(&mut self, columns: &[Column]) -> io::Result<()> {
+            self.columns = columns
+                .iter()
+                .map(|c| (c.name.clone(), c.type_name.clone(), c.nullable))
+                .collect();
+            Ok(())
+        }
+        fn wants_values(&self) -> bool {
+            true
+        }
+        fn cell_limit(&self) -> usize {
+            100
+        }
+        fn row(&mut self, values: &[Value]) -> io::Result<()> {
+            self.rows.push(values.to_vec());
+            Ok(())
+        }
+        fn skipped_row(&mut self) {}
+        fn counting_stopped(&mut self, _: Stop) {}
+        fn end_rows(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn end_rows_incomplete(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn rows_affected(&mut self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn message(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, _: &ServerMessage) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Decision 71, through the driver's decoder: a float32 and a float16 vector column as SQL
+    // Server sends them natively under vector feature version 2 (TYPE_INFO 0xF5 with a u16
+    // length and the base type as its scale, 0x00 float32 and 0x01 float16; each value a u16
+    // length, the 8-byte header `A9 01 dimensions base 00 00 00`, then the elements), and a NULL
+    // row. Both columns are `vector`, and each element is printed at its own precision.
+    #[test]
+    fn native_float32_and_float16_vectors_reach_the_sink_as_sqlh_prints_them() {
+        let float32: Vec<u8> = [0.1f32, 2.0, -3.5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let float16: Vec<u8> = [0.1f32, 2.0, -3.5, 65504.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let column = |name: u8, base: u8, elements: &[u8]| {
+            let length = u16::try_from(8 + elements.len()).unwrap();
+            let mut c = vec![0, 0, 0, 0, 1, 0, 0xf5];
+            c.extend(length.to_le_bytes());
+            c.extend([base, 1, name, 0]);
+            c
+        };
+        let value = |base: u8, dimensions: u16, elements: &[u8]| {
+            let mut v = u16::try_from(8 + elements.len())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            v.extend([0xa9, 1]);
+            v.extend(dimensions.to_le_bytes());
+            v.extend([base, 0, 0, 0]);
+            v.extend(elements);
+            v
+        };
+        let mut reply = vec![0x81, 2, 0];
+        reply.extend(column(b'v', 0, &float32));
+        reply.extend(column(b'w', 1, &float16));
+        reply.push(0xd1);
+        reply.extend(value(0, 3, &float32));
+        reply.extend(value(1, 4, &float16));
+        reply.extend([0xd1, 0xff, 0xff, 0xff, 0xff]);
+        reply.extend(done(2));
+        let ran = run_once(
+            serve(Script::Reply(reply)),
+            "SELECT v, w".into(),
+            Counting::EXACT,
+            Kept::default(),
+        );
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome);
+        let vector = |name: &str| (name.to_owned(), "vector".to_owned(), true);
+        assert_eq!(ran.sink.columns, [vector("v"), vector("w")]);
+        assert_eq!(
+            ran.sink.rows,
+            [
+                vec![
+                    Value::Text("[0.1,2,-3.5]".into()),
+                    Value::Text("[0.1,2,-3.5,65504]".into())
+                ],
+                vec![Value::Null, Value::Null],
+            ]
+        );
+    }
+
+    // driver-0.4.0.md §3.3: mssql-tds 0.4.0 rewrote the UTF-16 encoder every batch's text goes
+    // through, and keeps a supplementary character's low surrogate pending when a packet fills
+    // between the two halves. A wrong unit would change the query silently, so the text that
+    // arrives is compared with the text sent: ASCII runs longer than the encoder's 256-unit
+    // stage, characters of the Basic Multilingual Plane and 3,000 surrogate pairs. The fake's
+    // 4,096-byte packets hold 2,033 units of SQL after the 22-byte ALL_HEADERS, then 2,044 each,
+    // so they cut between the halves of a pair for an odd `k` and between pairs for an even
+    // one. A dropped or misplaced half would read back as U+FFFD.
+    #[test]
+    fn a_batch_reaches_the_server_unit_for_unit_across_packets() {
+        let fake = serve_pool(Vec::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut sent = Vec::new();
+        runtime.block_on(async {
+            let cancel = Cancel::new();
+            let mut session = Session::connect(&options(fake.server.clone()), &cancel)
+                .await
+                .expect("connected to the fake server");
+            for k in 0..4 {
+                let mut sql = format!("-- {}", "a".repeat(k));
+                sql.push_str(&"\u{1F600}".repeat(3000));
+                sql.push_str(&"x".repeat(600));
+                sql.push_str(&"é日本\u{10FFFF}".repeat(500));
+                sql.push_str(&format!("\nSELECT N'{}';", "\u{1F600}b".repeat(700)));
+                session.exec_internal(&sql, 5, &cancel).await.unwrap();
+                sent.push(sql);
+            }
+        });
+        let arrived = fake.sql(0);
+        assert_eq!(arrived.len(), sent.len(), "batches");
+        for (k, (arrived, sent)) in arrived.iter().zip(&sent).enumerate() {
+            assert!(
+                arrived == sent,
+                "k = {k}: {} units sent, {} arrived, first difference at unit {:?}",
+                sent.encode_utf16().count(),
+                arrived.encode_utf16().count(),
+                sent.encode_utf16()
+                    .zip(arrived.encode_utf16())
+                    .position(|(a, b)| a != b)
+            );
         }
     }
 
@@ -3965,6 +3970,291 @@ pub(crate) mod fake_server {
         assert_eq!(login_database(&login).as_deref(), Some("sales"));
         let features = login_features(&login);
         assert!(!features.contains(&0x01), "{features:02x?}");
+    }
+
+    // Decision 72: Windows auth's SPN provider (`db::spn`), through a real connect. The fake
+    // prelogin offers no encryption, so there is no TLS, and a LOGIN7 with a token from the
+    // recorder's mock context is answered with a plain LOGINACK, which the driver takes; real
+    // SSPI is a live check (driver-0.4.0.md §10).
+
+    use super::spn::tests::{Hop, NOT_LOOPBACK, TOKEN, answering, held, recorder};
+    use super::spn::{HopSpn, Slots};
+    use mssql_tds::security::SecurityContextProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The hops a recording provider saw.
+    type Hops = Arc<Mutex<Vec<Hop>>>;
+
+    fn integrated(server: String) -> ConnectOptions {
+        ConnectOptions {
+            auth: Auth::Integrated,
+            ..options(server)
+        }
+    }
+
+    /// The production provider's rule and slots, with `create` recording each hop, and a lookup
+    /// that counts its calls (no fake is looked up: every one is on a loopback address).
+    fn recording() -> (Arc<dyn SecurityContextProvider>, Hops, Arc<AtomicUsize>) {
+        static SLOTS: Slots = Slots::new(4);
+        let (create, seen) = recorder();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = HopSpn::with(
+            Duration::from_secs(10),
+            &SLOTS,
+            answering("looked-up.example", Arc::clone(&calls)),
+            NOT_LOOPBACK,
+            create,
+        );
+        (Arc::new(provider), seen, calls)
+    }
+
+    fn connect_as(
+        options: &ConnectOptions,
+        spn: Arc<dyn SecurityContextProvider>,
+    ) -> Result<Session, DbError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Session::connect_with(options, &Cancel::new(), spn))
+    }
+
+    /// LOGIN7's fIntSecurity (OptionFlags2, byte 25, 0x80) and its SSPI data (ibSSPI and cbSSPI
+    /// at 78..82 of the OffsetLength block, MS-TDS 2.2.6.4).
+    fn login_sspi(login: &[u8]) -> Option<&[u8]> {
+        let int_security = login.get(25).is_some_and(|b| b & 0x80 != 0);
+        let field = |i: usize| {
+            login
+                .get(i..i + 2)
+                .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        let (offset, length) = (field(78)?, field(80)?);
+        int_security.then(|| login.get(offset..offset + length))?
+    }
+
+    fn hop(server: &str, port: u16) -> Hop {
+        Hop {
+            server: server.into(),
+            port,
+            spn: Some(format!("MSSQLSvc/{server}:{port}")),
+            loopback: true,
+            bindings: None,
+            package: "Negotiate",
+        }
+    }
+
+    // The provider gets the host and port the driver dials, sets that hop's SPN, and its
+    // context's token is what the LOGIN7 carries. A port replaces an instance, so no SQL
+    // Browser is asked and the SPN names the port.
+    #[test]
+    fn windows_auth_gives_the_provider_the_dialled_host_and_port() {
+        for server in ["127.0.0.1,{port}", r"127.0.0.1\SQLHNOBROWSER,{port}"] {
+            let (port, seen_login) = serve_login(login_reply());
+            let (provider, seen, calls) = recording();
+            let server = server.replace("{port}", &port.to_string());
+            let session = connect_as(&integrated(server.clone()), provider);
+            assert!(session.is_ok(), "{server}: {:?}", session.err());
+            assert_eq!(*seen.lock().unwrap(), [hop("127.0.0.1", port)], "{server}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let login = seen_login.lock().unwrap().clone().expect("a LOGIN7");
+            assert_eq!(login_sspi(&login), Some(TOKEN), "{server}");
+        }
+    }
+
+    // R52, closed: each routed hop gets its own SPN, its host's and port's, with a read-only
+    // intent too (the pre-lookup left those to the driver), and through an acknowledged
+    // Enhanced Routing route, whose hop the driver builds from a cloned context.
+    #[test]
+    fn each_routed_hop_gets_its_own_spn() {
+        type Route = fn(u16) -> Vec<u8>;
+        let plain: Route = |target| login_reply_with(env_routing(target, "127.0.0.2"), true);
+        let enhanced: Route = |target| {
+            let route = env_route(21, target, "127.0.0.2", Some("sales"));
+            login_reply_with([feature_ext_ack(0x0f, &[1]), route].concat(), true)
+        };
+        for (route, read_only) in [(plain, false), (plain, true), (enhanced, false)] {
+            let (target, routed) = serve_login_on("127.0.0.2", login_reply());
+            let (gateway, _) = serve_login(route(target));
+            let (provider, seen, _) = recording();
+            let options = ConnectOptions {
+                read_only_intent: read_only,
+                ..integrated(format!("127.0.0.1,{gateway}"))
+            };
+            let session = connect_as(&options, provider);
+            assert!(session.is_ok(), "{:?}", session.err());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [hop("127.0.0.1", gateway), hop("127.0.0.2", target)],
+                "read-only {read_only}"
+            );
+            let login = routed.lock().unwrap().clone().expect("the routed LOGIN7");
+            assert_eq!(login_sspi(&login), Some(TOKEN));
+        }
+    }
+
+    /// A one-shot SQL Browser on `ip`:1434 (SSRP's fixed port, MS-SQLR) that names `tcp_port`
+    /// for `instance`, replying from the address and port asked, as the driver requires. It
+    /// returns once its thread is waiting for the request: the driver waits 1 s for the answer,
+    /// and a thread not yet started on a busy machine could miss that.
+    fn serve_browser(ip: &str, instance: &str, tcp_port: u16) {
+        let socket = std::net::UdpSocket::bind((ip, 1434)).unwrap_or_else(|e| {
+            panic!(
+                "{ip}:1434 can't be bound ({e}): another test process using this address, or a \
+                 SQL Server Browser holding the port exclusively"
+            )
+        });
+        let answer = format!(
+            "ServerName;FAKE;InstanceName;{instance};IsClustered;No;Version;17.0.0.0;tcp;{tcp_port};;"
+        );
+        let (ready, waiting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut asked = [0u8; 512];
+            let _ = ready.send(());
+            let Ok((_, from)) = socket.recv_from(&mut asked) else {
+                return;
+            };
+            let mut reply = vec![0x05];
+            reply.extend(u16::try_from(answer.len()).unwrap().to_le_bytes());
+            reply.extend(answer.as_bytes());
+            let _ = socket.send_to(&reply, from);
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fake SQL Browser started");
+    }
+
+    // R52, closed: a named instance without a port gets SQL Browser's port in its SPN, which
+    // the pre-lookup couldn't know before the connect. SQL Browser's port is fixed, so the
+    // address is this process's own (127.a.b.3, from the process id, never 127.0.0.x), and the
+    // instance's name is unique, since the driver caches what Browser said for the process.
+    #[test]
+    fn a_named_instance_gives_the_provider_sql_browsers_port() {
+        let pid = std::process::id();
+        let ip = format!("127.{}.{}.3", 1 + pid % 250, 1 + (pid / 250) % 250);
+        let (port, seen_login) = serve_login_on(&ip, login_reply());
+        serve_browser(&ip, "SQLHBROWSER72", port);
+        let (provider, seen, _) = recording();
+        let session = connect_as(&integrated(format!(r"{ip}\SQLHBROWSER72")), provider);
+        assert!(session.is_ok(), "{:?}", session.err());
+        assert_eq!(*seen.lock().unwrap(), [hop(&ip, port)]);
+        assert!(
+            seen_login.lock().unwrap().is_some(),
+            "the LOGIN7 reached the instance"
+        );
+    }
+
+    // The driver's own error from creating its context ends the connect with the Windows auth
+    // hint, before any LOGIN7.
+    #[test]
+    fn the_drivers_security_error_ends_the_connect_before_the_login() {
+        static SLOTS: Slots = Slots::new(4);
+        let (port, seen_login) = serve_login(login_reply());
+        let failing = HopSpn::with(
+            Duration::from_secs(10),
+            &SLOTS,
+            answering("x", Arc::new(AtomicUsize::new(0))),
+            NOT_LOOPBACK,
+            Arc::new(|_: &_, _: &str, _: u16| {
+                Err(mssql_tds::security::SecurityError::TargetUnknown(
+                    "MSSQLSvc/x:1".into(),
+                ))
+            }),
+        );
+        let outcome = connect_as(&integrated(format!("127.0.0.1,{port}")), Arc::new(failing));
+        assert!(
+            matches!(&outcome, Err(DbError::Connect(words))
+                if words.contains("Windows auth failed; check Kerberos/SPN setup")),
+            "{:?}",
+            outcome.err()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(seen_login.lock().unwrap().is_none(), "no LOGIN7");
+    }
+
+    /// The provider with every host looked up, by a lookup held until the `Sender` drops.
+    fn waiting(
+        budget: Duration,
+    ) -> (
+        Arc<dyn SecurityContextProvider>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        static SLOTS: Slots = Slots::new(4);
+        let (lookup, release, _) = held();
+        let (create, _) = recorder();
+        let provider = HopSpn::with(budget, &SLOTS, lookup, |_| true, create);
+        (Arc::new(provider), release)
+    }
+
+    // A cancel during the SPN wait ends the connect at once, as `Session::connect` races it;
+    // the wait is left to end by itself on the driver's thread. The runtime ends as sqlh's do,
+    // `shutdown_background`, since dropping it would wait for that thread.
+    #[test]
+    fn a_cancel_during_the_spn_wait_ends_the_connect() {
+        let (port, _) = serve_login(login_reply());
+        let (provider, release) = waiting(Duration::from_secs(10));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let outcome = runtime.block_on(async {
+            let root = Cancel::new();
+            let cancel = root.child();
+            let options = integrated(format!("127.0.0.1,{port}"));
+            let connecting = Session::connect_with(&options, &cancel, provider);
+            tokio::pin!(connecting);
+            tokio::select! {
+                outcome = &mut connecting => return outcome,
+                () = tokio::time::sleep(Duration::from_millis(100)) => root.cancel(),
+            }
+            connecting.await
+        });
+        runtime.shutdown_background();
+        drop(release);
+        assert!(
+            matches!(&outcome, Err(DbError::Cancelled(words)) if words == "cancelled while connecting"),
+            "{:?}",
+            outcome.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    // The SPN wait holds no runtime thread: the runtime keeps running other tasks through it,
+    // and past the budget the login goes on with the fallback SPN.
+    #[test]
+    fn a_slow_spn_wait_holds_no_runtime_thread() {
+        let (port, seen_login) = serve_login(login_reply());
+        let (provider, release) = waiting(Duration::from_millis(300));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (outcome, ticks) = runtime.block_on(async {
+            let cancel = Cancel::new();
+            let options = integrated(format!("127.0.0.1,{port}"));
+            let connecting = Session::connect_with(&options, &cancel, provider);
+            tokio::pin!(connecting);
+            let mut ticks = 0;
+            loop {
+                tokio::select! {
+                    outcome = &mut connecting => break (outcome, ticks),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => ticks += 1,
+                }
+            }
+        });
+        runtime.shutdown_background();
+        drop(release);
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+        assert!(
+            ticks >= 10,
+            "the runtime ticked {ticks} times during a 300 ms wait"
+        );
+        let login = seen_login.lock().unwrap().clone().expect("a LOGIN7");
+        assert_eq!(login_sspi(&login), Some(TOKEN));
     }
 }
 

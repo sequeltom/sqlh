@@ -37,7 +37,7 @@
   - `block2` is macOS-only (`:208-210`). `Cargo.lock` therefore gains macOS-only entries: block2 0.6.2 and the objc2 crates it needs, all MIT. They aren't compiled for Windows and don't reach THIRD-PARTY-NOTICES, because `about.toml` lists only `x86_64-pc-windows-msvc`. Unlike 0.3.0's bump, `Cargo.lock` changes beyond the `mssql-tds` line.
   - Licence MIT (`:40`), edition 2024, no `rust-version`. The new `build.rs` runs on the Windows build host and returns at once (`build.rs:12-16`).
 - **Behaviour sqlh sees at its settings:**
-  - **U9 partly fixed (§1.1):** the driver's SPN lookup and every SSPI call now run on tokio's blocking pool, inside `-l` + 1 s and Ctrl+C. sqlh's 500 ms pre-lookup stays (§7.3), but its comments and DESIGN.md §4.2's `-E` row become wrong.
+  - **U9 partly fixed (§1.1):** the driver's SPN lookup and every SSPI call now run on tokio's blocking pool, inside `-l` + 1 s and Ctrl+C. sqlh's 500 ms pre-lookup stays (§7.3), but its comments and DESIGN.md §4.2's `-E` row become wrong. (Superseded: decision 72 replaced the pre-lookup with a per-hop provider, §10.)
   - **A refusal gap that the bump opens (§1.2):** 0.4.0 accepts `np:` or `tcp:` before an IPv6 address. sqlh still parses the 0.3.0 way, so `np:<IPv6>\INST` and `np:\\<IPv6>\pipe\...` get through to a remote pipe open (U1). Step 2 must fix this. The same parser change lets sqlh keep an IPv6 named instance on TCP.
   - **Connect error detail (§1.3):** Schannel failures now read `TLS handshake failed for '<host>': ...` instead of `Unexpected Implementation Error: Schannel TLS handshake failed: ...`. Hints and exit 2 are unchanged.
   - **LOGIN7 asks for vector feature version 2 (§3.1),** because the driver's default moved. float16 vector columns may print differently. §7.2.
@@ -57,6 +57,8 @@
 ## 1. Connect and login
 
 ### 1.1 The driver's SPN lookup and SSPI calls leave the runtime thread (U9, partly fixed)
+
+**Superseded by decision 72 (2026-11-08):** the pre-lookup this describes is replaced by a per-hop `SecurityContextProvider` (`db::spn`, §10); what follows is step 1's analysis, kept as written.
 
 - **0.3.0 (`handler_factory.rs:736-737`, `:597-598`):** three calls ran inline in the async login, on the runtime thread:
   - `SspiAuthHandler::new`, which calls `WindowsSspiContext::new` and then, when `server_spn` is None, `make_spn_canonicalized` and its blocking `dns_lookup` (`security/windows/sspi_context.rs:99-102`);
@@ -400,6 +402,8 @@ Each entry says what it would replace and what it risks. None is for the bump (�
 
 ### 6.1 `SecurityContextProvider`: a per-hop SPN hook
 
+**Built by decision 72 (2026-11-08), for 0.1.0:** `db::spn::HopSpn` (§10). What follows is step 1's analysis, kept as written.
+
 - **What it is (**checked**).**
   - `ClientContext::security_context_provider: Option<Arc<dyn SecurityContextProvider>>` (`client_context.rs:380-383`; None at `:599` and `:666`; cloned to routed contexts at `:982`).
   - The trait's `create_context(&IntegratedAuthConfig, server, port)` (`security/security_context.rs:222-238`, exported at `security/mod.rs:40-42`) is called once per login hop, after TLS, inside `off_runtime_thread`, with the dialled server and port (`sspi_handler.rs:89-99`; `handler_factory.rs:796-808`). That is after SQL Browser has given the port, and again for each routed host.
@@ -482,7 +486,7 @@ Numbered §7.1–§7.5, so they aren't confused with PLAN.md §6's decisions; th
    **Recommended: V1 for the bump,** set explicitly, so the upgrade changes no output.
    - V2 can come later as its own item, with float16 rendered at its own precision, a `vector(N, float16)` header type (§6.6) and goldens.
    - Off would change float32 vectors too [inferred: down-level text].
-3. **sqlh's 500 ms SPN pre-lookup stays (§1.1).** It still saves about 5 s per connect to an address with no PTR record, and keeps a short `-l` working; only its stated reasons change.
+3. **(Decided otherwise: decision 72 replaced the pre-lookup with §6.1's provider, built in §10.)** **sqlh's 500 ms SPN pre-lookup stays (§1.1).** It still saves about 5 s per connect to an address with no PTR record, and keeps a short `-l` working; only its stated reasons change.
 
    **Recommended;** this records what is already built. Dropping it would break DESIGN.md §4.2's promise; the better replacement is §6.1.
 4. **Which name counts as "this computer" for local Named Pipes (§1.5, §6.4):** the driver's `this_computer_name()`, falling back to `COMPUTERNAME` only when it returns nothing, or `COMPUTERNAME` as now.
@@ -513,7 +517,7 @@ Read-only unless stated.
    - the `-M` rows, and a subset under `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage`;
    - Ctrl+Break during a connect, with and without `-M` (exit 6 within 2 s);
    - a failed SQL login (18456 and its hint).
-3. **U9 (§1.1),** against the test server's address, which has no PTR record (connect-latency.md):
+3. **U9 (§1.1),** against the test server's address, which has no PTR record (connect-latency.md). (These expectations are the pre-lookup's, as run in §10 item 3; under decision 72's provider `-K ReadOnly -l 2` and `-l 15` connect in about 0.6 s, as run in §10, Decision 72.)
    - `-E -S <address> -l 1 -Q "SELECT 1"`: about 0.6 s, exit 0 (sqlh's own pre-lookup, unchanged).
    - `-E -K ReadOnly -S <address> -l 2`: exit 4 at about 3 s. On 0.3.0 it ended only after the lookup (connect-latency.md:75-76).
    - The same with `-l 15`, in a `--features timing --verbose` build: the login step takes about 5 s.
@@ -613,3 +617,79 @@ On a local branch, `driver-0.4.0`, once §7's decisions are taken.
    - The brief covers `main..driver-0.4.0` and this note: the refusal change (connect and cancellation), the vector pin (the output contract), the TLS fixtures and the documentation changes.
    - Include the record of §8's measurements.
    - Before any release, every change since the last review is covered by one.
+
+## 10. As built and measured (step 2, 2026-11-08)
+
+On the local branch `driver-0.4.0`. Decisions taken: §7.1 is PLAN.md decision 70 (0.1.0 ships on 0.4.0 and takes no later driver), §7.2 is decision 71 (vector version 2, set explicitly; the owner chose the driver's default over the recommended version 1). §7.3 is decision 72 (the owner chose to build §6.1's provider now, in place of keeping the pre-lookup; built below); §7.4 is decision 73 (the local-pipe check takes the driver's `this_computer_name()`, with `COMPUTERNAME` only when it has none; built in `db::this_computer`, with a unit test that the driver's name is the one used and that a differing `COMPUTERNAME` is refused; on this workstation the two names are the same, and `np:<this computer>` reaches the driver's local pipe); §7.5 is decision 74 (the connect-stage spans, sensitivity labels by the catalog, and the cached-address and route refusals are candidates after 0.1.0). Every §7 decision is taken.
+
+**Built:**
+- `1352077`: the bump alone, `Cargo.toml` and `Cargo.lock` (block2 0.6.2, objc2 0.6.5, objc2-encode 4.1.0 added, macOS only). No source change; `scripts/check.ps1` passed.
+- `15a0e87`: §9 items 2, 4, 5, 6 and 7. `split_protocol` takes 0.4.0's rule and `data_source` puts `tcp:` before a remote IPv6 address, so `np:<IPv6>[\INST]` and the IPv6 UNC spellings are refused (exit 3) and an IPv6 named instance stays on TCP. The TLS fixtures take the `TlsHandshakeError` shape, with one 0.3.0 case kept. `a_batch_reaches_the_server_unit_for_unit_across_packets` covers the encoder: the fake's packets were checked at 4,096 bytes, 2,033 units of SQL in the first, so a pair is cut for an odd `k`.
+- Decision 71: `Session::connect` sets `VectorVersion::V2`; `the_login_asks_for_vector_version_2_and_no_data_classification` pins the 0x0E byte at 2 and 0x09 absent, and fails with V1 set. `value::push_half` writes a float16 element in the shortest decimal that reads back as the same float16, in `{:?}`'s form, and a whole number whole. It works in integers: a first version formatted each candidate to a precision (`{:.*e}`) and parsed it back, which brought Rust's exact float formatter into the exe, +25,600 bytes; the integer one costs 4,608. Checked against every finite float16 (round trip, no shorter decimal, the form `float` gives), with `half` 2.7.1 as a dev-dependency reference (from f32 only: its `from_f64` rounds twice). Live test `a_vector_prints_its_elements_at_their_own_precision`. `native_float32_and_float16_vectors_reach_the_sink_as_sqlh_prints_them` feeds both column types and a NULL row through the driver's decoder (§9 item 3's fake-server test). Before commit, an independent review (three lenses, each finding put to a skeptic) confirmed one P3, fixed here: the docs said float16 arrives natively unconditionally, where it does so only once the server acknowledges version 2 (the driver accepts 1), and the fake-server test was missing. It refuted three: the first version's float16 rendering cost about 0.8 µs an element against 0.1 µs for float32 (measured; no output was wrong; the integer version that replaced it after the review, for size, wasn't timed), float32's existing allocation per element (unchanged code), and the DESIGN.md row's wording.
+
+**Size (§8 item 14):** 2,999,808 bytes on 0.3.0; 3,099,648 with the bare bump; 3,099,136 at `15a0e87`; 3,103,744 with decision 71 (41,984 bytes of the 3 MiB budget left). `cargo bloat --release --crates`: mssql_tds 863.8 → 923.7 KiB, tokio 108.2 → 127.8 KiB, std 482.9 → 493.3 KiB, sqlh 623.5 → 618.0 KiB. The largest growths are the connect paths with their stage spans (`create_base_stream` +27 KiB, `handler_factory::execute` +21 KiB, `connect_with_transport_context` +18 KiB, `query_browser` +16 KiB). About 29 KiB is the data-classification parser, which sqlh never requests. Imports: the same ten in-box DLLs. `cargo about generate`: accepted, no macOS crate in the notices. windows-sys 0.59 gains `Win32_Security` and `Win32_System_Threading` only.
+
+**Live checks (§8), against `test` (SQL Server 2025, 17.0.5035) and `test2016` (2016 SP3 GDR):**
+
+1. `scripts/check.ps1 -Live` at `15a0e87` passed on both servers: 495 unit tests, 126 debug and 120 release process tests, 86 debug and 79 release live tests each.
+2. Connect failures, each beside 0.3.0 (a `main` build) measured the same way: refused `127.0.0.1,1` 2.03 s, exit 2; unroutable `192.0.2.1 -l 2` 2.01 s with a SQL login and 2.51 s with Windows auth on both drivers (the extra 0.5 s is sqlh's own SPN pre-lookup, which postdates driver-0.3.0.md §8's 2.11 s); `localhost,1` 4.08 s exit 2, and with `-l 2` exit 4 at 3.01 s; `2001:db8::5 -l 2` 2.01 s, `timed out after 2000ms` (now sent as `tcp:2001:db8::5`); `np:192.0.2.1` exit 3. `-M`: `192.0.2.1 -l 2` exit 2 at 2.51 s with the `-M` wording; `localhost,1` exit 2 at 2.1 s, `All parallel connection attempts failed`; `db01\SALES` refused, exit 2. `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true` and `=garbage` change nothing. A failed SQL login: error 18456 with its hint, exit 2. Ctrl+Break during a connect, with and without `-M`: the process test `ctrl_break_cancels_a_connect`.
+3. U9 (§1.1), Windows auth by the 2025 server's address, which has no PTR record:
+   - `-E -S <address> -l 1`: connects in 0.56 s (0.64 s on 0.3.0): sqlh's pre-lookup, unchanged.
+   - `-E -K ReadOnly -S <address> -l 2`: exit 4 at 3.02 s. On 0.3.0, 5.14 s: its deadline passed during the lookup and fired only once the lookup ended.
+   - `-l 15`: connects in about 5.1 s on both.
+   - Ctrl+C 1.5 s into that lookup: exit 6 after 0.32 s (also at 3.5 s in). On 0.3.0, exit 6 only after 3.52 s, when the lookup ended.
+   - Not tried: `sqlh mcp` with a `-K ReadOnly` Windows-auth profile (none exists).
+   - A trap found on the way: Ctrl+C sent to a sqlh started from Git Bash never arrives, so the console-event checks run from PowerShell.
+4. TLS (§1.3): `-E -Nm` without `-C` reads `TLS handshake failed for '<address>': InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)` with the untrusted-root hint, exit 2. The name is the `-S` host. `-Ns -C` reads `TLS handshake failed for '<host>': peer closed connection during TLS handshake` with R46's strict hint. Hints and exit codes are 0.3.0's.
+5. IPv6 pipes (§1.2), from PowerShell, since Git Bash collapses a leading `\\`:
+   - On the bare bump, `np:\\2001:db8::5\pipe\sql\query` and `tcp:\\fe80::1\pipe\sql\query` with `-l 2` each ended after 21.0 s with `The specified network name is no longer available (os error 64)`. That is U1's stall, past `-l`, so the gap was real.
+   - `np:2001:db8::5\SALES` ended at the SQL Browser lookup, 1.1 s.
+   - With the fix, all three are exit 3 in 14 ms. `2001:db8::5\SALES` asks SQL Browser and ends in 1.1 s.
+   - The test server has no IPv6 address, so `tcp:<IPv6>,1433` wasn't connected.
+6. SQL Browser with a named instance: not run (no named instance).
+7. `db::phases`, three `--features timing --verbose` connects: tcp 5–6, prelogin 2–16, tls 17–34, login 126–175 ms, totals 154–231 ms, in line with 0.3.0.
+8. Vectors on 2025: `CAST('[0.1,2,-3.5,1e-8]' AS vector(4))` gives `[0.1,2,-3.5,1e-8]` in text, json and csv on 0.4.0 with version 2, as on 0.3.0. float16 is refused with error 195, `'float16' is not a recognized vector base type`, since `sqlh_test` has PREVIEW_FEATURES off; turning it on is the owner's call. On 2016: error 243, `Type vector is not a defined system type`. The error log had no `SQLDump` line before or after.
+9. The encoder: from a UTF-8 file with `-i`, k = 0–3 ASCII letters, then 3,000 U+1F600, 600 ASCII and 500 × `é日本U+10FFFF`. Each server's `DATALENGTH` and `SHA2_256` matched the values computed locally from the UTF-16 LE bytes, on both servers.
+10. The engine and cancellation: `live::mcp_tools` and the `-t`, lock-timeout, deadlock and count tests in item 1; `db::spike::spike_reset` passed on both servers.
+11. U10: 2,000 iterations return `c`, and 5,000 fail with `Too many Done tokens with has_more=true without ColMetadata`, exit 10, on both servers. U11 (2025, `--check`): 1,000 statements give exit 1 and 1,000 errors; 1,001 give exit 10 and none. Both are as upstream-issues.md records.
+12. Memory and `image`: the live tests in item 1.
+13. LocalDB: not installed on the workstation; not run.
+14. The exe: above.
+
+### Decision 72: the per-hop SPN provider (2026-11-08)
+
+The owner chose to build §6.1's hook now, in place of §7.3's recommendation to keep the pre-lookup: "build the long term replacement now. as I said I want to flow with the 0.4.0's defaults, this is in the spirit of that ask" (PLAN.md decision 72). A read-only workflow (three readers, each with an independent checker, then a design) mapped the hook, sqlh's code and the fake server's reach before any code was written.
+
+**Still open:** real SSPI against a named instance through a real SQL Browser, an AG listener's routed hop, Kerberos on a domain, and channel bindings under TLS with a server that enforces Extended Protection; none is at hand. The fake-server tests cover the provider's calls with a mock context.
+
+**Built:**
+- `src/db/spn.rs`, `HopSpn`: the driver's `SecurityContextProvider`, set on every Windows-auth connect (`Session::connect`; `connect_with` is the tests' seam).
+  - For each login hop the driver calls it with the host and port it dials. sqlh looks the host up with the driver's `canonicalize_hostname` on a thread of its own, waits at most 500 ms, and sets `server_spn`: `make_spn(<answer>, None, port)` in time, which is `make_spn_canonicalized`'s; `make_spn(<host>, None, port)` past the budget, the driver's own fallback.
+  - The SPN is always set, so the driver never runs its own unbounded lookup. Nothing else in the config changes, so the TLS channel bindings, the loopback flag of the empty-SPN retry and the package are the driver's.
+  - A loopback name is not looked up (the driver's public `is_loopback_address`, which compares with this machine's DNS host name); a local `\\.\pipe`, shared memory and LocalDB arrive as `localhost`, a pipe named by host under that name. The design proposed also copying the driver's private `is_fqdn` rule; not done, so a later driver can't change it unseen: a dotted name goes to the lookup thread, where `canonicalize_hostname` returns it at once, and under a full cap it can wait the 500 ms for a slot, for the SPN it would have had anyway (accepted in review).
+  - R53's cap of 4, now on std's `Mutex` and `Condvar` (the provider is synchronous, on the driver's blocking thread, where a tokio timer would need the runtime thread). A slot is held until its lookup ends; the wait for one comes out of the 500 ms.
+  - The provider makes no error of its own: slowness, a full cap or a failed thread give the fallback SPN. The driver's own error from creating its context passes through.
+- Removed: `spn_if_lookup_is_slow`, `host_and_spn`, `outlasts`/`outlasts_within`, the tokio semaphore and the `-K ReadOnly` skip (R52), with their six tests.
+
+**Tests:** seven unit tests in `spn.rs` (the dialled host and port in the fallback SPN; an in-time answer; loopback names not looked up; the config passing through with only the SPN set, channel bindings included; the driver's error; the cap, with a slot held until its lookup ends; a slot freed within the budget being taken) and six fake-server tests through a real connect, with a mock context's token in the LOGIN7: the dialled host and port; each routed hop's own SPN, with a read-only intent and through an acknowledged Enhanced Routing route (R52, closed); SQL Browser's port for a named instance, from a fake SQL Browser on 127.0.0.3:1434 (R52, closed); the driver's security error ending the connect before any LOGIN7; a cancel during the wait; and the wait holding no runtime thread. Real SSPI, Kerberos and channel bindings under TLS stay live checks.
+
+**Review before commit:** an independent adversarial review (four lenses, each finding put to a skeptic; 19 agents) confirmed eight findings, none in the provider's behaviour, all fixed here:
+- three tests depended on scheduling and failed under 48 busy threads on the 12-core workstation: two asserted what a lookup thread had done before anything made it run (now a bounded wait for it), and the fake SQL Browser bound the fixed 127.0.0.3:1434 and replied from a thread that could start after the driver's 1 s window (now an address of the process's own, 127.a.b.3 from the process id, a clear failure if the port is taken, and a responder already waiting before the connect); after the fixes, ten runs of all four under the same load passed;
+- no test pinned the host given to the lookup (a mutation that looked up the wrong name passed all 13): the in-time test now derives its answer from the host;
+- the docs: this section lacked decision 72's record, §8 item 3 still expected the pre-lookup's results, and two comments and DESIGN.md overstated the lookup rule (dotted names and pipes named by host).
+It refuted six, among them the slot wait of a dotted name (a latency inside every stated bound) and that LocalDB reaches the provider as `(localdb)\name` (sqlh's connect path resolves it to a local pipe first).
+
+**Size:** 3,098,112 bytes, 5,632 fewer than with the pre-lookup (47,616 of the 3 MiB budget left).
+
+**Live, against both servers by address (no PTR record), from PowerShell:**
+- `-E -S <address> -l 1`: connects in 0.59–0.61 s, NTLM (0.56 s with the pre-lookup).
+- `-E -K ReadOnly -S <address> -l 2`: **connects in 0.56–0.61 s**; with the pre-lookup, exit 4 at 3.02 s (§10 item 3).
+- `-l 15`: 0.59–0.66 s (about 5.1 s before).
+- The 2016 server, by address and port: 0.54–0.68 s, NTLM, in all three.
+- A timing build: the login step now carries the wait (525–620 ms, against about 160 ms for a SQL login); tcp, prelogin and tls as before.
+- Ctrl+C 150, 250 and 400 ms after the start, inside the wait: exit 6 at the moment of the event (the run's own time 137–395 ms), six runs.
+- `192.0.2.1 -E -l 2`, with and without `-M`: exit 2 at 2.01 s (2.51 s with the pre-lookup, which ran before TCP).
+- `sqlh mcp --pool 2` with two Windows-auth profiles by address, from a scratch `SQLH_CONFIG`: two first calls at once both answered at about 0.6 s; a pooled call 13 ms; a first call cancelled 150 ms in got no answer, and the profile's next call connected afresh in 525 ms.
+- `admin:<address>`: exit 4 at 3.0 s with Windows auth and with a SQL login alike, since remote DAC is off on the test server: before the provider runs, so not its doing.
+- `scripts/check.ps1 -Live` passed on both servers after the review's fixes: 507 unit tests, 126 debug and 120 release process tests, 87 debug and 80 release live tests each.
+- Not run: the server by DNS name (it doesn't resolve on this workstation), a named instance through a real SQL Browser, an AG listener's two hops, and Kerberos on a domain.
