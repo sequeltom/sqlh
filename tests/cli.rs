@@ -797,6 +797,10 @@ fn remote_named_pipes_are_refused_before_anything_connects() {
         (r"NP:db01\SALES", r"db01\SALES"),
         (r"\\192.0.2.1\pipe\sql\query", "192.0.2.1"),
         (r"tcp:\\db01\pipe\MSSQL$SALES\sql\query", r"db01\SALES"),
+        // mssql-tds 0.4.0 splits `np:` off an IPv6 address and opens the pipe
+        // (driver-0.4.0.md §1.2).
+        (r"np:2001:db8::5\SALES", r"2001:db8::5\SALES"),
+        (r"np:\\2001:db8::5\pipe\sql\query", "2001:db8::5"),
     ] {
         let r = sqlh_args(&["-S", server, "-l", "30", "-Q", "SELECT 1"]);
         assert_eq!(r.code, 3, "{server}: {}", r.stdout);

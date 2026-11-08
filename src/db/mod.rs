@@ -442,9 +442,9 @@ fn fire(root: &Mutex<Option<CancelHandle>>, cause: &AtomicU8, which: u8) {
 }
 
 /// sqlh's own `-t` for one batch (R15): a monotonic deadline from the moment the batch is
-/// sent, enforced here and not by the driver, whose `timeout_secs` adds up only the time its
-/// transport reads wait and so never expires for data that is already in the buffer, or for
-/// work sqlh does between reads (DESIGN.md §4.4).
+/// sent, enforced here and not by the driver, whose `timeout_secs` counts only the request's send
+/// and the time its transport reads wait (0.4.0), and so never expires for data that is already
+/// in the buffer, or for work sqlh does between reads (DESIGN.md §4.4).
 ///
 /// It is enforced three ways, because each covers what the others cannot: a timer task fires
 /// the cancel while the batch waits for the server or for the reader; `tick` and `slice` look
@@ -732,7 +732,7 @@ impl Session {
         } else {
             ApplicationIntent::ReadWrite
         };
-        // Always explicit (owner decision 40): mssql-tds 0.3.0's `None` takes the driver's own
+        // Always explicit (owner decision 40): mssql-tds's `None` (0.3.0, 0.4.0) takes its own
         // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
         // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
         // keeps sqlcmd's rule: one address after another unless -M.
@@ -741,7 +741,7 @@ impl Session {
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
         let connecting = provider.create_client(context, &source, Some(&cancel.handle));
-        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 and 0.3.0
+        // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 to 0.4.0
         // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
         // flag keeps the cancel independent of that. Dropping an attempt closes the socket, and
@@ -1385,23 +1385,23 @@ fn runtime_error(error: TdsError) -> DbError {
 /// remote name gets `tcp:`, and `check_server` has already refused an explicit remote pipe.
 ///
 /// Local names keep the driver's order (shared memory, TCP, a local pipe), which never reaches
-/// SMB. A protocol, a pipe path or LocalDB passes through as written. An IPv6 address can't
-/// take `tcp:`, because the driver reads its colons as part of the name; without a port it
-/// would get the pipe fallback too (an unreachable address held a run for 23 s), so it gets the
-/// default port, 1433, and a port makes the driver use TCP only. Other text with a colon, such
-/// as `db01:1433`, is no name a host answers to, and the driver fails on it at once.
+/// SMB. A protocol, a pipe path or LocalDB passes through as written. An IPv6 address gets
+/// `tcp:` like a name, with or without a port or an instance: the driver (0.4.0) splits a
+/// protocol off at the first colon, and an address's first group is never one. Other text with a
+/// colon, such as `db01:1433`, is no name a host answers to, and the driver fails on it at once.
 fn data_source(server: &str) -> Cow<'_, str> {
     let server = server.trim();
+    if split_protocol(server).0.is_some() {
+        return Cow::Borrowed(server);
+    }
     let host = server.split(['\\', '/', ',']).next().unwrap_or_default();
     let local = [".", "(local)", "(localdb)", "localhost", "127.0.0.1", "::1"]
         .iter()
         .any(|name| host.eq_ignore_ascii_case(name));
     if local || host.is_empty() {
         Cow::Borrowed(server)
-    } else if !server.contains(':') {
+    } else if !host.contains(':') || looks_like_ipv6(host) {
         Cow::Owned(format!("tcp:{server}"))
-    } else if looks_like_ipv6(server) && !server.contains([',', '\\']) {
-        Cow::Owned(format!("{server},1433"))
     } else {
         Cow::Borrowed(server)
     }
@@ -1410,19 +1410,19 @@ fn data_source(server: &str) -> Cow<'_, str> {
 /// The protocols a data source can name, as the driver's parser accepts them.
 const PROTOCOLS: [&str; 4] = ["tcp", "np", "lpc", "admin"];
 
-/// The driver's test for an IPv6 address: `::`, or more than one colon.
-fn looks_like_ipv6(server: &str) -> bool {
-    server.contains("::") || server.matches(':').count() > 1
+/// Whether a host is an IPv6 address rather than text with a stray colon: `::`, or more than
+/// one colon.
+fn looks_like_ipv6(host: &str) -> bool {
+    host.contains("::") || host.matches(':').count() > 1
 }
 
-/// Splits a protocol prefix from the rest, the way the driver does
-/// (`datasource_parser.rs`, `parse_protocol`): at the first colon, unless the text looks like
-/// an IPv6 address, and only for `tcp`, `np`, `lpc` or `admin`, in any case. Anything else,
-/// such as `http:db01`, stays part of the name. The protocol comes back in lowercase.
+/// Splits a protocol prefix from the rest, the way the driver does (0.4.0,
+/// `datasource_parser.rs`, `parse_protocol`): at the first colon, for `tcp`, `np`, `lpc` or
+/// `admin` in any case, whatever follows, so `np:::1` is a pipe to `::1` and `np:2001:db8::5\SALES`
+/// a pipe to that address (driver-0.4.0.md §1.2). Anything else, such as `http:db01` or an IPv6
+/// address's first group, stays part of the name. The protocol comes back in lowercase.
 fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
-    if let Some(colon) = server.find(':')
-        && !looks_like_ipv6(server)
-    {
+    if let Some(colon) = server.find(':') {
         let name = server[..colon].trim();
         if let Some(protocol) = PROTOCOLS.iter().find(|p| name.eq_ignore_ascii_case(p)) {
             return (Some(protocol), server[colon + 1..].trim_start());
@@ -1437,16 +1437,17 @@ fn split_protocol(server: &str) -> (Option<&'static str>, &str) {
 const SPN_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
 
 /// The SPN sqlh gives the driver for a TCP `-S`, or `None` to let the driver build its own.
-/// The driver's lookup is a blocking call on the runtime thread (upstream-issues.md U9): it runs
-/// before any timer can fire, so `-l` can't bound it, a cancel can't reach it, and `sqlh mcp`'s
-/// other calls wait. So the same lookup runs here first, on its own thread.
+/// The driver's lookup has no bound of its own (upstream-issues.md U9). Since mssql-tds 0.4.0 it
+/// runs on tokio's blocking pool, inside the login deadline (`-l` + 1 s) and the cancel, but for
+/// an address with no PTR record it still takes about 5 s of that deadline, which fails a login
+/// at `-l 3` or less. So the same lookup runs here first, on its own thread, within 500 ms.
 ///
 /// In time, the driver is left to it: its own lookup repeats a recent answer, and it builds the
 /// SPN for each hop, which a fixed one would get wrong after a routing redirect. Past the budget,
 /// the SPN is the one the driver would build when its lookup fails: the host as given, and the
 /// port the driver dials. A named instance without a port gets none (`host_and_spn`), and a
-/// read-only intent isn't looked up here (`Session::connect`): for both the driver does its own,
-/// unbounded lookup, as before (R52).
+/// read-only intent isn't looked up here (`Session::connect`): for both the driver does its own
+/// lookup, bounded only by the login deadline and outside `LOOKUP_THREADS` (R52).
 async fn spn_if_lookup_is_slow(
     server: &str,
     budget: Duration,
@@ -1541,7 +1542,7 @@ fn host_and_spn(server: &str) -> Option<(String, String)> {
 /// pipe is refused before anything connects, whether the server came from `-S`, `SQLCMDSERVER`
 /// or a profile, and whether it is `np:host`, `np:host\instance`, or a UNC pipe path
 /// (`\\host\pipe\sql\query`) with any prefix: the driver reads a UNC path as a pipe even after
-/// `tcp:`.
+/// `tcp:`. The host may be an IPv6 address: 0.4.0 splits `np:` off one (`split_protocol`).
 ///
 /// Local pipes stay: `np:` with `.`, `(local)`, `localhost`, `127.0.0.1`, `::1` or this
 /// computer's name (`COMPUTERNAME`), a UNC path to one of those (`\\.\pipe\...`), `lpc:` (shared
@@ -1625,7 +1626,7 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     let target = format!("{} ({auth}, encrypt {encrypt})", options.server);
     let (detail, hint) = match &error {
-        // Under -M, mssql-tds 0.3.0's race of every address ends at the TCP limit, -l, with
+        // Under -M, mssql-tds's race of every address (0.3.0, 0.4.0) ends at the TCP limit, -l, with
         // its own "Connection timeout: ..." (parallel_connect.rs). That is no address
         // answering, as an unreachable one is without -M (exit 2), not a login that didn't
         // finish (found in review, 2026-10-31).
@@ -1708,8 +1709,8 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
         ),
         _ => (error.to_string(), ""),
     };
-    // The direct Schannel path reports TLS failures as generic errors carrying SSPI status
-    // names, so match the text too.
+    // The direct Schannel path's errors carry SSPI status names in their text, which say more
+    // than the variant: 0.4.0 reports them as `TlsHandshakeError`, 0.3.0 as generic errors.
     let tls = tls_hint(&detail, hints);
     let certificate = tls.is_some()
         || matches!(
@@ -2119,12 +2120,17 @@ mod tests {
             ("127.0.0.1", "127.0.0.1"),
             ("::1", "::1"),
             (r"(localdb)\MSSQLLocalDB", r"(localdb)\MSSQLLocalDB"),
-            // IPv6 takes no `tcp:` prefix, but without a port it gets one: otherwise the
-            // driver would go on to open a pipe to the address.
-            ("2001:db8::5", "2001:db8::5,1433"),
-            (" fe80::1%12 ", "fe80::1%12,1433"),
-            ("2001:db8::5,1433", "2001:db8::5,1433"),
-            (r"2001:db8::5\SQLEXPRESS", r"2001:db8::5\SQLEXPRESS"),
+            // IPv6 takes `tcp:` like a name, so an instance stays on TCP too, and a port is
+            // never added (driver-0.4.0.md §1.2).
+            ("2001:db8::5", "tcp:2001:db8::5"),
+            (" fe80::1%12 ", "tcp:fe80::1%12"),
+            ("2001:db8::5,1433", "tcp:2001:db8::5,1433"),
+            (r"2001:db8::5\SQLEXPRESS", r"tcp:2001:db8::5\SQLEXPRESS"),
+            ("tcp:2001:db8::5", "tcp:2001:db8::5"),
+            // Other protocols before an address pass as written: no port, no second prefix.
+            ("admin:fe80::1", "admin:fe80::1"),
+            ("lpc:::1", "lpc:::1"),
+            ("np:::1", "np:::1"),
             // A pipe path names its protocol; other text with a colon is left to the driver.
             (r"\\db01\pipe\sql\query", r"\\db01\pipe\sql\query"),
             ("db01:1433", "db01:1433"),
@@ -2153,12 +2159,18 @@ mod tests {
             ("http:myserver", None, "http:myserver"),
             (":db01", None, ":db01"),
             (r"\\db01\pipe\sql\query", None, r"\\db01\pipe\sql\query"),
-            // An IPv6 address has colons of its own, so nothing is split off, even after what
-            // looks like a protocol.
+            // An address's first group is no protocol, but a protocol before an address is
+            // split off whatever follows (0.4.0's rule; 0.3.0 split nothing from these).
             ("::1", None, "::1"),
             ("2001:db8::1,1433", None, "2001:db8::1,1433"),
-            ("np:::1", None, "np:::1"),
-            ("tcp:2001:db8:0:0:0:0:0:5", None, "tcp:2001:db8:0:0:0:0:0:5"),
+            ("np:::1", Some("np"), "::1"),
+            (
+                "tcp:2001:db8:0:0:0:0:0:5",
+                Some("tcp"),
+                "2001:db8:0:0:0:0:0:5",
+            ),
+            (r"np:2001:db8::5\SALES", Some("np"), r"2001:db8::5\SALES"),
+            ("ADMIN:fe80::1", Some("admin"), "fe80::1"),
         ] {
             assert_eq!(split_protocol(server), (protocol, rest), "{server}");
         }
@@ -2181,6 +2193,11 @@ mod tests {
                 "2001:db8::1",
                 "MSSQLSvc/2001:db8::1:1500",
             ),
+            (
+                "tcp:2001:db8::5,1500",
+                "2001:db8::5",
+                "MSSQLSvc/2001:db8::5:1500",
+            ),
         ] {
             let expected = Some((host.to_owned(), spn.to_owned()));
             assert_eq!(host_and_spn(server), expected, "{server}");
@@ -2198,6 +2215,8 @@ mod tests {
             r"db01\SALES",
             r"tcp:db01\SALES",
             r"192.0.2.1\SALES",
+            r"2001:db8::5\SALES",
+            "np:2001:db8::5",
         ] {
             assert_eq!(host_and_spn(server), None, "{server}");
         }
@@ -2362,6 +2381,17 @@ mod tests {
             (r"\\DB01\PIPE\mssql$Sales\SQL\QUERY", r"DB01\Sales"),
             (r"\\db01\pipe\custom\app", "db01"),
             (r"\\db01", "db01"),
+            // An IPv6 address after `np:`, or in a UNC path after any prefix: 0.4.0 opens a pipe
+            // to it, where 0.3.0 read the whole text as a name (driver-0.4.0.md §1.2).
+            ("np:2001:db8::5", "2001:db8::5"),
+            (r"np:2001:db8::5\SALES", r"2001:db8::5\SALES"),
+            ("np:fe80::1%12,1433", "fe80::1%12,1433"),
+            (r"np:\\2001:db8::5\pipe\sql\query", "2001:db8::5"),
+            (r"tcp:\\fe80::1\pipe\sql\query", "fe80::1"),
+            (
+                r"\\2001:db8::5\pipe\MSSQL$SALES\sql\query",
+                r"2001:db8::5\SALES",
+            ),
         ] {
             let message = check(server, Some("BUILDBOX")).unwrap_err();
             assert!(
@@ -2393,6 +2423,9 @@ mod tests {
             "admin:db01",
             "2001:db8::5",
             "2001:db8::5,1433",
+            r"2001:db8::5\SALES",
+            "tcp:2001:db8::5",
+            "admin:fe80::1",
             "db01:1433",
             // Local pipes, by every name for this computer.
             "np:.",
@@ -2446,10 +2479,20 @@ mod tests {
 
     #[test]
     fn tls_hints_from_schannel_status() {
-        let untrusted = "Unexpected Implementation Error: Schannel TLS handshake failed: \
-                         InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)";
+        // mssql-tds 0.4.0's text (`TlsHandshakeError`), and 0.3.0's (driver-0.4.0.md §1.3).
+        let untrusted = "TLS handshake failed for 'db01': InitializeSecurityContextW failed: \
+                         SEC_E_UNTRUSTED_ROOT (status=0x80090325)";
+        let untrusted_030 = "Unexpected Implementation Error: Schannel TLS handshake failed: \
+                             InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT \
+                             (status=0x80090325)";
         let flags = |detail| tls_hint(detail, Hints::Flags);
         assert!(flags(untrusted).unwrap().contains("pass -C"));
+        assert!(flags(untrusted_030).unwrap().contains("pass -C"));
+        assert!(
+            flags("TLS handshake failed for 'db01': AcquireCredentialsHandleW(UNISP_NAME) failed")
+                .unwrap()
+                .contains("-No")
+        );
         assert!(
             flags("SEC_E_WRONG_PRINCIPAL")
                 .unwrap()
@@ -2515,8 +2558,16 @@ mod tests {
             DbError::Connect(words) => words,
             other => panic!("{other:?}"),
         };
-        // The direct Schannel path's form, matched by its text (`tls_hint`).
-        let untrusted = || {
+        // The direct Schannel path's form in mssql-tds 0.4.0; its status name is matched by its
+        // text (`tls_hint`).
+        let untrusted = || TdsError::TlsHandshakeError {
+            source: Box::new(std::io::Error::other(
+                "InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)",
+            )),
+            expected_host: "db01".into(),
+        };
+        // 0.3.0's form, a generic error that only the text marks as a certificate failure.
+        let untrusted_030 = || {
             TdsError::ImplementationError(
                 "Schannel TLS handshake failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)".into(),
             )
@@ -2527,6 +2578,7 @@ mod tests {
             options.hints = hints;
             for error in [
                 untrusted(),
+                untrusted_030(),
                 TdsError::CertificateMismatch,
                 TdsError::NoServerCertificate,
             ] {
@@ -2545,6 +2597,15 @@ mod tests {
         assert!(words(&options, untrusted()).ends_with("or use -Nm, where -C applies"));
         options.encrypt = super::Encrypt::Mandatory;
         assert!(words(&options, untrusted()).contains("pass -C"));
+        assert!(words(&options, untrusted_030()).contains("pass -C"));
+        assert!(
+            words(&options, untrusted()).contains(
+                "): TLS handshake failed for 'db01': InitializeSecurityContextW failed: \
+                 SEC_E_UNTRUSTED_ROOT (status=0x80090325); this machine doesn't trust"
+            ),
+            "{}",
+            words(&options, untrusted())
+        );
         // A failure that isn't the certificate's keeps its own hint under strict.
         options.encrypt = super::Encrypt::Strict;
         assert!(words(&options, TdsError::ConnectionClosed("x".into())).ends_with("try host,port"));
@@ -3801,7 +3862,7 @@ pub(crate) mod fake_server {
     // recovery (FeatureExt 0x01), so the driver can't log in again behind sqlh's back, and
     // multi-subnet failover is set by sqlh itself (off without -M), never the driver's default.
     // The login does ask for DNS caching (0x0B) and Enhanced Routing (0x0F), which mssql-tds
-    // 0.3.0 always advertises (decisions 42 and 43).
+    // always advertises (0.3.0, 0.4.0; decisions 42 and 43).
     #[test]
     fn the_login_asks_for_no_session_recovery_and_failover_is_sqlhs_own() {
         let (port, seen) = serve_login(login_reply());
@@ -3845,6 +3906,52 @@ pub(crate) mod fake_server {
                 .expect("connected");
             let login = seen.lock().unwrap().clone().expect("a LOGIN7");
             assert_eq!(login_text(&login, 48).as_deref(), Some(sent));
+        }
+    }
+
+    // driver-0.4.0.md §3.3: mssql-tds 0.4.0 rewrote the UTF-16 encoder every batch's text goes
+    // through, and keeps a supplementary character's low surrogate pending when a packet fills
+    // between the two halves. A wrong unit would change the query silently, so the text that
+    // arrives is compared with the text sent: ASCII runs longer than the encoder's 256-unit
+    // stage, characters of the Basic Multilingual Plane and 3,000 surrogate pairs. The fake's
+    // 4,096-byte packets hold 2,033 units of SQL after the 22-byte ALL_HEADERS, then 2,044 each,
+    // so they cut between the halves of a pair for an odd `k` and between pairs for an even
+    // one. A dropped or misplaced half would read back as U+FFFD.
+    #[test]
+    fn a_batch_reaches_the_server_unit_for_unit_across_packets() {
+        let fake = serve_pool(Vec::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut sent = Vec::new();
+        runtime.block_on(async {
+            let cancel = Cancel::new();
+            let mut session = Session::connect(&options(fake.server.clone()), &cancel)
+                .await
+                .expect("connected to the fake server");
+            for k in 0..4 {
+                let mut sql = format!("-- {}", "a".repeat(k));
+                sql.push_str(&"\u{1F600}".repeat(3000));
+                sql.push_str(&"x".repeat(600));
+                sql.push_str(&"é日本\u{10FFFF}".repeat(500));
+                sql.push_str(&format!("\nSELECT N'{}';", "\u{1F600}b".repeat(700)));
+                session.exec_internal(&sql, 5, &cancel).await.unwrap();
+                sent.push(sql);
+            }
+        });
+        let arrived = fake.sql(0);
+        assert_eq!(arrived.len(), sent.len(), "batches");
+        for (k, (arrived, sent)) in arrived.iter().zip(&sent).enumerate() {
+            assert!(
+                arrived == sent,
+                "k = {k}: {} units sent, {} arrived, first difference at unit {:?}",
+                sent.encode_utf16().count(),
+                arrived.encode_utf16().count(),
+                sent.encode_utf16()
+                    .zip(arrived.encode_utf16())
+                    .position(|(a, b)| a != b)
+            );
         }
     }
 
