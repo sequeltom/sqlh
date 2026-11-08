@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.99"
 description = "SQL Server query tool for AI agents and harnesses"
 license = "MIT"
-repository = "https://github.com/tkwj/sqlh"
+repository = "https://github.com/sequeltom/sqlh"
 publish = false
 
 [dependencies]

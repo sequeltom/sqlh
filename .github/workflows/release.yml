@@ -12,7 +12,8 @@
 #            packages the exe as data, never running it
 #   verify   read-only; runs the signed exe and checks the sums
 #   publish  writes the draft release; no Azure access, and runs nothing it downloads
-# sign, verify and publish run only in tkwj's repository for a tag or main.
+# sign, verify and publish run only in the owner's repository for a tag or main. The owner is
+# checked by id, which a rename of the account doesn't change (tkwj became sequeltom, 2026-11-07).
 name: Release
 
 on:
@@ -108,11 +109,14 @@ jobs:
 
   sign:
     needs: build
-    if: github.repository_owner == 'tkwj' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
+    if: github.repository_owner_id == '6507651' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
     runs-on: windows-latest
     # The Azure federated credential's subject is GitHub's immutable form,
-    # repo:tkwj@6507651/sqlh@1420069809:environment:release (owner and repository ids), the same
-    # for tag and dispatch runs. The environment allows only main and v* tags.
+    # repo:sequeltom@6507651/sqlh@1420069809:environment:release (owner and repository ids), the
+    # same for tag and dispatch runs. The name in it follows the account: it was tkwj when the
+    # credential was made, so Azure's must name sequeltom (read from the repository's OIDC
+    # setting, 2026-11-07). The environment allows only main and v* tags. The signing account and profile below are
+    # Azure's names, which the rename didn't touch.
     environment: release
     permissions:
       contents: read
