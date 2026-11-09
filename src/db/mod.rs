@@ -1631,6 +1631,19 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
     };
     // The direct Schannel path's errors carry SSPI status names in their text, which say more
     // than the variant: 0.4.0 reports them as `TlsHandshakeError`, 0.3.0 as generic errors.
+    // A failure to set up Schannel's credentials on this machine, before anything reached the
+    // server, isn't the server's certificate, so neither -C nor -No is the advice: on Windows
+    // Server 2016 the driver's `SCH_CREDENTIALS` fails there (upstream-issues.md U12, measured
+    // under mandatory with -C on AppVeyor's Server 2016 job), and every mode sends at least the
+    // login over TLS to a server that can encrypt. It wins over the strict hint too, which would blame the certificate.
+    if detail.contains("AcquireCredentialsHandleW(UNISP_NAME)") {
+        return DbError::Connect(format!(
+            "cannot connect to {target}: {detail}; this machine couldn't set up TLS, before \
+             anything reached the server: the driver's TLS needs Windows 10 1809 or Windows \
+             Server 2019 or later (on a later Windows, check that this machine's Schannel \
+             settings allow TLS 1.2)"
+        ));
+    }
     let tls = tls_hint(&detail, hints);
     let certificate = tls.is_some()
         || matches!(
@@ -2249,11 +2262,6 @@ mod tests {
         assert!(flags(untrusted).unwrap().contains("pass -C"));
         assert!(flags(untrusted_030).unwrap().contains("pass -C"));
         assert!(
-            flags("TLS handshake failed for 'db01': AcquireCredentialsHandleW(UNISP_NAME) failed")
-                .unwrap()
-                .contains("-No")
-        );
-        assert!(
             flags("SEC_E_WRONG_PRINCIPAL")
                 .unwrap()
                 .contains("different host")
@@ -2369,6 +2377,46 @@ mod tests {
         // A failure that isn't the certificate's keeps its own hint under strict.
         options.encrypt = super::Encrypt::Strict;
         assert!(words(&options, TdsError::ConnectionClosed("x".into())).ends_with("try host,port"));
+    }
+
+    // AppVeyor's Windows Server 2016 job (U12): Schannel's credentials fail on this machine
+    // before anything reaches the server, so in every mode and form the hint names the Windows
+    // the driver's TLS needs, never -C, -No or the certificate.
+    #[test]
+    fn a_tls_setup_failure_on_this_machine_names_the_windows_it_needs() {
+        let mut options = fake_server::options("db01".into());
+        let setup = || TdsError::TlsHandshakeError {
+            source: Box::new(std::io::Error::other(
+                "AcquireCredentialsHandleW(UNISP_NAME) failed: unknown SECURITY_STATUS \
+                 (status=0x8009030D)",
+            )),
+            expected_host: "localhost".into(),
+        };
+        for encrypt in [
+            super::Encrypt::Optional,
+            super::Encrypt::Mandatory,
+            super::Encrypt::Strict,
+        ] {
+            for hints in [Hints::Flags, Hints::Profile] {
+                options.encrypt = encrypt;
+                options.hints = hints;
+                let DbError::Connect(words) = connect_error(setup(), &options) else {
+                    panic!("not a connect failure")
+                };
+                assert!(
+                    words.contains(
+                        "(status=0x8009030D); this machine couldn't set up TLS, before anything \
+                         reached the server: the driver's TLS needs Windows 10 1809 or Windows \
+                         Server 2019 or later (on a later Windows, check that this machine's \
+                         Schannel settings allow TLS 1.2)"
+                    ) && words.ends_with(')')
+                        && !words.contains(" -")
+                        && !words.contains("trust_server_certificate")
+                        && !words.contains("certificate needs"),
+                    "{words}"
+                );
+            }
+        }
     }
 
     // Found in review (2026-10-31): under -M, mssql-tds 0.3.0's race of every address ends at

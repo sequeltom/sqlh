@@ -142,7 +142,7 @@
   - before: `Unexpected Implementation Error: Schannel TLS handshake failed: InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)`
   - after: `TLS handshake failed for 'db01': InitializeSecurityContextW failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)`
 
-  A credential-acquisition failure also reads "TLS handshake failed for ...", though no handshake was attempted, and it gets the generic TLS hint. Which name `params.host_name` holds (the `-S` host, or a `host_name_in_cert`) was not checked; live check 4 shows it.
+  A credential-acquisition failure also reads "TLS handshake failed for ...", though no handshake was attempted, and it gets the generic TLS hint (since 2026-11-09 a hint of its own, naming the Windows the driver's TLS needs: DESIGN.md §6, upstream-issues.md U12). Which name `params.host_name` holds (the `-S` host, or a `host_name_in_cert`) was not checked; live check 4 shows it.
 - **Stale:**
   - the comment at `src/db/mod.rs:1711-1712` ("The direct Schannel path reports TLS failures as generic errors carrying SSPI status names");
   - the fixtures in `tls_hints_from_schannel_status` (`:2449-2450`) and `a_certificate_failure_under_strict_encryption_offers_no_trust` (`:2519-2523`). They still build the 0.3.0 shape, so they pass without testing the real one;

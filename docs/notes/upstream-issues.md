@@ -95,8 +95,8 @@ Each entry says what was read or observed, in which version, why it matters to s
 
 - **Seen in:** 0.4.0, on AppVeyor's Windows Server 2016 image (1607) against a local SQL Server 2017, with the signed `0.1.0-dev.10` (decision 75, 2026-11-08). The source is the same in 0.3.0. `connection/transport/win_tls/cred.rs`, `acquire_client_cred`, builds only `SCH_CREDENTIALS` and says so: "We intentionally do NOT fall back to the legacy SCHANNEL_CRED (v4) struct on older OSes — Windows Server 2016 is therefore unsupported."
 - **What:** every TLS connect fails before anything reaches the server: `AcquireCredentialsHandleW(UNISP_NAME) failed: unknown SECURITY_STATUS (status=0x8009030D)` (`SEC_E_UNKNOWN_CREDENTIALS`). sqlh encrypts by default (mandatory), and even optional encryption sends the login over TLS, so in practice it can't connect from those systems. On Windows Server 2019 (1809) the same jobs connect.
-- **Why it matters to sqlh:** the Windows 10 / Windows Server 2016 floor for the machine sqlh runs on is a candidate expansion (AGENTS.md, Hard constraints). This blocks it for Server 2016 and Windows 10 before 1809, whatever sqlh does. The error names neither cause, and sqlh's hint is wrong for it (PLAN.md §4, AppVeyor).
-- **sqlh's workaround:** none possible in sqlh: the TLS stack is the driver's. A wording fix for sqlh's hint is proposed (PLAN.md §4).
+- **Why it matters to sqlh:** the Windows 10 / Windows Server 2016 floor for the machine sqlh runs on is a candidate expansion (AGENTS.md, Hard constraints). This blocks it for Server 2016 and Windows 10 before 1809, whatever sqlh does. The error names neither cause, and until 2026-11-09 sqlh's hint was wrong for it (PLAN.md §4, AppVeyor).
+- **sqlh's workaround:** none possible in sqlh: the TLS stack is the driver's. Its hint for the failure now names the Windows the driver needs instead of `-C` and `-No` (2026-11-09, DESIGN.md §6).
 - **Possible fix:** fall back to `SCHANNEL_CRED` (TLS 1.2) when `SCH_CREDENTIALS` is refused, or report the requirement in the error.
 
 ## Decided not to raise
