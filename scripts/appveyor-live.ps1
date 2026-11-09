@@ -182,6 +182,12 @@ $testsExe = Join-Path $work 'sqlh-live-tests\sqlh-live-tests.exe'
 $signature = Get-AuthenticodeSignature $exe
 Write-Host "signature: $($signature.Status), $($signature.SignerCertificate.Subject)"
 if ($signature.Status -ne 'Valid') { throw "sqlh.exe's signature is $($signature.Status)" }
+# The release's publisher, as its signing certificate names it (seen in the first runs): a
+# valid signature from anyone else isn't the release's. The certificate itself is short-lived,
+# so its thumbprint isn't pinned.
+if ($signature.SignerCertificate.Subject -notmatch '(^|, )CN=Thomas Willwerth(,|$)') {
+    throw "sqlh.exe is signed by $($signature.SignerCertificate.Subject), not the release's publisher"
+}
 foreach ($line in Get-Content (Join-Path $dist 'SHA256SUMS.txt')) {
     $hash, $file = $line -split '  ', 2
     $actual = (Get-FileHash (Join-Path $dist $file) -Algorithm SHA256).Hash.ToLower()

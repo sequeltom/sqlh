@@ -11617,8 +11617,9 @@ mod live {
     }
 
     /// The JSON document with its volatile values replaced: times, the script's path (`smoke`,
-    /// which is the checkout's, so a worktree's differs), and the connection's server, version
-    /// and database.
+    /// which is the checkout's, so a worktree's differs), and the connection's server, version,
+    /// database and auth method (the profile's: SQL on the owner's servers, Windows on
+    /// AppVeyor's, decision 75).
     fn normalize_json(doc: &mut serde_json::Value, db: &str, smoke: &str) {
         use serde_json::Value;
         fn walk(value: &mut Value, smoke: &str) {
@@ -11644,6 +11645,11 @@ mod live {
         connection["database"] = Value::from("<database>");
         connection["server"] = Value::from("<server>");
         connection["server_version"] = Value::from("<version>");
+        assert!(
+            matches!(connection["auth"].as_str(), Some("windows" | "sql")),
+            "{connection}"
+        );
+        connection["auth"] = Value::from("<auth>");
         if let Some(summary) = doc["summary"].as_str() {
             let summary = match summary.rsplit_once(", ") {
                 Some((head, ms)) if ms.ends_with(" ms") => format!("{head}, N ms"),

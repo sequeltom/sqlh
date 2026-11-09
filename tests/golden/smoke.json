@@ -760,7 +760,7 @@
   ],
   "connect_ms": "N",
   "connection": {
-    "auth": "sql",
+    "auth": "<auth>",
     "database": "<database>",
     "encrypted": true,
     "server": "<server>",
