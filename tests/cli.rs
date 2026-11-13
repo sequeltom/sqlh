@@ -10423,10 +10423,7 @@ mod live {
         );
         assert_eq!(connection["database"], db);
         assert!(connection["server"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(matches!(
-            connection["auth"].as_str(),
-            Some("windows" | "sql")
-        ));
+        assert_eq!(connection["auth"], server_auth(&p, &db), "{connection:?}");
         assert!(connection["encrypted"].is_boolean());
         let version = connection["server_version"].as_str().expect("a version");
         assert!(
@@ -11549,7 +11546,7 @@ mod live {
         );
         assert_eq!(r.code, 1, "{}{}", r.stdout, r.stderr);
         let mut doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("valid JSON");
-        normalize_json(&mut doc, &db, smoke);
+        normalize_json(&mut doc, &db, smoke, server_auth(&p, &db));
         let json = serde_json::to_string_pretty(&doc).unwrap() + "\n";
 
         for (name, actual) in [("smoke.txt", &text), ("smoke.json", &json)] {
@@ -11616,11 +11613,34 @@ mod live {
         out
     }
 
+    /// The auth method sqlh must report for the profile, as the server saw the login in a run
+    /// of its own: `auth_scheme` is `SQL` for a SQL login, `NTLM` or `KERBEROS` for Windows
+    /// authentication. The profile's method varies (SQL on the owner's servers, Windows on
+    /// AppVeyor's, decision 75), so a test compares against this rather than a constant, and a
+    /// report of the other valid method still fails (R63).
+    fn server_auth(p: &str, db: &str) -> &'static str {
+        let r = live(
+            p,
+            db,
+            &[
+                "--format",
+                "csv",
+                "-Q",
+                "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+            ],
+        );
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        match r.stdout.lines().collect::<Vec<_>>()[..] {
+            ["auth_scheme", "SQL"] => "sql",
+            ["auth_scheme", "NTLM" | "KERBEROS"] => "windows",
+            ref other => panic!("{other:?}"),
+        }
+    }
+
     /// The JSON document with its volatile values replaced: times, the script's path (`smoke`,
     /// which is the checkout's, so a worktree's differs), and the connection's server, version,
-    /// database and auth method (the profile's: SQL on the owner's servers, Windows on
-    /// AppVeyor's, decision 75).
-    fn normalize_json(doc: &mut serde_json::Value, db: &str, smoke: &str) {
+    /// database and auth method, the last once it matches `auth` (`server_auth`).
+    fn normalize_json(doc: &mut serde_json::Value, db: &str, smoke: &str, auth: &str) {
         use serde_json::Value;
         fn walk(value: &mut Value, smoke: &str) {
             match value {
@@ -11645,10 +11665,7 @@ mod live {
         connection["database"] = Value::from("<database>");
         connection["server"] = Value::from("<server>");
         connection["server_version"] = Value::from("<version>");
-        assert!(
-            matches!(connection["auth"].as_str(), Some("windows" | "sql")),
-            "{connection}"
-        );
+        assert_eq!(connection["auth"], auth, "{connection}");
         connection["auth"] = Value::from("<auth>");
         if let Some(summary) = doc["summary"].as_str() {
             let summary = match summary.rsplit_once(", ") {
