@@ -917,46 +917,30 @@ fn remote_named_pipes_are_refused_before_anything_connects() {
     );
 }
 
-// `profiles add`'s connection test times itself, not what came before it in the process: the
-// password prompt, or here a wait for the profiles lock another editor holds (owner, 2026-11-14;
-// a 4.8 s status line for a 211 ms connect, the Sandbox check). Windows auth, so nothing is
-// prompted for; 127.0.0.1,1 refuses, so the test fails fast with exit 2.
+// Decision 77: `profiles add`'s connection test times itself, not what came before it in the
+// process, such as the password prompt (a 4.8 s status line for a 211 ms connect, the Sandbox
+// check). `SQLH_DEBUG_ADD_HOLD_MS` stands in for the prompt inside the child, after its start,
+// so the old process-start clock always counts it and no scheduling of this process can move it
+// (R66). Windows auth, so nothing is prompted for; 127.0.0.1,1 refuses, so the test fails fast
+// with exit 2. The name is a `sqlh-ut-` one of this process: SQLH_CONFIG moves the file, not
+// Credential Manager, and a Windows-auth add deletes `sqlh:<name>` (R65).
+#[cfg(debug_assertions)]
 #[test]
 fn the_connection_test_after_profiles_add_times_only_itself() {
     let dir = scratch("profiles_add_times_its_test");
     let config = dir.join("profiles.toml");
-    let hold = Duration::from_secs(3);
-    let lock = {
-        use std::os::windows::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(0)
-            .open(dir.join("profiles.toml.lock"))
-            .expect("the profiles lock")
-    };
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(hold);
-        drop(lock);
-    });
-    let started = Instant::now();
-    let r = run(sqlh().env("SQLH_CONFIG", &config).args([
-        "profiles",
-        "add",
-        "local",
-        "-S",
-        "127.0.0.1,1",
-        "-l",
-        "1",
-    ]));
-    let elapsed = started.elapsed();
-    releaser.join().unwrap();
+    let name = format!("sqlh-ut-add-timing-{}", std::process::id());
+    let hold = Duration::from_secs(4);
+    let r = run(sqlh()
+        .env("SQLH_CONFIG", &config)
+        .env("SQLH_DEBUG_ADD_HOLD_MS", hold.as_millis().to_string())
+        .args(["profiles", "add", &name, "-S", "127.0.0.1,1", "-l", "1"]));
     assert_reached_connect(&r, "the connection test");
     assert!(
-        elapsed >= hold,
-        "{elapsed:?}: the run didn't wait for the lock"
+        r.stdout
+            .contains(&format!("-- note: saved profile {name} in ")),
+        "{}",
+        r.stdout
     );
     let ms: u64 = r
         .stdout

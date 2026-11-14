@@ -807,6 +807,7 @@ The primary product measure is time to the next useful answer across repeated ag
   - query timeout and attention, including `-t` over a result read as fast as it is sent, a large value, and a loop of many small results (R15)
   - a session that starts with `XACT_ABORT` ON (R14): debug builds only, through `SQLH_DEBUG_SESSION_PREFIX`, SQL sent ahead of the session setup in the same batch (like `SQLH_DEBUG_PANIC` and `SQLH_DEBUG_STOP_HOLD_MS`, it does not exist in release builds)
   - the work of sqlh's own in the row and chunk loops (R15): debug builds only, `SQLH_DEBUG_ROW_WORK_US` makes `count_rows` and `large_value` spend that many microseconds per row and per chunk after reading it, so a ready stream outlasts `-t` (the real loops, not a model of them)
+  - `profiles add`'s connection-test time (decision 77): debug builds only, `SQLH_DEBUG_ADD_HOLD_MS` makes `add` wait that long before its edit, in place of the password prompt, so a test can check the test's status line leaves it out
   - very long values
   - the guard's transaction backstop
 - **Compatibility:**

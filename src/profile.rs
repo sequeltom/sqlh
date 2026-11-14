@@ -75,6 +75,16 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
         ProfileCommand::Test { name } => test(name, started),
         ProfileCommand::Add { name, opts } => {
             let mut out = stdout_sink(Limits::default());
+            // Debug builds only: `SQLH_DEBUG_ADD_HOLD_MS` stands in for the time someone takes
+            // at the password prompt, which a test can't drive, so a test can check that the
+            // connection test's time leaves it out (decision 77, R66).
+            #[cfg(debug_assertions)]
+            if let Some(ms) = std::env::var("SQLH_DEBUG_ADD_HOLD_MS")
+                .ok()
+                .and_then(|ms| ms.trim().parse().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             match add(&name, &opts, &mut out, &System) {
                 Ok(()) => {
                     let _ = out.flush();
@@ -509,6 +519,8 @@ mod tests {
         writes_left: Cell<Option<u32>>,
         /// Runs at the start of each save: between the password's write and the file's.
         on_save: RefCell<Option<Hook>>,
+        /// Every profile whose password a delete was asked for, in order.
+        deletes: RefCell<Vec<String>>,
     }
 
     type Hook = Box<dyn Fn(&Fake)>;
@@ -564,6 +576,7 @@ mod tests {
             Ok(())
         }
         fn delete_password(&self, profile: &str) -> io::Result<bool> {
+            self.deletes.borrow_mut().push(profile.into());
             if self.fail_delete.get() {
                 return Err(io::Error::other("access denied"));
             }
@@ -730,6 +743,22 @@ mod tests {
         fake.fail_delete.set(false);
         add("dev", &windows(), &mut out(), &fake).unwrap();
         assert_eq!(password(&fake, "dev"), None);
+    }
+
+    // R65: a Windows-auth add deletes its own profile's password (`sqlh:<name>`), even for a new
+    // profile, and no other's. So a process test's add touches Credential Manager only under
+    // its own name, which is why those tests use `sqlh-ut-` names: SQLH_CONFIG moves the file,
+    // not Credential Manager.
+    #[test]
+    fn a_windows_auth_add_deletes_only_its_own_password() {
+        let fake = with_dev("");
+        let opts = Opts {
+            server: Some("127.0.0.1,1".into()),
+            ..windows()
+        };
+        add("sqlh-ut-new", &opts, &mut out(), &fake).unwrap();
+        assert_eq!(*fake.deletes.borrow(), ["sqlh-ut-new"]);
+        assert_eq!(password(&fake, "dev").as_deref(), Some("old"));
     }
 
     // F12: a removal whose password delete failed can be finished by running it again.
