@@ -13354,9 +13354,9 @@ mod live {
     // Decision 71: under vector feature version 2 a float32 vector prints as it did under
     // version 1, in every format (SQL Server 2025). A float16 one needs the database's
     // PREVIEW_FEATURES, which sqlh_test leaves off (turning it on is a database-level change
-    // outside decision 21), so the server refuses the type and its rendering is checked by the
-    // unit tests in `db::value`; with the setting on, this checks it here too. SQL Server 2016
-    // has no vector type.
+    // outside decision 21), so the server refuses the type and sqlh's native rendering is
+    // checked by the unit tests in `db::value`; with the setting on, this checks what the server
+    // sends (run on a throwaway Azure VM, 2026-11-14). SQL Server 2016 has no vector type.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn a_vector_prints_its_elements_at_their_own_precision() {
@@ -13377,12 +13377,12 @@ mod live {
             );
             return;
         }
-        let shown = |sql: &str, elements: &str| {
+        let shown = |sql: &str, ty: &str, elements: &str| {
             let r = live(&p, &db, &["-Q", sql]);
             assert_eq!(r.code, 0, "{}", r.stdout);
             assert!(
                 r.stdout
-                    .starts_with(&format!("-- result 1\nv:vector\n{elements}\n-- 1 row\n")),
+                    .starts_with(&format!("-- result 1\nv:{ty}\n{elements}\n-- 1 row\n")),
                 "{}",
                 r.stdout
             );
@@ -13390,7 +13390,7 @@ mod live {
             assert_eq!(r.code, 0, "{}", r.stdout);
             assert!(
                 r.stdout.contains(&format!(
-                    r#""columns":[{{"name":"v","type":"vector","nullable":true}}],"rows":[["{elements}"]]"#
+                    r#""columns":[{{"name":"v","type":"{ty}","nullable":true}}],"rows":[["{elements}"]]"#
                 )),
                 "{}",
                 r.stdout
@@ -13403,14 +13403,27 @@ mod live {
                 r.stdout
             );
         };
-        shown(float32, "[0.1,2,-3.5,1e-8]");
+        shown(float32, "vector", "[0.1,2,-3.5,1e-8]");
         let preview = value(
             &*server,
             "SELECT CAST(value AS int) AS on_ FROM sys.database_scoped_configurations \
              WHERE name = N'PREVIEW_FEATURES'",
         );
         if preview == "1" {
-            shown(float16, "[0.1,2,-3.5,65504]");
+            // SQL Server 2025 (17.0.1155, measured 2026-11-14) sends float16 down-level even to
+            // a client asking for version 2, as JSON text in its own exponent form, which sqlh
+            // shows as written: Microsoft documents no binary transport for float16 yet. A
+            // server that sends it natively gets sqlh's own form, checked here as well.
+            let header = live(&p, &db, &["-Q", float16]).stdout;
+            if header.starts_with("-- result 1\nv:vector\n") {
+                shown(float16, "vector", "[0.1,2,-3.5,65504]");
+            } else {
+                shown(
+                    float16,
+                    "varchar(max)",
+                    "[9.9975586e-002,2.0000000e+000,-3.5000000e+000,6.5504000e+004]",
+                );
+            }
         } else {
             let r = live(&p, &db, &["-Q", float16]);
             assert_eq!(r.code, 1, "{}", r.stdout);
