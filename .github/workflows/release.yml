@@ -14,7 +14,7 @@
 #   verify   read-only; runs the signed exe and checks the sums
 #   publish  writes the draft release; no Azure access, and runs nothing it downloads
 # sign, verify and publish run only in the owner's repository for a tag or main. The owner is
-# checked by id, which a rename of the account doesn't change (tkwj became sequeltom, 2026-11-07).
+# checked by immutable id, so the gate survives an account rename.
 name: Release
 
 on:
@@ -41,7 +41,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     # SQLH_VERSION is what `sqlh --version` reports (DESIGN.md §4); tests read it too.
     # SQLH_BUILD, the run number, is the fourth number of the exe's Windows file version
@@ -103,7 +103,7 @@ jobs:
         Copy-Item $bin[0] tests-bin/sqlh-live-tests.exe
 
     - name: Upload tests
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: sqlh-live-tests
         path: tests-bin/
@@ -125,7 +125,7 @@ jobs:
         Copy-Item target/release/sqlh.exe, THIRD-PARTY-NOTICES.html unsigned/
 
     - name: Upload unsigned
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: unsigned
         path: unsigned/
@@ -135,12 +135,8 @@ jobs:
     needs: build
     if: github.repository_owner_id == '6507651' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
     runs-on: windows-latest
-    # The Azure federated credential's subject is GitHub's immutable form,
-    # repo:sequeltom@6507651/sqlh@1420069809:environment:release (owner and repository ids), the
-    # same for tag and dispatch runs. The name in it follows the account: it was tkwj when the
-    # credential was made, so Azure's must name sequeltom (read from the repository's OIDC
-    # setting, 2026-11-07). The environment allows only main and v* tags. The signing account and profile below are
-    # Azure's names, which the rename didn't touch.
+    # Signing is restricted to this repository's release environment and the owner-id gate
+    # above. The environment limits eligible refs to main and version tags.
     environment: release
     permissions:
       contents: read
@@ -149,16 +145,16 @@ jobs:
       SQLH_VERSION: ${{ needs.build.outputs.version }}
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     - name: Download unsigned
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: unsigned
         path: build
 
     - name: Azure login
-      uses: azure/login@v3
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -199,7 +195,7 @@ jobs:
         Get-Content dist/SHA256SUMS.txt
 
     - name: Upload signed
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: sqlh-${{ env.SQLH_VERSION }}
         path: dist/
@@ -216,7 +212,7 @@ jobs:
 
     steps:
     - name: Download signed
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: sqlh-${{ env.SQLH_VERSION }}
         path: dist
@@ -257,7 +253,7 @@ jobs:
 
     steps:
     - name: Download signed
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: sqlh-${{ env.SQLH_VERSION }}
         path: dist
