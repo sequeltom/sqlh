@@ -1,6 +1,6 @@
 # sqlh
 
-`sqlh.exe` is a SQL Server query tool for AI agents (Claude Code and other harnesses) working through a person's DBA or developer questions. It does the job of `sqlcmd`, as a single Windows executable with no runtime dependencies: no ODBC, no OLE DB, no .NET.
+`sqlh.exe` (sqlh: SQL for harnesses) is a SQL Server query tool for AI agents working through a person's DBA or developer questions, in Claude Code and other agent harnesses. It does the job of `sqlcmd`, as a single Windows executable with no runtime dependencies: no ODBC, no OLE DB, no .NET.
 
 What makes it agent-friendly, in brief: compact typed output with hard limits, errors that point at the input line, documented exit codes, no prompts, and read-only by default. The full running list is [Built for agents](#built-for-agents).
 
