@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Bumped by hand, never by a PR from here: the driver is pinned exactly and its changelog
+      # is read before each upgrade, and windows-sys stays on the version mssql-tds uses
+      # (AGENTS.md, Stack).
+      - dependency-name: mssql-tds
+      - dependency-name: windows-sys
   - package-ecosystem: github-actions
     directory: /
     schedule:
