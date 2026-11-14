@@ -79,7 +79,9 @@ pub fn run(command: ProfileCommand, started: Instant) -> Exit {
                 Ok(()) => {
                     let _ = out.flush();
                     drop(out);
-                    test(name, started)
+                    // The connection test's status line times the test, not the person typing
+                    // the password or a wait for the profiles lock (owner, 2026-11-14).
+                    test(name, Instant::now())
                 }
                 Err(failure) => finish(&mut out, RunOutcome::new(Err(failure)), started),
             }

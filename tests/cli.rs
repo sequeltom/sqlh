@@ -917,6 +917,61 @@ fn remote_named_pipes_are_refused_before_anything_connects() {
     );
 }
 
+// `profiles add`'s connection test times itself, not what came before it in the process: the
+// password prompt, or here a wait for the profiles lock another editor holds (owner, 2026-11-14;
+// a 4.8 s status line for a 211 ms connect, the Sandbox check). Windows auth, so nothing is
+// prompted for; 127.0.0.1,1 refuses, so the test fails fast with exit 2.
+#[test]
+fn the_connection_test_after_profiles_add_times_only_itself() {
+    let dir = scratch("profiles_add_times_its_test");
+    let config = dir.join("profiles.toml");
+    let hold = Duration::from_secs(3);
+    let lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(dir.join("profiles.toml.lock"))
+            .expect("the profiles lock")
+    };
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(lock);
+    });
+    let started = Instant::now();
+    let r = run(sqlh().env("SQLH_CONFIG", &config).args([
+        "profiles",
+        "add",
+        "local",
+        "-S",
+        "127.0.0.1,1",
+        "-l",
+        "1",
+    ]));
+    let elapsed = started.elapsed();
+    releaser.join().unwrap();
+    assert_reached_connect(&r, "the connection test");
+    assert!(
+        elapsed >= hold,
+        "{elapsed:?}: the run didn't wait for the lock"
+    );
+    let ms: u64 = r
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("-- failed (exit 2): connection failed, "))
+        .and_then(|rest| rest.strip_suffix(" ms"))
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("{}", r.stdout));
+    assert!(
+        Duration::from_millis(ms) < hold,
+        "{ms} ms counts the wait: {}",
+        r.stdout
+    );
+}
+
 // Phase 2 review, answer 2: a name can have several addresses, and they are tried in turn. On
 // a dual-stack machine `localhost` has two, ::1 and 127.0.0.1, and a refused attempt at each takes
 // about 2 s. Each TCP attempt gets -l seconds and the whole login one more. If every attempt
