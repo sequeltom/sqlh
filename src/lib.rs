@@ -11,6 +11,7 @@ mod config;
 mod console;
 mod credman;
 mod db;
+mod dns;
 mod engine;
 mod error;
 mod files;

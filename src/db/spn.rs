@@ -19,7 +19,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use dns_lookup::{AddrInfoHints, getaddrinfo};
 use mssql_tds::security::{
     IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
     canonicalize_hostname, create_security_context, is_loopback_address, make_spn,
@@ -64,7 +63,7 @@ impl HopSpn {
         Arc::new(HopSpn {
             budget: SPN_LOOKUP_BUDGET,
             slots: &LOOKUPS,
-            lookup: Arc::new(|host: &str| canonical_name(host, forward_canonical)),
+            lookup: Arc::new(|host: &str| canonical_name(host, crate::dns::canonical_name)),
             looked_up: not_loopback,
             create: Arc::new(create_security_context),
         })
@@ -137,20 +136,6 @@ fn canonical_name(host: &str, forward: fn(&str) -> Option<String>) -> String {
     forward(host)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| host.to_owned())
-}
-
-/// `getaddrinfo` with `AI_CANONNAME`: the canonical name, which comes with the first result.
-fn forward_canonical(host: &str) -> Option<String> {
-    // ws2def.h's AI_CANONNAME; dns_lookup leaves the flags to the platform's values.
-    const AI_CANONNAME: i32 = 0x2;
-    let hints = AddrInfoHints {
-        flags: AI_CANONNAME,
-        ..AddrInfoHints::default()
-    };
-    getaddrinfo(Some(host), None, Some(hints))
-        .ok()?
-        .flatten()
-        .find_map(|found| found.canonname)
 }
 
 /// The lookup's answer if it came within `budget`, else `None`. The wait for a slot comes out of
