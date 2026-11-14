@@ -56,8 +56,25 @@ Before connecting, sqlh spends about 3 ms on startup, settings and the Credentia
 Not measured:
 - Other servers and networks: older SQL Server versions, other hardware, a wired or remote link.
 - The split of the login interval (a server-side trace would show it).
-- Strict encryption (TDS 8.0), and a second login within one process.
-- The release target, SQL Server 2025 Standard over a real network (checklist in PLAN.md §7).
+- A second login within one process.
+- Strict encryption (TDS 8.0) and a real network: measured 2026-11-13 below.
+
+## Over the internet: an Azure VM (2026-11-13)
+
+PLAN.md §7's real-network check, with the signed `0.1.0-dev.12` from the owner's Windows 11 workstation, wired, to a throwaway Azure VM in East US 2: SQL Server 2025 Enterprise Developer RTM (17.0.1000.7) on Windows Server 2025, `Standard_D2as_v4` (2 vCPU), port 1433 open to the workstation's address only, SQL authentication, a self-signed certificate in the VM's DNS name trusted on the workstation. A session setup's single round trip took about 40 ms.
+
+| Measure | Median | Range | Runs |
+|---|---|---|---|
+| Connect, mandatory encryption (`--verbose`) | 425 ms | 369–504 | 20 |
+| Session setup | 40 ms | 37–67 | 20 |
+| TCP (timing build) | 52 ms | 46–101 | 15 |
+| Prelogin | 46 ms | 40–49 | 15 |
+| TLS | 91 ms | 84–96 | 15 |
+| Login | 219 ms | 192–272 | 15 |
+
+- **TCP, prelogin and TLS are about four round trips;** the login is mostly the server's SQL-login work, as on the LAN (about 150 ms there).
+- **Every encryption mode connected:** optional (`encrypt_option` FALSE: the server doesn't force encryption, so only the login was encrypted), mandatory validated and with `-C`, strict (TDS 8.0, `protocol_version` 0x08000000) validated: the first strict success, since no earlier server's certificate was trusted. Before the certificate was trusted, mandatory without `-C` failed with the untrusted-root hint and strict with R46's hint, exit 2.
+- **`sqlh mcp`:** the first `info` call 570 ms (connect 450), each reused call 113–125 ms; reuse saves about 450 ms a call here, against about 210 on the LAN.
 
 ## Windows authentication (2026-11-01)
 

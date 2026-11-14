@@ -11375,9 +11375,12 @@ mod live {
         let result = &doc["batches"][0]["events"][0];
         assert_eq!(result["interrupted"], true, "{doc}");
         assert_eq!(result["row_count_exact"], false, "{doc}");
-        // --max-rows 0 with the default output budget: the rows past the budget are hidden,
-        // and the 250 ms count ends the run long before -t.
-        let (r, elapsed) = timed(&p, SO, &["--max-rows", "0"], sql);
+        // --max-rows 0 with an output budget: the rows past the budget are hidden, and the
+        // 250 ms count ends the run long before -t. The smallest budget (4096 bytes, about 500
+        // rows) is reached at any throughput; the default 1 MB needs about 125,000 rows within
+        // -t, which a loaded server over a WAN didn't send (78,034 in the second, Azure VM,
+        // 2026-11-13), and a live clock can't promise.
+        let (r, elapsed) = timed(&p, SO, &["--max-rows", "0", "--max-output", "4096"], sql);
         assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
         assert!(
             r.stdout
