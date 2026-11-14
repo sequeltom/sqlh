@@ -13410,10 +13410,10 @@ mod live {
              WHERE name = N'PREVIEW_FEATURES'",
         );
         if preview == "1" {
-            // SQL Server 2025 (17.0.1155, measured 2026-11-14) sends float16 down-level even to
-            // a client asking for version 2, as JSON text in its own exponent form, which sqlh
-            // shows as written: Microsoft documents no binary transport for float16 yet. A
-            // server that sends it natively gets sqlh's own form, checked here as well.
+            // SQL Server 2025 build 17.0.1155 sent float16 down-level to sqlh, which asks for
+            // version 2 (2026-11-14, driver-0.4.0.md §10 item 8), as JSON text in its own
+            // exponent form, which sqlh shows as written. A server that sends it natively gets
+            // sqlh's own form, checked here as well.
             let header = live(&p, &db, &["-Q", float16]).stdout;
             if header.starts_with("-- result 1\nv:vector\n") {
                 shown(float16, "vector", "[0.1,2,-3.5,65504]");
