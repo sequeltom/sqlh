@@ -29,6 +29,10 @@ log = { version = "0.4", optional = true }
 timing = ["dep:log"]
 
 [target.'cfg(windows)'.dependencies]
+# A name's canonical name for Windows auth's SPN (decision 79, src/db/spn.rs): getaddrinfo with
+# AI_CANONNAME. Already in the tree through mssql-tds, at the version it uses, so it costs no
+# build time and next to no size.
+dns-lookup = "2"
 # Same version mssql-tds already uses; we add the console API (password prompt) and
 # file identity (refusing -o onto an input file).
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console"] }

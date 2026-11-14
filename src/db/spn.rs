@@ -3,17 +3,23 @@
 //! the host and port it dials: the port given or 1433, SQL Browser's port for a named instance,
 //! 1434 for `admin:`, and each routed host's own.
 //!
-//! The SPN is the driver's own: `make_spn_canonicalized` when sqlh's lookup of the host answers
-//! within 500 ms, else what the driver builds when its lookup fails, the host as dialled. Either
-//! way the config carries the SPN, so the driver makes no lookup of its own, which has no bound
-//! (upstream-issues.md U9; about 5 s for an address with no PTR record, enough to fail a login at
-//! `-l 3` or less). Only the SPN changes, so the TLS channel bindings and the loopback retry are
-//! the driver's.
+//! The SPN is built by the driver's `make_spn` from the canonical name sqlh's lookup gives within
+//! 500 ms, else from the host as dialled, which is what the driver builds when its lookup fails.
+//! Either way the config carries the SPN, so the driver makes no lookup of its own, which has no
+//! bound (upstream-issues.md U9; about 5 s for an address with no PTR record, enough to fail a
+//! login at `-l 3` or less). Only the SPN changes, so the TLS channel bindings and the loopback
+//! retry are the driver's.
+//!
+//! The lookup is `canonical_name` (owner decision 79): a name's forward lookup, not the driver's
+//! reverse one, which named Azure's host instead of the domain's and so fell back to NTLM where
+//! Microsoft's SqlClient got Kerberos (upstream-issues.md U13).
 
+use std::net::IpAddr;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use dns_lookup::{AddrInfoHints, getaddrinfo};
 use mssql_tds::security::{
     IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
     canonicalize_hostname, create_security_context, is_loopback_address, make_spn,
@@ -44,8 +50,7 @@ pub(super) type Create = Arc<
 pub(super) struct HopSpn {
     budget: Duration,
     slots: &'static Slots,
-    /// `canonicalize_hostname`, which never fails and gives back its input when nothing
-    /// resolves.
+    /// `canonical_name`, which never fails and gives back its input when nothing resolves.
     lookup: Lookup,
     /// Which hosts go to the lookup: `not_loopback` (tests on a 127.x fake take every host).
     looked_up: fn(&str) -> bool,
@@ -59,7 +64,7 @@ impl HopSpn {
         Arc::new(HopSpn {
             budget: SPN_LOOKUP_BUDGET,
             slots: &LOOKUPS,
-            lookup: Arc::new(canonicalize_hostname),
+            lookup: Arc::new(|host: &str| canonical_name(host, forward_canonical)),
             looked_up: not_loopback,
             create: Arc::new(create_security_context),
         })
@@ -110,13 +115,42 @@ impl SecurityContextProvider for HopSpn {
 /// Whether `host` goes to the lookup: any name but one the driver's `is_loopback_address` takes
 /// for this machine (`localhost`, `127.*`, `::1`, `.`, the DNS host name), which
 /// `canonicalize_hostname` gives back as it is. A local `\\.\pipe`, shared memory and LocalDB
-/// arrive as `localhost`; a pipe named by host arrives under that name. A dotted name that isn't
-/// an address goes to the lookup too, which gives it back at once, though the driver wouldn't
-/// look it up: its rule for that, `is_fqdn`, is private, and copying it would let a later
-/// driver change it unseen. Such a name still takes one of the slots, so under a full cap it
-/// waits up to the budget, for the SPN it would have had anyway.
+/// arrive as `localhost`; a pipe named by host arrives under that name. A dotted name goes to
+/// the lookup too, which follows an alias to its host (decision 79), where the driver's rule
+/// looks a dotted name up not at all.
 fn not_loopback(host: &str) -> bool {
     !is_loopback_address(host)
+}
+
+/// The name a hop's SPN is built from (decision 79). An address keeps the driver's rule,
+/// `canonicalize_hostname`: its reverse lookup's name, else the address. A name, short or full,
+/// takes its forward lookup's canonical name, else stays as given: a short name gets its DNS
+/// suffix, and an alias (a CNAME) the real host's name, whose SPN the service registers. The
+/// driver's rule for a short name, forward then reverse, takes whatever a PTR record says, which
+/// needn't be the domain's name (U13); for a dotted name it looks nothing up, so an alias kept
+/// its own name. `forward` is the lookup, a parameter for the tests.
+fn canonical_name(host: &str, forward: fn(&str) -> Option<String>) -> String {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return canonicalize_hostname(host);
+    }
+    forward(host)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| host.to_owned())
+}
+
+/// `getaddrinfo` with `AI_CANONNAME`: the canonical name, which comes with the first result.
+fn forward_canonical(host: &str) -> Option<String> {
+    // ws2def.h's AI_CANONNAME; dns_lookup leaves the flags to the platform's values.
+    const AI_CANONNAME: i32 = 0x2;
+    let hints = AddrInfoHints {
+        flags: AI_CANONNAME,
+        ..AddrInfoHints::default()
+    };
+    getaddrinfo(Some(host), None, Some(hints))
+        .ok()?
+        .flatten()
+        .find_map(|found| found.canonname)
 }
 
 /// The lookup's answer if it came within `budget`, else `None`. The wait for a slot comes out of
@@ -402,6 +436,48 @@ pub(super) mod tests {
                 package: "Kerberos",
             }
         );
+    }
+
+    // Decision 79: a name, short or dotted, takes its forward lookup's canonical name, so a short
+    // name gets its domain and an alias its host; with no answer, or an empty one, it stays as
+    // given. An address never goes to the forward lookup: it keeps the driver's rule (here the
+    // loopback ones, which `canonicalize_hostname` gives back without a network lookup).
+    #[test]
+    fn a_name_takes_its_forward_lookups_canonical_name_and_an_address_doesnt() {
+        fn found(host: &str) -> Option<String> {
+            Some(match host {
+                "db01" => "db01.corp.example".into(),
+                "sqlalias.corp.example" | "sqlalias" => "db01.corp.example".into(),
+                other => other.to_owned(),
+            })
+        }
+        fn nothing(_: &str) -> Option<String> {
+            None
+        }
+        fn empty(_: &str) -> Option<String> {
+            Some(String::new())
+        }
+        fn never(host: &str) -> Option<String> {
+            panic!("{host} went to the forward lookup")
+        }
+        for (host, forward, name) in [
+            (
+                "db01",
+                found as fn(&str) -> Option<String>,
+                "db01.corp.example",
+            ),
+            ("sqlalias", found, "db01.corp.example"),
+            ("sqlalias.corp.example", found, "db01.corp.example"),
+            ("db01.corp.example", found, "db01.corp.example"),
+            ("db01", nothing, "db01"),
+            ("db01.corp.example", nothing, "db01.corp.example"),
+            ("db01", empty, "db01"),
+            ("127.0.0.1", never, "127.0.0.1"),
+            ("::1", never, "::1"),
+            ("[::1]", never, "[::1]"),
+        ] {
+            assert_eq!(canonical_name(host, forward), name, "{host}");
+        }
     }
 
     // The driver's own error comes back unchanged.
