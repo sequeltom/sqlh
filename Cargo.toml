@@ -32,7 +32,7 @@ timing = ["dep:log"]
 # Same version mssql-tds already uses; we add the console API (password prompt), file identity
 # (refusing -o onto an input file) and WinSock's GetAddrInfoW (a name's canonical name for the
 # SPN, decision 79, src/dns.rs: the wide API, since dns-lookup's ANSI one unwraps its answer, R67).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [profile.release]
 opt-level = 3
