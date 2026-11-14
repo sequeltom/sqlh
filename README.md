@@ -12,6 +12,8 @@ Read-only mode **guards against accidents; it is not a security boundary.** Befo
 
 **Give agents a login with only the permissions they need**, for example `db_datareader` and `VIEW DEFINITION`. The database is the enforcement boundary. A new profile refuses writes altogether; a profile changed to allow them (`--write-policy flag`) still needs `--allow-write` on each run.
 
+For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not post vulnerability details in a public issue.
+
 ## Build
 
 You need Rust (via `rustup`; the toolchain is pinned in `rust-toolchain.toml`) and the Visual Studio C++ build tools with a Windows SDK.
@@ -213,6 +215,7 @@ This README is the human-facing overview. The other documents, [AGENTS.md](AGENT
 - [docs/mcp-mode.md](docs/mcp-mode.md): `sqlh mcp`, its tools and how it keeps connections
 - [docs/schema-commands.md](docs/schema-commands.md): the schema commands (`describe`, `find`, `deps`, ...)
 - [docs/command-categories.md](docs/command-categories.md): the decided design for sorting commands by risk (Phase 6, not built yet)
+- [CONTRIBUTING.md](CONTRIBUTING.md): contribution, build and test guidance
 
 ## License
 

@@ -59,9 +59,9 @@ Not measured:
 - A second login within one process.
 - Strict encryption (TDS 8.0) and a real network: measured 2026-11-13 below.
 
-## Over the internet: an Azure VM (2026-11-13)
+## Over the internet: a disposable cloud VM (2026-11-13)
 
-PLAN.md §7's real-network check, with the signed `0.1.0-dev.12` from the owner's Windows 11 workstation, wired, to a throwaway Azure VM in East US 2: SQL Server 2025 Enterprise Developer RTM (17.0.1000.7) on Windows Server 2025, `Standard_D2as_v4` (2 vCPU), port 1433 open to the workstation's address only, SQL authentication, a self-signed certificate in the VM's DNS name trusted on the workstation. A session setup's single round trip took about 40 ms.
+PLAN.md §7's real-network check, using the signed `0.1.0-dev.12` and a disposable cloud VM running SQL Server 2025 Enterprise Developer RTM (17.0.1000.7) on Windows Server 2025. Port 1433 was restricted to the test client; the run used SQL authentication and a self-signed certificate trusted by that client. A session setup's single round trip took about 40 ms.
 
 | Measure | Median | Range | Runs |
 |---|---|---|---|
