@@ -13774,9 +13774,37 @@ mod live {
             .collect()
     }
 
+    /// Whether `errorlog --agent` found no Agent log at all. AppVeyor's certification
+    /// (decision 75) starts only the database engine, so an instance whose Agent never ran is
+    /// possible there and its answer unmeasured (schema-commands.md §6.9): exit 1 with this
+    /// error is taken, never exit 10.
+    fn no_agent_log(r: &Run) -> bool {
+        r.code == 1
+            && r.stdout
+                .starts_with("-- error: this server lists no SQL Server Agent log archives\n")
+    }
+
+    /// An `errorlog --agent` run's rows: its section, possibly empty, or none when the server
+    /// lists no Agent log (`no_agent_log`).
+    fn agent_log_rows(r: &Run) -> Vec<Vec<&str>> {
+        if no_agent_log(r) {
+            return Vec::new();
+        }
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- agent_log\ntime\tlevel\ttext\n")
+                || r.stdout.starts_with("-- no rows: agent_log\n"),
+            "{}",
+            r.stdout
+        );
+        section_rows(&r.stdout)
+    }
+
     // schema-commands.md §6.9 as the owner (sysadmin): the server's log, newest first, in its
-    // section; the Agent log with its levels as words; an archive past the last is exit 1 and
-    // never the driver's protocol error (exit 10, U14).
+    // section; the Agent log with its levels as words, and its search's companions; an archive
+    // past the last is exit 1 and never the driver's protocol error (exit 10, U14). A server
+    // with no Agent log may answer `--agent` so (`no_agent_log`), and then has no Agent rows to
+    // check.
     #[test]
     #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
     fn errorlog_reads_the_servers_and_the_agents_log() {
@@ -13799,24 +13827,52 @@ mod live {
             "{}",
             r.stdout
         );
-        let r = live(&p, &db, &["errorlog", "--agent"]);
-        assert_eq!(r.code, 0, "{}", r.stdout);
+        let r = live(&p, &db, &["errorlog", "--agent", "--max-rows", "0"]);
+        let agent_log = agent_log_rows(&r);
         assert!(
-            r.stdout.starts_with("-- agent_log\ntime\tlevel\ttext\n"),
+            agent_log
+                .iter()
+                .all(|row| matches!(row[1], "error" | "warning" | "info")),
             "{}",
             r.stdout
         );
-        let rows = section_rows(&r.stdout);
-        assert!(
-            rows.iter()
-                .any(|row| matches!(row[1], "error" | "warning" | "info")),
-            "{}",
-            r.stdout
-        );
+        // The Agent log's search keeps the lines of the same time and level (schema-commands.md
+        // §6.9): every row shares both with a line that matches. The search is a line shown
+        // whole, with no escape in it.
+        let probe = agent_log.iter().find(|row| {
+            let text = row[2].trim();
+            !text.is_empty() && text.len() < 400 && !row[2].contains(['\\', '…'])
+        });
+        if let Some(probe) = probe {
+            let search = probe[2].trim();
+            let r = live(
+                &p,
+                &db,
+                &["errorlog", "--agent", "--search", search, "--max-rows", "0"],
+            );
+            assert_eq!(r.code, 0, "{search}: {}", r.stdout);
+            let rows = section_rows(&r.stdout);
+            // CHARINDEX compares in tempdb's collation, case-insensitive on the test servers.
+            let lower = search.to_lowercase();
+            let matched: Vec<_> = rows
+                .iter()
+                .filter(|row| row[2].to_lowercase().contains(&lower))
+                .collect();
+            assert!(!matched.is_empty(), "{search}: {}", r.stdout);
+            assert!(
+                rows.iter()
+                    .all(|row| matched.iter().any(|m| (m[0], m[1]) == (row[0], row[1]))),
+                "{search}: {}",
+                r.stdout
+            );
+        }
         for agent in [&[][..], &["--agent"][..]] {
             let mut args = vec!["errorlog", "--archive", "99"];
             args.extend(agent);
             let r = live(&p, &db, &args);
+            if !agent.is_empty() && no_agent_log(&r) {
+                continue;
+            }
             assert_eq!(r.code, 1, "{args:?}: {}", r.stdout);
             let log = if agent.is_empty() {
                 "the error log"
@@ -13856,15 +13912,20 @@ mod live {
             .iter()
             .position(|row| row[2].starts_with(&format!("Login failed for user '{login}'.")))
             .unwrap_or_else(|| panic!("no Login failed line:\n{}", r.stdout));
-        assert!(failed > 0, "{}", r.stdout);
-        let (error, line) = (&rows[failed - 1], &rows[failed]);
+        let line = &rows[failed];
+        assert_eq!(line[1], "Logon", "{}", r.stdout);
+        // Its Error line is above it among the lines of its time and source, not necessarily
+        // next to it: other tests' failed logins of the same moment come too, and their lines
+        // can interleave with this one's.
         assert!(
-            error[2].starts_with("Error: 18456, Severity: 14, State: "),
+            rows[..failed]
+                .iter()
+                .rev()
+                .take_while(|row| (row[0], row[1]) == (line[0], line[1]))
+                .any(|row| row[2].starts_with("Error: 18456, Severity: 14, State: ")),
             "{}",
             r.stdout
         );
-        assert_eq!((error[0], error[1]), (line[0], line[1]), "{}", r.stdout);
-        assert_eq!(line[1], "Logon", "{}", r.stdout);
 
         // Archive 1's newest line, and a window from its second.
         let r = live(&p, &db, &["errorlog", "--archive", "1", "--max-rows", "1"]);
@@ -14557,21 +14618,37 @@ mod live {
                     .any(|l| l.starts_with("-- 2 of ") && l.contains(" rows shown (max_rows 2")),
                 "{text}"
             );
-            let document = ok_document(&mcp.call(
-                2,
-                "errorlog",
-                json!({"agent": true, "max_rows": 1, "format": "json"}),
-            ));
+            let document =
+                ok_document(&mcp.call(2, "errorlog", json!({"max_rows": 1, "format": "json"})));
             let results = events(&document, "result");
             assert_eq!(results.len(), 1, "{document}");
-            assert_eq!(results[0]["label"], "agent_log", "{document}");
+            assert_eq!(results[0]["label"], "server_log", "{document}");
             let names: Vec<&str> = results[0]["columns"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|c| c["name"].as_str())
                 .collect();
-            assert_eq!(names, ["time", "level", "text"], "{document}");
+            assert_eq!(names, ["time", "source", "text"], "{document}");
+            // The Agent log, or on a server that lists none (AppVeyor's, which never starts the
+            // Agent) the command's own error, never exit 10.
+            let (error, text) =
+                tool_text(&mcp.call(4, "errorlog", json!({"agent": true, "max_rows": 1})));
+            if error {
+                assert!(
+                    text.starts_with(
+                        "-- error: this server lists no SQL Server Agent log archives\n\
+                         -- failed (exit 1): "
+                    ),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("-- agent_log\ntime\tlevel\ttext\n")
+                        || text.starts_with("-- no rows: agent_log\n"),
+                    "{text}"
+                );
+            }
             let (error, text) = tool_text(&mcp.call(3, "errorlog", json!({"since": "soon"})));
             assert!(error, "{text}");
             assert!(

@@ -192,11 +192,12 @@ const TOOLS: &[Tool] = &[
         description: "The SQL Server error log, newest first, with server-local times (time, \
             source, text). Without since: the current log, or archive N. since keeps the lines \
             from 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 on, reading back \
-            through older archives as far as that needs. search returns whole entries: each \
-            matching line with the lines of the same time and source (a Login failed line with \
-            its Error: 18456 line). agent reads the SQL Server Agent log instead (time, level, \
-            text). Needs VIEW ANY ERROR LOG or VIEW SERVER STATE (info shows \
-            server_permissions).",
+            through older archives as far as that needs. search returns each matching line \
+            with the lines of the same time and source, which keeps an entry whole (a Login \
+            failed line with its Error: 18456 line) but at a startup brings unrelated lines \
+            too. agent reads the SQL Server Agent log instead (time, level, text; a search \
+            there keeps the lines of the same time and level). Needs VIEW ANY ERROR LOG or \
+            VIEW SERVER STATE (info shows server_permissions).",
         args: &[Arg::Since, Arg::Search, Arg::Agent, Arg::Archive],
         rows: true,
         database: false,
@@ -287,7 +288,7 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                         "search",
                         json!({"type": "string", "minLength": 1, "maxLength": 500,
                             "description": "Text a line contains; each match comes with the \
-                             other lines of its entry."}),
+                             lines of the same time and source (level, in the Agent log)."}),
                         false,
                     ),
                     Arg::Agent => (

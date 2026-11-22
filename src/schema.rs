@@ -1287,9 +1287,10 @@ fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failu
 /// small enough for `DATEADD`'s `int`.
 const MAX_SINCE_MINUTES: u64 = 3650 * 24 * 60;
 
-/// The longest `--search`, in UTF-16 units: `@search` is `nvarchar(500)`, and a longer value
-/// would be cut there without a word.
-const MAX_SEARCH_UNITS: usize = 500;
+/// The longest `--search`, in characters (code points), as MCP's schema counts its
+/// `maxLength`. `@search` holds twice as many UTF-16 units, since a character outside the BMP
+/// takes two, so it never cuts one without a word.
+const MAX_SEARCH_CHARS: usize = 500;
 
 /// The most `--archive` names: SQL Server keeps at most 99 archives besides the current log.
 const MAX_ARCHIVE: u32 = 99;
@@ -1297,7 +1298,8 @@ const MAX_ARCHIVE: u32 = 99;
 /// `--since` as a T-SQL `datetime` expression in the server's clock (schema-commands.md §6.9),
 /// or `None` when it is none of the forms: `<N>m`, `<N>h` or `<N>d` before now, or a
 /// server-local time. sqlh writes the expression itself, so the server never parses the user's
-/// text: a date it couldn't read would be an error inside `INSERT ... EXEC`, exit 10 (U14).
+/// text and a bad one is a usage error before anything connects. It only sets `@since`, which
+/// filters `#log` after the read: no date reaches `INSERT ... EXEC`.
 fn since_sql(since: &str) -> Option<String> {
     let per = match since.as_bytes().last() {
         Some(b'm') => Some(1),
@@ -1362,11 +1364,11 @@ fn local_time(text: &str) -> Option<String> {
         .then(|| format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"))
 }
 
-/// Whether `search` can be searched for: 1 to 500 UTF-16 units, not only whitespace, and no
+/// Whether `search` can be searched for: 1 to 500 characters, not only whitespace, and no
 /// control character, which the server can't be trusted with (a NUL cuts the string short
 /// without an error, measured).
 fn search_ok(search: &str) -> bool {
-    (1..=MAX_SEARCH_UNITS).contains(&search.encode_utf16().count())
+    (1..=MAX_SEARCH_CHARS).contains(&search.chars().count())
         && !search.trim().is_empty()
         && !search.chars().any(|c| c < ' ')
 }
@@ -1391,7 +1393,7 @@ fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
     };
     if log.search.as_deref().is_some_and(|s| !search_ok(s)) {
         return Err(Failure::usage(format!(
-            "{} takes 1 to {MAX_SEARCH_UNITS} characters and no control characters",
+            "{} takes 1 to {MAX_SEARCH_CHARS} characters and no control characters",
             flag("search")
         )));
     }
@@ -1421,13 +1423,15 @@ fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
 }
 
 /// The lookup: which logs the login may read and the server keeps, and the lines asked for,
-/// copied into `#log` for the step. Every value reaches `INSERT ... EXEC` typed, and only an
-/// archive `sp_enumerrorlogs` lists is read: a 22004 there ends the batch as the driver's
-/// protocol error, exit 10, whatever `TRY` says (DESIGN.md §7, U14). `sp_readerrorlog` reads
-/// whole archives (decision 89); `@type` is always passed, since with it NULL the procedure
-/// drops its filters. `--since` reads back, archive after archive, until one starts at or
-/// before the window (decision 84). A search keeps each matching line's companions, the lines
-/// of the same time and source, so `Login failed` keeps its `Error: 18456` line. Without the
+/// copied into `#log` for the step. Only `@a` and `@type`, both `int`, reach `INSERT ... EXEC`,
+/// and only an archive `sp_enumerrorlogs` lists is read: a 22004 there ends the batch as the
+/// driver's protocol error, exit 10, whatever `TRY` says (DESIGN.md §7, U14). The time and the
+/// search filter `#log` afterwards, in SQL. `sp_readerrorlog` reads whole archives (decision
+/// 89); `@type` is always passed, since with it NULL the procedure drops its filters. `--since`
+/// reads back, archive after archive, until one starts at or before the window (decision 84).
+/// A search keeps each matching line's companions, the lines of the same time and
+/// `ProcessInfo`, so `Login failed` keeps its `Error: 18456` line; at a startup, and in the
+/// Agent log, whose `ProcessInfo` is the level, they include unrelated lines. Without the
 /// permission nothing is read: `sp_readerrorlog` would refuse with error 27219, which sqlh
 /// words itself.
 fn errorlog_sql(
@@ -1439,7 +1443,7 @@ fn errorlog_sql(
     format!(
         "SET NOCOUNT ON;\n\
          DECLARE @type int = {log_type}, @archive int = {archive}, @since datetime = {since}, \
-         @search nvarchar({MAX_SEARCH_UNITS}) = {search};\n\
+         @search nvarchar({search_units}) = {search};\n\
          DECLARE @can bit = CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 \
          OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1 \
          OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 THEN 1 ELSE 0 END;\n\
@@ -1471,6 +1475,7 @@ fn errorlog_sql(
         archive = archive.map_or_else(|| "NULL".to_owned(), |n| n.to_string()),
         since = since.unwrap_or("NULL"),
         search = literal_or_null(search),
+        search_units = 2 * MAX_SEARCH_CHARS,
     )
 }
 
@@ -2487,7 +2492,7 @@ mod tests {
             "a\0b".into(),
             "line\nbreak".into(),
             "x".repeat(501),
-            "\u{1F600}".repeat(251),
+            "\u{1F600}".repeat(501),
         ] {
             assert_eq!(
                 refused(search(&bad), Advice::Cli),
@@ -2499,7 +2504,7 @@ mod tests {
             refused(search(""), Advice::Mcp),
             "search takes 1 to 500 characters and no control characters"
         );
-        for good in ["x".repeat(500), "\u{1F600}".repeat(250), " a ".into()] {
+        for good in ["x".repeat(500), "\u{1F600}".repeat(500), " a ".into()] {
             assert!(errorlog(&search(&good), Advice::Cli).is_ok(), "{good:?}");
         }
         let archive = |n| Errorlog {
@@ -2542,16 +2547,17 @@ mod tests {
         sql
     }
 
-    // U14: what reaches `INSERT ... EXEC` is typed and listed, so the server never refuses it
-    // there. The log type is always passed; the search is an N'...' literal with its quotes
-    // doubled; the time is sqlh's own expression.
+    // U14: only the listed archive and the log type, both int, reach `INSERT ... EXEC`, so the
+    // server never refuses them there. The log type is always passed; the search is an N'...'
+    // literal with its quotes doubled, in a variable that holds 500 characters of two UTF-16
+    // units each; the time is sqlh's own expression.
     #[test]
     fn errorlogs_lookup_passes_only_typed_values() {
         let sql = errorlog_lookup_sql(&Errorlog::default());
         assert!(
             sql.starts_with(
                 "SET NOCOUNT ON;\nDECLARE @type int = 1, @archive int = NULL, @since datetime = \
-                 NULL, @search nvarchar(500) = NULL;\n"
+                 NULL, @search nvarchar(1000) = NULL;\n"
             ),
             "{sql}"
         );
@@ -2576,8 +2582,17 @@ mod tests {
         assert!(
             sql.starts_with(
                 "SET NOCOUNT ON;\nDECLARE @type int = 2, @archive int = NULL, @since datetime = \
-                 CONVERT(datetime, N'2026-11-20T08:00:00', 126), @search nvarchar(500) = \
+                 CONVERT(datetime, N'2026-11-20T08:00:00', 126), @search nvarchar(1000) = \
                  N'it''s ]; DROP TABLE x --';\n"
+            ),
+            "{sql}"
+        );
+        // The Agent log's companions are the server log's rule as it stands: the same time
+        // and `ProcessInfo`, there the level (schema-commands.md §6.9).
+        assert!(
+            sql.contains(
+                "WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
+                 AND CHARINDEX(@search, m.[Text]) > 0);"
             ),
             "{sql}"
         );
