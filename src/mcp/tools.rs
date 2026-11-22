@@ -210,8 +210,8 @@ const TOOLS: &[Tool] = &[
             blocked or block another, from one snapshot, blocking chains first. blocked_by: the \
             session waited on (-2 orphaned distributed transaction, -3 deferred recovery, -4 \
             latch owner unknown); blocking: how many wait on it, directly or down its chain; \
-            depth: 0 for a head blocker, 1 and on down its chain. Times are durations in ms. \
-            open_tran 1 on a sqlh or sqlh mcp session is its rolled-back wrapper, not a leak. \
+            depth: 0 for a head blocker, 1 and on down its chain, NULL in or behind a cycle. Times \
+            are durations in ms. open_tran 1 on a sqlh or sqlh mcp session is its rolled-back wrapper, not a leak. \
             input_buffer: the last batch of a head blocker or of an idle session with an open \
             transaction. A plan: query sys.dm_exec_text_query_plan with the session's \
             plan_handle and offsets from sys.dm_exec_requests. Needs VIEW SERVER PERFORMANCE \

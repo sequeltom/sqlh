@@ -245,7 +245,7 @@ Column-level detail (which columns a procedure reads) is left out: `sys.dm_sql_r
 
 ### 6.8 `activity` (built 2026-11-22)
 
-A server command (Phase 6 slice 2; decision 28 as amended by decisions 83, 85, 86 and 88, PLAN.md §6): the server's sessions worth looking at during an investigation, with their blocking chains, as `sp_WhoIsActive` would show them, from DMVs alone. Its evidence is live check 10 and the slice's design review (`artifacts/slice2/`, local; `activity2.sql` is the SQL below, run on SQL Server 2025 and 2016 SP3 under a three-session chain). No arguments (decision 85: no `--plans`); MCP's `activity` tool is the same (mcp-mode.md §4), with no `database` argument, since it reads the server. Anything after the word is refused before connecting (`activity takes no arguments, not "x"`, exit 3), and so is another command's option (`--since only applies to sqlh errorlog`).
+A server command (Phase 6 slice 2; decision 28 as amended by decisions 83, 85, 86 and 88, PLAN.md §6): the server's sessions worth looking at during an investigation, with their blocking chains, as `sp_WhoIsActive` would show them, from DMVs alone. Its evidence is live check 10 and the slice's design review (`artifacts/slice2/`, local; `activity2.sql` is the SQL as first built and `activity3.sql` the SQL below, with the ages clamped and the cycle mark, each run on SQL Server 2025 and 2016 SP3 under a three-session chain, 2026-11-22). No arguments (decision 85: no `--plans`); MCP's `activity` tool is the same (mcp-mode.md §4), with no `database` argument, since it reads the server. Anything after the word is refused before connecting (`activity takes no arguments, not "x"`, exit 3), and so is another command's option (`--since only applies to sqlh errorlog`).
 
 **The lookup** (one batch, `run::Plan::Lookup`, label `reading the server's sessions`; `schema::ACTIVITY_SQL`) takes one snapshot into `#s`:
 
@@ -261,8 +261,10 @@ SELECT s.session_id,
        COALESCE(w.wait_type, r.wait_type) AS wait, COALESCE(w.wait_duration_ms, r.wait_time) AS wait_ms,
        COALESCE(NULLIF(r.wait_resource, N''), w.resource_description) AS wait_resource,
        r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,
-       CASE WHEN r.session_id IS NULL THEN DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END AS idle_ms,
-       s.open_transaction_count AS open_tran, DATEDIFF_BIG(ms, t.begun, GETDATE()) AS tran_ms,
+       CASE WHEN r.session_id IS NULL THEN CASE WHEN s.last_request_end_time > GETDATE() THEN 0
+            ELSE DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END END AS idle_ms,
+       s.open_transaction_count AS open_tran,
+       CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END AS tran_ms,
        s.login_name AS login, s.host_name AS host, s.program_name AS program,
        DB_NAME(COALESCE(r.database_id, s.database_id)) AS [database],
        r.sql_handle, r.statement_start_offset AS stmt_start, r.statement_end_offset AS stmt_end,
@@ -299,12 +301,18 @@ WITH shown AS (
   WHERE (x.is_user = 1 AND (x.busy = 1 OR x.open_tran > 0)) OR x.blocked_by IS NOT NULL
      OR EXISTS (SELECT 1 FROM #s b WHERE b.blocked_by = x.session_id)
 ), up AS (
-  SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b WHERE b.blocked_by > 0
+  SELECT b.session_id, b.blocked_by AS above, 1 AS hops,
+         CAST(CONCAT(',', b.session_id, ',', b.blocked_by, ',') AS varchar(1000)) AS seen, 0 AS again
+  FROM shown b WHERE b.blocked_by > 0
   UNION ALL
-  SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u JOIN shown p ON p.session_id = u.above
-  WHERE p.blocked_by > 0 AND u.hops < 100
+  SELECT u.session_id, p.blocked_by, u.hops + 1,
+         CAST(CONCAT(u.seen, p.blocked_by, ',') AS varchar(1000)),
+         CASE WHEN CHARINDEX(CONCAT(',', p.blocked_by, ','), u.seen) > 0 THEN 1 ELSE 0 END
+  FROM up u JOIN shown p ON p.session_id = u.above
+  WHERE p.blocked_by > 0 AND u.again = 0 AND u.hops < 100
 ), tops AS (
-  SELECT u.session_id, MAX(u.hops) AS depth, MAX(CASE WHEN u.above = u.session_id THEN 1 ELSE 0 END) AS cycle
+  SELECT u.session_id, MAX(u.hops) AS depth,
+         MAX(CASE WHEN u.again = 1 OR u.hops = 100 THEN 1 ELSE 0 END) AS cycle
   FROM up u GROUP BY u.session_id
 ), heads AS (
   SELECT u.session_id, u.above AS head FROM up u JOIN tops t ON t.session_id = u.session_id AND t.depth = u.hops
@@ -334,9 +342,9 @@ OPTION (MAXRECURSION 100);
 
 - **Rows:** a user session with a request or an open transaction; any blocked session, system ones too; any session a shown one is blocked by. An idle pooled `sqlh mcp` connection has neither a request nor a transaction (`put_back` rolls it back), so it falls out by this rule, and shows when it blocks, as its blocker (decision 83: no `own` column; an agent tells a `sqlh mcp` session by `program` and `host`). The report's own session never shows.
 - **Columns:** `session, blocked_by, blocking, depth, status, command, wait, wait_ms, wait_resource, cpu_ms, reads, elapsed_ms, idle_ms, open_tran, tran_ms, login, host, program, database, statement, input_buffer`.
-  - `blocking`: how many shown sessions wait on it, directly or down its chain; NULL when none. `depth`: 0 for a head blocker (it blocks and isn't blocked by a shown session), 1 and on down its chain; NULL outside any chain and inside a cycle (`up` stops at 100 hops, `MAXRECURSION 100`, and `tops.cycle` marks a session that reaches itself).
+  - `blocking`: how many shown sessions wait on it, directly or down its chain; NULL when none. `depth`: 0 for a head blocker (it blocks and isn't blocked by a shown session), 1 and on down its chain; NULL outside any chain, inside a cycle, and behind one: `up` carries the sessions each walk has passed (`seen`) and stops at a step back to one of them (`again`) or at 100 hops (`MAXRECURSION 100`), and `tops.cycle` marks a walk that did either, so a session waiting on a cycle it isn't in gets NULL, not the hop bound's 100 (as does one at the end of a chain of 100 hops or more, which no real server has).
   - `status`: the request's, else the session's (`sleeping`). `wait`, `wait_ms`, `wait_resource`: the blocked task's when there is one, else the request's; `wait_resource` the request's compact form (`RID: 7:1:584:0`), else the task's description.
-  - `cpu_ms`, `reads` (logical) and `elapsed_ms` are the request's, NULL without one; `idle_ms` is since the session's last request ended, only without a request; `open_tran` the session's `open_transaction_count`; `tran_ms` the age of its oldest active transaction. Durations only, no datetimes, so there is no time zone to explain.
+  - `cpu_ms`, `reads` (logical) and `elapsed_ms` are the request's, NULL without one; `idle_ms` is since the session's last request ended, only without a request; `open_tran` the session's `open_transaction_count`; `tran_ms` the age of its oldest active transaction. `idle_ms` and `tran_ms` are 0, never negative, for a time later than the snapshot's `GETDATE()`, which is fixed when its statement starts while the DMVs are read after it (a `tran_ms` of -3 was seen on 2016 before the clamp). Durations only, no datetimes, so there is no time zone to explain.
   - `statement`: the running statement, cut from the batch's text by its offsets (none for a negative length). `input_buffer`: `dm_exec_input_buffer`'s `event_info`, the client's batch, for a head blocker and for a session with no request and an open transaction, where the statement says nothing.
   - **A sqlh read-only run shows `open_tran 1`**, its rolled-back wrapper (measured on the blocked reader, live check 10): not a transaction left open. `--allow-write` runs show the transactions they open.
 - **Order:** chains first, the largest `blocking` first, each chain by depth; then the rest by age (`elapsed_ms`, else `tran_ms`, else `idle_ms`) descending; then session.
@@ -347,7 +355,7 @@ OPTION (MAXRECURSION 100);
 
 **In `sqlh mcp`** the call takes a pooled connection like any other (decision 88), so with every connection of its profile held by calls stuck behind a lock it waits until its timeout; that wait's error then adds `; sqlh activity on the command line opens a connection of its own` (`engine::wait_for_connection`), since `sqlh activity` connects afresh. The engine reserves nothing for it; reopen that if real use shows the wait.
 
-**Tested:** unit tests in `schema::tests` (`activity_takes_nothing`: the parse, every refusal of another command's option, the limits; `activitys_lookup_reads_one_snapshot_after_the_permission`; `activitys_step_is_one_select_of_its_columns`: `several_outputs` false, the columns in order, the recursion's bounds; `activity_says_which_permission_it_lacks`: each branch of its row), `mcp::tools::tests::the_activity_tool_takes_no_database_and_shows_its_defaults`; exact output through the fake server (`engine::tests::activity_shows_its_sessions_or_says_which_permission_it_lacks`, the section, `-- no rows:` and both `-- error:` wordings; `an_activity_timeout_says_what_it_was_reading_and_what_helps`, the lookup's timeout and the pool wait's advice); refusals before connecting (`tests/cli.rs`, `activity_refuses_what_it_is_given_before_connecting` and `mcp::the_activity_tool_refuses_an_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `mcp_tools::activity_shows_the_tests_own_chain_to_who_may_see_it` (a write of the test's own held open and a read waiting on it: the head at depth 0 with `blocking` 1 or more and its batch in `input_buffer`, the read with `blocked_by` the head, an `LCK_M_` wait on a `RID: ` resource, depth 1, `open_tran 1`; asserted on those two sessions only, since other live tests' chains show too; a reader without permission refused in its version's words, and with VIEW SERVER STATE, and on 2022 and later VIEW SERVER PERFORMANCE STATE alone, seeing the same chain) and `mcp_tools::the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one` (`--pool 2`: a call blocked behind the test's write shows in another call's `activity` with `program` `sqlh mcp`, blocked, `open_tran 1`; after it times out, the next `activity` runs on one connection and the other, idle and rolled back, doesn't show).
+**Tested:** unit tests in `schema::tests` (`activity_takes_nothing`: the parse, every refusal of another command's option, the limits; `activitys_lookup_reads_one_snapshot_after_the_permission`; `activitys_step_is_one_select_of_its_columns`: `several_outputs` false, the columns in order, the recursion's bounds and the cycle mark; `activity_says_which_permission_it_lacks`: each branch of its row; `the_docs_show_activitys_sql_as_built`: both SQL blocks above are the constants, word for word), `mcp::tools::tests::the_activity_tool_takes_no_database_and_shows_its_defaults`; exact output through the fake server (`engine::tests::activity_shows_its_sessions_or_says_which_permission_it_lacks`, the section, `-- no rows:` and both `-- error:` wordings; `an_activity_timeout_says_what_it_was_reading_and_what_helps`, the lookup's timeout and the pool wait's advice); refusals before connecting (`tests/cli.rs`, `activity_refuses_what_it_is_given_before_connecting` and `mcp::the_activity_tool_refuses_an_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `mcp_tools::activity_shows_the_tests_own_chain_to_who_may_see_it` (a write of the test's own held open and a read waiting on it: the head at depth 0 with `blocking` 1 or more and its batch in `input_buffer`, the read with `blocked_by` the head, an `LCK_M_` wait on a `RID: ` resource, depth 1, `open_tran 1`; asserted on those two sessions only, since other live tests' chains show too; a reader without permission refused in its version's words, and with VIEW SERVER STATE, and on 2022 and later VIEW SERVER PERFORMANCE STATE alone, seeing the same chain) and `mcp_tools::the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one` (`--pool 2`: a call blocked behind the test's write shows in another call's `activity` with `program` `sqlh mcp`, blocked, `open_tran 1`; after it times out, the next `activity` runs on one connection and the other, idle and rolled back, doesn't show); and `mcp_tools::activitys_depth_is_null_in_a_cycle_and_behind_one`, the step above run on a `#s` of made-up sessions (a three-session chain 0, 1, 2; a two-session cycle, a session waiting on it and one waiting on that, all NULL; a chain of 101, 99 one from its end and NULL at 100 hops), since no server keeps a cycle long enough to be read.
 
 ### 6.9 `errorlog [--since T] [--search TEXT] [--agent] [--archive N]` (built 2026-11-21)
 

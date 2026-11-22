@@ -1596,7 +1596,9 @@ fn errorlog_step(agent: bool) -> Step {
 /// first: without it SQL Server shows a login only its own session, which `@@SPID` leaves out,
 /// so the list would read as an idle server (decision 86). VIEW SERVER PERFORMANCE STATE came
 /// with SQL Server 2022 (HAS_PERMS_BY_NAME gives NULL before it, and VIEW SERVER STATE
-/// decides).
+/// decides). `GETDATE()` is fixed when the statement starts, and a transaction can begin, or
+/// a request end, while the DMVs are read after it, so an age is clamped at 0 (a `tran_ms` of
+/// -3 was seen on 2016).
 const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
     DECLARE @can int = COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
     HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\n\
@@ -1611,9 +1613,11 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
     wait_ms,\n\
     COALESCE(NULLIF(r.wait_resource, N''), w.resource_description) AS wait_resource,\n\
     r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,\n\
-    CASE WHEN r.session_id IS NULL THEN DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) \
-    END AS idle_ms,\n\
-    s.open_transaction_count AS open_tran, DATEDIFF_BIG(ms, t.begun, GETDATE()) AS tran_ms,\n\
+    CASE WHEN r.session_id IS NULL THEN CASE WHEN s.last_request_end_time > GETDATE() THEN 0 \
+    ELSE DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END END AS idle_ms,\n\
+    s.open_transaction_count AS open_tran,\n\
+    CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END AS \
+    tran_ms,\n\
     s.login_name AS login, s.host_name AS host, s.program_name AS program,\n\
     DB_NAME(COALESCE(r.database_id, s.database_id)) AS [database],\n\
     r.sql_handle, r.statement_start_offset AS stmt_start, r.statement_end_offset AS stmt_end,\n\
@@ -1641,24 +1645,31 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
 /// `-- partial:` advice, `run::Plan`). Shown: a user session with a request or an open
 /// transaction (an idle pooled `sqlh mcp` connection has neither after `put_back`'s rollback,
 /// decision 83), any blocked session, system ones too, and any session one of them waits on.
-/// `up` walks each blocked session's chain to its head; `hops < 100` and `MAXRECURSION 100`
-/// end a cycle, which `tops.cycle` then marks, so its sessions get no depth. `under` counts
-/// who waits on a session, directly or down its chain. The input buffer is read only for a
-/// head blocker and an idle session holding a transaction, where the statement says nothing.
+/// `up` walks each blocked session's chain to its head, carrying the sessions it has passed
+/// (`seen`); a step back to one of them (`again`) ends the walk, and so does `hops < 100`,
+/// within `MAXRECURSION 100`. `tops.cycle` marks a walk that came back or reached 100 hops,
+/// so a session in a cycle, and one waiting behind a cycle without being in it, gets no depth
+/// rather than the hop bound's 100. `under` counts who waits on a session, directly or down
+/// its chain. The input buffer is read only for a head blocker and an idle session holding a
+/// transaction, where the statement says nothing.
 /// Chains come first, the largest first, each in depth order; then the rest, oldest first.
 const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     SELECT x.* FROM #s x\n\
     WHERE (x.is_user = 1 AND (x.busy = 1 OR x.open_tran > 0)) OR x.blocked_by IS NOT NULL\n\
     OR EXISTS (SELECT 1 FROM #s b WHERE b.blocked_by = x.session_id)\n\
     ), up AS (\n\
-    SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b WHERE b.blocked_by > 0\n\
+    SELECT b.session_id, b.blocked_by AS above, 1 AS hops,\n\
+    CAST(CONCAT(',', b.session_id, ',', b.blocked_by, ',') AS varchar(1000)) AS seen, 0 AS again\n\
+    FROM shown b WHERE b.blocked_by > 0\n\
     UNION ALL\n\
-    SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u JOIN shown p ON p.session_id = \
-    u.above\n\
-    WHERE p.blocked_by > 0 AND u.hops < 100\n\
+    SELECT u.session_id, p.blocked_by, u.hops + 1,\n\
+    CAST(CONCAT(u.seen, p.blocked_by, ',') AS varchar(1000)),\n\
+    CASE WHEN CHARINDEX(CONCAT(',', p.blocked_by, ','), u.seen) > 0 THEN 1 ELSE 0 END\n\
+    FROM up u JOIN shown p ON p.session_id = u.above\n\
+    WHERE p.blocked_by > 0 AND u.again = 0 AND u.hops < 100\n\
     ), tops AS (\n\
-    SELECT u.session_id, MAX(u.hops) AS depth, MAX(CASE WHEN u.above = u.session_id THEN 1 ELSE \
-    0 END) AS cycle\n\
+    SELECT u.session_id, MAX(u.hops) AS depth,\n\
+    MAX(CASE WHEN u.again = 1 OR u.hops = 100 THEN 1 ELSE 0 END) AS cycle\n\
     FROM up u GROUP BY u.session_id\n\
     ), heads AS (\n\
     SELECT u.session_id, u.above AS head FROM up u JOIN tops t ON t.session_id = u.session_id \
@@ -2978,6 +2989,42 @@ mod tests {
             "\nSELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS \
              major;"
         ));
+        // An age is never negative: GETDATE() is fixed before the DMVs are read.
+        for age in [
+            "CASE WHEN s.last_request_end_time > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, \
+             s.last_request_end_time, GETDATE()) END END AS idle_ms,\n",
+            "CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END \
+             AS tran_ms,\n",
+        ] {
+            assert!(ACTIVITY_SQL.contains(age), "{age}");
+        }
+        assert_eq!(ACTIVITY_SQL.matches("DATEDIFF_BIG").count(), 2);
+    }
+
+    /// schema-commands.md §6.8's `sql` blocks, the lookup's and the step's, in order.
+    fn activitys_documented_sql() -> Vec<&'static str> {
+        let doc = include_str!("../docs/schema-commands.md");
+        let section = doc
+            .split_once("\n### 6.8 `activity`")
+            .and_then(|(_, rest)| rest.split_once("\n### 6.9 "))
+            .map(|(section, _)| section)
+            .expect("schema-commands.md §6.8");
+        section
+            .split("```sql\n")
+            .skip(1)
+            .filter_map(|block| block.split_once("\n```").map(|(sql, _)| sql))
+            .collect()
+    }
+
+    // The docs are the source of truth: §6.8 shows the SQL `activity` runs, to the word (the
+    // layout aside), and its live test runs the step from there.
+    #[test]
+    fn the_docs_show_activitys_sql_as_built() {
+        let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let documented = activitys_documented_sql();
+        assert_eq!(documented.len(), 2, "{documented:?}");
+        assert_eq!(words(documented[0]), words(ACTIVITY_SQL));
+        assert_eq!(words(documented[1]), words(ACTIVITY_STEP));
     }
 
     // `Plan::Lookup`'s rule: the step is one statement, so a capped list gets the brief count
@@ -2990,7 +3037,20 @@ mod tests {
             "{ACTIVITY_STEP}"
         );
         assert!(ACTIVITY_STEP.starts_with("WITH shown AS (\n"));
-        assert!(ACTIVITY_STEP.contains("WHERE p.blocked_by > 0 AND u.hops < 100\n"));
+        assert!(
+            ACTIVITY_STEP.contains("WHERE p.blocked_by > 0 AND u.again = 0 AND u.hops < 100\n")
+        );
+        // A walk that comes back to a session it passed, or reaches the bound, gives no depth,
+        // so a waiter behind a cycle isn't 100 deep (live:
+        // `activitys_depth_is_null_in_a_cycle_and_behind_one`).
+        assert!(ACTIVITY_STEP.contains(
+            "CASE WHEN CHARINDEX(CONCAT(',', p.blocked_by, ','), u.seen) > 0 THEN 1 ELSE 0 END\n"
+        ));
+        assert!(
+            ACTIVITY_STEP.contains(
+                "MAX(CASE WHEN u.again = 1 OR u.hops = 100 THEN 1 ELSE 0 END) AS cycle\n"
+            )
+        );
         assert!(ACTIVITY_STEP.ends_with("\nOPTION (MAXRECURSION 100);"));
         let list = ACTIVITY_STEP
             .split_once("\nSELECT x.session_id AS session,")

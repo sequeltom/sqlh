@@ -14881,6 +14881,95 @@ mod live {
             }
         }
 
+        // schema-commands.md §6.8's step, the SQL `activity` runs (the unit test
+        // `the_docs_show_activitys_sql_as_built` holds the doc to it), on a `#s` of made-up
+        // sessions, since no server keeps a blocking cycle for long (the deadlock monitor ends
+        // one within about 5 s): a chain's depths from its head; a cycle's two sessions, one
+        // waiting on the cycle and one waiting on that, all with no depth rather than the hop
+        // bound's 100; a chain of 101 sessions, 99 deep one from the end and no depth at 100
+        // hops. Only temp tables are written.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn activitys_depth_is_null_in_a_cycle_and_behind_one() {
+            let (p, db) = target();
+            let doc = fs::read_to_string(root().join("docs").join("schema-commands.md"))
+                .expect("docs/schema-commands.md");
+            let step = doc
+                .split_once("\n### 6.8 `activity`")
+                .and_then(|(_, rest)| rest.split_once("\n### 6.9 "))
+                .and_then(|(section, _)| section.split("```sql\n").nth(2))
+                .and_then(|block| block.split_once("\n```"))
+                .map(|(sql, _)| sql)
+                .expect("§6.8's step");
+            let mut sessions: Vec<(i64, Option<i64>)> = vec![
+                (30001, None),
+                (30002, Some(30001)),
+                (30003, Some(30002)),
+                (30011, Some(30012)),
+                (30012, Some(30011)),
+                (30013, Some(30011)),
+                (30014, Some(30013)),
+                (30101, None),
+            ];
+            sessions.extend((30102..=30201).map(|s| (s, Some(s - 1))));
+            let values: Vec<String> = sessions
+                .iter()
+                .map(|(s, b)| format!("({s}, {})", b.map_or("NULL".into(), |b| b.to_string())))
+                .collect();
+            // `#s` as the lookup makes it, every session busy so the row rule shows it.
+            let sql = format!(
+                "SELECT CAST(v.s AS smallint) AS session_id, v.b AS blocked_by, \
+                 N'suspended' AS status, N'SELECT' AS command, N'LCK_M_S' AS wait, \
+                 CAST(1 AS bigint) AS wait_ms, N'RID: 1:1:1:0' AS wait_resource, 0 AS cpu_ms, \
+                 CAST(0 AS bigint) AS reads, 1 AS elapsed_ms, CAST(NULL AS bigint) AS idle_ms, \
+                 1 AS open_tran, CAST(1 AS bigint) AS tran_ms, N'made up' AS login, N'h' AS host, \
+                 N'p' AS program, N'db' AS [database], CAST(NULL AS varbinary(64)) AS sql_handle, \
+                 0 AS stmt_start, -1 AS stmt_end, 1 AS busy, CAST(1 AS bit) AS is_user \
+                 INTO #s FROM (VALUES {}) AS v (s, b);\nGO\n{step}\n",
+                values.join(", ")
+            );
+            let dir = OwnScratch::new("activity_depth");
+            let input = dir.0.join("depth.sql");
+            fs::write(&input, sql).expect("the script");
+            let input = input.to_str().expect("a UTF-8 path");
+            let r = live(
+                &p,
+                &db,
+                &["--format", "json", "--max-rows", "0", "-i", input],
+            );
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            let document: Value = serde_json::from_str(r.stdout.trim_end())
+                .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+            let rows = result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            assert_eq!(rows.len(), sessions.len(), "{document}");
+            let of = |session: i64, column: &str| {
+                rows.iter()
+                    .find(|row| row["session"] == session)
+                    .unwrap_or_else(|| panic!("session {session} isn't shown: {document}"))[column]
+                    .clone()
+            };
+            for (session, depth) in [
+                (30001, json!(0)),
+                (30002, json!(1)),
+                (30003, json!(2)),
+                (30011, Value::Null),
+                (30012, Value::Null),
+                (30013, Value::Null),
+                (30014, Value::Null),
+                (30101, json!(0)),
+                (30200, json!(99)),
+                (30201, Value::Null),
+            ] {
+                assert_eq!(of(session, "depth"), depth, "session {session}'s depth");
+            }
+            for (session, blocking) in [(30001, 2), (30011, 3), (30012, 3), (30101, 100)] {
+                assert_eq!(of(session, "blocking"), blocking, "session {session}");
+            }
+        }
+
         // Decision 83 through sqlh mcp, on two pooled connections: a call stuck behind the
         // test's held write shows in another call's activity as `sqlh mcp`, blocked, with its
         // wrapper's open transaction; an idle pooled connection, rolled back by `put_back`,
