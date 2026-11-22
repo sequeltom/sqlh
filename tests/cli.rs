@@ -13822,9 +13822,11 @@ mod live {
                  VIEW ANY DEFINITION, securityadmin"
             );
         } else {
+            // VIEW ANY ERROR LOG is SQL Server 2022's: before that, the grant doesn't parse.
             let grant = format!("USE master; GRANT VIEW ANY ERROR LOG TO [{login}];");
             let r = reader.probe.server.write(&grant);
             assert_eq!(r.code, 1, "{grant}\n{}", r.stdout);
+            assert!(r.stdout.contains("-- error 102 "), "{}", r.stdout);
             assert_eq!(
                 shown(),
                 "VIEW SERVER STATE, VIEW ANY DEFINITION, securityadmin"
@@ -14346,7 +14348,7 @@ mod live {
         /// its transaction back) and then drops the table.
         struct Blocked {
             read: String,
-            _hold: Reaped,
+            hold: Reaped,
             _probe: Probe,
         }
 
@@ -14360,7 +14362,7 @@ mod live {
                 );
                 Blocked {
                     read,
-                    _hold: hold,
+                    hold,
                     _probe: probe,
                 }
             }
@@ -14368,6 +14370,19 @@ mod live {
             /// The test's own table, which only its own sessions' batches name.
             fn table(&self) -> &str {
                 &self._probe.name
+            }
+
+            /// Fails the test, saying why, if the held write has ended: `hold_a_write` holds it
+            /// for a minute, and what a test then sees is no longer its chain. Called after a
+            /// look at the server and before its assertions, so a holder still running here was
+            /// running during the look.
+            fn still_held(&mut self, before: &str) {
+                if let Some(status) = self.hold.child().try_wait().expect("the holder's status") {
+                    panic!(
+                        "the held write ended ({status}) before {before}: the test outran \
+                         hold_a_write's minute"
+                    );
+                }
             }
         }
 
@@ -14773,7 +14788,7 @@ mod live {
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn activity_shows_the_tests_own_chain_to_who_may_see_it() {
             let (p, db) = target();
-            let blocked = Blocked::on(&p, &db);
+            let mut blocked = Blocked::on(&p, &db);
             let table = blocked.table().to_owned();
             let _waiter = Reaped(Some(spawn_live(
                 &p,
@@ -14798,6 +14813,7 @@ mod live {
                 if let Some(chain) = own_chain(&activity_rows(&r), &table) {
                     break chain;
                 }
+                blocked.still_held("the test's chain showed");
                 assert!(
                     Instant::now() < give_up,
                     "the test's chain never showed:\n{}",
@@ -14871,11 +14887,33 @@ mod live {
             for grant in grants {
                 server(&format!("GRANT {grant} TO [{{login}}];"));
                 let r = reader.run(&args);
+                blocked.still_held(&format!("the read with {grant}"));
                 assert_eq!(r.code, 0, "{grant}: {}", r.stdout);
                 let (seen_head, seen_waiting) = own_chain(&activity_rows(&r), &table)
                     .unwrap_or_else(|| panic!("{grant} sees the chain:\n{}", r.stdout));
                 assert_eq!(seen_head["session"], head["session"], "{grant}");
                 assert_eq!(seen_waiting["session"], waiting["session"], "{grant}");
+                // The input buffer, the statement and the waiting task come from functions and
+                // DMVs with permission checks of their own (dm_exec_input_buffer,
+                // dm_exec_sql_text, dm_os_waiting_tasks): the grant alone shows them as the
+                // owner sees them. `own_chain` found the read by its statement, which names
+                // the table.
+                assert_eq!(
+                    seen_head["input_buffer"], head["input_buffer"],
+                    "{grant}: {seen_head:?}"
+                );
+                assert!(
+                    seen_waiting["wait"]
+                        .as_str()
+                        .is_some_and(|w| w.starts_with("LCK_M_")),
+                    "{grant}: {seen_waiting:?}"
+                );
+                assert!(
+                    seen_waiting["wait_resource"]
+                        .as_str()
+                        .is_some_and(|w| w.starts_with("RID: ")),
+                    "{grant}: {seen_waiting:?}"
+                );
                 server(&format!("REVOKE {grant} FROM [{{login}}];"));
                 refused(&format!("after revoking {grant}"));
             }
@@ -14975,12 +15013,12 @@ mod live {
         // wrapper's open transaction; an idle pooled connection, rolled back by `put_back`,
         // has neither a request nor a transaction, so it doesn't show. The call runs on a
         // connection of the pool like any other (decision 88), and its own session is left
-        // out.
+        // out. That the idle one was there to be left out is seen from another session.
         #[test]
         #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
         fn the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one() {
             let (p, db) = target();
-            let blocked = Blocked::on(&p, &db);
+            let mut blocked = Blocked::on(&p, &db);
             let mut command = Command::new(exe());
             command.args([
                 "mcp",
@@ -15000,8 +15038,15 @@ mod live {
                     .expect("an SPID")
             };
             let busy = spid_of(&mcp.call(1, "query", spid.clone()));
-            // Long enough for the calls below, short enough to give the connection back.
-            mcp.request(2, "query", &json!({"sql": blocked.read, "timeout": 8}));
+            // Longer than the looks below may take (`wait_until_blocked`'s 20 s at most, then
+            // a connect), within the server's -t 30; it is cancelled once it has been seen.
+            const BUSY_FOR: u64 = 28;
+            let sent = Instant::now();
+            mcp.request(
+                2,
+                "query",
+                &json!({"sql": blocked.read, "timeout": BUSY_FOR}),
+            );
             wait_until_blocked(&p, &db, busy);
             let idle = spid_of(&mcp.call(3, "query", spid));
             assert_ne!(idle, busy, "a second connection");
@@ -15009,6 +15054,13 @@ mod live {
             // On the idle connection: the busy one shows, this call's own doesn't.
             let document =
                 ok_document(&mcp.call(4, "activity", json!({"format": "json", "max_rows": 0})));
+            let looked = sent.elapsed();
+            assert!(
+                looked < Duration::from_secs(BUSY_FOR),
+                "the looks took {looked:?}, past the blocked call's {BUSY_FOR} s timeout, so it \
+                 may have ended before activity read the server"
+            );
+            blocked.still_held("activity read the server");
             let rows = result_sets(&document)
                 .into_iter()
                 .next()
@@ -15031,12 +15083,46 @@ mod live {
                 "the call's own session: {document}"
             );
 
-            let (error, text) = tool_text(&mcp.answer(2)["result"]);
-            assert!(error && text.contains("query timeout after 8 s"), "{text}");
-            // Both connections idle now; the call takes the one put back last, and the other,
-            // rolled back, isn't shown.
+            // The cancelled call's connection is put back, its wrapper rolled back, before its
+            // end is logged.
+            mcp.cancel(2);
+            let stderr = mcp.stderr_with("exit 6 (cancelled)", Duration::from_secs(10));
+            assert!(stderr.contains("exit 6 (cancelled)"), "{stderr}");
+            // Each pooled session as another session sees it: there, idle and with no
+            // transaction, before and after the next call. The reset on reuse gives the
+            // session that call takes a new login_time (seen on both servers), so the other,
+            // whose login_time doesn't change, sat idle in the pool while the call read the
+            // server.
+            let pooled = |spid: i64| {
+                let sql = format!(
+                    "SELECT s.program_name, CONVERT(nvarchar(30), s.login_time, 126) AS \
+                     login_time, s.open_transaction_count AS open_tran, (SELECT COUNT(*) FROM \
+                     sys.dm_exec_requests AS r WHERE r.session_id = s.session_id) AS requests \
+                     FROM sys.dm_exec_sessions AS s WHERE s.session_id = {spid}"
+                );
+                let r = live(&p, &db, &["--format", "json", "-Q", &sql]);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                let document: Value = serde_json::from_str(r.stdout.trim_end())
+                    .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+                let row = result_sets(&document)
+                    .into_iter()
+                    .next()
+                    .and_then(|rows| rows.into_iter().next())
+                    .unwrap_or_else(|| panic!("session {spid} is gone: the pool didn't keep it"));
+                assert_eq!(row["program_name"], "sqlh mcp", "{spid}: {row:?}");
+                assert_eq!(row["open_tran"], 0, "{spid}: {row:?}");
+                assert_eq!(row["requests"], 0, "{spid}: {row:?}");
+                row
+            };
+            let before = [pooled(busy), pooled(idle)];
             let (error, text) = tool_text(&mcp.call(5, "activity", json!({"max_rows": 0})));
             assert!(!error, "{text}");
+            let after = [pooled(busy), pooled(idle)];
+            assert_eq!(
+                before.iter().zip(&after).filter(|(b, a)| b == a).count(),
+                1,
+                "one connection the call reset, one idle: {before:?} then {after:?}"
+            );
             assert!(
                 text.starts_with(
                     "-- sessions\nsession\tblocked_by\tblocking\tdepth\tstatus\tcommand\twait\t\

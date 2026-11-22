@@ -1588,24 +1588,50 @@ mod tests {
         );
     }
 
-    // `Plan::Lookup`'s rule: the lookup holds a command's server work, its `#temp` tables live
+    // `Plan::Lookup`'s rule: the lookup holds a server command's work, its `#temp` tables live
     // on into the step, and a step that is one `SELECT` reading them is not a batch with later
-    // statements, so it gets no longer count and no `-- partial:` advice. A query after common
-    // table expressions (a recursive one with `UNION ALL` inside it) and a query hint are still
-    // one; a second `SELECT` is not, nor is the lookup itself (which is never asked).
+    // statements, so it gets no longer count and no `-- partial:` advice. Checked on the steps
+    // `activity` and `errorlog` build from their lookups' rows, as a run builds them (one after
+    // common table expressions, a recursive one with `UNION ALL` in it, and a query hint); a
+    // second `SELECT` is not one, nor is a lookup (which is never asked).
     #[test]
     fn a_step_of_one_select_after_a_lookup_has_no_later_statements() {
-        for step in [
-            "SELECT LogDate AS [time], ProcessInfo AS source, [Text] AS [text] FROM #log \
-             ORDER BY LogDate DESC, n;",
-            "WITH shown AS (SELECT x.* FROM #s x WHERE x.busy = 1), \
-             up AS (SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b \
-             UNION ALL SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u \
-             JOIN shown p ON p.session_id = u.above WHERE u.hops < 100) \
-             SELECT x.session_id AS session FROM shown x LEFT JOIN up u ON u.session_id = \
-             x.session_id ORDER BY x.session_id OPTION (MAXRECURSION 100);",
+        use crate::output::Advice;
+        use crate::schema::{Command, Errorlog};
+        let row = |values: &[i64]| -> Found {
+            vec![vec![values.iter().map(|&n| Value::Int(n)).collect()]]
+        };
+        let agent_search = Errorlog {
+            since: Some("1h".into()),
+            search: Some("x".into()),
+            agent: true,
+            archive: None,
+        };
+        for (command, found) in [
+            // can_view, major
+            (Command::Activity, row(&[1, 17])),
+            // can_read, archives, last, read, major
+            (
+                Command::Errorlog(Errorlog::default()),
+                row(&[1, 7, 6, 1, 17]),
+            ),
+            (Command::Errorlog(agent_search), row(&[1, 10, 9, 2, 13])),
         ] {
-            assert!(!guard::several_outputs(step), "{step}");
+            let Ok(Input::Command {
+                plan: Plan::Lookup { sql, then, .. },
+                ..
+            }) = command.input(Advice::Cli)
+            else {
+                panic!("{command:?} looks up first");
+            };
+            assert!(guard::several_outputs(&sql), "{command:?}'s lookup");
+            let steps = then(&found).unwrap_or_else(|f| panic!("{command:?}: {}", f.message));
+            assert_eq!(steps.len(), 1, "{command:?}");
+            assert!(
+                !guard::several_outputs(&steps[0].sql),
+                "{command:?}: {}",
+                steps[0].sql
+            );
         }
         for not_one in [
             "SELECT 1 AS a FROM #log; SELECT 2 AS b FROM #log;",
