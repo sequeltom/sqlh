@@ -1,27 +1,47 @@
 //! Schema commands (docs/schema-commands.md, plan-history.md Phase 4): `info`, `dbs`, `tables`,
-//! `describe`, `find` and `def`. Each is canned T-SQL run as sqlh's own SQL
+//! `describe`, `find`, `def` and `deps`. Each is canned T-SQL run as sqlh's own SQL
 //! (`QueryOrigin::Generated`): read-only, in the wrapper transaction, no guard and no `$(var)`.
 //! Arguments reach the SQL only as `N'...'` literals (`literal`), never as identifiers. Each
 //! result set fills a labeled section (`output::Section`).
 //!
-//! `describe` and `def` first look the name up (`run::Plan::Lookup`), on the same connection:
-//! the object's id and type decide what runs next.
+//! `describe`, `def` and `deps` first look the name up (`run::Plan::Lookup`), on the same
+//! connection: the object's id and type decide what runs next.
 
 use crate::db::Value;
 use crate::error::{Exit, Failure};
 use crate::output::{Advice, Limits, Section};
 use crate::run::{Found, Input, Plan, Report, Step};
 
-/// The `profiles test` and `info` query. Runs on SQL Server 2012+ and Azure SQL DB without extra
-/// permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a client-side
-/// fact, printed as a note with the connection line.
+/// The `profiles test` and `info` query: one row, so `profiles test` stays one unlabeled result.
+/// Any login can run it on SQL Server 2016 SP3 and later (CONNECTIONPROPERTY needs no VIEW SERVER
+/// STATE; HAS_PERMS_BY_NAME and IS_SRVROLEMEMBER ask about the caller); Azure SQL DB is
+/// unverified. Encryption is a client-side fact, printed as a note with the connection line.
+///
+/// `server_permissions` names what decides which server-wide reads work (schema-commands.md
+/// §6.1): `sysadmin` alone, since it holds everything; else the held ones of the list, `none`
+/// without any. The two 2022 permissions VIEW SERVER STATE implies are listed only without it.
+/// HAS_PERMS_BY_NAME gives NULL for a permission the server doesn't know (the 2022 ones on 2016),
+/// so every test is `= 1`. STUFF drops the first `, ` and gives NULL for an empty string.
 pub const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
     CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS version, \
     CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition, \
     DB_NAME() AS [database], SUSER_SNAME() AS login, USER_NAME() AS [user], \
     CAST(CONNECTIONPROPERTY('net_transport') AS nvarchar(40)) AS transport, \
     CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
-    SYSDATETIMEOFFSET() AS server_time;";
+    SYSDATETIMEOFFSET() AS server_time, \
+    CASE WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1 THEN N'sysadmin' ELSE ISNULL(STUFF(\
+    CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1 \
+    THEN N', VIEW SERVER STATE' \
+    ELSE CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE') = 1 \
+    THEN N', VIEW SERVER PERFORMANCE STATE' ELSE N'' END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER SECURITY STATE') = 1 \
+    THEN N', VIEW SERVER SECURITY STATE' ELSE N'' END END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 \
+    THEN N', VIEW ANY ERROR LOG' ELSE N'' END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY DEFINITION') = 1 \
+    THEN N', VIEW ANY DEFINITION' ELSE N'' END \
+    + CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 THEN N', securityadmin' ELSE N'' END, \
+    1, 2, N''), N'none') END AS server_permissions;";
 
 /// The longest name `describe` and `def` take: four delimited parts of 128 characters, each
 /// with every character a doubled `]`, and three dots (`parse_name` checks each part).
@@ -1247,6 +1267,52 @@ mod tests {
             let error = parse(args, text).unwrap().unwrap_err();
             assert!(error.contains(wanted), "{args:?}: {error}");
         }
+    }
+
+    // schema-commands.md §6.1: `server_permissions` is the last column of the one statement, so
+    // `profiles test` (which runs INFO_SQL as a plain query) still shows one result; each
+    // permission is asked for by its name, and only VIEW SERVER STATE's absence lists the two
+    // it implies.
+    #[test]
+    fn info_ends_with_the_server_permissions() {
+        assert!(!crate::guard::several_outputs(INFO_SQL), "{INFO_SQL}");
+        assert_eq!(INFO_SQL.matches("SELECT").count(), 1, "{INFO_SQL}");
+        assert!(
+            INFO_SQL.ends_with(" END AS server_permissions;"),
+            "{INFO_SQL}"
+        );
+        let column = &INFO_SQL[INFO_SQL
+            .find("SYSDATETIMEOFFSET() AS server_time, ")
+            .unwrap()..];
+        let mut from = 0;
+        for shown in [
+            "N'sysadmin'",
+            "N', VIEW SERVER STATE'",
+            "N', VIEW SERVER PERFORMANCE STATE'",
+            "N', VIEW SERVER SECURITY STATE'",
+            "N', VIEW ANY ERROR LOG'",
+            "N', VIEW ANY DEFINITION'",
+            "N', securityadmin'",
+            "1, 2, N''), N'none')",
+        ] {
+            let at = column[from..]
+                .find(shown)
+                .unwrap_or_else(|| panic!("{shown} after {from} in {column}"));
+            from += at + shown.len();
+        }
+        let implied = &column[column.find("N', VIEW SERVER STATE'").unwrap()..];
+        assert!(
+            implied.starts_with(
+                "N', VIEW SERVER STATE' ELSE CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, \
+                 N'VIEW SERVER PERFORMANCE STATE') = 1"
+            ),
+            "{implied}"
+        );
+        // A permission SQL Server 2016 doesn't know is NULL there, and NULL is never held.
+        let asked = column.matches("HAS_PERMS_BY_NAME(").count()
+            + column.matches("IS_SRVROLEMEMBER(").count();
+        assert_eq!(asked, 7, "{column}");
+        assert_eq!(column.matches(") = 1 THEN").count(), asked, "{column}");
     }
 
     // Arguments only ever reach the SQL as N'...' literals with doubled quotes.

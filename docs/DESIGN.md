@@ -737,7 +737,7 @@ The spec is [schema-commands.md](schema-commands.md): invocation, labeled output
 
 | Command | Output |
 |---|---|
-| `info` | Server, version, edition, database, login, user, transport, auth scheme, server time; the connection as a note. |
+| `info` | Server, version, edition, database, login, user, transport, auth scheme, server time, and `server_permissions`: `sysadmin`, else the held ones of VIEW SERVER STATE (or the 2022 PERFORMANCE and SECURITY STATE it implies), VIEW ANY ERROR LOG, VIEW ANY DEFINITION and securityadmin, else `none` (schema-commands.md §6.1); the connection as a note. |
 | `dbs` | Databases with state, access, compatibility level, recovery model, read-only and collation. |
 | `tables [pattern]` | Tables and views (name, type, estimated rows, modified) whose name or `schema.name` matches. |
 | `describe <object>` | Tables: `object` (rows, flags, description), `columns`, `indexes`, `foreign_keys`, `referenced_by`, `check_constraints`, `triggers`. Views: `object`, `columns`, `indexes`. Procedures and functions: `object`, `parameters` (and `columns` for table-valued functions). System objects too (`describe sys.dm_exec_requests`). |

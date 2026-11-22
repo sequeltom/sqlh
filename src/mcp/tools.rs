@@ -90,7 +90,9 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "info",
         description: "The server, its version and edition, the database, the login and \
-            user, the transport, the auth scheme and the server's time.",
+            user, the transport, the auth scheme, the server's time, and server_permissions: \
+            sysadmin, or the server-wide permissions this login holds that decide which server \
+            reads work (VIEW SERVER STATE, VIEW ANY ERROR LOG and the like), or none.",
         args: &[],
         rows: false,
     },

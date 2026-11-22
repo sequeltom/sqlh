@@ -32,7 +32,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 
 | Command | Answers |
 |---|---|
-| `sqlh info` | Server, version, edition, database, login, user, transport, auth scheme, server time; encryption as a note. Same as `profiles test`. |
+| `sqlh info` | Server, version, edition, database, login, user, transport, auth scheme, server time, server permissions (§6.1); encryption as a note. Same as `profiles test`. |
 | `sqlh dbs` | The databases this login can see, with state and access. |
 | `sqlh tables [pattern]` | Tables and views with estimated rows. |
 | `sqlh describe <object>` | Everything needed to query a table or view, or call a procedure or function. |
@@ -111,7 +111,9 @@ Alias types (`CREATE TYPE Phone FROM varchar(20)`) show their alias name; `descr
 
 ### 6.1 `info`
 
-The `profiles test` query already in `src/profile.rs`, moved to `src/schema.rs`, with encryption printed as a note.
+The `profiles test` query already in `src/profile.rs`, moved to `src/schema.rs` (`INFO_SQL`), with encryption printed as a note. It is one `SELECT` of one row, so `profiles test`, which runs it as a plain query, shows one result with a typed header, and the MCP `info` tool one row. Its columns: `server, version, edition, database, login, user, transport, auth_scheme, server_time, server_permissions`.
+
+**`server_permissions`** (Phase 6 slice 2, spec §1; `nvarchar(114)` on SQL Server 2025 and 2016) says which server-wide reads the login has, so an agent knows before it tries whether a server-wide read (a server DMV, the error log) will be refused: `sysadmin` alone for a sysadmin (it holds everything); otherwise the held ones of, in this order, `VIEW SERVER STATE`, `VIEW SERVER PERFORMANCE STATE` and `VIEW SERVER SECURITY STATE` (these two only when VIEW SERVER STATE isn't held, since it implies them), `VIEW ANY ERROR LOG`, `VIEW ANY DEFINITION`, `securityadmin`, separated by `, `; `none` when it holds none of them. Each is the server's own answer for the caller (`HAS_PERMS_BY_NAME(NULL, NULL, N'...')`, `IS_SRVROLEMEMBER(N'...')`), compared with `= 1`: a permission the server doesn't know (the SQL Server 2022 ones on 2016, where `HAS_PERMS_BY_NAME` gives NULL) is not held. `securityadmin` is listed because SQL Server's `sp_readerrorlog` admits it (Microsoft treats it as near-sysadmin; sqlh detects it, never advises it). `VIEW DEFINITION` on a database is not `VIEW ANY DEFINITION`. Any login can run it; Azure SQL DB is unverified for these functions. Tested: `schema::tests::info_ends_with_the_server_permissions` (the SQL's shape and order) and live `info_names_the_logins_server_permissions` on both servers (the owner's `sysadmin` in `info` and in `profiles test`'s typed header; a reader's `none`; VIEW SERVER STATE, VIEW ANY DEFINITION and securityadmin each alone, and on SQL Server 2022 and later VIEW ANY ERROR LOG, VIEW SERVER PERFORMANCE STATE and VIEW SERVER SECURITY STATE; several at once in the fixed order, VIEW SERVER STATE hiding the two it implies; on 2016 the VIEW ANY ERROR LOG grant refused as a syntax error).
 
 ### 6.2 `dbs`
 

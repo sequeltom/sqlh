@@ -13507,6 +13507,127 @@ mod live {
         }
     }
 
+    // schema-commands.md §6.1: `info`'s last column names the server-wide permissions that decide
+    // which server reads a login has, as the server answers for it: `sysadmin` for the owner's
+    // login (in `info` and in `profiles test`, whose header is typed), `none` for a reader with
+    // nothing on the server, then each permission granted alone and in the fixed order. VIEW
+    // SERVER STATE hides the two SQL Server 2022 permissions it implies; on 2016 those and VIEW
+    // ANY ERROR LOG don't exist (the grant doesn't parse), and are never listed.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn info_names_the_logins_server_permissions() {
+        let (p, db) = target();
+        // The row under the header that ends in `server_permissions`, and its last value.
+        let permissions = |r: &Run, header_end: &str| -> String {
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            let mut lines = r.stdout.lines();
+            let header = lines.find(|l| l.starts_with("server")).unwrap_or_default();
+            assert!(header.ends_with(header_end), "{}", r.stdout);
+            let row = lines.next().unwrap_or_default();
+            assert_eq!(
+                row.split('\t').count(),
+                header.split('\t').count(),
+                "{}",
+                r.stdout
+            );
+            row.rsplit('\t').next().unwrap_or_default().to_owned()
+        };
+        let named = "\tauth_scheme\tserver_time\tserver_permissions";
+        let typed = "\tserver_time:datetimeoffset(7)\tserver_permissions:nvarchar(114)";
+        assert_eq!(permissions(&live(&p, &db, &["info"]), named), "sysadmin");
+        let mut test = Command::new(exe());
+        test.stdin(Stdio::null()).args(["profiles", "test", &p]);
+        assert_eq!(permissions(&run(&mut test), typed), "sysadmin");
+
+        let reader = Reader::create(&p, &db);
+        let login = reader.login.clone();
+        let server = |sql: &str| {
+            let sql = sql.replace("{login}", &login);
+            let r = reader.probe.server.write(&format!("USE master; {sql}"));
+            assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        };
+        let shown = || permissions(&reader.run(&["info"]), named);
+        // VIEW DEFINITION on the scratch database isn't VIEW ANY DEFINITION on the server.
+        assert_eq!(shown(), "none");
+        let mut cases = vec![
+            ("GRANT VIEW SERVER STATE TO [{login}];", "VIEW SERVER STATE"),
+            (
+                "GRANT VIEW ANY DEFINITION TO [{login}];",
+                "VIEW ANY DEFINITION",
+            ),
+            (
+                "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}];",
+                "securityadmin",
+            ),
+        ];
+        let modern = server_major(&*reader.probe.server) >= 16;
+        if modern {
+            cases.extend([
+                (
+                    "GRANT VIEW ANY ERROR LOG TO [{login}];",
+                    "VIEW ANY ERROR LOG",
+                ),
+                (
+                    "GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];",
+                    "VIEW SERVER PERFORMANCE STATE",
+                ),
+                (
+                    "GRANT VIEW SERVER SECURITY STATE TO [{login}];",
+                    "VIEW SERVER SECURITY STATE",
+                ),
+            ]);
+        }
+        for (grant, expected) in cases {
+            server(grant);
+            assert_eq!(shown(), expected, "{grant}");
+            server(
+                &grant
+                    .replace("GRANT ", "REVOKE ")
+                    .replace(" TO [", " FROM [")
+                    .replace(" ADD MEMBER [", " DROP MEMBER ["),
+            );
+            assert_eq!(shown(), "none", "after undoing {grant}");
+        }
+
+        // Several at once, in the fixed order whatever the grants' order.
+        server(
+            "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}]; \
+             GRANT VIEW ANY DEFINITION TO [{login}]; GRANT VIEW SERVER STATE TO [{login}];",
+        );
+        assert_eq!(
+            shown(),
+            "VIEW SERVER STATE, VIEW ANY DEFINITION, securityadmin"
+        );
+        if modern {
+            server(
+                "GRANT VIEW ANY ERROR LOG TO [{login}]; \
+                 GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];",
+            );
+            assert_eq!(
+                shown(),
+                "VIEW SERVER STATE, VIEW ANY ERROR LOG, VIEW ANY DEFINITION, securityadmin",
+                "VIEW SERVER STATE hides what it implies"
+            );
+            server(
+                "REVOKE VIEW SERVER STATE FROM [{login}]; \
+                 GRANT VIEW SERVER SECURITY STATE TO [{login}];",
+            );
+            assert_eq!(
+                shown(),
+                "VIEW SERVER PERFORMANCE STATE, VIEW SERVER SECURITY STATE, VIEW ANY ERROR LOG, \
+                 VIEW ANY DEFINITION, securityadmin"
+            );
+        } else {
+            let grant = format!("USE master; GRANT VIEW ANY ERROR LOG TO [{login}];");
+            let r = reader.probe.server.write(&grant);
+            assert_eq!(r.code, 1, "{grant}\n{}", r.stdout);
+            assert_eq!(
+                shown(),
+                "VIEW SERVER STATE, VIEW ANY DEFINITION, securityadmin"
+            );
+        }
+    }
+
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
     // configuration listing run in the read-only wrapper, from a user database; a value for
     // sp_configure is refused before anything runs. Whether a login may run each one is the
