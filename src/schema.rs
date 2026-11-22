@@ -10,7 +10,7 @@
 use crate::db::Value;
 use crate::error::{Exit, Failure};
 use crate::output::{Advice, Limits, Section};
-use crate::run::{Found, Input, Plan, Report, Step};
+use crate::run::{Found, Input, LookupLabel, Plan, Report, Step};
 
 /// The `profiles test` and `info` query: one row, so `profiles test` stays one unlabeled result.
 /// Any login can run it on SQL Server 2016 SP3 and later (CONNECTIONPROPERTY needs no VIEW SERVER
@@ -191,9 +191,10 @@ fn steps(sql: String, sections: &[Section]) -> Plan {
     }])
 }
 
-/// A failure of a schema command's argument: exit 1, as the design gives name errors
+/// A command's own refusal of what it was given or found (a name that names nothing usable, a
+/// lookup's answer that leaves nothing to show): exit 1, as the design gives name errors
 /// (schema-commands.md §5), with the message as the run's error.
-fn name_error(message: String) -> Failure {
+fn command_error(message: String) -> Failure {
     Failure::new(Exit::SqlError, message)
 }
 
@@ -575,7 +576,7 @@ enum Shows {
 fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
     let name = parse_name(asked)?;
     if name.object.starts_with('#') {
-        return Err(name_error(format!(
+        return Err(command_error(format!(
             "{asked} is a temporary table, which only the session that made it can see; each \
              sqlh run is a new session"
         )));
@@ -631,6 +632,7 @@ fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
     Ok(Plan::Lookup {
         sql,
         then: Box::new(then),
+        label: LookupLabel::Name,
     })
 }
 
@@ -726,7 +728,7 @@ fn resolve(asked: &str, name: &Name, found: &Found, advice: Advice) -> Result<Ob
         return Err(unexpected());
     }
     match candidates.len() {
-        0 => Err(name_error(format!(
+        0 => Err(command_error(format!(
             "no object named {asked} in database {current}; try: {} {}",
             match advice {
                 Advice::Cli => "sqlh find",
@@ -747,7 +749,7 @@ fn resolve(asked: &str, name: &Name, found: &Found, advice: Advice) -> Result<Ob
             } else {
                 String::new()
             };
-            Err(name_error(format!(
+            Err(command_error(format!(
                 "ambiguous name {asked}: {}{more}; qualify it with the schema",
                 names.join(", ")
             )))
@@ -966,7 +968,7 @@ fn parameters_sql() -> String {
 fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
     let name = &object.qualified;
     if matches!(object.kind.as_str(), "U" | "S" | "IT") {
-        return Err(name_error(match advice {
+        return Err(command_error(match advice {
             Advice::Cli => format!(
                 "def shows views, procedures, functions and triggers; for a table use: sqlh \
                  describe {name}"
@@ -978,7 +980,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
         }));
     }
     if let Some(base) = &object.base {
-        return Err(name_error(match advice {
+        return Err(command_error(match advice {
             Advice::Cli => format!("{name} is a synonym for {base}; run: sqlh def {base}"),
             Advice::Mcp => {
                 format!("{name} is a synonym for {base}; call definition with object {base}")
@@ -986,7 +988,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
         }));
     }
     if !object.visible {
-        return Err(name_error(format!(
+        return Err(command_error(format!(
             "the definition of {name} ({}) is not visible: it is encrypted, it has none (a \
              constraint, a CLR or extended procedure), or the login lacks VIEW DEFINITION",
             object.type_desc
@@ -1192,7 +1194,7 @@ fn used_by_sql() -> String {
 /// `deps`: what the object uses and what uses it, or why that can't be shown.
 fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failure> {
     if !view_definition {
-        return Err(name_error(
+        return Err(command_error(
             "deps needs VIEW DEFINITION on the database, which the login lacks: without it SQL \
              Server shows no dependencies at all. describe shows foreign keys, and def an \
              object's source"

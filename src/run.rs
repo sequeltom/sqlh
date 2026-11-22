@@ -51,10 +51,45 @@ pub(crate) type Then = Box<dyn Fn(&Found) -> Result<Vec<Step>, Failure>>;
 /// A command's SQL: steps known in advance (`tables`), or a lookup whose rows decide them
 /// (`describe` resolves a name first, and what it describes depends on the object's type).
 /// The lookup runs on the run's own connection, inside its wrapper transaction, and shows
-/// nothing: its rows go to `then`, and an error in it ends the run as a failure.
+/// nothing: its rows go to `then`, and an error in it ends the run as a failure that `label`
+/// words.
+///
+/// A lookup may hold several statements and fill `#temp` tables, which its steps read: same
+/// session, same wrapper. A command that does its server work there and whose step is one
+/// `SELECT` keeps `guard::several_outputs` false for the step, so a capped result gets the
+/// brief count and no `-- partial:` advice, which a command's user can't act on (it has no
+/// `GO` to add; decision 45).
 pub(crate) enum Plan {
     Steps(Vec<Step>),
-    Lookup { sql: String, then: Then },
+    Lookup {
+        sql: String,
+        then: Then,
+        label: LookupLabel,
+    },
+}
+
+/// What a lookup does, as its failures say it: a timeout, the server's error, a reply past
+/// the `CAPTURE_` bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupLabel {
+    /// `describe`, `def` and `deps` resolving a name.
+    Name,
+}
+
+impl LookupLabel {
+    /// The lookup as something being done: `while looking the name up`, `... failed`.
+    fn doing(self) -> &'static str {
+        match self {
+            LookupLabel::Name => "looking the name up",
+        }
+    }
+
+    /// The lookup as a thing: `the name lookup returned more than it should`.
+    fn noun(self) -> &'static str {
+        match self {
+            LookupLabel::Name => "the name lookup",
+        }
+    }
 }
 
 /// Where the line about the connection goes: nowhere, to stderr as a diagnostic
@@ -538,7 +573,7 @@ pub(crate) struct Prepared {
     /// The sections each batch's result sets fill; empty for the user's SQL.
     sections: Vec<Vec<Section>>,
     /// A command's lookup (`Plan::Lookup`): its SQL, and what makes the batches of its rows.
-    lookup: Option<(String, Then)>,
+    lookup: Option<(String, Then, LookupLabel)>,
     policy: RunPolicy,
     report: Report,
     /// Where and why the guard refused the input, if it did.
@@ -626,7 +661,7 @@ pub(crate) fn prepare(
                 let (batches, sections) = step_batches(steps);
                 (batches, sections, None)
             }
-            Plan::Lookup { sql, then } => (Vec::new(), Vec::new(), Some((sql, then))),
+            Plan::Lookup { sql, then, label } => (Vec::new(), Vec::new(), Some((sql, then, label))),
         };
         return Ok(Prepared {
             sources,
@@ -1110,10 +1145,13 @@ pub(crate) async fn run_opened(
     let looked_up;
     let (batches, sections) = match &prepared.lookup {
         None => (batches, &prepared.sections),
-        Some((sql, then)) => {
+        Some((sql, then, label)) => {
             // Boxed: its state would otherwise add to the session's future, which a debug
             // build lays out big enough to overflow the main thread's stack.
-            let found = Box::pin(look_up(session, sql, timeout, settings, cancel, gate)).await?;
+            let found = Box::pin(look_up(
+                session, sql, *label, timeout, settings, cancel, gate,
+            ))
+            .await?;
             looked_up = step_batches(then(&found)?);
             (&looked_up.0, &looked_up.1)
         }
@@ -1262,6 +1300,7 @@ pub(crate) async fn run_opened(
 async fn look_up(
     session: &mut Session,
     sql: &str,
+    label: LookupLabel,
     timeout: u32,
     settings: &Settings,
     cancel: &Cancel,
@@ -1283,14 +1322,15 @@ async fn look_up(
             DbError::Timeout(_) => Failure::new(
                 Exit::Timeout,
                 format!(
-                    "query timeout after {timeout} s while looking the name up; {}",
+                    "query timeout after {timeout} s while {}; {}",
+                    label.doing(),
                     raise_timeout(settings, timeout)
                         .unwrap_or_else(|| format!("{timeout} s is the server's limit"))
                 ),
             ),
             e => db_failure(e, settings.limits.advice),
         })?;
-    capture.finish()
+    capture.finish(label)
 }
 
 /// The most a lookup keeps (R31): result sets, rows in each, and characters of a value. The
@@ -1313,17 +1353,20 @@ struct Capture {
 
 impl Capture {
     /// What the lookup returned, or why it can't be used.
-    fn finish(self) -> Result<Found, Failure> {
+    fn finish(self, label: LookupLabel) -> Result<Found, Failure> {
         if let Some((number, text)) = self.error {
             return Err(Failure::new(
                 Exit::SqlError,
-                format!("looking the name up failed: error {number}: {text}"),
+                format!("{} failed: error {number}: {text}", label.doing()),
             ));
         }
         if self.overflow {
             return Err(Failure::new(
                 Exit::Internal,
-                "the name lookup returned more than it should; nothing was shown",
+                format!(
+                    "{} returned more than it should; nothing was shown",
+                    label.noun()
+                ),
             ));
         }
         Ok(self.found)
@@ -1440,14 +1483,14 @@ mod tests {
         }
         assert!(!capture.wants_values());
         assert_eq!(capture.cell_limit(), CAPTURE_CHARS);
-        let found = capture.finish().unwrap();
+        let found = capture.finish(LookupLabel::Name).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].len(), CAPTURE_ROWS);
 
         let overflowed = |feed: &dyn Fn(&mut Capture)| {
             let mut capture = Capture::default();
             feed(&mut capture);
-            let failure = capture.finish().unwrap_err();
+            let failure = capture.finish(LookupLabel::Name).unwrap_err();
             assert_eq!(failure.exit, Exit::Internal);
             assert!(failure.message.contains("returned more than it should"));
         };
@@ -1485,12 +1528,54 @@ mod tests {
             text: "Invalid object name".into(),
         };
         capture.error(&error).unwrap();
-        let failure = capture.finish().unwrap_err();
+        let failure = capture.finish(LookupLabel::Name).unwrap_err();
         assert_eq!(failure.exit, Exit::SqlError);
         assert_eq!(
             failure.message,
             "looking the name up failed: error 208: Invalid object name"
         );
+    }
+
+    // A lookup's failures say what it was doing (`LookupLabel`); the name commands' words are
+    // the ones they always had (engine.rs's lookup timeout test has the timeout's).
+    #[test]
+    fn a_lookups_failures_name_what_it_was_doing() {
+        assert_eq!(LookupLabel::Name.doing(), "looking the name up");
+        let mut capture = Capture::default();
+        capture.columns(&[]).unwrap();
+        capture.counting_stopped(Stop::Budget);
+        assert_eq!(
+            capture.finish(LookupLabel::Name).unwrap_err().message,
+            "the name lookup returned more than it should; nothing was shown"
+        );
+    }
+
+    // `Plan::Lookup`'s rule: the lookup holds a command's server work, its `#temp` tables live
+    // on into the step, and a step that is one `SELECT` reading them is not a batch with later
+    // statements, so it gets no longer count and no `-- partial:` advice. A query after common
+    // table expressions (a recursive one with `UNION ALL` inside it) and a query hint are still
+    // one; a second `SELECT` is not, nor is the lookup itself (which is never asked).
+    #[test]
+    fn a_step_of_one_select_after_a_lookup_has_no_later_statements() {
+        for step in [
+            "SELECT LogDate AS [time], ProcessInfo AS source, [Text] AS [text] FROM #log \
+             ORDER BY LogDate DESC, n;",
+            "WITH shown AS (SELECT x.* FROM #s x WHERE x.busy = 1), \
+             up AS (SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b \
+             UNION ALL SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u \
+             JOIN shown p ON p.session_id = u.above WHERE u.hops < 100) \
+             SELECT x.session_id AS session FROM shown x LEFT JOIN up u ON u.session_id = \
+             x.session_id ORDER BY x.session_id OPTION (MAXRECURSION 100);",
+        ] {
+            assert!(!guard::several_outputs(step), "{step}");
+        }
+        for not_one in [
+            "SELECT 1 AS a FROM #log; SELECT 2 AS b FROM #log;",
+            "SET NOCOUNT ON; CREATE TABLE #log (n int); INSERT INTO #log EXEC sys.sp_readerrorlog \
+             0, 1; SELECT COUNT(*) AS n FROM #log;",
+        ] {
+            assert!(guard::several_outputs(not_one), "{not_one}");
+        }
     }
 
     // R14: a read-only run whose wrapper is gone after the last batch, with no batch having
