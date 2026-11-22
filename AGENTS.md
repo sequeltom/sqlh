@@ -28,7 +28,7 @@ Don't trade these away.
   - Tokio with the `current_thread` runtime.
   - `lexopt` for arguments. It's tiny, and sqlcmd-style flags (`-v a=1 b=2`, `-Ns`) are awkward in clap.
   - `windows-sys` for Win32 calls. It's already a transitive dependency.
-  - `serde_json` for `sqlh mcp`'s JSON-RPC: `Value` and `json!` only, no serde derive, to keep it small. It costs the exe 65 KB (spike 5.1); all of MCP is 310.0 KiB of decision 20's 350 KiB gate (amended 2026-10-18), with `serde_json` built for size (`opt-level = "z"`, `Cargo.toml`; PLAN.md §6).
+  - `serde_json` for `sqlh mcp`'s JSON-RPC: `Value` and `json!` only, no serde derive, to keep it small. It costs the exe 65 KB (spike 5.1); all of MCP is 298.0 KiB of decision 20's 350 KiB gate (amended 2026-10-18; measured at Phase 6 slice 2, mcp-mode.md §8), with `serde_json` built for size (`opt-level = "z"`, `Cargo.toml`; PLAN.md §6).
   - `zeroize` wipes sqlh's own copies of a password on drop (`src/secret.rs`, F14). It's already a transitive dependency.
   - `log`, only with `--features timing` (dev builds): it reads the driver's log events to time each connect step, and prints none of them (see Driver logging below).
 
@@ -95,7 +95,7 @@ tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
-                 size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
+                 size budget (3 MiB), in-box imports; -Live adds the live tests. CI runs it too
 .github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
                  read-only; sign, the only job with the Azure token, which never runs the exe;
                  verify, read-only; publish, the draft release; plan-history.md 3.6, R22);

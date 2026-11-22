@@ -19,7 +19,7 @@ For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not post vulnerabi
 You need Rust (via `rustup`; the toolchain is pinned in `rust-toolchain.toml`) and the Visual Studio C++ build tools with a Windows SDK.
 
 ```powershell
-cargo build --release      # target\release\sqlh.exe, under 3 MB
+cargo build --release      # target\release\sqlh.exe, about 3 MB
 cargo test                 # no server needed
 pwsh scripts/check.ps1     # everything a change must pass; CI runs the same script
 ```
@@ -51,7 +51,7 @@ Orders	2026-09-30T14:02:11.483
 
 `--format json` and `--format csv` are also available. `sqlh --help` is the full reference; it's written to be read by models.
 
-**Command line or MCP?** The command line is built for local and offline models, such as Qwen on a GPU with 24 GB or less: the agent reads `sqlh --help` once, when it needs it, and each call returns compact output. An MCP server's tool definitions go out with every request (3,000–4,000 tokens for sqlh's), which a frontier model barely notices and a small one can't spare. With a frontier model, such as Claude, use MCP: native tools, and connections kept open between calls.
+**Command line or MCP?** The command line is built for local and offline models, such as Qwen on a GPU with 24 GB or less: the agent reads `sqlh --help` once, when it needs it, and each call returns compact output. An MCP server's tool definitions go out with every request (about 16 KB of JSON for sqlh's eleven tools, roughly 4,000–5,000 tokens), which a frontier model barely notices and a small one can't spare. With a frontier model, such as Claude, use MCP: native tools, and connections kept open between calls.
 
 To give a harness such as Claude Code or OpenCode sqlh's commands as tools, add it as an MCP server (list each profile it may use):
 
@@ -204,7 +204,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. So does UTF-16 without a BOM, or UTF-32, instead of a refusal that blames the SQL. The extra byte order marks Windows PowerShell 5.1 puts in front of piped SQL when its output is captured are dropped, so the documented setup works there too. *(Phase 2.13; wide text since the 2026-11-02 review; repeated marks since the 0.1.0 release check)*
 - **The same answers as SSMS.** Session `SET` options match SSMS, so plans and filtered-index behavior match what the DBA sees. *(MVP)*
 - **Profiles say what they're for, and can be searched.** Each profile can carry a one-line description (`sqlh profiles add dev --description "prod reporting replica, read-only"`), and `sqlh profiles list --search reporting` lists the profiles whose name or description matches, so an agent picks the right server in one call. *(Phase 4.1–4.2)*
-- **One exe, no dependencies.** Under 3 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
+- **One exe, no dependencies.** About 3 MB, with no ODBC, .NET or redistributable to install first. *(MVP)*
 - **Flat memory for huge values.** A 1 GB `varchar(max)` shown with `--max-cell 500` costs sqlh about 10 MB instead of 2 GB, rows past `--max-rows` aren't kept, a runaway `$(var)` expansion is refused at 10 MB before it is built, and the read-only guard checks a 10 MB script in under 60 MB whatever it holds, so one careless query can't exhaust the machine the agent runs on. The old `text`, `ntext` and `image` types are the exception: those values are still read whole. *(Phase 2.7; the guard in 2.14)*
 
 ### Planned
