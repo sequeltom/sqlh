@@ -192,7 +192,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 **Fits how models already work**
 - **sqlcmd-compatible.** `-S -d -U -Q -i -v -t`, `GO`, `GO n` and `$(var)`; sqlcmd's formatting flags are accepted and ignored with one note, so a model's habits don't break. *(MVP)*
-- **`--help` written for models.** Example-first, about 60 lines, with the discovery tips agent trial 1 showed were missing (`describe` for a table's or view's columns). *(Phase 2.9; `describe` in Phase 4)*
+- **`--help` written for models.** Example-first, about 60 lines, with the discovery tips agent trial 1 showed were missing (`describe` for a table's or view's columns), and one for the error log, the first place a DBA looks. *(Phase 2.9; `describe` in Phase 4; `errorlog` and `activity` in Phase 6, slice 2)*
 - **It says which build it is.** `sqlh --version`, named on `--help`'s first line, and the MCP server's info give the release (`0.1.0`), a pre-release (`0.1.0-dev.5`) or `-local` for a build made anywhere else, so an agent or a person can tell which exe answered. Windows' file properties show the same version. *(versioning, 2026-10-31)*
 - **The schema in one call.** `describe dbo.Orders` gives a table's columns, keys, indexes, foreign keys both ways, checks and triggers (or a procedure's parameters, or a system view's columns); `def` prints a view's or procedure's source; `deps` lists what an object uses and what uses it, including foreign keys, synonyms and calls resolved only at run time; `tables`, `find` (names, or with `--text` module bodies), `dbs` and `info` answer the rest. Each is a few labeled sections with empty ones folded into one line, where hand-written catalog queries took agent trial 1 five calls and an invented view name. Any name it prints can be passed straight back (odd names come bracketed), and a cut definition says what was left out and which limit cut it. *(Phase 4)*
 - **It says what the login may read on the server.** `info` (and `profiles test`) ends with `server_permissions`: `sysadmin`, the server-wide permissions that decide whether server views and the error log can be read (`VIEW SERVER STATE`, `VIEW ANY ERROR LOG` and the like), or `none`. An agent knows before it tries whether a server-wide read will be refused, and which grant to ask a DBA for. *(Phase 6, slice 2)*
@@ -209,7 +209,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 ### Planned
 
-- **Commands sorted by what they risk**, so DBA workflows (showplans, community procedures such as `sp_WhoIsActive`) run where it is safe, from a categorization of commands, not a longer blocklist. *(Phase 6)*
+- **Commands sorted by what they risk**, so DBA workflows (showplans, community procedures such as `sp_Blitz`) run where it is safe, from a categorization of commands, not a longer blocklist. What `sp_WhoIsActive` is mostly run for is built: `activity`, above. *(Phase 6)*
 - **A skill and a plugin** that teach agents the investigation workflow and install it in one step. *(Phase 8)*
 
 ## Documents
@@ -221,7 +221,7 @@ This README is the human-facing overview. The other documents, [AGENTS.md](AGENT
 - [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
 - [docs/mcp-mode.md](docs/mcp-mode.md): `sqlh mcp`, its tools and how it keeps connections
 - [docs/schema-commands.md](docs/schema-commands.md): the schema commands (`describe`, `find`, `deps`, ...)
-- [docs/command-categories.md](docs/command-categories.md): the decided design for sorting commands by risk (Phase 6, not built yet)
+- [docs/command-categories.md](docs/command-categories.md): the decided design for sorting commands by risk (Phase 6, built in slices: two so far)
 - [CONTRIBUTING.md](CONTRIBUTING.md): contribution, build and test guidance
 
 ## License

@@ -8,6 +8,7 @@ EXAMPLES  (same in cmd.exe, PowerShell and Git Bash)
   sqlh -S myserver -d AppDb -Q "SELECT TOP 5 * FROM dbo.Orders WHERE Status = 'Open' ORDER BY Id DESC"
   sqlh -S myserver,1433 -U reader -d AppDb -i report.sql   (password: env SQLCMDPASSWORD)
   sqlh --profile dev describe sys.dm_exec_requests   (its columns and types: see SCHEMA)
+  sqlh --profile dev errorlog --since 2h --search "Login failed"   (the error log, newest first: see SERVER)
   sqlh --profile dev -i "my queries\report.sql" -o report.txt
   SQL with " $ % ` or several lines goes in a file (-i). Quote -S "host\inst" and paths with spaces.
   Paths: C:/dir/f.sql works everywhere; C:\dir\f.sql needs quotes in Git Bash; /c/dir/f.sql is Git Bash only.
@@ -46,9 +47,8 @@ SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs 
   describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
 SERVER  activity: sessions running, blocked or blocking | errorlog [--since 2h|DATE] [--search T] [--agent] [--archive N]: newest first, server-local times
 
-PROFILES  sqlh profiles ... saves and manages them; --profile NAME uses one. Passwords stay in Credential Manager
-  sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
-  sqlh profiles list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks)
+PROFILES  sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
+  sqlh profiles list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks; passwords stay in Credential Manager)
   sqlh mcp --profile NAME [--profile NAME ...]   MCP server on stdio for harnesses: read-only tools
 
 FORMAT
