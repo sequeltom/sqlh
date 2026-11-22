@@ -44,7 +44,7 @@ OUTPUT
 
 SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
   describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
-SERVER  errorlog [--since 2h|DATE] [--search T] [--agent] [--archive N]   (newest first; server-local times)
+SERVER  activity: sessions running, blocked or blocking | errorlog [--since 2h|DATE] [--search T] [--agent] [--archive N]: newest first, server-local times
 
 PROFILES  sqlh profiles ... saves and manages them; --profile NAME uses one. Passwords stay in Credential Manager
   sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]

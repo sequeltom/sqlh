@@ -201,7 +201,8 @@ impl Engine {
         counts: &mut Accounting,
         started: Instant,
     ) -> Result<Stats, Failure> {
-        let _permit = wait_for_connection(pool, timeout, cancel, started).await?;
+        let activity = prepared.lookup_label() == Some(run::LookupLabel::Activity);
+        let _permit = wait_for_connection(pool, timeout, cancel, started, activity).await?;
         let mut retried = false;
         // The connect time a call reports runs from here to the open that worked: a reused
         // connection that opened at once reports 0, and one that took a probe, a second
@@ -393,12 +394,14 @@ impl Engine {
 }
 
 /// Waits for one of `pool`'s connections to be free: at most the call's timeout, and a cancel
-/// ends the wait.
+/// ends the wait. `activity` gets no connection of its own (decision 88), so its timeout also
+/// names the CLI's, which opens one: the connections are busy just when it is wanted.
 async fn wait_for_connection<'p>(
     pool: &'p Pool,
     timeout: u32,
     cancel: &Cancel,
     started: Instant,
+    activity: bool,
 ) -> Result<tokio::sync::SemaphorePermit<'p>, Failure> {
     let limit = (timeout > 0).then(|| Duration::from_secs(u64::from(timeout)));
     let deadline = async {
@@ -418,12 +421,17 @@ async fn wait_for_connection<'p>(
         () = deadline => Err(Failure::new(
             Exit::Timeout,
             format!(
-                "query timeout after {timeout} s waiting for a free connection ({}); {}",
+                "query timeout after {timeout} s waiting for a free connection ({}); {}{}",
                 match pool.max {
                     1 => "the profile's only connection was busy".to_owned(),
                     max => format!("all {max} of the profile's connections were busy"),
                 },
-                more_connections(&pool.settings, timeout)
+                more_connections(&pool.settings, timeout),
+                if activity && pool.settings.limits.advice == Advice::Mcp {
+                    "; sqlh activity on the command line opens a connection of its own"
+                } else {
+                    ""
+                }
             ),
         )),
     }
@@ -2139,6 +2147,217 @@ mod tests {
                 )),
                 "{}",
                 called.text
+            );
+        }
+    }
+
+    /// `activity`'s request, for a call (`Advice::Mcp`).
+    fn activity_request() -> Request {
+        Request {
+            input: crate::schema::Command::Activity
+                .input(Advice::Mcp)
+                .expect("a lookup"),
+            ..request("")
+        }
+    }
+
+    /// `activity`'s lookup row, as `schema::ACTIVITY_SQL` ends: can_view, major.
+    fn activity_found(can: Option<i32>, major: i32) -> Vec<u8> {
+        use fake_server::{Cell, Wire};
+        fake_server::result(
+            &[("can_view", Wire::Int), ("major", Wire::Int)],
+            &[&[can.map_or(Cell::Null, Cell::Int), Cell::Int(major)]],
+        )
+    }
+
+    // schema-commands.md §6.8, the shapes through the real run path: the lookup shows nothing,
+    // its row decides; the step is the `sessions` section, names-only header, NULL as NULL, a
+    // batch's line break escaped; `-- no rows: sessions` when nothing is worth showing; without
+    // the permission `-- error:` in the server version's words and exit 1. The fake answers
+    // the lookup (request 2) and the step (3).
+    #[test]
+    fn activity_shows_its_sessions_or_says_which_permission_it_lacks() {
+        use fake_server::{Cell, Wire};
+        const COLUMNS: [(&str, Wire); 21] = [
+            ("session", Wire::Int),
+            ("blocked_by", Wire::Int),
+            ("blocking", Wire::Int),
+            ("depth", Wire::Int),
+            ("status", Wire::Text),
+            ("command", Wire::Text),
+            ("wait", Wire::Text),
+            ("wait_ms", Wire::Int),
+            ("wait_resource", Wire::Text),
+            ("cpu_ms", Wire::Int),
+            ("reads", Wire::Int),
+            ("elapsed_ms", Wire::Int),
+            ("idle_ms", Wire::Int),
+            ("open_tran", Wire::Int),
+            ("tran_ms", Wire::Int),
+            ("login", Wire::Text),
+            ("host", Wire::Text),
+            ("program", Wire::Text),
+            ("database", Wire::Text),
+            ("statement", Wire::Text),
+            ("input_buffer", Wire::Text),
+        ];
+        let head: [Cell; 21] = [
+            Cell::Int(54),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(0),
+            Cell::Text("suspended"),
+            Cell::Text("WAITFOR"),
+            Cell::Text("WAITFOR"),
+            Cell::Int(1200),
+            Cell::Null,
+            Cell::Int(0),
+            Cell::Int(2),
+            Cell::Int(1250),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(1300),
+            Cell::Text("app"),
+            Cell::Text("WS1"),
+            Cell::Text("sqlh (writes)"),
+            Cell::Text("sqlh_test"),
+            Cell::Text("WAITFOR DELAY '00:01:00'"),
+            Cell::Text("BEGIN TRAN; INSERT dbo.t VALUES (1);\r\nWAITFOR DELAY '00:01:00'"),
+        ];
+        let blocked: [Cell; 21] = [
+            Cell::Int(74),
+            Cell::Int(54),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Text("suspended"),
+            Cell::Text("SELECT"),
+            Cell::Text("LCK_M_S"),
+            Cell::Int(900),
+            Cell::Text("RID: 7:1:584:0"),
+            Cell::Int(0),
+            Cell::Int(0),
+            Cell::Int(950),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(960),
+            Cell::Text("reader"),
+            Cell::Text("WS1"),
+            Cell::Text("sqlh"),
+            Cell::Text("sqlh_test"),
+            Cell::Text("SELECT COUNT(*) AS n FROM dbo.t"),
+            Cell::Null,
+        ];
+        let shown = |found: Vec<u8>, step: Vec<u8>| {
+            let conns = vec![Conn::new().replying(2, found).replying(3, step)];
+            mcp_text(conns, 30, activity_request(), QueryOrigin::Generated, 30)
+        };
+        let ok = "-- ok: 1 batch, N ms; ?/master, connect N ms\n";
+        let (exit, text) = shown(
+            activity_found(Some(1), 17),
+            fake_server::result(&COLUMNS, &[&head, &blocked]),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- sessions\nsession\tblocked_by\tblocking\tdepth\tstatus\tcommand\twait\t\
+                 wait_ms\twait_resource\tcpu_ms\treads\telapsed_ms\tidle_ms\topen_tran\t\
+                 tran_ms\tlogin\thost\tprogram\tdatabase\tstatement\tinput_buffer\n\
+                 54\tNULL\t1\t0\tsuspended\tWAITFOR\tWAITFOR\t1200\tNULL\t0\t2\t1250\tNULL\t1\t\
+                 1300\tapp\tWS1\tsqlh (writes)\tsqlh_test\tWAITFOR DELAY '00:01:00'\t\
+                 BEGIN TRAN; INSERT dbo.t VALUES (1);\\r\\nWAITFOR DELAY '00:01:00'\n\
+                 74\t54\tNULL\t1\tsuspended\tSELECT\tLCK_M_S\t900\tRID: 7:1:584:0\t0\t0\t950\t\
+                 NULL\t1\t960\treader\tWS1\tsqlh\tsqlh_test\tSELECT COUNT(*) AS n FROM dbo.t\t\
+                 NULL\n{ok}"
+            )
+        );
+        let (exit, text) = shown(
+            activity_found(Some(1), 13),
+            fake_server::result(&COLUMNS, &[]),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(text, format!("-- no rows: sessions\n{ok}"));
+
+        let failed = "-- failed (exit 1): SQL error, N ms; ?/master, connect N ms\n";
+        for (found, error) in [
+            (
+                activity_found(Some(0), 17),
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it",
+            ),
+            (
+                activity_found(None, 13),
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL \
+                 Server shows a login only its own session. A DBA can grant it",
+            ),
+        ] {
+            let (exit, text) = shown(found, fake_server::result(&COLUMNS, &[]));
+            assert_eq!(exit, Exit::SqlError, "{text}");
+            assert_eq!(text, format!("-- error: {error}\n{failed}"));
+        }
+    }
+
+    // A timeout while reading the sessions says so, and offers only the timeout: a command's
+    // user has no query to narrow. While every connection is busy, the wait's advice also
+    // names the CLI's `sqlh activity`, which opens its own (decision 88); another call's
+    // doesn't.
+    #[test]
+    fn an_activity_timeout_says_what_it_was_reading_and_what_helps() {
+        let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+        let (exit, text) = mcp_text(hangs, 30, activity_request(), QueryOrigin::Generated, 1);
+        assert_eq!(exit, Exit::Timeout, "{text}");
+        assert_eq!(
+            text,
+            "-- error: query timeout after 1 s while reading the server's sessions; raise \
+             timeout (the server allows up to 30 s)\n\
+             -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+        );
+
+        for (activity, after) in [
+            (
+                true,
+                "; raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger \
+                 --pool; sqlh activity on the command line opens a connection of its own",
+            ),
+            (
+                false,
+                "; raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger \
+                 --pool",
+            ),
+        ] {
+            let busy = Conn::new().at(2, Turn::Delay(Duration::from_millis(1500)));
+            let fake = serve_pool(vec![busy]);
+            let engine = Rc::new(serving_mcp(&fake, 1, 30));
+            let waiting = block_on_local(async {
+                let holder =
+                    tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30));
+                let engine = Rc::clone(&engine);
+                let waiting = tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let request = if activity {
+                        activity_request()
+                    } else {
+                        request("SELECT 1")
+                    };
+                    let origin = if activity {
+                        QueryOrigin::Generated
+                    } else {
+                        QueryOrigin::User
+                    };
+                    call_as(&engine, request, origin, 1, &Cancel::new()).await
+                });
+                let waiting = waiting.await.expect("waiting");
+                assert_ok(&holder.await.expect("holder"));
+                waiting
+            });
+            assert_eq!(waiting.exit, Exit::Timeout, "{}", waiting.text);
+            assert_eq!(
+                untimed(&waiting.text),
+                format!(
+                    "-- error: query timeout after 1 s waiting for a free connection (the \
+                     profile's only connection was busy){after}\n\
+                     -- failed (exit 4): timeout, N ms\n"
+                ),
             );
         }
     }

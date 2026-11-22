@@ -4046,6 +4046,44 @@ fn errorlog_refuses_its_bad_options_before_connecting() {
     }
 }
 
+// schema-commands.md §6.8: activity takes nothing, and what it is given is refused before
+// anything connects, exit 3; the server named is a closed port, which would be exit 2.
+#[test]
+fn activity_refuses_what_it_is_given_before_connecting() {
+    let run = |args: &[&str]| run(sqlh().args(DEAD).args(args));
+    for (args, wanted) in [
+        (&["activity", "--plans"][..], "invalid option '--plans'"),
+        (
+            &["activity", "54"][..],
+            "activity takes no arguments, not \"54\"",
+        ),
+        (
+            &["activity", "--since", "1h"][..],
+            "--since only applies to sqlh errorlog",
+        ),
+        (
+            &["activity", "--text"][..],
+            "--text only applies to sqlh find",
+        ),
+        (
+            &["--check", "activity"][..],
+            "--check compiles your SQL; a schema command runs its own",
+        ),
+        (
+            &["-Q", "SELECT 1", "activity"][..],
+            "a schema command runs its own SQL; give it without -Q or -i",
+        ),
+    ] {
+        let r = run(args);
+        assert_eq!(r.code, 3, "{args:?}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains(&format!("-- error: {wanted}")),
+            "{args:?}: {}",
+            r.stdout
+        );
+    }
+}
+
 // AGENTS.md: models read --help, so it stays short. plan-history.md 2.13 holds it at 62 lines.
 #[test]
 fn help_stays_within_its_line_budget() {
@@ -5730,6 +5768,38 @@ mod mcp {
         }
     }
 
+    // schema-commands.md §6.8 through sqlh mcp: the activity tool takes no database and no
+    // argument of its own; either is a tool error with exit 3 before anything connects (the
+    // profile is a closed port, which would be exit 2).
+    #[test]
+    fn the_activity_tool_refuses_an_argument_before_connecting() {
+        let config = profiles("mcp_activity");
+        let lines: Vec<String> = [r#"{"database":"master"}"#, r#"{"session":54}"#]
+            .iter()
+            .enumerate()
+            .map(|(n, arguments)| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{{META},"name":"activity","arguments":{arguments}}}}}"#,
+                    n + 1
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (n, wanted) in ["database", "session"].into_iter().enumerate() {
+            let call = &by_id(&messages, n as i64 + 1)["result"];
+            assert_eq!(call["isError"], true, "{call}");
+            let text = call["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(&format!(
+                    "-- error: invalid arguments for activity: unknown argument {wanted} \
+                     (activity takes profile, max_rows, max_cell, timeout, format)\n"
+                )) && text.contains("-- failed (exit 3): usage error, "),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn a_modern_session_discovers_lists_and_calls() {
         let config = profiles("mcp_modern");
@@ -5775,7 +5845,7 @@ mod mcp {
         );
 
         let tools = by_id(&messages, 2)["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         assert_eq!(
             tools[0]["inputSchema"]["properties"]["profile"]["enum"],
             serde_json::json!(["win", "other"])
@@ -5867,7 +5937,7 @@ mod mcp {
         assert_eq!(by_id(&messages, 0)["result"], serde_json::json!({}));
         assert_eq!(by_id(&messages, 2)["result"], serde_json::json!({}));
         let list = &by_id(&messages, 3)["result"];
-        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 11);
         assert!(list.get("ttlMs").is_none() && list.get("resultType").is_none());
         // The only profile is the default; the run fails to connect, as a tool error.
         let call = &by_id(&messages, 4)["result"];
@@ -6372,7 +6442,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            10
+            11
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
     }
@@ -7645,7 +7715,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            10
+            11
         );
         invalid(23, "Invalid params: _meta must be an object");
         invalid(
@@ -7688,7 +7758,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            10
+            11
         );
         // Only 14 was acknowledged, and only 14 is answered and torn down at the end.
         let acks: Vec<_> = messages
@@ -14299,6 +14369,11 @@ mod live {
                     _probe: probe,
                 }
             }
+
+            /// The test's own table, which only its own sessions' batches name.
+            fn table(&self) -> &str {
+                &self._probe.name
+            }
         }
 
         /// `sqlh mcp` driven as a harness drives it: a request at a time, each answer read as
@@ -14658,6 +14733,242 @@ mod live {
                 ),
                 "{text}"
             );
+            assert_eq!(mcp.finish().0, 0);
+        }
+
+        /// `activity`'s sessions, as a run in `--format json` gives them (none on any failure).
+        fn activity_rows(r: &Run) -> Vec<Row> {
+            if r.code != 0 {
+                return Vec::new();
+            }
+            let document: Value = serde_json::from_str(r.stdout.trim_end())
+                .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+            assert_eq!(events(&document, "result")[0]["label"], "sessions");
+            result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        }
+
+        /// The test's own chain in `rows`, if both its sessions are there: the read waiting on
+        /// `table` and the session it waits on. Other live tests' chains show too, so only
+        /// these two are looked at.
+        fn own_chain(rows: &[Row], table: &str) -> Option<(Row, Row)> {
+            let names = |row: &Row, column: &str| {
+                row[column]
+                    .as_str()
+                    .is_some_and(|text| text.contains(table))
+            };
+            let blocked = rows
+                .iter()
+                .find(|row| names(row, "statement") && !row["blocked_by"].is_null())?;
+            let head = rows
+                .iter()
+                .find(|row| row["session"] == blocked["blocked_by"])?;
+            Some((head.clone(), blocked.clone()))
+        }
+
+        // schema-commands.md §6.8 and decision 86, on a chain of the test's own: a write held
+        // open (`Blocked`'s holder) and a read waiting on it. The owner sees the head with
+        // depth 0, what it blocks counted and its batch in input_buffer, and the read with
+        // blocked_by the head, a lock wait on the heap's row, depth 1 and its statement. A
+        // reader with no server permission is refused in its version's words; VIEW SERVER STATE
+        // and, on SQL Server 2022 and later, VIEW SERVER PERFORMANCE STATE alone each see it.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn activity_shows_the_tests_own_chain_to_who_may_see_it() {
+            let (p, db) = target();
+            let blocked = Blocked::on(&p, &db);
+            let table = blocked.table().to_owned();
+            let _waiter = Reaped(Some(spawn_live(
+                &p,
+                &db,
+                &["--lock-timeout", "0", "-t", "90", "-Q", &blocked.read],
+            )));
+            let args = [
+                "activity",
+                "--format",
+                "json",
+                "--max-rows",
+                "0",
+                "--max-cell",
+                "0",
+            ];
+            // Each look is a login, so the first comes after the read has had time to start.
+            let give_up = Instant::now() + Duration::from_secs(20);
+            let (head, waiting) = loop {
+                std::thread::sleep(Duration::from_millis(300));
+                let r = live(&p, &db, &args);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                if let Some(chain) = own_chain(&activity_rows(&r), &table) {
+                    break chain;
+                }
+                assert!(
+                    Instant::now() < give_up,
+                    "the test's chain never showed:\n{}",
+                    r.stdout
+                );
+            };
+            assert_eq!(head["depth"], 0, "{head:?}");
+            assert!(head["blocking"].as_i64() >= Some(1), "{head:?}");
+            assert!(head["blocked_by"].is_null(), "{head:?}");
+            assert_eq!(head["program"], "sqlh (writes)", "{head:?}");
+            assert!(
+                head["input_buffer"]
+                    .as_str()
+                    .is_some_and(|batch| batch.contains(&format!("INSERT {table} VALUES (1)"))),
+                "{head:?}"
+            );
+            assert_eq!(waiting["depth"], 1, "{waiting:?}");
+            assert!(waiting["blocking"].is_null(), "{waiting:?}");
+            assert_eq!(waiting["status"], "suspended", "{waiting:?}");
+            assert_eq!(waiting["command"], "SELECT", "{waiting:?}");
+            assert!(
+                waiting["wait"]
+                    .as_str()
+                    .is_some_and(|w| w.starts_with("LCK_M_")),
+                "{waiting:?}"
+            );
+            assert!(
+                waiting["wait_resource"]
+                    .as_str()
+                    .is_some_and(|w| w.starts_with("RID: ")),
+                "the compact form: {waiting:?}"
+            );
+            // A read-only sqlh run holds its rolled-back wrapper.
+            assert_eq!(waiting["open_tran"], 1, "{waiting:?}");
+            assert_eq!(waiting["program"], "sqlh", "{waiting:?}");
+            assert!(waiting["input_buffer"].is_null(), "{waiting:?}");
+            for column in ["wait_ms", "elapsed_ms", "tran_ms"] {
+                assert!(waiting[column].as_i64() >= Some(0), "{column}: {waiting:?}");
+            }
+
+            let reader = Reader::create(&p, &db);
+            let login = reader.login.clone();
+            let server = |sql: &str| {
+                let sql = sql.replace("{login}", &login);
+                let r = reader.probe.server.write(&format!("USE master; {sql}"));
+                assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+            };
+            let modern = server_major(&*reader.probe.server) >= 16;
+            let refused = |why: &str| {
+                let r = reader.run(&["activity"]);
+                assert_eq!(r.code, 1, "{why}: {}", r.stdout);
+                let lacks = if modern {
+                    "VIEW SERVER PERFORMANCE STATE"
+                } else {
+                    "VIEW SERVER STATE"
+                };
+                assert!(
+                    r.stdout.starts_with(&format!(
+                        "-- error: activity needs {lacks}, which this login lacks: without it \
+                         SQL Server shows a login only its own session. A DBA can grant it\n"
+                    )),
+                    "{why}: {}",
+                    r.stdout
+                );
+            };
+            refused("no permission");
+            let mut grants = vec!["VIEW SERVER STATE"];
+            if modern {
+                grants.push("VIEW SERVER PERFORMANCE STATE");
+            }
+            for grant in grants {
+                server(&format!("GRANT {grant} TO [{{login}}];"));
+                let r = reader.run(&args);
+                assert_eq!(r.code, 0, "{grant}: {}", r.stdout);
+                let (seen_head, seen_waiting) = own_chain(&activity_rows(&r), &table)
+                    .unwrap_or_else(|| panic!("{grant} sees the chain:\n{}", r.stdout));
+                assert_eq!(seen_head["session"], head["session"], "{grant}");
+                assert_eq!(seen_waiting["session"], waiting["session"], "{grant}");
+                server(&format!("REVOKE {grant} FROM [{{login}}];"));
+                refused(&format!("after revoking {grant}"));
+            }
+        }
+
+        // Decision 83 through sqlh mcp, on two pooled connections: a call stuck behind the
+        // test's held write shows in another call's activity as `sqlh mcp`, blocked, with its
+        // wrapper's open transaction; an idle pooled connection, rolled back by `put_back`,
+        // has neither a request nor a transaction, so it doesn't show. The call runs on a
+        // connection of the pool like any other (decision 88), and its own session is left
+        // out.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one() {
+            let (p, db) = target();
+            let blocked = Blocked::on(&p, &db);
+            let mut command = Command::new(exe());
+            command.args([
+                "mcp",
+                "--profile",
+                &p,
+                "--pool",
+                "2",
+                "--verbose",
+                "-t",
+                "30",
+            ]);
+            let mut mcp = Mcp::start(&mut command);
+            let spid = json!({"sql": "SELECT @@SPID AS spid", "format": "json"});
+            let spid_of = |result: &Value| {
+                first_row(&ok_document(result))["spid"]
+                    .as_i64()
+                    .expect("an SPID")
+            };
+            let busy = spid_of(&mcp.call(1, "query", spid.clone()));
+            // Long enough for the calls below, short enough to give the connection back.
+            mcp.request(2, "query", &json!({"sql": blocked.read, "timeout": 8}));
+            wait_until_blocked(&p, &db, busy);
+            let idle = spid_of(&mcp.call(3, "query", spid));
+            assert_ne!(idle, busy, "a second connection");
+
+            // On the idle connection: the busy one shows, this call's own doesn't.
+            let document =
+                ok_document(&mcp.call(4, "activity", json!({"format": "json", "max_rows": 0})));
+            let rows = result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let shown = rows
+                .iter()
+                .find(|row| row["session"] == busy)
+                .unwrap_or_else(|| panic!("session {busy} isn't shown: {document}"));
+            assert_eq!(shown["program"], "sqlh mcp", "{shown:?}");
+            assert!(!shown["blocked_by"].is_null(), "{shown:?}");
+            assert_eq!(shown["open_tran"], 1, "{shown:?}");
+            assert!(
+                shown["statement"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(blocked.table())),
+                "{shown:?}"
+            );
+            assert!(
+                rows.iter().all(|row| row["session"] != idle),
+                "the call's own session: {document}"
+            );
+
+            let (error, text) = tool_text(&mcp.answer(2)["result"]);
+            assert!(error && text.contains("query timeout after 8 s"), "{text}");
+            // Both connections idle now; the call takes the one put back last, and the other,
+            // rolled back, isn't shown.
+            let (error, text) = tool_text(&mcp.call(5, "activity", json!({"max_rows": 0})));
+            assert!(!error, "{text}");
+            assert!(
+                text.starts_with(
+                    "-- sessions\nsession\tblocked_by\tblocking\tdepth\tstatus\tcommand\twait\t\
+                     wait_ms\twait_resource\tcpu_ms\treads\telapsed_ms\tidle_ms\topen_tran\t\
+                     tran_ms\tlogin\thost\tprogram\tdatabase\tstatement\tinput_buffer\n"
+                ) || text.starts_with("-- no rows: sessions\n"),
+                "{text}"
+            );
+            for spid in [busy, idle] {
+                assert!(
+                    !text
+                        .lines()
+                        .any(|line| line.split('\t').next() == Some(&spid.to_string())),
+                    "session {spid} is shown:\n{text}"
+                );
+            }
             assert_eq!(mcp.finish().0, 0);
         }
 

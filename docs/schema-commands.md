@@ -1,6 +1,6 @@
 # Schema commands: design and plan
 
-Status: built 2026-10-13 (`src/schema.rs`; plan-history.md Phase 4), `deps` on 2026-10-14 (§6.7), and the server command `errorlog` on 2026-11-21 (§6.9; Phase 6 slice 2, decisions 84 and 89). This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
+Status: built 2026-10-13 (`src/schema.rs`; plan-history.md Phase 4), `deps` on 2026-10-14 (§6.7), the server command `errorlog` on 2026-11-21 (§6.9; Phase 6 slice 2, decisions 84 and 89), and the server command `activity` on 2026-11-22 (§6.8; decisions 83, 85, 86 and 88). This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
 
 **As built, where it differs from the proposal below** (the sections below are corrected too):
 - **The lookup is not a batch.** `describe` and `def` look the name up first on the run's own connection (`run::Plan::Lookup`), inside the read-only wrapper; the lookup shows nothing, and its rows decide the one batch that follows. So a `describe` is `ok: 1 batch`. An error in the lookup ends the run as a failure quoting the server's message.
@@ -39,6 +39,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 | `sqlh find <pattern> [--text]` | Objects and columns whose names match. With `--text`, also procedure, view and function bodies that contain the pattern. |
 | `sqlh def <object>` | The source of a view, procedure, function or trigger. |
 | `sqlh deps <object>` | What the object references and what references it. |
+| `sqlh activity` | A server command (§6.8): the sessions running, blocked or blocking, with their chains. |
 | `sqlh errorlog [--since T] [--search TEXT] [--agent] [--archive N]` | A server command (§6.9): the SQL Server error log, or the SQL Server Agent log, newest first. |
 
 **Invocation.**
@@ -48,7 +49,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 - `--format`, the limits and `-o` all apply.
 - A command's own options (`--text` for `find`; `--since`, `--search`, `--agent`, `--archive` for `errorlog`) can come anywhere on the line, and reach the command through one struct (`schema::Flags`). With another command, or with SQL, each is a usage error (exit 3) before anything connects: `--text only applies to sqlh find`, `--since only applies to sqlh errorlog` (and so on), `--search only applies to sqlh errorlog and sqlh profiles list` (whose own `--search` is parsed apart).
 
-**Scope.** Schema commands cover the current database, set by `-d` or the profile; a server command (`errorlog`) reads the server, whatever the database. Cross-database names (`OtherDb.dbo.T`) are refused with a hint to use `-d`. Catalog views are per database, and Azure SQL DB doesn't allow cross-database queries at all.
+**Scope.** Schema commands cover the current database, set by `-d` or the profile; a server command (`activity`, `errorlog`) reads the server, whatever the database. Cross-database names (`OtherDb.dbo.T`) are refused with a hint to use `-d`. Catalog views are per database, and Azure SQL DB doesn't allow cross-database queries at all.
 
 ## 3. How they run
 
@@ -242,6 +243,112 @@ Column-level detail (which columns a procedure reads) is left out: `sys.dm_sql_r
 
 **Limits:** as `describe`: 2,000 rows a section and 4,000 characters a value by default (§4).
 
+### 6.8 `activity` (built 2026-11-22)
+
+A server command (Phase 6 slice 2; decision 28 as amended by decisions 83, 85, 86 and 88, PLAN.md §6): the server's sessions worth looking at during an investigation, with their blocking chains, as `sp_WhoIsActive` would show them, from DMVs alone. Its evidence is live check 10 and the slice's design review (`artifacts/slice2/`, local; `activity2.sql` is the SQL below, run on SQL Server 2025 and 2016 SP3 under a three-session chain). No arguments (decision 85: no `--plans`); MCP's `activity` tool is the same (mcp-mode.md §4), with no `database` argument, since it reads the server. Anything after the word is refused before connecting (`activity takes no arguments, not "x"`, exit 3), and so is another command's option (`--since only applies to sqlh errorlog`).
+
+**The lookup** (one batch, `run::Plan::Lookup`, label `reading the server's sessions`; `schema::ACTIVITY_SQL`) takes one snapshot into `#s`:
+
+```sql
+SET NOCOUNT ON;
+DECLARE @can int = COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));
+IF @can = 1
+SELECT s.session_id,
+       CASE WHEN r.blocking_session_id > 0 AND r.blocking_session_id <> s.session_id THEN r.blocking_session_id
+            WHEN w.blocking_session_id IS NOT NULL THEN w.blocking_session_id
+            WHEN r.blocking_session_id IN (-2, -3, -4) THEN r.blocking_session_id END AS blocked_by,
+       COALESCE(r.status, s.status) AS status, r.command,
+       COALESCE(w.wait_type, r.wait_type) AS wait, COALESCE(w.wait_duration_ms, r.wait_time) AS wait_ms,
+       COALESCE(NULLIF(r.wait_resource, N''), w.resource_description) AS wait_resource,
+       r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,
+       CASE WHEN r.session_id IS NULL THEN DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END AS idle_ms,
+       s.open_transaction_count AS open_tran, DATEDIFF_BIG(ms, t.begun, GETDATE()) AS tran_ms,
+       s.login_name AS login, s.host_name AS host, s.program_name AS program,
+       DB_NAME(COALESCE(r.database_id, s.database_id)) AS [database],
+       r.sql_handle, r.statement_start_offset AS stmt_start, r.statement_end_offset AS stmt_end,
+       CASE WHEN r.session_id IS NULL THEN 0 ELSE 1 END AS busy, s.is_user_process AS is_user
+INTO #s
+FROM sys.dm_exec_sessions s
+OUTER APPLY (SELECT TOP (1) q.* FROM sys.dm_exec_requests q WHERE q.session_id = s.session_id
+             ORDER BY CASE WHEN q.blocking_session_id <> 0 THEN 0 ELSE 1 END, q.request_id) r
+OUTER APPLY (SELECT TOP (1) k.blocking_session_id, k.wait_type, k.wait_duration_ms, k.resource_description
+             FROM sys.dm_os_waiting_tasks k
+             WHERE k.session_id = s.session_id AND k.blocking_session_id > 0 AND k.blocking_session_id <> s.session_id
+             ORDER BY CASE WHEN k.blocking_session_id = r.blocking_session_id THEN 0 ELSE 1 END, k.wait_duration_ms DESC) w
+OUTER APPLY (SELECT MIN(a.transaction_begin_time) AS begun
+             FROM sys.dm_tran_session_transactions st
+             JOIN sys.dm_tran_active_transactions a ON a.transaction_id = st.transaction_id
+             WHERE st.session_id = s.session_id) t
+WHERE s.session_id <> @@SPID;
+SELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;
+```
+
+Why each piece:
+- **One snapshot, materialized.** Reading the DMVs in place through the step's CTEs scanned each one 10 times: 203 ms of CPU and 29,832 reads on an idle SQL Server 2025, against 49 ms and 1,815 reads into `#s` (the design review), and every scan a different instant, so a chain could be half seen.
+- **The permission first** (decision 86). Without VIEW SERVER PERFORMANCE STATE (VIEW SERVER STATE before SQL Server 2022, which implies it after) SQL Server shows a login only its own session, which `@@SPID` leaves out, and `dm_os_waiting_tasks` and the transaction DMVs raise error 300 (live check 10, both servers): an empty list would read as an idle server. On 2016 `HAS_PERMS_BY_NAME` gives NULL for the permission it doesn't know, and VIEW SERVER STATE decides. VIEW SERVER PERFORMANCE STATE alone is enough for every DMV and function here (live check 10, 2025).
+- **One request and one waiting task per session.** The request is the blocked one if any; the waiting task is the one blocked by the request's blocker, else the longest waiting, so a parallel query whose worker is blocked while its request isn't is still seen as blocked. `blocked_by` is the request's blocker when positive and not itself, else the task's, else -2, -3 or -4 as the server gives them (an orphaned distributed transaction, deferred recovery, a latch owner unknown); -5, "latch owner not tracked", is NULL.
+- **Not itself:** `@@SPID` is the report's own session, the lookup's and the step's.
+
+**What the lookup's row decides** (`schema::activity_then`): `can_view` 1, the step; otherwise exit 1 with `-- error: activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without it SQL Server shows a login only its own session. A DBA can grant it` (`major` 16 and later), or `... needs VIEW SERVER STATE, which ...` before.
+
+**The step,** one `SELECT` (so a capped list gets the brief count and no `-- partial:` advice, §3), section `sessions` (`schema::ACTIVITY_STEP`):
+
+```sql
+WITH shown AS (
+  SELECT x.* FROM #s x
+  WHERE (x.is_user = 1 AND (x.busy = 1 OR x.open_tran > 0)) OR x.blocked_by IS NOT NULL
+     OR EXISTS (SELECT 1 FROM #s b WHERE b.blocked_by = x.session_id)
+), up AS (
+  SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b WHERE b.blocked_by > 0
+  UNION ALL
+  SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u JOIN shown p ON p.session_id = u.above
+  WHERE p.blocked_by > 0 AND u.hops < 100
+), tops AS (
+  SELECT u.session_id, MAX(u.hops) AS depth, MAX(CASE WHEN u.above = u.session_id THEN 1 ELSE 0 END) AS cycle
+  FROM up u GROUP BY u.session_id
+), heads AS (
+  SELECT u.session_id, u.above AS head FROM up u JOIN tops t ON t.session_id = u.session_id AND t.depth = u.hops
+), under AS (
+  SELECT u.above AS session_id, COUNT(DISTINCT u.session_id) AS blocking FROM up u WHERE u.above <> u.session_id GROUP BY u.above
+)
+SELECT x.session_id AS session, x.blocked_by, n.blocking,
+       CASE WHEN t.cycle = 1 THEN NULL WHEN t.depth IS NOT NULL THEN t.depth WHEN n.blocking IS NOT NULL THEN 0 END AS depth,
+       x.status, x.command, x.wait, x.wait_ms, x.wait_resource, x.cpu_ms, x.reads, x.elapsed_ms, x.idle_ms,
+       x.open_tran, x.tran_ms, x.login, x.host, x.program, x.[database],
+       CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start
+            THEN SUBSTRING(st.text, x.stmt_start / 2 + 1,
+                 (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 + 1) END AS statement,
+       ib.event_info AS input_buffer
+FROM shown x
+LEFT JOIN tops t ON t.session_id = x.session_id
+LEFT JOIN heads h ON h.session_id = x.session_id
+LEFT JOIN under n ON n.session_id = x.session_id
+LEFT JOIN under hn ON hn.session_id = COALESCE(h.head, CASE WHEN n.blocking IS NOT NULL THEN x.session_id END)
+OUTER APPLY sys.dm_exec_sql_text(x.sql_handle) st
+OUTER APPLY (SELECT i.event_info FROM sys.dm_exec_input_buffer(x.session_id, NULL) i
+             WHERE (n.blocking IS NOT NULL AND t.depth IS NULL) OR (x.busy = 0 AND x.open_tran > 0)) ib
+ORDER BY CASE WHEN hn.blocking IS NULL THEN 1 ELSE 0 END, hn.blocking DESC, COALESCE(h.head, x.session_id), COALESCE(t.depth, 0),
+         COALESCE(x.elapsed_ms, x.tran_ms, x.idle_ms) DESC, x.session_id
+OPTION (MAXRECURSION 100);
+```
+
+- **Rows:** a user session with a request or an open transaction; any blocked session, system ones too; any session a shown one is blocked by. An idle pooled `sqlh mcp` connection has neither a request nor a transaction (`put_back` rolls it back), so it falls out by this rule, and shows when it blocks, as its blocker (decision 83: no `own` column; an agent tells a `sqlh mcp` session by `program` and `host`). The report's own session never shows.
+- **Columns:** `session, blocked_by, blocking, depth, status, command, wait, wait_ms, wait_resource, cpu_ms, reads, elapsed_ms, idle_ms, open_tran, tran_ms, login, host, program, database, statement, input_buffer`.
+  - `blocking`: how many shown sessions wait on it, directly or down its chain; NULL when none. `depth`: 0 for a head blocker (it blocks and isn't blocked by a shown session), 1 and on down its chain; NULL outside any chain and inside a cycle (`up` stops at 100 hops, `MAXRECURSION 100`, and `tops.cycle` marks a session that reaches itself).
+  - `status`: the request's, else the session's (`sleeping`). `wait`, `wait_ms`, `wait_resource`: the blocked task's when there is one, else the request's; `wait_resource` the request's compact form (`RID: 7:1:584:0`), else the task's description.
+  - `cpu_ms`, `reads` (logical) and `elapsed_ms` are the request's, NULL without one; `idle_ms` is since the session's last request ended, only without a request; `open_tran` the session's `open_transaction_count`; `tran_ms` the age of its oldest active transaction. Durations only, no datetimes, so there is no time zone to explain.
+  - `statement`: the running statement, cut from the batch's text by its offsets (none for a negative length). `input_buffer`: `dm_exec_input_buffer`'s `event_info`, the client's batch, for a head blocker and for a session with no request and an open transaction, where the statement says nothing.
+  - **A sqlh read-only run shows `open_tran 1`**, its rolled-back wrapper (measured on the blocked reader, live check 10): not a transaction left open. `--allow-write` runs show the transactions they open.
+- **Order:** chains first, the largest `blocking` first, each chain by depth; then the rest by age (`elapsed_ms`, else `tran_ms`, else `idle_ms`) descending; then session.
+- **Empty:** `-- no rows: sessions`.
+- **Limits** (`Command::limits`): 50 rows and 300 characters a value (the statement and the input buffer) by default; a flag over either. A plan is not shown (decision 85: 2,900 to over 200,000 characters each); an agent reads one session's plan with a query of `sys.dm_exec_text_query_plan(plan_handle, statement_start_offset, statement_end_offset)` over its `sys.dm_exec_requests` row, which the MCP tool's description says.
+
+**A timeout during the lookup** says `query timeout after N s while reading the server's sessions; raise -t` (through `sqlh mcp`, `raise timeout (the server allows up to S s)`, or `S s is the server's limit`); its other failures are `reading the server's sessions failed: error N: ...` (exit 1) and `the read of the server's sessions returned more than it should; nothing was shown` (exit 10).
+
+**In `sqlh mcp`** the call takes a pooled connection like any other (decision 88), so with every connection of its profile held by calls stuck behind a lock it waits until its timeout; that wait's error then adds `; sqlh activity on the command line opens a connection of its own` (`engine::wait_for_connection`), since `sqlh activity` connects afresh. The engine reserves nothing for it; reopen that if real use shows the wait.
+
+**Tested:** unit tests in `schema::tests` (`activity_takes_nothing`: the parse, every refusal of another command's option, the limits; `activitys_lookup_reads_one_snapshot_after_the_permission`; `activitys_step_is_one_select_of_its_columns`: `several_outputs` false, the columns in order, the recursion's bounds; `activity_says_which_permission_it_lacks`: each branch of its row), `mcp::tools::tests::the_activity_tool_takes_no_database_and_shows_its_defaults`; exact output through the fake server (`engine::tests::activity_shows_its_sessions_or_says_which_permission_it_lacks`, the section, `-- no rows:` and both `-- error:` wordings; `an_activity_timeout_says_what_it_was_reading_and_what_helps`, the lookup's timeout and the pool wait's advice); refusals before connecting (`tests/cli.rs`, `activity_refuses_what_it_is_given_before_connecting` and `mcp::the_activity_tool_refuses_an_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `mcp_tools::activity_shows_the_tests_own_chain_to_who_may_see_it` (a write of the test's own held open and a read waiting on it: the head at depth 0 with `blocking` 1 or more and its batch in `input_buffer`, the read with `blocked_by` the head, an `LCK_M_` wait on a `RID: ` resource, depth 1, `open_tran 1`; asserted on those two sessions only, since other live tests' chains show too; a reader without permission refused in its version's words, and with VIEW SERVER STATE, and on 2022 and later VIEW SERVER PERFORMANCE STATE alone, seeing the same chain) and `mcp_tools::the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one` (`--pool 2`: a call blocked behind the test's write shows in another call's `activity` with `program` `sqlh mcp`, blocked, `open_tran 1`; after it times out, the next `activity` runs on one connection and the other, idle and rolled back, doesn't show).
+
 ### 6.9 `errorlog [--since T] [--search TEXT] [--agent] [--archive N]` (built 2026-11-21)
 
 A server command (Phase 6 slice 2; decision 28 as amended by decisions 84 and 89, PLAN.md §6): the SQL Server error log, or with `--agent` the SQL Server Agent log, newest first. Its evidence is live check 10 (`artifacts/slice2/`, local), run on SQL Server 2025 and 2016 SP3. MCP's `errorlog` tool is the same (mcp-mode.md §4), with no `database` argument: it is a server-wide read, and an agent would take the argument for a filter.
@@ -331,7 +438,7 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
 - **First release:** SQL Server 2025 Standard on Windows Server 2025 Standard. Catalog fixtures and assertions must cover that target.
 - **Floor:** SQL Server 2016 SP3 is supported for reading and tested live (decision 49). Prefer inexpensive portability; do not add speculative fallback paths or retain an unconditional SQL Server 2012 restriction.
 - **Azure SQL DB:** a future compatibility consideration, not a first-release gate. The scope restrictions and limited `dbs` behavior described above remain constraints if Azure support is pursued.
-- **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed, and its `server_permissions` the server-wide reads the login has (§6.1). The schema commands need no server permission; the server command `errorlog` needs VIEW ANY ERROR LOG or VIEW SERVER STATE (or securityadmin) and, without one, fails with exit 1, naming what to grant (§6.9).
+- **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed, and its `server_permissions` the server-wide reads the login has (§6.1). The schema commands need no server permission; the server commands do, and without it each fails with exit 1, naming what to grant: `activity` needs VIEW SERVER PERFORMANCE STATE, or VIEW SERVER STATE before SQL Server 2022 (§6.8), and `errorlog` VIEW ANY ERROR LOG or VIEW SERVER STATE (or securityadmin; §6.9).
 - **Temp tables:** `describe #t` works only on the session that created the table. Every CLI run is a new session, and so, in effect, is every `sqlh mcp` call (stateless, owner decision 15: the reset before a call drops the temp tables, `docs/mcp-mode.md` §5), so both refuse `#` names before connecting (exit 1, `#t is a temporary table, which only the session that made it can see; each sqlh run is a new session`; the same text in MCP). A session that keeps temp tables across calls would need MCP sessions, deferred until an agent trial shows the need.
 
 ## 9. Implementation plan (done 2026-10-13, `deps` 2026-10-14; as built above)

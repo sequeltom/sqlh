@@ -70,6 +70,7 @@ enum Id {
     Definition,
     Deps,
     Errorlog,
+    Activity,
 }
 
 struct Tool {
@@ -202,6 +203,24 @@ const TOOLS: &[Tool] = &[
         rows: true,
         database: false,
     },
+    Tool {
+        id: Id::Activity,
+        name: "activity",
+        description: "The server's sessions that are running, hold an open transaction, are \
+            blocked or block another, from one snapshot, blocking chains first. blocked_by: the \
+            session waited on (-2 orphaned distributed transaction, -3 deferred recovery, -4 \
+            latch owner unknown); blocking: how many wait on it, directly or down its chain; \
+            depth: 0 for a head blocker, 1 and on down its chain. Times are durations in ms. \
+            open_tran 1 on a sqlh or sqlh mcp session is its rolled-back wrapper, not a leak. \
+            input_buffer: the last batch of a head blocker or of an idle session with an open \
+            transaction. A plan: query sys.dm_exec_text_query_plan with the session's \
+            plan_handle and offsets from sys.dm_exec_requests. Needs VIEW SERVER PERFORMANCE \
+            STATE (VIEW SERVER STATE before SQL Server 2022). It waits for a pooled connection \
+            like any call, up to its timeout; the CLI's sqlh activity opens its own.",
+        args: &[],
+        rows: true,
+        database: false,
+    },
 ];
 
 /// The `max_rows` and `max_cell` descriptions for `tool`, each with the call's default: the
@@ -212,12 +231,14 @@ fn limit_descriptions(tool: &str, launch: &Launch) -> (String, String) {
         (Some(n), _) => format!("default {n}"),
         (None, "describe" | "deps" | "definition") => "default 2000".into(),
         (None, "errorlog") => "default 50, the newest".into(),
+        (None, "activity") => "default 50".into(),
         (None, _) => "default 100, or the profile's max_rows".into(),
     };
     let cell = match (launch.max_cell, tool) {
         (Some(0), _) | (None, "definition") => "default: no limit".into(),
         (Some(n), _) => format!("default {n}"),
         (None, "describe" | "deps") => "default 4000".into(),
+        (None, "activity") => "default 300".into(),
         (None, _) => "default 500, or the profile's max_cell".into(),
     };
     (
@@ -613,6 +634,7 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
             agent: flag("agent")?,
             archive: number("archive", 0, 99)?.map(|n| n as u32),
         })),
+        Id::Activity => What::Command(SchemaCommand::Activity),
     };
     Ok(Planned {
         tool: tool.name,
@@ -920,7 +942,8 @@ mod tests {
                 "find",
                 "definition",
                 "deps",
-                "errorlog"
+                "errorlog",
+                "activity"
             ]
         );
         for tool in tools.as_array().unwrap() {
@@ -935,7 +958,7 @@ mod tests {
             // A server-wide read takes no database, which an agent would take for a filter.
             assert_eq!(
                 tool["inputSchema"]["properties"].get("database").is_some(),
-                tool["name"] != "errorlog",
+                tool["name"] != "errorlog" && tool["name"] != "activity",
                 "{}",
                 tool["name"]
             );
@@ -1342,6 +1365,70 @@ mod tests {
             properties["max_rows"]["description"],
             "Rows shown per result set (default 50, the newest); 0 shows all (within the size \
              limit)."
+        );
+    }
+
+    // schema-commands.md §6.8 through the `activity` tool: no arguments of its own and no
+    // `database` (a server-wide read), refused as arguments; its limits' defaults are the
+    // command's, 50 sessions and 300 characters, unless the launch set them.
+    #[test]
+    fn the_activity_tool_takes_no_database_and_shows_its_defaults() {
+        let one = launch(&["test"]);
+        let planned =
+            plan(&call(json!({"name": "activity"})), &one).unwrap_or_else(|_| panic!("planned"));
+        assert!(matches!(
+            planned.what,
+            What::Command(SchemaCommand::Activity)
+        ));
+        for (arguments, wanted) in [
+            (
+                json!({"database": "master"}),
+                "unknown argument database (activity takes profile, max_rows, max_cell, \
+                 timeout, format)",
+            ),
+            (
+                json!({"plans": true}),
+                "unknown argument plans (activity takes profile, max_rows, max_cell, timeout, \
+                 format)",
+            ),
+        ] {
+            match plan(
+                &call(json!({"name": "activity", "arguments": arguments.clone()})),
+                &one,
+            ) {
+                Err(Refused::Arguments { message, .. }) => {
+                    assert!(message.contains(wanted), "{arguments}: {message}")
+                }
+                _ => panic!("{arguments}: not refused as arguments"),
+            }
+        }
+        let schema = |launch: &Launch| {
+            definitions(launch)
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "activity")
+                .unwrap()["inputSchema"]
+                .clone()
+        };
+        let own = schema(&one);
+        assert_eq!(own.get("required"), None);
+        assert_eq!(
+            own["properties"]["max_rows"]["description"],
+            "Rows shown per result set (default 50); 0 shows all (within the size limit)."
+        );
+        assert_eq!(
+            own["properties"]["max_cell"]["description"],
+            "Characters shown per value (default 300); 0 shows all (within the size limit)."
+        );
+        let launched = schema(&Launch {
+            max_rows: Some(7),
+            max_cell: Some(9),
+            ..launch(&["test"])
+        });
+        assert_eq!(
+            launched["properties"]["max_cell"]["description"],
+            "Characters shown per value (default 9); 0 shows all (within the size limit)."
         );
     }
 }

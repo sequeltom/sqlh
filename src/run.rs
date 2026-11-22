@@ -74,6 +74,8 @@ pub(crate) enum Plan {
 pub(crate) enum LookupLabel {
     /// `describe`, `def` and `deps` resolving a name.
     Name,
+    /// `activity` copying the server's sessions.
+    Activity,
     /// `errorlog` copying the log; `since` is whether `--since` chose the archives.
     ErrorLog { since: bool },
 }
@@ -83,6 +85,7 @@ impl LookupLabel {
     fn doing(self) -> &'static str {
         match self {
             LookupLabel::Name => "looking the name up",
+            LookupLabel::Activity => "reading the server's sessions",
             LookupLabel::ErrorLog { .. } => "reading the error log",
         }
     }
@@ -91,6 +94,7 @@ impl LookupLabel {
     fn noun(self) -> &'static str {
         match self {
             LookupLabel::Name => "the name lookup",
+            LookupLabel::Activity => "the read of the server's sessions",
             LookupLabel::ErrorLog { .. } => "the error log read",
         }
     }
@@ -101,7 +105,7 @@ impl LookupLabel {
     fn after_timeout(self, advice: output::Advice) -> Option<&'static str> {
         use output::Advice::{Cli, Mcp};
         match (self, advice) {
-            (LookupLabel::Name, _) => None,
+            (LookupLabel::Name | LookupLabel::Activity, _) => None,
             (LookupLabel::ErrorLog { since: true }, Cli) => {
                 Some("a later --since reads fewer archives, each one whole even with --search")
             }
@@ -617,6 +621,11 @@ impl Prepared {
     /// `RunPolicy::application_name`.
     pub(crate) fn application_name(&self) -> &'static str {
         self.policy.application_name()
+    }
+
+    /// What its lookup does, for a command that has one.
+    pub(crate) fn lookup_label(&self) -> Option<LookupLabel> {
+        self.lookup.as_ref().map(|(_, _, label)| *label)
     }
 
     /// Whether the request asked to count every hidden row (`Request::exact_count`).

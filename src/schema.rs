@@ -1,13 +1,14 @@
 //! Schema and server commands (docs/schema-commands.md, plan-history.md Phase 4, Phase 6 slice
-//! 2): `info`, `dbs`, `tables`, `describe`, `find`, `def`, `deps` and `errorlog`. Each is canned
-//! T-SQL run as sqlh's own SQL (`QueryOrigin::Generated`): read-only, in the wrapper
-//! transaction, no guard and no `$(var)`. Arguments reach the SQL only as `N'...'` literals
-//! (`literal`) or numbers sqlh wrote, never as identifiers. Each result set fills a labeled
-//! section (`output::Section`).
+//! 2): `info`, `dbs`, `tables`, `describe`, `find`, `def`, `deps`, `activity` and `errorlog`.
+//! Each is canned T-SQL run as sqlh's own SQL (`QueryOrigin::Generated`): read-only, in the
+//! wrapper transaction, no guard and no `$(var)`. Arguments reach the SQL only as `N'...'`
+//! literals (`literal`) or numbers sqlh wrote, never as identifiers. Each result set fills a
+//! labeled section (`output::Section`).
 //!
 //! `describe`, `def` and `deps` first look the name up (`run::Plan::Lookup`), on the same
-//! connection: the object's id and type decide what runs next. `errorlog` does its server work
-//! in its lookup, and its step is one `SELECT` of the `#temp` table the lookup filled.
+//! connection: the object's id and type decide what runs next. `activity` and `errorlog` do
+//! their server work in their lookup, and each one's step is one `SELECT` of the `#temp` table
+//! the lookup filled.
 
 use crate::db::Value;
 use crate::error::{Exit, Failure, echo};
@@ -68,6 +69,7 @@ pub enum Command {
     Find { pattern: String, text: bool },
     Def(String),
     Deps(String),
+    Activity,
     Errorlog(Errorlog),
 }
 
@@ -131,7 +133,15 @@ impl Command {
         let name = first.as_str();
         if !matches!(
             name,
-            "info" | "dbs" | "tables" | "describe" | "find" | "def" | "deps" | "errorlog"
+            "info"
+                | "dbs"
+                | "tables"
+                | "describe"
+                | "find"
+                | "def"
+                | "deps"
+                | "activity"
+                | "errorlog"
         ) {
             return None;
         }
@@ -146,9 +156,10 @@ impl Command {
             }
         };
         let command = match name {
-            "info" | "dbs" if !rest.is_empty() => {
+            "info" | "dbs" | "activity" if !rest.is_empty() => {
                 Err(format!("{name} takes no arguments, not {:?}", rest[0]))
             }
+            "activity" => Ok(Command::Activity),
             "errorlog" if !rest.is_empty() => Err(format!(
                 "errorlog takes --since, --search, --agent and --archive, not {:?}",
                 rest[0]
@@ -190,6 +201,7 @@ impl Command {
             Command::Find { .. } => "find",
             Command::Def(_) => "def",
             Command::Deps(_) => "deps",
+            Command::Activity => "activity",
             Command::Errorlog(_) => "errorlog",
         }
     }
@@ -207,11 +219,14 @@ impl Command {
     /// constraint is the answer, not noise (and so are `deps`'s lists); `def` shows its definition whole, as far as
     /// `--max-output` allows. A flag still wins; a profile's setting doesn't, since it was
     /// chosen for queries. `errorlog` shows its newest 50 lines (about 220 bytes each), and
-    /// keeps the run's cell limit.
+    /// keeps the run's cell limit. `activity` shows 50 sessions, and 300 characters of each
+    /// statement and input buffer, the start that names what runs: 50 whole batches could fill
+    /// `--max-output` alone.
     pub fn limits(&self, limits: &mut Limits, rows_given: bool, cell_given: bool) {
         let (rows, cell) = match self {
             Command::Describe(_) | Command::Deps(_) => (2000, Some(4000)),
             Command::Def(_) => (2000, Some(0)),
+            Command::Activity => (50, Some(300)),
             Command::Errorlog(_) => (50, None),
             _ => return,
         };
@@ -244,6 +259,11 @@ impl Command {
             Command::Describe(name) => lookup(name, Shows::Describe, advice)?,
             Command::Def(name) => lookup(name, Shows::Def, advice)?,
             Command::Deps(name) => lookup(name, Shows::Deps, advice)?,
+            Command::Activity => Plan::Lookup {
+                sql: ACTIVITY_SQL.to_owned(),
+                then: Box::new(activity_then),
+                label: LookupLabel::Activity,
+            },
             Command::Errorlog(log) => errorlog(log, advice)?,
         };
         Ok(Input::Command {
@@ -1561,6 +1581,144 @@ fn errorlog_step(agent: bool) -> Step {
     }
 }
 
+/// `activity`'s lookup (schema-commands.md §6.8): one snapshot of every session but this one,
+/// with its request, its waiting task and its oldest transaction, copied into `#s` so the step
+/// reads one instant (read in place, the step's CTEs scanned each DMV 10 times: 203 ms of CPU
+/// and 29,832 reads on an idle server, against 49 ms and 1,815). A request is the one that is
+/// blocked, if any; a waiting task the one blocked by the request's blocker, else the longest
+/// waiting (a parallel worker can be blocked while its request isn't). The permission comes
+/// first: without it SQL Server shows a login only its own session, which `@@SPID` leaves out,
+/// so the list would read as an idle server (decision 86). VIEW SERVER PERFORMANCE STATE came
+/// with SQL Server 2022 (HAS_PERMS_BY_NAME gives NULL before it, and VIEW SERVER STATE
+/// decides).
+const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
+    DECLARE @can int = COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
+    HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\n\
+    IF @can = 1\n\
+    SELECT s.session_id,\n\
+    CASE WHEN r.blocking_session_id > 0 AND r.blocking_session_id <> s.session_id \
+    THEN r.blocking_session_id\n\
+    WHEN w.blocking_session_id IS NOT NULL THEN w.blocking_session_id\n\
+    WHEN r.blocking_session_id IN (-2, -3, -4) THEN r.blocking_session_id END AS blocked_by,\n\
+    COALESCE(r.status, s.status) AS status, r.command,\n\
+    COALESCE(w.wait_type, r.wait_type) AS wait, COALESCE(w.wait_duration_ms, r.wait_time) AS \
+    wait_ms,\n\
+    COALESCE(NULLIF(r.wait_resource, N''), w.resource_description) AS wait_resource,\n\
+    r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,\n\
+    CASE WHEN r.session_id IS NULL THEN DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) \
+    END AS idle_ms,\n\
+    s.open_transaction_count AS open_tran, DATEDIFF_BIG(ms, t.begun, GETDATE()) AS tran_ms,\n\
+    s.login_name AS login, s.host_name AS host, s.program_name AS program,\n\
+    DB_NAME(COALESCE(r.database_id, s.database_id)) AS [database],\n\
+    r.sql_handle, r.statement_start_offset AS stmt_start, r.statement_end_offset AS stmt_end,\n\
+    CASE WHEN r.session_id IS NULL THEN 0 ELSE 1 END AS busy, s.is_user_process AS is_user\n\
+    INTO #s\n\
+    FROM sys.dm_exec_sessions s\n\
+    OUTER APPLY (SELECT TOP (1) q.* FROM sys.dm_exec_requests q WHERE q.session_id = \
+    s.session_id\n\
+    ORDER BY CASE WHEN q.blocking_session_id <> 0 THEN 0 ELSE 1 END, q.request_id) r\n\
+    OUTER APPLY (SELECT TOP (1) k.blocking_session_id, k.wait_type, k.wait_duration_ms, \
+    k.resource_description\n\
+    FROM sys.dm_os_waiting_tasks k\n\
+    WHERE k.session_id = s.session_id AND k.blocking_session_id > 0 AND k.blocking_session_id \
+    <> s.session_id\n\
+    ORDER BY CASE WHEN k.blocking_session_id = r.blocking_session_id THEN 0 ELSE 1 END, \
+    k.wait_duration_ms DESC) w\n\
+    OUTER APPLY (SELECT MIN(a.transaction_begin_time) AS begun\n\
+    FROM sys.dm_tran_session_transactions st\n\
+    JOIN sys.dm_tran_active_transactions a ON a.transaction_id = st.transaction_id\n\
+    WHERE st.session_id = s.session_id) t\n\
+    WHERE s.session_id <> @@SPID;\n\
+    SELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;";
+
+/// `activity`'s step, one `SELECT` of `#s` (so a capped list gets the brief count and no
+/// `-- partial:` advice, `run::Plan`). Shown: a user session with a request or an open
+/// transaction (an idle pooled `sqlh mcp` connection has neither after `put_back`'s rollback,
+/// decision 83), any blocked session, system ones too, and any session one of them waits on.
+/// `up` walks each blocked session's chain to its head; `hops < 100` and `MAXRECURSION 100`
+/// end a cycle, which `tops.cycle` then marks, so its sessions get no depth. `under` counts
+/// who waits on a session, directly or down its chain. The input buffer is read only for a
+/// head blocker and an idle session holding a transaction, where the statement says nothing.
+/// Chains come first, the largest first, each in depth order; then the rest, oldest first.
+const ACTIVITY_STEP: &str = "WITH shown AS (\n\
+    SELECT x.* FROM #s x\n\
+    WHERE (x.is_user = 1 AND (x.busy = 1 OR x.open_tran > 0)) OR x.blocked_by IS NOT NULL\n\
+    OR EXISTS (SELECT 1 FROM #s b WHERE b.blocked_by = x.session_id)\n\
+    ), up AS (\n\
+    SELECT b.session_id, b.blocked_by AS above, 1 AS hops FROM shown b WHERE b.blocked_by > 0\n\
+    UNION ALL\n\
+    SELECT u.session_id, p.blocked_by, u.hops + 1 FROM up u JOIN shown p ON p.session_id = \
+    u.above\n\
+    WHERE p.blocked_by > 0 AND u.hops < 100\n\
+    ), tops AS (\n\
+    SELECT u.session_id, MAX(u.hops) AS depth, MAX(CASE WHEN u.above = u.session_id THEN 1 ELSE \
+    0 END) AS cycle\n\
+    FROM up u GROUP BY u.session_id\n\
+    ), heads AS (\n\
+    SELECT u.session_id, u.above AS head FROM up u JOIN tops t ON t.session_id = u.session_id \
+    AND t.depth = u.hops\n\
+    ), under AS (\n\
+    SELECT u.above AS session_id, COUNT(DISTINCT u.session_id) AS blocking FROM up u WHERE \
+    u.above <> u.session_id GROUP BY u.above\n\
+    )\n\
+    SELECT x.session_id AS session, x.blocked_by, n.blocking,\n\
+    CASE WHEN t.cycle = 1 THEN NULL WHEN t.depth IS NOT NULL THEN t.depth WHEN n.blocking IS \
+    NOT NULL THEN 0 END AS depth,\n\
+    x.status, x.command, x.wait, x.wait_ms, x.wait_resource, x.cpu_ms, x.reads, x.elapsed_ms, \
+    x.idle_ms,\n\
+    x.open_tran, x.tran_ms, x.login, x.host, x.program, x.[database],\n\
+    CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start\n\
+    THEN SUBSTRING(st.text, x.stmt_start / 2 + 1,\n\
+    (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 \
+    + 1) END AS statement,\n\
+    ib.event_info AS input_buffer\n\
+    FROM shown x\n\
+    LEFT JOIN tops t ON t.session_id = x.session_id\n\
+    LEFT JOIN heads h ON h.session_id = x.session_id\n\
+    LEFT JOIN under n ON n.session_id = x.session_id\n\
+    LEFT JOIN under hn ON hn.session_id = COALESCE(h.head, CASE WHEN n.blocking IS NOT NULL \
+    THEN x.session_id END)\n\
+    OUTER APPLY sys.dm_exec_sql_text(x.sql_handle) st\n\
+    OUTER APPLY (SELECT i.event_info FROM sys.dm_exec_input_buffer(x.session_id, NULL) i\n\
+    WHERE (n.blocking IS NOT NULL AND t.depth IS NULL) OR (x.busy = 0 AND x.open_tran > 0)) ib\n\
+    ORDER BY CASE WHEN hn.blocking IS NULL THEN 1 ELSE 0 END, hn.blocking DESC, \
+    COALESCE(h.head, x.session_id), COALESCE(t.depth, 0),\n\
+    COALESCE(x.elapsed_ms, x.tran_ms, x.idle_ms) DESC, x.session_id\n\
+    OPTION (MAXRECURSION 100);";
+
+/// What `activity`'s lookup found (`can_view`, `major`) as the step, or the refusal without the
+/// permission, worded by the server's version (decision 86).
+fn activity_then(found: &Found) -> Result<Vec<Step>, Failure> {
+    let unexpected = || {
+        Failure::new(
+            Exit::Internal,
+            "the read of the server's sessions returned unexpected rows",
+        )
+    };
+    let row = found
+        .first()
+        .and_then(|rows| rows.first())
+        .ok_or_else(unexpected)?;
+    let major = int(row.get(1)).ok_or_else(unexpected)?;
+    match row.first() {
+        Some(Value::Int(1)) => Ok(vec![Step {
+            sql: ACTIVITY_STEP.to_owned(),
+            sections: vec![Section::rows("sessions")],
+        }]),
+        Some(Value::Int(_) | Value::Null) => Err(command_error(
+            if major >= 16 {
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it"
+            } else {
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL Server \
+                 shows a login only its own session. A DBA can grant it"
+            }
+            .to_owned(),
+        )),
+        _ => Err(unexpected()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2721,5 +2879,184 @@ mod tests {
             "SELECT LogDate AS [time], CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN \
              N'warning' WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level, "
         ));
+    }
+
+    // schema-commands.md §6.8: activity takes no words and none of errorlog's options or find's
+    // --text; 50 sessions and 300 characters a value unless a flag says otherwise.
+    #[test]
+    fn activity_takes_nothing() {
+        assert_eq!(
+            Command::parse(&words(&["activity"]), &flags()),
+            Some(Ok(Command::Activity))
+        );
+        assert_eq!(
+            Command::parse(&words(&["activity", "--plans"]), &flags()),
+            Some(Err("activity takes no arguments, not \"--plans\"".into()))
+        );
+        for (given, refusal) in [
+            (
+                Flags {
+                    since: Some("1h".into()),
+                    ..flags()
+                },
+                "--since only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    search: Some("x".into()),
+                    ..flags()
+                },
+                "--search only applies to sqlh errorlog and sqlh profiles list",
+            ),
+            (
+                Flags {
+                    agent: true,
+                    ..flags()
+                },
+                "--agent only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    archive: Some(1),
+                    ..flags()
+                },
+                "--archive only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    text: true,
+                    ..flags()
+                },
+                "--text only applies to sqlh find",
+            ),
+        ] {
+            assert_eq!(
+                Command::parse(&words(&["activity"]), &given),
+                Some(Err(refusal.to_owned()))
+            );
+        }
+        let mut limits = Limits::default();
+        Command::Activity.limits(&mut limits, false, false);
+        assert_eq!((limits.max_rows, limits.max_cell), (50, 300));
+        let mut limits = Limits::default();
+        Command::Activity.limits(&mut limits, true, true);
+        assert_eq!(
+            (limits.max_rows, limits.max_cell),
+            (Limits::default().max_rows, Limits::default().max_cell)
+        );
+        let Ok(Input::Command { name, plan }) = Command::Activity.input(Advice::Mcp) else {
+            panic!("a command");
+        };
+        assert_eq!(name, "activity");
+        let Plan::Lookup { sql, label, .. } = plan else {
+            panic!("a lookup");
+        };
+        assert_eq!((sql.as_str(), label), (ACTIVITY_SQL, LookupLabel::Activity));
+    }
+
+    // The snapshot leaves out the report's own session, and its one result is the row `then`
+    // reads, last; the permission decides whether anything is read.
+    #[test]
+    fn activitys_lookup_reads_one_snapshot_after_the_permission() {
+        assert!(ACTIVITY_SQL.starts_with(
+            "SET NOCOUNT ON;\nDECLARE @can int = \
+             COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
+             HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\nIF @can = 1\nSELECT "
+        ));
+        assert!(ACTIVITY_SQL.contains("\nINTO #s\nFROM sys.dm_exec_sessions s\n"));
+        assert!(ACTIVITY_SQL.contains("\nWHERE s.session_id <> @@SPID;\n"));
+        assert!(ACTIVITY_SQL.ends_with(
+            "\nSELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS \
+             major;"
+        ));
+    }
+
+    // `Plan::Lookup`'s rule: the step is one statement, so a capped list gets the brief count
+    // and no `-- partial:` advice; its columns are schema-commands.md §6.8's, in order, and a
+    // cycle can't recurse past 100 hops.
+    #[test]
+    fn activitys_step_is_one_select_of_its_columns() {
+        assert!(
+            !crate::guard::several_outputs(ACTIVITY_STEP),
+            "{ACTIVITY_STEP}"
+        );
+        assert!(ACTIVITY_STEP.starts_with("WITH shown AS (\n"));
+        assert!(ACTIVITY_STEP.contains("WHERE p.blocked_by > 0 AND u.hops < 100\n"));
+        assert!(ACTIVITY_STEP.ends_with("\nOPTION (MAXRECURSION 100);"));
+        let list = ACTIVITY_STEP
+            .split_once("\nSELECT x.session_id AS session,")
+            .and_then(|(_, rest)| rest.split_once("\nFROM shown x\n"))
+            .map(|(list, _)| list)
+            .expect("the outer select list");
+        let mut at = 0;
+        for column in [
+            "x.blocked_by",
+            "n.blocking",
+            "END AS depth",
+            "x.status",
+            "x.command",
+            "x.wait,",
+            "x.wait_ms",
+            "x.wait_resource",
+            "x.cpu_ms",
+            "x.reads",
+            "x.elapsed_ms",
+            "x.idle_ms",
+            "x.open_tran",
+            "x.tran_ms",
+            "x.login",
+            "x.host",
+            "x.program",
+            "x.[database]",
+            "AS statement",
+            "AS input_buffer",
+        ] {
+            let found = list[at..]
+                .find(column)
+                .unwrap_or_else(|| panic!("{column} after byte {at}:\n{list}"));
+            at += found + column.len();
+        }
+    }
+
+    /// `activity`'s lookup row: can_view, major.
+    fn activity_found(can: Value, major: i64) -> Found {
+        vec![vec![vec![can, Value::Int(major)]]]
+    }
+
+    // Decision 86: without the permission, exit 1 naming the one the server knows; with it, the
+    // step, in the `sessions` section.
+    #[test]
+    fn activity_says_which_permission_it_lacks() {
+        let refused = |found: Found| {
+            let failure = activity_then(&found).unwrap_err();
+            assert_eq!(failure.exit, Exit::SqlError, "{}", failure.message);
+            failure.message
+        };
+        for major in [16, 17] {
+            assert_eq!(
+                refused(activity_found(Value::Int(0), major)),
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it"
+            );
+        }
+        for can in [Value::Int(0), Value::Null] {
+            assert_eq!(
+                refused(activity_found(can, 13)),
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL \
+                 Server shows a login only its own session. A DBA can grant it"
+            );
+        }
+        let steps = activity_then(&activity_found(Value::Int(1), 17)).unwrap();
+        assert_eq!(labels(&steps), ["sessions"]);
+        assert_eq!(steps[0].sql, ACTIVITY_STEP);
+        for found in [
+            Vec::new(),
+            vec![Vec::new()],
+            vec![vec![vec![Value::Int(1)]]],
+            activity_found(Value::Text("1".into()), 17),
+        ] {
+            let failure = activity_then(&found).unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal, "{found:?}");
+        }
     }
 }
