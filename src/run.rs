@@ -74,6 +74,8 @@ pub(crate) enum Plan {
 pub(crate) enum LookupLabel {
     /// `describe`, `def` and `deps` resolving a name.
     Name,
+    /// `errorlog` copying the log; `since` is whether `--since` chose the archives.
+    ErrorLog { since: bool },
 }
 
 impl LookupLabel {
@@ -81,6 +83,7 @@ impl LookupLabel {
     fn doing(self) -> &'static str {
         match self {
             LookupLabel::Name => "looking the name up",
+            LookupLabel::ErrorLog { .. } => "reading the error log",
         }
     }
 
@@ -88,6 +91,29 @@ impl LookupLabel {
     fn noun(self) -> &'static str {
         match self {
             LookupLabel::Name => "the name lookup",
+            LookupLabel::ErrorLog { .. } => "the error log read",
+        }
+    }
+
+    /// What a timeout's advice adds to raising the timeout. The error log is read an archive at
+    /// a time, each whole, and a search filters only what was copied (decision 89), so a
+    /// narrower search doesn't help; a later `--since` reads fewer archives.
+    fn after_timeout(self, advice: output::Advice) -> Option<&'static str> {
+        use output::Advice::{Cli, Mcp};
+        match (self, advice) {
+            (LookupLabel::Name, _) => None,
+            (LookupLabel::ErrorLog { since: true }, Cli) => {
+                Some("a later --since reads fewer archives, each one whole even with --search")
+            }
+            (LookupLabel::ErrorLog { since: true }, Mcp) => {
+                Some("a later since reads fewer archives, each one whole even with search")
+            }
+            (LookupLabel::ErrorLog { since: false }, Cli) => {
+                Some("the archive is read whole, even with --search")
+            }
+            (LookupLabel::ErrorLog { since: false }, Mcp) => {
+                Some("the archive is read whole, even with search")
+            }
         }
     }
 }
@@ -1322,10 +1348,13 @@ async fn look_up(
             DbError::Timeout(_) => Failure::new(
                 Exit::Timeout,
                 format!(
-                    "query timeout after {timeout} s while {}; {}",
+                    "query timeout after {timeout} s while {}; {}{}",
                     label.doing(),
                     raise_timeout(settings, timeout)
-                        .unwrap_or_else(|| format!("{timeout} s is the server's limit"))
+                        .unwrap_or_else(|| format!("{timeout} s is the server's limit")),
+                    label
+                        .after_timeout(settings.limits.advice)
+                        .map_or_else(String::new, |more| format!("; {more}"))
                 ),
             ),
             e => db_failure(e, settings.limits.advice),

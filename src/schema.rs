@@ -1,14 +1,16 @@
-//! Schema commands (docs/schema-commands.md, plan-history.md Phase 4): `info`, `dbs`, `tables`,
-//! `describe`, `find`, `def` and `deps`. Each is canned T-SQL run as sqlh's own SQL
-//! (`QueryOrigin::Generated`): read-only, in the wrapper transaction, no guard and no `$(var)`.
-//! Arguments reach the SQL only as `N'...'` literals (`literal`), never as identifiers. Each
-//! result set fills a labeled section (`output::Section`).
+//! Schema and server commands (docs/schema-commands.md, plan-history.md Phase 4, Phase 6 slice
+//! 2): `info`, `dbs`, `tables`, `describe`, `find`, `def`, `deps` and `errorlog`. Each is canned
+//! T-SQL run as sqlh's own SQL (`QueryOrigin::Generated`): read-only, in the wrapper
+//! transaction, no guard and no `$(var)`. Arguments reach the SQL only as `N'...'` literals
+//! (`literal`) or numbers sqlh wrote, never as identifiers. Each result set fills a labeled
+//! section (`output::Section`).
 //!
 //! `describe`, `def` and `deps` first look the name up (`run::Plan::Lookup`), on the same
-//! connection: the object's id and type decide what runs next.
+//! connection: the object's id and type decide what runs next. `errorlog` does its server work
+//! in its lookup, and its step is one `SELECT` of the `#temp` table the lookup filled.
 
 use crate::db::Value;
-use crate::error::{Exit, Failure};
+use crate::error::{Exit, Failure, echo};
 use crate::output::{Advice, Limits, Section};
 use crate::run::{Found, Input, LookupLabel, Plan, Report, Step};
 
@@ -66,20 +68,74 @@ pub enum Command {
     Find { pattern: String, text: bool },
     Def(String),
     Deps(String),
+    Errorlog(Errorlog),
+}
+
+/// `errorlog`'s options (schema-commands.md §6.9), as given: `input` checks them, so both front
+/// ends refuse the same values in their own words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Errorlog {
+    /// `--since`: `30m`, `12h`, `7d` or a server-local time.
+    pub since: Option<String>,
+    pub search: Option<String>,
+    /// `--agent`: the SQL Server Agent log instead of the server's.
+    pub agent: bool,
+    pub archive: Option<u32>,
+}
+
+/// The flags only some commands take, as the command line gives them; `Command::parse` hands
+/// each to its command and refuses it anywhere else.
+#[derive(Debug, Default)]
+pub struct Flags {
+    /// `--text`, for `find`.
+    pub text: bool,
+    /// The rest are `errorlog`'s.
+    pub since: Option<String>,
+    pub search: Option<String>,
+    pub agent: bool,
+    pub archive: Option<u32>,
+}
+
+impl Flags {
+    /// The refusal of the first flag given that `command` doesn't take (`None`: the run is SQL,
+    /// not a command).
+    pub fn misplaced(&self, command: Option<&Command>) -> Option<String> {
+        let find = matches!(command, Some(Command::Find { .. }));
+        let errorlog = matches!(command, Some(Command::Errorlog(_)));
+        let only = |flag: &str| Some(format!("{flag} only applies to sqlh errorlog"));
+        if self.text && !find {
+            Some("--text only applies to sqlh find".to_owned())
+        } else if errorlog {
+            None
+        } else if self.since.is_some() {
+            only("--since")
+        } else if self.search.is_some() {
+            // `profiles list --search` is parsed apart, so it never comes here.
+            Some("--search only applies to sqlh errorlog and sqlh profiles list".to_owned())
+        } else if self.agent {
+            only("--agent")
+        } else if self.archive.is_some() {
+            only("--archive")
+        } else {
+            None
+        }
+    }
 }
 
 impl Command {
     /// The command a first positional word names, with the words after it, or `None` when the
-    /// word isn't a command (it is then SQL, as before). `text` is `--text`, for `find` only.
-    pub fn parse(words: &[String], text: bool) -> Option<Result<Command, String>> {
+    /// word isn't a command (it is then SQL, as before). `flags` are the options only some
+    /// commands take.
+    pub fn parse(words: &[String], flags: &Flags) -> Option<Result<Command, String>> {
         let (first, rest) = words.split_first()?;
         let name = first.as_str();
         if !matches!(
             name,
-            "info" | "dbs" | "tables" | "describe" | "find" | "def" | "deps"
+            "info" | "dbs" | "tables" | "describe" | "find" | "def" | "deps" | "errorlog"
         ) {
             return None;
         }
+        let text = flags.text;
         let one = |what: &str| -> Result<String, String> {
             match rest {
                 [arg] if !arg.is_empty() => Ok(arg.clone()),
@@ -93,6 +149,16 @@ impl Command {
             "info" | "dbs" if !rest.is_empty() => {
                 Err(format!("{name} takes no arguments, not {:?}", rest[0]))
             }
+            "errorlog" if !rest.is_empty() => Err(format!(
+                "errorlog takes --since, --search, --agent and --archive, not {:?}",
+                rest[0]
+            )),
+            "errorlog" => Ok(Command::Errorlog(Errorlog {
+                since: flags.since.clone(),
+                search: flags.search.clone(),
+                agent: flags.agent,
+                archive: flags.archive,
+            })),
             "info" => Ok(Command::Info),
             "dbs" => Ok(Command::Dbs),
             "tables" => match rest {
@@ -107,13 +173,12 @@ impl Command {
             "deps" => one("NAME").map(Command::Deps),
             _ => one("NAME").map(Command::Def),
         };
-        Some(command.and_then(|command| {
-            if text && !matches!(command, Command::Find { .. }) {
-                Err("--text only applies to sqlh find".to_owned())
-            } else {
-                Ok(command)
-            }
-        }))
+        Some(
+            command.and_then(|command| match flags.misplaced(Some(&command)) {
+                Some(refusal) => Err(refusal),
+                None => Ok(command),
+            }),
+        )
     }
 
     pub fn name(&self) -> &'static str {
@@ -125,6 +190,7 @@ impl Command {
             Command::Find { .. } => "find",
             Command::Def(_) => "def",
             Command::Deps(_) => "deps",
+            Command::Errorlog(_) => "errorlog",
         }
     }
 
@@ -140,17 +206,19 @@ impl Command {
     /// rows a section and 4,000 characters a value, since a wide table or a long check
     /// constraint is the answer, not noise (and so are `deps`'s lists); `def` shows its definition whole, as far as
     /// `--max-output` allows. A flag still wins; a profile's setting doesn't, since it was
-    /// chosen for queries.
+    /// chosen for queries. `errorlog` shows its newest 50 lines (about 220 bytes each), and
+    /// keeps the run's cell limit.
     pub fn limits(&self, limits: &mut Limits, rows_given: bool, cell_given: bool) {
         let (rows, cell) = match self {
-            Command::Describe(_) | Command::Deps(_) => (2000, 4000),
-            Command::Def(_) => (2000, 0),
+            Command::Describe(_) | Command::Deps(_) => (2000, Some(4000)),
+            Command::Def(_) => (2000, Some(0)),
+            Command::Errorlog(_) => (50, None),
             _ => return,
         };
         if !rows_given {
             limits.max_rows = rows;
         }
-        if !cell_given {
+        if let (Some(cell), false) = (cell, cell_given) {
             limits.max_cell = cell;
         }
     }
@@ -176,6 +244,7 @@ impl Command {
             Command::Describe(name) => lookup(name, Shows::Describe, advice)?,
             Command::Def(name) => lookup(name, Shows::Def, advice)?,
             Command::Deps(name) => lookup(name, Shows::Deps, advice)?,
+            Command::Errorlog(log) => errorlog(log, advice)?,
         };
         Ok(Input::Command {
             name: self.name(),
@@ -1214,6 +1283,279 @@ fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failu
     }])
 }
 
+/// The furthest back `--since` reaches, in minutes: ten years, past any log's archives, and
+/// small enough for `DATEADD`'s `int`.
+const MAX_SINCE_MINUTES: u64 = 3650 * 24 * 60;
+
+/// The longest `--search`, in UTF-16 units: `@search` is `nvarchar(500)`, and a longer value
+/// would be cut there without a word.
+const MAX_SEARCH_UNITS: usize = 500;
+
+/// The most `--archive` names: SQL Server keeps at most 99 archives besides the current log.
+const MAX_ARCHIVE: u32 = 99;
+
+/// `--since` as a T-SQL `datetime` expression in the server's clock (schema-commands.md §6.9),
+/// or `None` when it is none of the forms: `<N>m`, `<N>h` or `<N>d` before now, or a
+/// server-local time. sqlh writes the expression itself, so the server never parses the user's
+/// text: a date it couldn't read would be an error inside `INSERT ... EXEC`, exit 10 (U14).
+fn since_sql(since: &str) -> Option<String> {
+    let per = match since.as_bytes().last() {
+        Some(b'm') => Some(1),
+        Some(b'h') => Some(60),
+        Some(b'd') => Some(24 * 60),
+        _ => None,
+    };
+    if let Some(per) = per {
+        // The unit is one ASCII byte, so the rest is a whole string.
+        let count = &since[..since.len() - 1];
+        if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let minutes = count.parse::<u64>().ok()?.checked_mul(per)?;
+        return (1..=MAX_SINCE_MINUTES)
+            .contains(&minutes)
+            .then(|| format!("DATEADD(minute, -{minutes}, GETDATE())"));
+    }
+    local_time(since).map(|at| format!("CONVERT(datetime, N'{at}', 126)"))
+}
+
+/// A server-local time, `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` or `YYYY-MM-DD HH:MM:SS` (a `T` may
+/// stand for the space), as ISO 8601 `YYYY-MM-DDTHH:MM:SS`: a real calendar date in
+/// `datetime`'s years, 1753 to 9999. No offset: the log's times have none.
+fn local_time(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let digits = |from: usize, len: usize| -> Option<u32> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| part.iter().fold(0, |n, d| n * 10 + u32::from(d - b'0')))
+    };
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let (year, month, day) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
+    let (hour, minute, second) = match b.len() {
+        10 => (0, 0, 0),
+        16 | 19
+            if matches!(b[10], b' ' | b'T')
+                && b[13] == b':'
+                && (b.len() == 16 || b[16] == b':') =>
+        {
+            let second = if b.len() == 19 { digits(17, 2)? } else { 0 };
+            (digits(11, 2)?, digits(14, 2)?, second)
+        }
+        _ => return None,
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    ((1753..=9999).contains(&year)
+        && (1..=days).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60)
+        .then(|| format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"))
+}
+
+/// Whether `search` can be searched for: 1 to 500 UTF-16 units, not only whitespace, and no
+/// control character, which the server can't be trusted with (a NUL cuts the string short
+/// without an error, measured).
+fn search_ok(search: &str) -> bool {
+    (1..=MAX_SEARCH_UNITS).contains(&search.encode_utf16().count())
+        && !search.trim().is_empty()
+        && !search.chars().any(|c| c < ' ')
+}
+
+/// `errorlog` (schema-commands.md §6.9): its options checked before anything connects, then a
+/// lookup that copies the log into `#log` and a step that shows it.
+fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
+    let flag = |name: &str| match advice {
+        Advice::Cli => format!("--{name}"),
+        Advice::Mcp => name.to_owned(),
+    };
+    let since = match &log.since {
+        None => None,
+        Some(text) => Some(since_sql(text).ok_or_else(|| {
+            Failure::usage(format!(
+                "{} {}: expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no \
+                 offset)",
+                flag("since"),
+                echo(text)
+            ))
+        })?),
+    };
+    if log.search.as_deref().is_some_and(|s| !search_ok(s)) {
+        return Err(Failure::usage(format!(
+            "{} takes 1 to {MAX_SEARCH_UNITS} characters and no control characters",
+            flag("search")
+        )));
+    }
+    if let Some(archive) = log.archive.filter(|&n| n > MAX_ARCHIVE) {
+        return Err(Failure::usage(format!(
+            "{} {archive}: expected 0 to {MAX_ARCHIVE}",
+            flag("archive")
+        )));
+    }
+    if since.is_some() && log.archive.is_some() {
+        return Err(Failure::usage(format!(
+            "{since} and {archive} don't combine: {since} reads back through the archives its \
+             window needs",
+            since = flag("since"),
+            archive = flag("archive")
+        )));
+    }
+    let agent = log.agent;
+    let archive = log.archive;
+    Ok(Plan::Lookup {
+        sql: errorlog_sql(agent, archive, since.as_deref(), log.search.as_deref()),
+        then: Box::new(move |found: &Found| errorlog_then(found, agent, archive)),
+        label: LookupLabel::ErrorLog {
+            since: since.is_some(),
+        },
+    })
+}
+
+/// The lookup: which logs the login may read and the server keeps, and the lines asked for,
+/// copied into `#log` for the step. Every value reaches `INSERT ... EXEC` typed, and only an
+/// archive `sp_enumerrorlogs` lists is read: a 22004 there ends the batch as the driver's
+/// protocol error, exit 10, whatever `TRY` says (DESIGN.md §7, U14). `sp_readerrorlog` reads
+/// whole archives (decision 89); `@type` is always passed, since with it NULL the procedure
+/// drops its filters. `--since` reads back, archive after archive, until one starts at or
+/// before the window (decision 84). A search keeps each matching line's companions, the lines
+/// of the same time and source, so `Login failed` keeps its `Error: 18456` line. Without the
+/// permission nothing is read: `sp_readerrorlog` would refuse with error 27219, which sqlh
+/// words itself.
+fn errorlog_sql(
+    agent: bool,
+    archive: Option<u32>,
+    since: Option<&str>,
+    search: Option<&str>,
+) -> String {
+    format!(
+        "SET NOCOUNT ON;\n\
+         DECLARE @type int = {log_type}, @archive int = {archive}, @since datetime = {since}, \
+         @search nvarchar({MAX_SEARCH_UNITS}) = {search};\n\
+         DECLARE @can bit = CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 \
+         OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1 \
+         OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 THEN 1 ELSE 0 END;\n\
+         DECLARE @logs TABLE (archive int, [date] nvarchar(259), bytes int);\n\
+         CREATE TABLE #log (n int IDENTITY, LogDate datetime, ProcessInfo nvarchar(64), \
+         [Text] nvarchar(max));\n\
+         DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int;\n\
+         IF @can = 1\n\
+         BEGIN\n\
+         INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;\n\
+         WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)\n\
+         BEGIN\n\
+         SET @mark = ISNULL((SELECT MAX(n) FROM #log), 0);\n\
+         INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;\n\
+         SET @read += 1;\n\
+         IF @archive IS NOT NULL OR @since IS NULL \
+         OR (SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;\n\
+         SET @a += 1;\n\
+         END;\n\
+         IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;\n\
+         IF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m \
+         WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
+         AND CHARINDEX(@search, m.[Text]) > 0);\n\
+         END;\n\
+         SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, \
+         (SELECT MAX(archive) FROM @logs) AS last, @read AS [read], \
+         CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;",
+        log_type = if agent { 2 } else { 1 },
+        archive = archive.map_or_else(|| "NULL".to_owned(), |n| n.to_string()),
+        since = since.unwrap_or("NULL"),
+        search = literal_or_null(search),
+    )
+}
+
+/// What the lookup found (`errorlog_sql`'s last row) as the step, or the refusal: no
+/// permission (worded by the server's version: VIEW ANY ERROR LOG came with SQL Server 2022;
+/// securityadmin, which Microsoft treats as near sysadmin, is never offered), no archives, or no
+/// archive of the number asked for.
+fn errorlog_then(found: &Found, agent: bool, archive: Option<u32>) -> Result<Vec<Step>, Failure> {
+    let unexpected = || {
+        Failure::new(
+            Exit::Internal,
+            "the error log read returned unexpected rows",
+        )
+    };
+    let row = found
+        .first()
+        .and_then(|rows| rows.first())
+        .ok_or_else(unexpected)?;
+    let (can_read, archives, read) = (
+        int(row.first()).ok_or_else(unexpected)?,
+        int(row.get(1)).ok_or_else(unexpected)?,
+        int(row.get(3)).ok_or_else(unexpected)?,
+    );
+    let log = if agent {
+        "the SQL Server Agent log"
+    } else {
+        "the error log"
+    };
+    if can_read != 1 {
+        return Err(command_error(
+            if int(row.get(4)).is_some_and(|major| major >= 16) {
+                "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; \
+                 a DBA can grant one"
+            } else {
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it"
+            }
+            .to_owned(),
+        ));
+    }
+    if archives == 0 {
+        return Err(command_error(format!(
+            "this server lists no {} archives",
+            if agent {
+                "SQL Server Agent log"
+            } else {
+                "error log"
+            }
+        )));
+    }
+    if read == 0 {
+        let last = int(row.get(2)).ok_or_else(unexpected)?;
+        return Err(command_error(format!(
+            "{log} has no archive {}; it keeps 0 to {last}",
+            archive.unwrap_or(0)
+        )));
+    }
+    Ok(vec![errorlog_step(agent)])
+}
+
+/// The step: `#log`, newest first, and within one time in the log's own order (`n`), so an
+/// `Error: 18456, Severity: 14, State: 8.` line stays above its `Login failed` line. The
+/// server ends some lines with CR LF, which is dropped; `LEN` of the text with an `x` after it
+/// counts trailing spaces, which `LEN` alone leaves out. The Agent log's `ProcessInfo` is a
+/// level number, shown as its word.
+fn errorlog_step(agent: bool) -> Step {
+    let (second, label) = if agent {
+        (
+            "CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN N'warning' \
+             WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level",
+            "agent_log",
+        )
+    } else {
+        ("ProcessInfo AS source", "server_log")
+    };
+    Step {
+        sql: format!(
+            "SELECT LogDate AS [time], {second}, \
+             CASE WHEN RIGHT([Text], 2) COLLATE Latin1_General_100_BIN2 = NCHAR(13) + NCHAR(10) \
+             THEN LEFT([Text], LEN([Text] + N'x') - 3) ELSE [Text] END AS [text] \
+             FROM #log ORDER BY LogDate DESC, n;"
+        ),
+        sections: vec![Section::rows(label)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1224,7 +1566,15 @@ mod tests {
 
     #[test]
     fn commands_are_the_first_word() {
-        let parse = |args: &[&str], text| Command::parse(&words(args), text);
+        let parse = |args: &[&str], text| {
+            Command::parse(
+                &words(args),
+                &Flags {
+                    text,
+                    ..Flags::default()
+                },
+            )
+        };
         assert_eq!(parse(&["SELECT 1"], false), None);
         assert_eq!(parse(&["Describe", "x"], false), None, "lower case only");
         assert_eq!(parse(&["info"], false), Some(Ok(Command::Info)));
@@ -1901,5 +2251,460 @@ mod tests {
         let mut limits = Limits::default();
         Command::Tables(None).limits(&mut limits, false, false);
         assert_eq!(limits.max_rows, Limits::default().max_rows);
+        // errorlog: its newest 50 lines, the run's cell limit, a flag over both.
+        let log = Command::Errorlog(Errorlog::default());
+        let mut limits = Limits {
+            max_cell: 77,
+            ..Limits::default()
+        };
+        log.limits(&mut limits, false, false);
+        assert_eq!((limits.max_rows, limits.max_cell), (50, 77));
+        let mut limits = Limits::default();
+        log.limits(&mut limits, true, true);
+        assert_eq!(limits.max_rows, Limits::default().max_rows);
+    }
+
+    fn flags() -> Flags {
+        Flags::default()
+    }
+
+    // schema-commands.md §6.9: errorlog takes its four options and no words; each option is
+    // refused with any other command, and with SQL (`Flags::misplaced`).
+    #[test]
+    fn errorlog_takes_its_options_and_nothing_else_does() {
+        let given = Flags {
+            since: Some("2h".into()),
+            search: Some("Login failed".into()),
+            agent: true,
+            archive: Some(3),
+            ..flags()
+        };
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &given),
+            Some(Ok(Command::Errorlog(Errorlog {
+                since: Some("2h".into()),
+                search: Some("Login failed".into()),
+                agent: true,
+                archive: Some(3),
+            })))
+        );
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &flags()),
+            Some(Ok(Command::Errorlog(Errorlog::default())))
+        );
+        assert_eq!(
+            Command::parse(&words(&["errorlog", "x"]), &flags()),
+            Some(Err(
+                "errorlog takes --since, --search, --agent and --archive, not \"x\"".into()
+            ))
+        );
+        for (flags, refusal) in [
+            (
+                Flags {
+                    since: Some("1h".into()),
+                    ..flags()
+                },
+                "--since only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    search: Some("x".into()),
+                    ..flags()
+                },
+                "--search only applies to sqlh errorlog and sqlh profiles list",
+            ),
+            (
+                Flags {
+                    agent: true,
+                    ..flags()
+                },
+                "--agent only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    archive: Some(0),
+                    ..flags()
+                },
+                "--archive only applies to sqlh errorlog",
+            ),
+        ] {
+            assert_eq!(
+                Command::parse(&words(&["tables"]), &flags),
+                Some(Err(refusal.to_owned())),
+                "{refusal}"
+            );
+            assert_eq!(flags.misplaced(None).as_deref(), Some(refusal));
+            assert_eq!(
+                flags.misplaced(Some(&Command::Errorlog(Errorlog::default()))),
+                None
+            );
+        }
+        let text = Flags {
+            text: true,
+            ..flags()
+        };
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &text),
+            Some(Err("--text only applies to sqlh find".into()))
+        );
+    }
+
+    // schema-commands.md §6.9: every form `--since` takes, as the expression sqlh writes, and
+    // what it refuses: a zero or a count past ten years, a unit or digit it doesn't know, a
+    // date that isn't on the calendar or outside datetime's years, an offset.
+    #[test]
+    fn since_takes_a_span_or_a_server_local_time() {
+        for (since, sql) in [
+            ("30m", "DATEADD(minute, -30, GETDATE())"),
+            ("1m", "DATEADD(minute, -1, GETDATE())"),
+            ("12h", "DATEADD(minute, -720, GETDATE())"),
+            ("7d", "DATEADD(minute, -10080, GETDATE())"),
+            ("007d", "DATEADD(minute, -10080, GETDATE())"),
+            ("3650d", "DATEADD(minute, -5256000, GETDATE())"),
+            ("87600h", "DATEADD(minute, -5256000, GETDATE())"),
+            ("5256000m", "DATEADD(minute, -5256000, GETDATE())"),
+            (
+                "2026-11-20",
+                "CONVERT(datetime, N'2026-11-20T00:00:00', 126)",
+            ),
+            (
+                "2026-11-20 08:00",
+                "CONVERT(datetime, N'2026-11-20T08:00:00', 126)",
+            ),
+            (
+                "2026-11-20T08:05:09",
+                "CONVERT(datetime, N'2026-11-20T08:05:09', 126)",
+            ),
+            (
+                "2024-02-29 23:59:59",
+                "CONVERT(datetime, N'2024-02-29T23:59:59', 126)",
+            ),
+            (
+                "2000-02-29",
+                "CONVERT(datetime, N'2000-02-29T00:00:00', 126)",
+            ),
+            (
+                "1753-01-01",
+                "CONVERT(datetime, N'1753-01-01T00:00:00', 126)",
+            ),
+            (
+                "9999-12-31 23:59:59",
+                "CONVERT(datetime, N'9999-12-31T23:59:59', 126)",
+            ),
+        ] {
+            assert_eq!(since_sql(since).as_deref(), Some(sql), "{since}");
+        }
+        for since in [
+            "",
+            "m",
+            "0m",
+            "0d",
+            "3651d",
+            "87601h",
+            "5256001m",
+            "99999999999999999999999d",
+            "-5m",
+            "+5m",
+            "5 m",
+            "5M",
+            "5s",
+            "5w",
+            "1.5h",
+            "２h",
+            "2h ",
+            " 2h",
+            "2023-02-29",
+            "1900-02-29",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-04-31",
+            "2026-11-00",
+            "1752-12-31",
+            "10000-01-01",
+            "2026-11-20 24:00",
+            "2026-11-20 08:60",
+            "2026-11-20 08:00:60",
+            "2026-11-20 8:00",
+            "2026-11-20 08:00:5",
+            "2026-11-20t08:00",
+            "2026-11-20  08:00",
+            "2026-11-20 08",
+            "2026-11-20T08:00Z",
+            "2026-11-20T08:00:00Z",
+            "2026-11-20T08:00:00+01:00",
+            "2026-11-20 08:00:00.000",
+            "2026/11/20",
+            "26-11-20",
+            "2026-1-20",
+            "20261120",
+            "yesterday",
+            "2026-11-2é",
+            "2026-11-20é",
+        ] {
+            assert_eq!(since_sql(since), None, "{since:?}");
+        }
+    }
+
+    // The options are checked before anything connects (exit 3), in the words of the front end
+    // that took them; a search and a time reach the SQL only as sqlh writes them.
+    #[test]
+    fn errorlogs_options_are_checked_before_it_runs() {
+        let refused = |log: Errorlog, advice| match errorlog(&log, advice) {
+            Err(failure) => {
+                assert_eq!(failure.exit, Exit::Usage);
+                failure.message
+            }
+            Ok(_) => panic!("{log:?} is refused"),
+        };
+        let since = |text: &str| Errorlog {
+            since: Some(text.into()),
+            ..Errorlog::default()
+        };
+        assert_eq!(
+            refused(since("2x"), Advice::Cli),
+            "--since 2x: expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no \
+             offset)"
+        );
+        assert_eq!(
+            refused(since("2026-11-20T08:00Z"), Advice::Mcp),
+            "since 2026-11-20T08:00Z: expected 30m, 12h, 7d or a server-local time like \
+             2026-11-20 08:00 (no offset)"
+        );
+        // A huge value is shown cut short.
+        let long = refused(since(&"x".repeat(5000)), Advice::Cli);
+        assert!(
+            long.starts_with(&format!("--since {}…: expected", "x".repeat(100))),
+            "{long}"
+        );
+        let search = |text: &str| Errorlog {
+            search: Some(text.into()),
+            ..Errorlog::default()
+        };
+        for bad in [
+            String::new(),
+            "   ".into(),
+            "\t".into(),
+            "a\0b".into(),
+            "line\nbreak".into(),
+            "x".repeat(501),
+            "\u{1F600}".repeat(251),
+        ] {
+            assert_eq!(
+                refused(search(&bad), Advice::Cli),
+                "--search takes 1 to 500 characters and no control characters",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            refused(search(""), Advice::Mcp),
+            "search takes 1 to 500 characters and no control characters"
+        );
+        for good in ["x".repeat(500), "\u{1F600}".repeat(250), " a ".into()] {
+            assert!(errorlog(&search(&good), Advice::Cli).is_ok(), "{good:?}");
+        }
+        let archive = |n| Errorlog {
+            archive: Some(n),
+            ..Errorlog::default()
+        };
+        assert!(errorlog(&archive(99), Advice::Cli).is_ok());
+        assert_eq!(
+            refused(archive(100), Advice::Cli),
+            "--archive 100: expected 0 to 99"
+        );
+        let both = Errorlog {
+            since: Some("1h".into()),
+            archive: Some(0),
+            ..Errorlog::default()
+        };
+        assert_eq!(
+            refused(both.clone(), Advice::Cli),
+            "--since and --archive don't combine: --since reads back through the archives its \
+             window needs"
+        );
+        assert_eq!(
+            refused(both, Advice::Mcp),
+            "since and archive don't combine: since reads back through the archives its window \
+             needs"
+        );
+    }
+
+    /// The SQL `errorlog` would run for `log`.
+    fn errorlog_lookup_sql(log: &Errorlog) -> String {
+        let Ok(Plan::Lookup { sql, label, .. }) = errorlog(log, Advice::Cli) else {
+            panic!("a lookup");
+        };
+        assert_eq!(
+            label,
+            LookupLabel::ErrorLog {
+                since: log.since.is_some()
+            }
+        );
+        sql
+    }
+
+    // U14: what reaches `INSERT ... EXEC` is typed and listed, so the server never refuses it
+    // there. The log type is always passed; the search is an N'...' literal with its quotes
+    // doubled; the time is sqlh's own expression.
+    #[test]
+    fn errorlogs_lookup_passes_only_typed_values() {
+        let sql = errorlog_lookup_sql(&Errorlog::default());
+        assert!(
+            sql.starts_with(
+                "SET NOCOUNT ON;\nDECLARE @type int = 1, @archive int = NULL, @since datetime = \
+                 NULL, @search nvarchar(500) = NULL;\n"
+            ),
+            "{sql}"
+        );
+        for part in [
+            "INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;",
+            "WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)",
+            "INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;",
+            "AND CHARINDEX(@search, m.[Text]) > 0",
+            "(SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;",
+        ] {
+            assert!(sql.contains(part), "{part}\n{sql}");
+        }
+        // No other EXEC: never xp_readerrorlog (decision 89).
+        assert_eq!(sql.matches("EXEC ").count(), 2, "{sql}");
+        assert!(!sql.contains("xp_"), "{sql}");
+        let sql = errorlog_lookup_sql(&Errorlog {
+            since: Some("2026-11-20 08:00".into()),
+            search: Some("it's ]; DROP TABLE x --".into()),
+            agent: true,
+            archive: None,
+        });
+        assert!(
+            sql.starts_with(
+                "SET NOCOUNT ON;\nDECLARE @type int = 2, @archive int = NULL, @since datetime = \
+                 CONVERT(datetime, N'2026-11-20T08:00:00', 126), @search nvarchar(500) = \
+                 N'it''s ]; DROP TABLE x --';\n"
+            ),
+            "{sql}"
+        );
+        let sql = errorlog_lookup_sql(&Errorlog {
+            since: Some("90m".into()),
+            ..Errorlog::default()
+        });
+        assert!(
+            sql.contains("@since datetime = DATEADD(minute, -90, GETDATE()),"),
+            "{sql}"
+        );
+        let sql = errorlog_lookup_sql(&Errorlog {
+            archive: Some(7),
+            ..Errorlog::default()
+        });
+        assert!(sql.contains("@archive int = 7,"), "{sql}");
+        // The lookup's one result is a row, the last statement.
+        assert!(
+            sql.ends_with(
+                "SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, (SELECT \
+                 MAX(archive) FROM @logs) AS last, @read AS [read], \
+                 CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// The lookup's row: can_read, archives, last, read, major.
+    fn log_found(can: i64, archives: i64, last: Option<i64>, read: i64, major: i64) -> Found {
+        vec![vec![vec![
+            Value::Int(can),
+            Value::Int(archives),
+            last.map_or(Value::Null, Value::Int),
+            Value::Int(read),
+            Value::Int(major),
+        ]]]
+    }
+
+    // schema-commands.md §6.9: each answer the lookup can give, as the step or the refusal
+    // (exit 1, `-- error:`), worded by the log and the server's version.
+    #[test]
+    fn errorlog_says_why_it_shows_nothing() {
+        let message = |found: Found, agent, archive| {
+            let failure = errorlog_then(&found, agent, archive).unwrap_err();
+            assert_eq!(failure.exit, Exit::SqlError, "{}", failure.message);
+            failure.message
+        };
+        assert_eq!(
+            message(log_found(0, 0, None, 0, 17), false, None),
+            "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a \
+             DBA can grant one"
+        );
+        assert_eq!(
+            message(log_found(0, 0, None, 0, 16), true, None),
+            "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a \
+             DBA can grant one"
+        );
+        for major in [13, 15] {
+            assert_eq!(
+                message(log_found(0, 0, None, 0, major), false, None),
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it"
+            );
+        }
+        assert_eq!(
+            message(log_found(1, 0, None, 0, 17), false, None),
+            "this server lists no error log archives"
+        );
+        assert_eq!(
+            message(log_found(1, 0, None, 0, 17), true, None),
+            "this server lists no SQL Server Agent log archives"
+        );
+        assert_eq!(
+            message(log_found(1, 7, Some(6), 0, 17), false, Some(9)),
+            "the error log has no archive 9; it keeps 0 to 6"
+        );
+        assert_eq!(
+            message(log_found(1, 10, Some(9), 0, 13), true, Some(12)),
+            "the SQL Server Agent log has no archive 12; it keeps 0 to 9"
+        );
+        // A reply that isn't the lookup's row is sqlh's error, not an answer.
+        for found in [
+            Vec::new(),
+            vec![Vec::new()],
+            vec![vec![vec![Value::Text("1".into())]]],
+        ] {
+            let failure = errorlog_then(&found, false, None).unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal, "{found:?}");
+        }
+        // Read: the step, in one section.
+        let steps = errorlog_then(&log_found(1, 7, Some(6), 2, 17), false, None).unwrap();
+        assert_eq!(labels(&steps), ["server_log"]);
+        let steps = errorlog_then(&log_found(1, 10, Some(9), 1, 13), true, Some(3)).unwrap();
+        assert_eq!(labels(&steps), ["agent_log"]);
+    }
+
+    // `Plan::Lookup`'s rule (run.rs): the step is one SELECT, so a capped log gets the brief
+    // count and no `-- partial:` advice; newest first, in the log's order within one time, and
+    // without the server's trailing CR LF.
+    #[test]
+    fn errorlogs_step_is_one_select() {
+        for agent in [false, true] {
+            let step = errorlog_step(agent);
+            assert!(!crate::guard::several_outputs(&step.sql), "{}", step.sql);
+            assert_eq!(step.sql.matches("SELECT").count(), 1, "{}", step.sql);
+            assert!(
+                step.sql.ends_with(" FROM #log ORDER BY LogDate DESC, n;"),
+                "{}",
+                step.sql
+            );
+            assert!(
+                step.sql.contains(
+                    "CASE WHEN RIGHT([Text], 2) COLLATE Latin1_General_100_BIN2 = NCHAR(13) + \
+                     NCHAR(10) THEN LEFT([Text], LEN([Text] + N'x') - 3) ELSE [Text] END AS \
+                     [text]"
+                ),
+                "{}",
+                step.sql
+            );
+        }
+        assert!(
+            errorlog_step(false)
+                .sql
+                .starts_with("SELECT LogDate AS [time], ProcessInfo AS source, ")
+        );
+        assert!(errorlog_step(true).sql.starts_with(
+            "SELECT LogDate AS [time], CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN \
+             N'warning' WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level, "
+        ));
     }
 }

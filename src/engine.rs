@@ -1909,6 +1909,240 @@ mod tests {
         }
     }
 
+    /// `errorlog`'s request, for a call (`Advice::Mcp`) or the CLI.
+    fn errorlog_request(log: crate::schema::Errorlog, advice: Advice) -> Request {
+        Request {
+            input: crate::schema::Command::Errorlog(log)
+                .input(advice)
+                .expect("a lookup"),
+            ..request("")
+        }
+    }
+
+    /// The lookup's row, as `schema::errorlog_sql` ends: can_read, archives, last, read, major.
+    fn errorlog_found(
+        can: i32,
+        archives: i32,
+        last: Option<i32>,
+        read: i32,
+        major: i32,
+    ) -> Vec<u8> {
+        use fake_server::{Cell, Wire};
+        fake_server::result(
+            &[
+                ("can_read", Wire::Int),
+                ("archives", Wire::Int),
+                ("last", Wire::Int),
+                ("read", Wire::Int),
+                ("major", Wire::Int),
+            ],
+            &[&[
+                Cell::Int(can),
+                Cell::Int(archives),
+                last.map_or(Cell::Null, Cell::Int),
+                Cell::Int(read),
+                Cell::Int(major),
+            ]],
+        )
+    }
+
+    // schema-commands.md §6.9, the shapes through the real run path: the lookup shows nothing,
+    // its row decides; the step is the `server_log` or `agent_log` section, names-only header,
+    // values escaped as any (a tab; a later column's leading `--` needs none), `-- no rows:`
+    // when empty; a refusal is `-- error:` and exit 1. The fake answers the lookup (request 2)
+    // and the step (3).
+    #[test]
+    fn errorlog_shows_its_section_or_says_why_not() {
+        use crate::schema::Errorlog;
+        use fake_server::{Cell, Wire};
+        // 2026-11-21 10:15:30.120 and 2026-11-20 00:00, as datetime's days and 1/300 s.
+        let (today, at) = (46345, 36930 * 300 + 36);
+        let log = |second: &str, rows: &[&[Cell]]| {
+            fake_server::result(
+                &[
+                    ("time", Wire::DateTime),
+                    (second, Wire::Text),
+                    ("text", Wire::Text),
+                ],
+                rows,
+            )
+        };
+        let server = log(
+            "source",
+            &[
+                &[
+                    Cell::DateTime(today, at),
+                    Cell::Text("Logon"),
+                    Cell::Text("Error: 18456, Severity: 14, State: 5."),
+                ],
+                &[
+                    Cell::DateTime(today, at),
+                    Cell::Text("Logon"),
+                    Cell::Text("Login failed for user 'x'.\tReason: none"),
+                ],
+                &[
+                    Cell::DateTime(today - 1, 0),
+                    Cell::Text("spid9s"),
+                    Cell::Text("-- a line that looks like metadata"),
+                ],
+            ],
+        );
+        let ok = "-- ok: 1 batch, N ms; ?/master, connect N ms\n";
+        let shown = |found: Vec<u8>, step: Vec<u8>, log: Errorlog| {
+            let conns = vec![Conn::new().replying(2, found).replying(3, step)];
+            let request = errorlog_request(log, Advice::Mcp);
+            mcp_text(conns, 30, request, QueryOrigin::Generated, 30)
+        };
+        let (exit, text) = shown(
+            errorlog_found(1, 7, Some(6), 1, 17),
+            server,
+            Errorlog::default(),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- server_log\ntime\tsource\ttext\n\
+                 2026-11-21T10:15:30.120\tLogon\tError: 18456, Severity: 14, State: 5.\n\
+                 2026-11-21T10:15:30.120\tLogon\tLogin failed for user 'x'.\\tReason: none\n\
+                 2026-11-20T00:00:00.000\tspid9s\t-- a line that looks like metadata\n{ok}"
+            )
+        );
+        let agent = log(
+            "level",
+            &[&[
+                Cell::DateTime(today, at),
+                Cell::Text("warning"),
+                Cell::Text("[396] An idle CPU condition has not been defined"),
+            ]],
+        );
+        let agent_log = Errorlog {
+            agent: true,
+            ..Errorlog::default()
+        };
+        let (exit, text) = shown(errorlog_found(1, 10, Some(9), 1, 13), agent, agent_log);
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- agent_log\ntime\tlevel\ttext\n\
+                 2026-11-21T10:15:30.120\twarning\t[396] An idle CPU condition has not been \
+                 defined\n{ok}"
+            )
+        );
+        let searched = Errorlog {
+            since: Some("10m".into()),
+            search: Some("nothing like it".into()),
+            ..Errorlog::default()
+        };
+        let (exit, text) = shown(
+            errorlog_found(1, 7, Some(6), 2, 17),
+            log("source", &[]),
+            searched,
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(text, format!("-- no rows: server_log\n{ok}"));
+
+        let failed = "-- failed (exit 1): SQL error, N ms; ?/master, connect N ms\n";
+        for (found, asked, error) in [
+            (
+                errorlog_found(0, 0, None, 0, 17),
+                Errorlog::default(),
+                "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login \
+                 lacks; a DBA can grant one",
+            ),
+            (
+                errorlog_found(0, 0, None, 0, 13),
+                Errorlog::default(),
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it",
+            ),
+            (
+                errorlog_found(1, 0, None, 0, 17),
+                Errorlog::default(),
+                "this server lists no error log archives",
+            ),
+            (
+                errorlog_found(1, 7, Some(6), 0, 17),
+                Errorlog {
+                    archive: Some(12),
+                    ..Errorlog::default()
+                },
+                "the error log has no archive 12; it keeps 0 to 6",
+            ),
+        ] {
+            let (exit, text) = shown(found, log("source", &[]), asked);
+            assert_eq!(exit, Exit::SqlError, "{text}");
+            assert_eq!(text, format!("-- error: {error}\n{failed}"));
+        }
+    }
+
+    // A timeout while reading the error log names what helps: the timeout, and a later --since
+    // (fewer archives), never a narrower query, since each archive is read whole, search or not
+    // (decision 89). In the CLI's words and a call's.
+    #[test]
+    fn an_errorlog_timeout_names_since_and_the_timeout() {
+        use crate::schema::Errorlog;
+        let since = Errorlog {
+            since: Some("7d".into()),
+            ..Errorlog::default()
+        };
+        for (log, limit, advice) in [
+            (
+                since.clone(),
+                30,
+                "raise timeout (the server allows up to 30 s); a later since reads fewer \
+                 archives, each one whole even with search",
+            ),
+            (
+                Errorlog::default(),
+                1,
+                "1 s is the server's limit; the archive is read whole, even with search",
+            ),
+        ] {
+            let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+            let request = errorlog_request(log, Advice::Mcp);
+            let (exit, text) = mcp_text(hangs, limit, request, QueryOrigin::Generated, 1);
+            assert_eq!(exit, Exit::Timeout, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    "-- error: query timeout after 1 s while reading the error log; {advice}\n\
+                     -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+                )
+            );
+        }
+        for (log, advice) in [
+            (
+                since,
+                "raise -t; a later --since reads fewer archives, each one whole even with \
+                 --search",
+            ),
+            (
+                Errorlog::default(),
+                "raise -t; the archive is read whole, even with --search",
+            ),
+        ] {
+            let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: true })]);
+            let engine = serving(&fake, DEFAULT_POOL, None);
+            let request = errorlog_request(log, Advice::Cli);
+            let called = block_on(call_as(
+                &engine,
+                request,
+                QueryOrigin::Generated,
+                1,
+                &Cancel::new(),
+            ));
+            assert_eq!(called.exit, Exit::Timeout, "{}", called.text);
+            assert!(
+                called.text.starts_with(&format!(
+                    "-- error: query timeout after 1 s while reading the error log; {advice}\n"
+                )),
+                "{}",
+                called.text
+            );
+        }
+    }
+
     // The wait for a free connection, whole: what was busy (the profile's only connection, or
     // all of them), then a larger `timeout` and the server's --pool, or, once the call has the
     // server's limit, the server's --pool and -t.

@@ -2649,6 +2649,72 @@ pub(crate) mod fake_server {
         reply
     }
 
+    /// A column of `result`, as SQL Server describes a nullable one of these types.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Wire {
+        /// INTN of 4 bytes: `int`.
+        Int,
+        /// DATETIMN of 8 bytes: `datetime`.
+        DateTime,
+        /// NVARCHAR of 8,000 bytes, in the login's collation: `nvarchar(4000)`.
+        Text,
+    }
+
+    /// A value of a `result` row, for its column's `Wire`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Cell<'a> {
+        Null,
+        Int(i32),
+        /// `datetime`'s days from 1900-01-01 and its time in 1/300 s.
+        DateTime(i32, u32),
+        Text(&'a str),
+    }
+
+    /// One result set and its final DONE: COLMETADATA (`81 | count u16 LE`, then per column
+    /// `user type u32 | flags u16, 0x01 nullable | type info | name B_VARCHAR`), a ROW (`D1`)
+    /// per row, each value as its type writes it (a length byte for INTN and DATETIMN, a u16
+    /// LE byte count for NVARCHAR, 0xFFFF for NULL).
+    pub(crate) fn result(columns: &[(&str, Wire)], rows: &[&[Cell]]) -> Vec<u8> {
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let mut tokens = vec![0x81];
+        tokens.extend(u16::try_from(columns.len()).unwrap().to_le_bytes());
+        for (name, wire) in columns {
+            tokens.extend([0, 0, 0, 0, 1, 0]);
+            match wire {
+                Wire::Int => tokens.extend([0x26, 4]),
+                Wire::DateTime => tokens.extend([0x6f, 8]),
+                Wire::Text => tokens.extend([0xe7, 0x40, 0x1f, 9, 4, 0xd0, 0, 0x34]),
+            }
+            tokens.push(u8::try_from(name.encode_utf16().count()).unwrap());
+            tokens.extend(utf16(name));
+        }
+        for row in rows {
+            tokens.push(0xd1);
+            for (cell, (_, wire)) in row.iter().zip(columns) {
+                match (cell, wire) {
+                    (Cell::Null, Wire::Text) => tokens.extend([0xff, 0xff]),
+                    (Cell::Null, _) => tokens.push(0),
+                    (Cell::Int(n), _) => {
+                        tokens.push(4);
+                        tokens.extend(n.to_le_bytes());
+                    }
+                    (Cell::DateTime(days, ticks), _) => {
+                        tokens.push(8);
+                        tokens.extend(days.to_le_bytes());
+                        tokens.extend(ticks.to_le_bytes());
+                    }
+                    (Cell::Text(text), _) => {
+                        let bytes = utf16(text);
+                        tokens.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
+                        tokens.extend(bytes);
+                    }
+                }
+            }
+        }
+        tokens.extend(done(rows.len() as u64));
+        tokens
+    }
+
     /// The login's answer: LOGINACK, the packet size, database and collation changes, DONE.
     fn login_reply() -> Vec<u8> {
         let name: Vec<u8> = "fake".encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -2776,6 +2842,8 @@ pub(crate) mod fake_server {
     #[derive(Clone, Debug, Default)]
     pub(crate) struct Conn {
         turns: Vec<(usize, Turn)>,
+        /// Requests answered with these tokens instead (`Conn::replying`).
+        replies: Vec<(usize, Vec<u8>)>,
         close_after: Option<usize>,
         no_reset_ack: bool,
         refuse_login: bool,
@@ -2814,6 +2882,13 @@ pub(crate) mod fake_server {
         /// connection can meet.
         pub(crate) fn refusing_login(mut self) -> Conn {
             self.refuse_login = true;
+            self
+        }
+
+        /// Answers the connection's `request`th SQL batch with `tokens` (built with `result`),
+        /// whatever it says: a command's lookup and step, with the rows a test needs.
+        pub(crate) fn replying(mut self, request: usize, tokens: Vec<u8>) -> Conn {
+            self.replies.push((request, tokens));
             self
         }
 
@@ -3047,7 +3122,15 @@ pub(crate) mod fake_server {
                     reply.extend(env_reset());
                 }
             }
+            let replied = script
+                .replies
+                .iter()
+                .find(|(number, _)| *number == answered);
             let sent = match script.turn(answered) {
+                Turn::Answer if let Some((_, tokens)) = replied => {
+                    reply.extend(tokens);
+                    write_packet(&mut s, &reply, true)
+                }
                 Turn::Answer => {
                     reply.extend(answer(&sql, conn, log));
                     write_packet(&mut s, &reply, true)

@@ -25,14 +25,13 @@ CONNECTION
 EXECUTION
   -i file         input file, repeatable; "-i -" reads stdin. UTF-8, or UTF-16 with a BOM
   -v n=v ...      values for $(n); environment variables also resolve, not SQLCMDPASSWORD. -x turns this off
-  -c word         batch separator (default GO; "GO 3" runs a batch 3 times)
+  -c word         batch separator (default GO; "GO 3" runs it 3 times)   --continue-on-error  go on after a failed one
   -t seconds      per-batch query timeout, also for a stalled reader (default 60; 0 = none)
   --lock-timeout S      seconds a statement waits for a lock, then error 1222 (default 10; 0 = none)
   --read-uncommitted    read-only runs only: read without waiting for writers; rows may be dirty
   --allow-write   permit writes. Without it, writes other than to #temp/@table are refused before anything
                   runs; every batch runs in a rolled-back transaction. Not security: use a read-only login.
   --check         compile only (SET NOEXEC ON): finds syntax errors and unknown columns, not missing tables
-  --continue-on-error   run later batches after one fails (default: stop)
 
 OUTPUT
   --format F      text (default) | json (one document; exit status last) | csv (data; -- lines on stderr)
@@ -45,6 +44,7 @@ OUTPUT
 
 SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
   describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
+SERVER  errorlog [--since 2h|DATE] [--search T] [--agent] [--archive N]   (newest first; server-local times)
 
 PROFILES  sqlh profiles ... saves and manages them; --profile NAME uses one. Passwords stay in Credential Manager
   sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]

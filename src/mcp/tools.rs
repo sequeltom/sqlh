@@ -14,6 +14,7 @@ use crate::engine::{Call, Engine};
 use crate::error::{Exit, Failure};
 use crate::output::{Advice, Collected, Format, Limits};
 use crate::run::{self, Input, QueryOrigin, Report, Request, RunOutcome};
+use crate::schema::Errorlog;
 
 /// The most rows a call may ask to see per result set.
 const MAX_ROWS_ARG: u64 = 10_000;
@@ -49,20 +50,45 @@ enum Arg {
     OptionalPattern,
     InDefinitions,
     ExactCount,
+    Since,
+    Search,
+    Agent,
+    Archive,
+}
+
+/// Which tool a `Tool` is, so that `plan`'s match over the tools is exhaustive: a tool added to
+/// `TOOLS` without an arm there doesn't compile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Id {
+    Query,
+    Check,
+    Info,
+    Databases,
+    Tables,
+    Describe,
+    Find,
+    Definition,
+    Deps,
+    Errorlog,
 }
 
 struct Tool {
+    id: Id,
     name: &'static str,
     description: &'static str,
     args: &'static [Arg],
     /// Whether `max_rows` means anything for it: `info` returns one row. `max_cell` always
     /// does, since a profile's or the launch's small limit cuts `info`'s values too (R49).
     rows: bool,
+    /// Whether it takes `database`: a server-wide read doesn't, since an agent would take the
+    /// argument for a filter.
+    database: bool,
 }
 
 /// The tools, in `tools/list` order.
 const TOOLS: &[Tool] = &[
     Tool {
+        id: Id::Query,
         name: "query",
         description: "Run read-only T-SQL on SQL Server. A read-only guard refuses writes, and \
             everything runs in a transaction that is rolled back. Several batches separated by \
@@ -78,16 +104,20 @@ const TOOLS: &[Tool] = &[
             format json gives the same as one JSON document.",
         args: &[Arg::Sql, Arg::ExactCount],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Check,
         name: "check",
         description: "Compile T-SQL without running it (SET NOEXEC ON): syntax and name \
             binding errors only. A missing table is reported only when a query runs, because \
             SQL Server defers its name resolution.",
         args: &[Arg::Sql],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Info,
         name: "info",
         description: "The server, its version and edition, the database, the login and \
             user, the transport, the auth scheme, the server's time, and server_permissions: \
@@ -95,23 +125,29 @@ const TOOLS: &[Tool] = &[
             reads work (VIEW SERVER STATE, VIEW ANY ERROR LOG and the like), or none.",
         args: &[],
         rows: false,
+        database: true,
     },
     Tool {
+        id: Id::Databases,
         name: "databases",
         description: "The databases on the server, with their state, whether this login \
             can use them, compatibility level, recovery model, read-only flag and collation.",
         args: &[],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Tables,
         name: "tables",
         description: "Tables and views with their estimated rows. pattern is a substring, \
             or a glob with * and ? (case-insensitive), matched against the name or \
             schema.name.",
         args: &[Arg::OptionalPattern],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Describe,
         name: "describe",
         description: "Everything needed to query a table or view, or call a procedure or \
             function: columns and types, keys, indexes, foreign keys both ways, checks, \
@@ -119,29 +155,51 @@ const TOOLS: &[Tool] = &[
             before writing queries against unfamiliar tables.",
         args: &[Arg::Object],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Find,
         name: "find",
         description: "Objects and columns whose names match a pattern (a substring, or a glob \
             with * and ?); with in_definitions, also the module bodies that contain it, with \
             the first matching line.",
         args: &[Arg::Pattern, Arg::InDefinitions],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Definition,
         name: "definition",
         description: "The source of a view, procedure, function or trigger, as a block framed \
             by its line count.",
         args: &[Arg::Object],
         rows: true,
+        database: true,
     },
     Tool {
+        id: Id::Deps,
         name: "deps",
         description: "What an object uses and what uses it, one level each way: code \
             references, foreign keys and synonyms, with the column or constraint that holds \
             each reference.",
         args: &[Arg::Object],
         rows: true,
+        database: true,
+    },
+    Tool {
+        id: Id::Errorlog,
+        name: "errorlog",
+        description: "The SQL Server error log, newest first, with server-local times (time, \
+            source, text). Without since: the current log, or archive N. since keeps the lines \
+            from 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 on, reading back \
+            through older archives as far as that needs. search returns whole entries: each \
+            matching line with the lines of the same time and source (a Login failed line with \
+            its Error: 18456 line). agent reads the SQL Server Agent log instead (time, level, \
+            text). Needs VIEW ANY ERROR LOG or VIEW SERVER STATE (info shows \
+            server_permissions).",
+        args: &[Arg::Since, Arg::Search, Arg::Agent, Arg::Archive],
+        rows: true,
+        database: false,
     },
 ];
 
@@ -152,6 +210,7 @@ fn limit_descriptions(tool: &str, launch: &Launch) -> (String, String) {
     let rows = match (launch.max_rows, tool) {
         (Some(n), _) => format!("default {n}"),
         (None, "describe" | "deps" | "definition") => "default 2000".into(),
+        (None, "errorlog") => "default 50, the newest".into(),
         (None, _) => "default 100, or the profile's max_rows".into(),
     };
     let cell = match (launch.max_cell, tool) {
@@ -217,6 +276,32 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                             "Also search module bodies (views, procedures, functions)."}),
                         false,
                     ),
+                    Arg::Since => (
+                        "since",
+                        json!({"type": "string", "minLength": 1, "description":
+                            "The lines from this point on: 30m, 12h, 7d, or a server-local \
+                             time 2026-11-20 08:00 (no offset). Not with archive."}),
+                        false,
+                    ),
+                    Arg::Search => (
+                        "search",
+                        json!({"type": "string", "minLength": 1, "maxLength": 500,
+                            "description": "Text a line contains; each match comes with the \
+                             other lines of its entry."}),
+                        false,
+                    ),
+                    Arg::Agent => (
+                        "agent",
+                        json!({"type": "boolean", "description":
+                            "The SQL Server Agent log instead of the server's (default false)."}),
+                        false,
+                    ),
+                    Arg::Archive => (
+                        "archive",
+                        json!({"type": "integer", "minimum": 0, "maximum": 99, "description":
+                            "The archive to read (default 0, the current log)."}),
+                        false,
+                    ),
                 };
                 properties.insert(name.into(), schema);
                 if needed {
@@ -232,11 +317,13 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                 "profile".into(),
                 json!({"type": "string", "enum": names, "description": profile_description}),
             );
-            properties.insert(
-                "database".into(),
-                json!({"type": "string", "minLength": 1, "maxLength": 128, "description":
-                    "A database to run in, instead of the profile's."}),
-            );
+            if tool.database {
+                properties.insert(
+                    "database".into(),
+                    json!({"type": "string", "minLength": 1, "maxLength": 128, "description":
+                        "A database to run in, instead of the profile's."}),
+                );
+            }
             let (rows, cell) = limit_descriptions(tool.name, launch);
             if tool.rows {
                 properties.insert(
@@ -346,30 +433,25 @@ pub(crate) enum Refused {
     Arguments { message: String, format: Format },
 }
 
-/// What a refusal shows of a name the client sent (a tool, an argument, a profile): enough to
-/// recognize it, so a huge one can't make the answer huge.
-pub(crate) fn echo(name: &str) -> String {
-    const SHOWN: usize = 100;
-    match name.char_indices().nth(SHOWN) {
-        Some((at, _)) => format!("{}…", &name[..at]),
-        None => name.to_owned(),
-    }
-}
+pub(crate) use crate::error::echo;
 
 /// The arguments that are whole numbers, which `protocol::parse` reads from their text so that
 /// none is rounded (R41), and only these, so a call costs at most this many rereadings of its
 /// line however many other arguments it holds (R42). Every tool's schema declares exactly these
 /// as `integer` (`the_numeric_arguments_are_the_schemas_integers`).
-pub(crate) const NUMERIC_ARGS: [&str; 3] = ["max_rows", "max_cell", "timeout"];
+pub(crate) const NUMERIC_ARGS: [&str; 4] = ["max_rows", "max_cell", "timeout", "archive"];
 
-/// The arguments `tool` takes: its own, then those every tool takes, `max_rows` only where it
-/// applies (all but `info`, R49).
+/// The arguments `tool` takes: its own, then those every tool takes, `database` and `max_rows`
+/// only where they apply (`database` not for a server-wide read, `max_rows` not for `info`,
+/// R49).
 fn takes(tool: &Tool) -> Vec<&'static str> {
+    let database: &[&str] = if tool.database { &["database"] } else { &[] };
     let rows: &[&str] = if tool.rows { &["max_rows"] } else { &[] };
     tool.args
         .iter()
         .map(|arg| arg_name(*arg))
-        .chain(["profile", "database"])
+        .chain(["profile"])
+        .chain(database.iter().copied())
         .chain(rows.iter().copied())
         .chain(["max_cell", "timeout", "format"])
         .collect()
@@ -506,23 +588,30 @@ pub(crate) fn plan(params: &Map<String, Value>, launch: &Launch) -> Result<Plann
     };
     let in_definitions = flag("in_definitions")?;
     let exact_count = flag("exact_count")?;
-    let what = match tool.name {
-        "query" | "check" => What::Sql {
+    let what = match tool.id {
+        Id::Query | Id::Check => What::Sql {
             sql: required("sql")?,
-            check: tool.name == "check",
+            check: tool.id == Id::Check,
         },
-        "info" => What::Command(SchemaCommand::Info),
-        "databases" => What::Command(SchemaCommand::Dbs),
-        "tables" => What::Command(SchemaCommand::Tables(
+        Id::Info => What::Command(SchemaCommand::Info),
+        Id::Databases => What::Command(SchemaCommand::Dbs),
+        Id::Tables => What::Command(SchemaCommand::Tables(
             text("pattern")?.filter(|p| !p.is_empty()),
         )),
-        "describe" => What::Command(SchemaCommand::Describe(required("object")?)),
-        "find" => What::Command(SchemaCommand::Find {
+        Id::Describe => What::Command(SchemaCommand::Describe(required("object")?)),
+        Id::Find => What::Command(SchemaCommand::Find {
             pattern: required("pattern")?,
             text: in_definitions,
         }),
-        "definition" => What::Command(SchemaCommand::Def(required("object")?)),
-        _ => What::Command(SchemaCommand::Deps(required("object")?)),
+        Id::Definition => What::Command(SchemaCommand::Def(required("object")?)),
+        Id::Deps => What::Command(SchemaCommand::Deps(required("object")?)),
+        // `since` and `search` are checked by the command, as the CLI's are, in a call's words.
+        Id::Errorlog => What::Command(SchemaCommand::Errorlog(Errorlog {
+            since: text("since")?,
+            search: text("search")?,
+            agent: flag("agent")?,
+            archive: number("archive", 0, 99)?.map(|n| n as u32),
+        })),
     };
     Ok(Planned {
         tool: tool.name,
@@ -544,6 +633,10 @@ fn arg_name(arg: Arg) -> &'static str {
         Arg::Pattern | Arg::OptionalPattern => "pattern",
         Arg::InDefinitions => "in_definitions",
         Arg::ExactCount => "exact_count",
+        Arg::Since => "since",
+        Arg::Search => "search",
+        Arg::Agent => "agent",
+        Arg::Archive => "archive",
     }
 }
 
@@ -691,11 +784,13 @@ mod tests {
                 .map(|(name, _)| name.as_str())
                 .collect();
             integers.sort_unstable();
-            // `info` takes no max_rows (it returns one row), but max_cell (R49).
+            // `info` takes no max_rows (it returns one row), but max_cell (R49); `archive` is
+            // errorlog's.
             let mut wanted: Vec<&str> = NUMERIC_ARGS
                 .iter()
                 .copied()
                 .filter(|arg| tool["name"] != "info" || *arg != "max_rows")
+                .filter(|arg| tool["name"] == "errorlog" || *arg != "archive")
                 .collect();
             wanted.sort_unstable();
             assert_eq!(integers, wanted, "{}", tool["name"]);
@@ -823,7 +918,8 @@ mod tests {
                 "describe",
                 "find",
                 "definition",
-                "deps"
+                "deps",
+                "errorlog"
             ]
         );
         for tool in tools.as_array().unwrap() {
@@ -834,6 +930,13 @@ mod tests {
             assert_eq!(
                 tool["inputSchema"]["properties"]["profile"]["enum"],
                 json!(["test", "reporting"])
+            );
+            // A server-wide read takes no database, which an agent would take for a filter.
+            assert_eq!(
+                tool["inputSchema"]["properties"].get("database").is_some(),
+                tool["name"] != "errorlog",
+                "{}",
+                tool["name"]
             );
         }
         // With several profiles, a call must name one; with one, it is the default.
@@ -1128,5 +1231,116 @@ mod tests {
         );
         assert_eq!(echo("short"), "short");
         assert_eq!(echo(&"é".repeat(150)), format!("{}…", "é".repeat(100)));
+    }
+
+    // schema-commands.md §6.9 through the `errorlog` tool: its four arguments reach the command;
+    // a type or bound the schema states is an argument refusal; `since` and `search` are the
+    // command's to check, before anything connects, in a call's words (no `--`); there is no
+    // `database`, and its rows default to the newest 50.
+    #[test]
+    fn the_errorlog_tool_takes_its_arguments_and_no_database() {
+        let one = launch(&["test"]);
+        let planned = plan(
+            &call(
+                json!({"name": "errorlog", "arguments": {"since": "2h", "search": "Login",
+                "agent": true}}),
+            ),
+            &one,
+        )
+        .unwrap_or_else(|_| panic!("planned"));
+        let What::Command(SchemaCommand::Errorlog(log)) = &planned.what else {
+            panic!("errorlog");
+        };
+        assert_eq!(
+            log,
+            &Errorlog {
+                since: Some("2h".into()),
+                search: Some("Login".into()),
+                agent: true,
+                archive: None,
+            }
+        );
+        let planned = plan(
+            &call(json!({"name": "errorlog", "arguments": {"archive": 99}})),
+            &one,
+        )
+        .unwrap_or_else(|_| panic!("planned"));
+        let What::Command(SchemaCommand::Errorlog(log)) = &planned.what else {
+            panic!("errorlog");
+        };
+        assert_eq!(log.archive, Some(99));
+        for (arguments, wanted) in [
+            (
+                json!({"database": "master"}),
+                "unknown argument database (errorlog takes since, search, agent, archive, \
+                 profile, max_rows, max_cell, timeout, format)",
+            ),
+            (
+                json!({"archive": 100}),
+                "archive must be a whole number from 0 to 99",
+            ),
+            (
+                json!({"archive": -1}),
+                "archive must be a whole number from 0 to 99",
+            ),
+            (json!({"agent": "yes"}), "agent must be true or false"),
+            (json!({"since": 2}), "since must be a string"),
+            (json!({"search": ["x"]}), "search must be a string"),
+        ] {
+            match plan(
+                &call(json!({"name": "errorlog", "arguments": arguments.clone()})),
+                &one,
+            ) {
+                Err(Refused::Arguments { message, .. }) => {
+                    assert!(message.contains(wanted), "{arguments}: {message}")
+                }
+                _ => panic!("{arguments}: not refused as arguments"),
+            }
+        }
+        let mut settings = run::unconnected_settings(false);
+        settings.limits.advice = Advice::Mcp;
+        let usage = |arguments: Value| {
+            let planned = plan(
+                &call(json!({"name": "errorlog", "arguments": arguments})),
+                &one,
+            )
+            .unwrap_or_else(|_| panic!("planned"));
+            let Err(failure) = prepare(&planned, &settings) else {
+                panic!("refused before running");
+            };
+            assert_eq!(failure.exit, Exit::Usage);
+            failure.message
+        };
+        assert_eq!(
+            usage(json!({"since": "yesterday"})),
+            "since yesterday: expected 30m, 12h, 7d or a server-local time like 2026-11-20 \
+             08:00 (no offset)"
+        );
+        assert_eq!(
+            usage(json!({"search": ""})),
+            "search takes 1 to 500 characters and no control characters"
+        );
+        assert_eq!(
+            usage(json!({"since": "1h", "archive": 1})),
+            "since and archive don't combine: since reads back through the archives its window \
+             needs"
+        );
+        let tools = definitions(&one);
+        let errorlog = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "errorlog")
+            .unwrap();
+        let properties = &errorlog["inputSchema"]["properties"];
+        assert_eq!(properties["archive"]["maximum"], 99);
+        assert_eq!(properties["search"]["maxLength"], 500);
+        assert_eq!(properties["agent"]["type"], "boolean");
+        assert_eq!(errorlog["inputSchema"].get("required"), None);
+        assert_eq!(
+            properties["max_rows"]["description"],
+            "Rows shown per result set (default 50, the newest); 0 shows all (within the size \
+             limit)."
+        );
     }
 }

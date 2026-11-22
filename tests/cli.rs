@@ -3962,6 +3962,90 @@ fn schema_commands_refuse_what_they_cannot_answer_before_connecting() {
     }
 }
 
+// schema-commands.md §6.9: errorlog's options are checked before anything connects, each
+// refusal exit 3 with its reason; the server named is a closed port, which would be exit 2.
+#[test]
+fn errorlog_refuses_its_bad_options_before_connecting() {
+    let run = |args: &[&str]| run(sqlh().args(DEAD).args(args));
+    let since = "expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no offset)";
+    for (args, wanted) in [
+        (
+            &["errorlog", "--since", "0m"][..],
+            format!("--since 0m: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "3651d"][..],
+            format!("--since 3651d: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "2026-02-29"][..],
+            format!("--since 2026-02-29: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "2026-11-20T08:00+01:00"][..],
+            format!("--since 2026-11-20T08:00+01:00: {since}"),
+        ),
+        (
+            &["errorlog", "--search", " "][..],
+            "--search takes 1 to 500 characters and no control characters".into(),
+        ),
+        (
+            &["errorlog", "--search", "a\tb"][..],
+            "--search takes 1 to 500 characters and no control characters".into(),
+        ),
+        (
+            &["errorlog", "--archive", "100"][..],
+            "--archive 100: expected 0 to 99".into(),
+        ),
+        (
+            &["errorlog", "--archive", "-1"][..],
+            "--archive -1: expected a non-negative whole number".into(),
+        ),
+        (
+            &["errorlog", "--since", "1h", "--archive", "1"][..],
+            "--since and --archive don't combine: --since reads back through the archives its \
+             window needs"
+                .into(),
+        ),
+        (
+            &["errorlog", "x"][..],
+            "errorlog takes --since, --search, --agent and --archive, not \"x\"".into(),
+        ),
+        (
+            &["--since", "1h", "-Q", "SELECT 1"][..],
+            "--since only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["tables", "--search", "x"][..],
+            "--search only applies to sqlh errorlog and sqlh profiles list".into(),
+        ),
+        (
+            &["--agent", "SELECT 1"][..],
+            "--agent only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["dbs", "--archive", "1"][..],
+            "--archive only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["--check", "errorlog"][..],
+            "--check compiles your SQL; a schema command runs its own".into(),
+        ),
+        (
+            &["-Q", "SELECT 1", "errorlog"][..],
+            "a schema command runs its own SQL; give it without -Q or -i".into(),
+        ),
+    ] {
+        let r = run(args);
+        assert_eq!(r.code, 3, "{args:?}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains(&format!("-- error: {wanted}")),
+            "{args:?}: {}",
+            r.stdout
+        );
+    }
+}
+
 // AGENTS.md: models read --help, so it stays short. plan-history.md 2.13 holds it at 62 lines.
 #[test]
 fn help_stays_within_its_line_budget() {
@@ -5596,6 +5680,56 @@ mod mcp {
         }
     }
 
+    // schema-commands.md §6.9 through sqlh mcp: the errorlog tool's arguments are refused before
+    // anything connects (the profile is a closed port, which would be exit 2), as a tool error
+    // with exit 3 in a call's words: a bad since or search the command checks, a bound the
+    // schema states, the database it doesn't take.
+    #[test]
+    fn the_errorlog_tool_refuses_a_bad_argument_before_connecting() {
+        let config = profiles("mcp_errorlog");
+        let calls = [
+            r#"{"since":"2026-11-20T08:00Z"}"#,
+            r#"{"search":"a\u0000b"}"#,
+            r#"{"since":"1h","archive":2}"#,
+            r#"{"archive":100}"#,
+            r#"{"database":"master"}"#,
+        ];
+        let lines: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(n, arguments)| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{{META},"name":"errorlog","arguments":{arguments}}}}}"#,
+                    n + 1
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (n, wanted) in [
+            "-- error: since 2026-11-20T08:00Z: expected 30m, 12h, 7d or a server-local time like \
+             2026-11-20 08:00 (no offset)\n",
+            "-- error: search takes 1 to 500 characters and no control characters\n",
+            "-- error: since and archive don't combine: since reads back through the archives \
+             its window needs\n",
+            "-- error: invalid arguments for errorlog: archive must be a whole number from 0 to \
+             99\n",
+            "-- error: invalid arguments for errorlog: unknown argument database (errorlog takes \
+             since, search, agent, archive, profile, max_rows, max_cell, timeout, format)\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = &by_id(&messages, n as i64 + 1)["result"];
+            assert_eq!(call["isError"], true, "{call}");
+            let text = call["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(wanted) && text.contains("-- failed (exit 3): usage error, "),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn a_modern_session_discovers_lists_and_calls() {
         let config = profiles("mcp_modern");
@@ -5641,7 +5775,7 @@ mod mcp {
         );
 
         let tools = by_id(&messages, 2)["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         assert_eq!(
             tools[0]["inputSchema"]["properties"]["profile"]["enum"],
             serde_json::json!(["win", "other"])
@@ -5733,7 +5867,7 @@ mod mcp {
         assert_eq!(by_id(&messages, 0)["result"], serde_json::json!({}));
         assert_eq!(by_id(&messages, 2)["result"], serde_json::json!({}));
         let list = &by_id(&messages, 3)["result"];
-        assert_eq!(list["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
         assert!(list.get("ttlMs").is_none() && list.get("resultType").is_none());
         // The only profile is the default; the run fails to connect, as a tool error.
         let call = &by_id(&messages, 4)["result"];
@@ -6238,7 +6372,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            10
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
     }
@@ -7511,7 +7645,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            10
         );
         invalid(23, "Invalid params: _meta must be an object");
         invalid(
@@ -7554,7 +7688,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            10
         );
         // Only 14 was acknowledged, and only 14 is answered and torn down at the end.
         let acks: Vec<_> = messages
@@ -13628,6 +13762,203 @@ mod live {
         }
     }
 
+    /// A text run's rows (the lines after the first header, up to the first `-- ` line), each
+    /// split at its tabs.
+    fn section_rows(stdout: &str) -> Vec<Vec<&str>> {
+        stdout
+            .lines()
+            .skip_while(|line| line.starts_with("-- "))
+            .skip(1)
+            .take_while(|line| !line.starts_with("-- "))
+            .map(|line| line.split('\t').collect())
+            .collect()
+    }
+
+    // schema-commands.md §6.9 as the owner (sysadmin): the server's log, newest first, in its
+    // section; the Agent log with its levels as words; an archive past the last is exit 1 and
+    // never the driver's protocol error (exit 10, U14).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_reads_the_servers_and_the_agents_log() {
+        let (p, db) = target();
+        let r = live(&p, &db, &["errorlog", "--max-rows", "0"]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- server_log\ntime\tsource\ttext\n"),
+            "{}",
+            r.stdout
+        );
+        let rows = section_rows(&r.stdout);
+        assert!(!rows.is_empty(), "{}", r.stdout);
+        for pair in rows.windows(2) {
+            assert!(pair[0][0] >= pair[1][0], "newest first: {pair:?}");
+        }
+        // The server's trailing CR LF is gone.
+        assert!(
+            rows.iter().all(|row| !row[2].ends_with("\\r\\n")),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["errorlog", "--agent"]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- agent_log\ntime\tlevel\ttext\n"),
+            "{}",
+            r.stdout
+        );
+        let rows = section_rows(&r.stdout);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row[1], "error" | "warning" | "info")),
+            "{}",
+            r.stdout
+        );
+        for agent in [&[][..], &["--agent"][..]] {
+            let mut args = vec!["errorlog", "--archive", "99"];
+            args.extend(agent);
+            let r = live(&p, &db, &args);
+            assert_eq!(r.code, 1, "{args:?}: {}", r.stdout);
+            let log = if agent.is_empty() {
+                "the error log"
+            } else {
+                "the SQL Server Agent log"
+            };
+            assert!(
+                r.stdout.starts_with(&format!(
+                    "-- error: {log} has no archive 99; it keeps 0 to "
+                )),
+                "{}",
+                r.stdout
+            );
+        }
+    }
+
+    // Decisions 84 and 89: a failed login of the test's own makes a known entry, and a search
+    // finds it whole: its `Error: 18456` line above its `Login failed` line, the two together
+    // (same time and source), newest first. A window that starts inside archive 1 reads back
+    // into it: its newest line is returned with archive 0's.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_finds_a_whole_entry_and_reads_back_through_archives() {
+        let (p, db) = target();
+        let login = format!("sqlh_nologin_{}", std::process::id());
+        let mut attempt = Command::new(exe());
+        attempt
+            .stdin(Stdio::null())
+            .env("SQLCMDPASSWORD", random_password())
+            .args(["--profile", &p, "-d", &db, "-U", &login, "-Q", "SELECT 1"]);
+        let r = run(&mut attempt);
+        assert_eq!(r.code, 2, "{}", r.stdout);
+        let r = live(&p, &db, &["errorlog", "--since", "10m", "--search", &login]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let rows = section_rows(&r.stdout);
+        let failed = rows
+            .iter()
+            .position(|row| row[2].starts_with(&format!("Login failed for user '{login}'.")))
+            .unwrap_or_else(|| panic!("no Login failed line:\n{}", r.stdout));
+        assert!(failed > 0, "{}", r.stdout);
+        let (error, line) = (&rows[failed - 1], &rows[failed]);
+        assert!(
+            error[2].starts_with("Error: 18456, Severity: 14, State: "),
+            "{}",
+            r.stdout
+        );
+        assert_eq!((error[0], error[1]), (line[0], line[1]), "{}", r.stdout);
+        assert_eq!(line[1], "Logon", "{}", r.stdout);
+
+        // Archive 1's newest line, and a window from its second.
+        let r = live(&p, &db, &["errorlog", "--archive", "1", "--max-rows", "1"]);
+        if r.code == 1 && r.stdout.contains("has no archive 1") {
+            // Only archive 0: what --since reads is archive 0's, checked above.
+            return;
+        }
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let newest = section_rows(&r.stdout)
+            .into_iter()
+            .next()
+            .map(|row| row.join("\t"))
+            .unwrap_or_else(|| panic!("archive 1 is empty:\n{}", r.stdout));
+        let since = newest[..19].replace('T', " ");
+        // Archive 1's line is the oldest shown, so nothing may cut the output before it.
+        let r = live(
+            &p,
+            &db,
+            &[
+                "errorlog",
+                "--since",
+                &since,
+                "--max-rows",
+                "0",
+                "--max-output",
+                "0",
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.lines().any(|l| l == newest),
+            "--since {since} reads back into archive 1 ({newest}):\n{}",
+            r.stdout
+        );
+    }
+
+    // schema-commands.md §6.9: who may read the log. A reader with nothing on the server is
+    // refused (exit 1), in words by the server's version; VIEW SERVER STATE, VIEW ANY ERROR LOG
+    // (SQL Server 2022 and later) and securityadmin each read it; VIEW SERVER PERFORMANCE STATE
+    // alone doesn't (live check 10).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_needs_a_permission_and_says_which() {
+        let (p, db) = target();
+        let reader = Reader::create(&p, &db);
+        let login = reader.login.clone();
+        let server = |sql: &str| {
+            let sql = sql.replace("{login}", &login);
+            let r = reader.probe.server.write(&format!("USE master; {sql}"));
+            assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        };
+        let modern = server_major(&*reader.probe.server) >= 16;
+        let refused = |why: &str| {
+            let r = reader.run(&["errorlog"]);
+            assert_eq!(r.code, 1, "{why}: {}", r.stdout);
+            let wanted = if modern {
+                "-- error: errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this \
+                 login lacks; a DBA can grant one\n"
+            } else {
+                "-- error: errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can \
+                 grant it\n"
+            };
+            assert!(r.stdout.starts_with(wanted), "{why}: {}", r.stdout);
+        };
+        refused("no permission");
+        let mut grants = vec![
+            "GRANT VIEW SERVER STATE TO [{login}];",
+            "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}];",
+        ];
+        if modern {
+            grants.push("GRANT VIEW ANY ERROR LOG TO [{login}];");
+            server("GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];");
+            refused("VIEW SERVER PERFORMANCE STATE alone");
+            server("REVOKE VIEW SERVER PERFORMANCE STATE FROM [{login}];");
+        }
+        for grant in grants {
+            server(grant);
+            let r = reader.run(&["errorlog", "--max-rows", "1"]);
+            assert_eq!(r.code, 0, "{grant}: {}", r.stdout);
+            assert!(
+                r.stdout.starts_with("-- server_log\ntime\tsource\ttext\n"),
+                "{grant}: {}",
+                r.stdout
+            );
+            server(
+                &grant
+                    .replace("GRANT ", "REVOKE ")
+                    .replace(" TO [", " FROM [")
+                    .replace(" ADD MEMBER [", " DROP MEMBER ["),
+            );
+            refused(&format!("after undoing {grant}"));
+        }
+    }
+
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
     // configuration listing run in the read-only wrapper, from a user database; a value for
     // sp_configure is refused before anything runs. Whether a login may run each one is the
@@ -14203,6 +14534,54 @@ mod live {
                     "session {spid} never waited for the held write"
                 );
             }
+        }
+
+        // schema-commands.md §6.9 through sqlh mcp: the errorlog tool's sections in text and
+        // JSON, its rows the newest within max_rows, and a bad since a tool error that names the
+        // argument without `--`.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn the_errorlog_tool_reads_the_log() {
+            let (p, _db) = target();
+            let mut mcp = Mcp::on(&p);
+            let (error, text) = tool_text(&mcp.call(1, "errorlog", json!({"max_rows": 2})));
+            assert!(!error, "{text}");
+            assert!(
+                text.starts_with("-- server_log\ntime\tsource\ttext\n"),
+                "{text}"
+            );
+            let (body, status) = split_status(&text);
+            assert!(status.starts_with("-- ok: 1 batch, "), "{text}");
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with("-- 2 of ") && l.contains(" rows shown (max_rows 2")),
+                "{text}"
+            );
+            let document = ok_document(&mcp.call(
+                2,
+                "errorlog",
+                json!({"agent": true, "max_rows": 1, "format": "json"}),
+            ));
+            let results = events(&document, "result");
+            assert_eq!(results.len(), 1, "{document}");
+            assert_eq!(results[0]["label"], "agent_log", "{document}");
+            let names: Vec<&str> = results[0]["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["name"].as_str())
+                .collect();
+            assert_eq!(names, ["time", "level", "text"], "{document}");
+            let (error, text) = tool_text(&mcp.call(3, "errorlog", json!({"since": "soon"})));
+            assert!(error, "{text}");
+            assert!(
+                text.starts_with(
+                    "-- error: since soon: expected 30m, 12h, 7d or a server-local time like \
+                     2026-11-20 08:00 (no offset)\n-- failed (exit 3): usage error, "
+                ),
+                "{text}"
+            );
+            assert_eq!(mcp.finish().0, 0);
         }
 
         // Decision 30(c), as the server sees it: `sqlh` for a read-only run, `sqlh (writes)` for

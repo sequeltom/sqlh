@@ -61,3 +61,13 @@ impl Failure {
         Failure::new(Exit::Usage, message)
     }
 }
+
+/// What a refusal shows of a value the caller sent (a tool, an argument, a profile, an
+/// option's value): enough to recognize it, so a huge one can't make the answer huge.
+pub(crate) fn echo(name: &str) -> String {
+    const SHOWN: usize = 100;
+    match name.char_indices().nth(SHOWN) {
+        Some((at, _)) => format!("{}…", &name[..at]),
+        None => name.to_owned(),
+    }
+}

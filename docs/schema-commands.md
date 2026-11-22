@@ -1,6 +1,6 @@
 # Schema commands: design and plan
 
-Status: built 2026-10-13 (`src/schema.rs`; plan-history.md Phase 4), and `deps` on 2026-10-14 (§6.7). This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
+Status: built 2026-10-13 (`src/schema.rs`; plan-history.md Phase 4), `deps` on 2026-10-14 (§6.7), and the server command `errorlog` on 2026-11-21 (§6.9; Phase 6 slice 2, decisions 84 and 89). This doc is the spec, with DESIGN.md §5.1 "Sections" and §9. MCP mode exposes the same commands as tools (`docs/mcp-mode.md`).
 
 **As built, where it differs from the proposal below** (the sections below are corrected too):
 - **The lookup is not a batch.** `describe` and `def` look the name up first on the run's own connection (`run::Plan::Lookup`), inside the read-only wrapper; the lookup shows nothing, and its rows decide the one batch that follows. So a `describe` is `ok: 1 batch`. An error in the lookup ends the run as a failure quoting the server's message.
@@ -39,14 +39,16 @@ The schema commands give compact, correct answers in one call each, reducing rep
 | `sqlh find <pattern> [--text]` | Objects and columns whose names match. With `--text`, also procedure, view and function bodies that contain the pattern. |
 | `sqlh def <object>` | The source of a view, procedure, function or trigger. |
 | `sqlh deps <object>` | What the object references and what references it. |
+| `sqlh errorlog [--since T] [--search TEXT] [--agent] [--archive N]` | A server command (§6.9): the SQL Server error log, or the SQL Server Agent log, newest first. |
 
 **Invocation.**
 - The command is the first positional word after the connection options: `sqlh --profile test describe dbo.Users`.
 - Only these names count as commands. A query given with `-Q`, `-i` or stdin is unaffected, and none of these words is valid T-SQL on its own, so nothing that worked before changes meaning.
 - `-Q`/`-i` can't be combined with a command.
 - `--format`, the limits and `-o` all apply.
+- A command's own options (`--text` for `find`; `--since`, `--search`, `--agent`, `--archive` for `errorlog`) can come anywhere on the line, and reach the command through one struct (`schema::Flags`). With another command, or with SQL, each is a usage error (exit 3) before anything connects: `--text only applies to sqlh find`, `--since only applies to sqlh errorlog` (and so on), `--search only applies to sqlh errorlog and sqlh profiles list` (whose own `--search` is parsed apart).
 
-**Scope.** Commands cover the current database, set by `-d` or the profile. Cross-database names (`OtherDb.dbo.T`) are refused with a hint to use `-d`. Catalog views are per database, and Azure SQL DB doesn't allow cross-database queries at all.
+**Scope.** Schema commands cover the current database, set by `-d` or the profile; a server command (`errorlog`) reads the server, whatever the database. Cross-database names (`OtherDb.dbo.T`) are refused with a hint to use `-d`. Catalog views are per database, and Azure SQL DB doesn't allow cross-database queries at all.
 
 ## 3. How they run
 
@@ -240,6 +242,82 @@ Column-level detail (which columns a procedure reads) is left out: `sys.dm_sql_r
 
 **Limits:** as `describe`: 2,000 rows a section and 4,000 characters a value by default (§4).
 
+### 6.9 `errorlog [--since T] [--search TEXT] [--agent] [--archive N]` (built 2026-11-21)
+
+A server command (Phase 6 slice 2; decision 28 as amended by decisions 84 and 89, PLAN.md §6): the SQL Server error log, or with `--agent` the SQL Server Agent log, newest first. Its evidence is live check 10 (`artifacts/slice2/`, local), run on SQL Server 2025 and 2016 SP3. MCP's `errorlog` tool is the same (mcp-mode.md §4), with no `database` argument: it is a server-wide read, and an agent would take the argument for a filter.
+
+**Options**, each checked before anything connects (exit 3; through `sqlh mcp` a tool error with exit 3, the option named without `--`, mcp-mode.md §4):
+- `--since T`: the lines from `T` on, in the server's clock. `T` is `<N>m`, `<N>h` or `<N>d` before now (N a whole number of ASCII digits, at least 1; the whole span at most 3,650 days), or a server-local time `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` or `YYYY-MM-DD HH:MM:SS`, with a space or a `T` between date and time: a real calendar date (leap years counted) in `datetime`'s years, 1753 to 9999. An offset or `Z` is refused: the log's times have none. sqlh's own parser (`schema::since_sql`, no date crate) turns it into the SQL, `DATEADD(minute, -<minutes>, GETDATE())` or `CONVERT(datetime, N'<YYYY-MM-DDTHH:MM:SS>', 126)`, so the server never parses the user's text. Refused: `--since <value>: expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no offset)`, the value cut after 100 characters (`error::echo`).
+- `--search TEXT`: 1 to 500 UTF-16 units (the size of `@search`, `nvarchar(500)`, which would cut a longer one without a word), not only whitespace, and no control character below U+0020 (a NUL cuts the string short on the server without an error, measured). Refused: `--search takes 1 to 500 characters and no control characters`. Always sent as `N'...'` (`literal`).
+- `--agent`: the SQL Server Agent log (`@type` 2) instead of the server's (1).
+- `--archive N`: 0 to 99 (`--archive N: expected 0 to 99`; in MCP, the schema's bound: `archive must be a whole number from 0 to 99`). With `--since`: `--since and --archive don't combine: --since reads back through the archives its window needs`, since each picks what is read.
+
+**What is read** (decision 84). Without `--since`, archive 0 (the current log) or the one `--archive` names. With it, archive 0, then 1 and on, newest first into one list, stopping after the first archive whose oldest line is at or before the window's start: each restart and each `sp_cycle_errorlog` starts a new archive, so archive 0 alone often begins hours ago, and the lead-up to a restart is always in archive 1. Only an archive `sp_enumerrorlogs` lists is read.
+
+**The lookup** (one batch, `run::Plan::Lookup`, label `reading the error log`; `schema::errorlog_sql`):
+
+```sql
+SET NOCOUNT ON;
+DECLARE @type int = 1, @archive int = NULL, @since datetime = DATEADD(minute, -120, GETDATE()), @search nvarchar(500) = N'Login failed';
+DECLARE @can bit = CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1
+    OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 THEN 1 ELSE 0 END;
+DECLARE @logs TABLE (archive int, [date] nvarchar(259), bytes int);
+CREATE TABLE #log (n int IDENTITY, LogDate datetime, ProcessInfo nvarchar(64), [Text] nvarchar(max));
+DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int;
+IF @can = 1
+BEGIN
+  INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;
+  WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)
+  BEGIN
+    SET @mark = ISNULL((SELECT MAX(n) FROM #log), 0);
+    INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;
+    SET @read += 1;
+    IF @archive IS NOT NULL OR @since IS NULL OR (SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;
+    SET @a += 1;
+  END;
+  IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;
+  IF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m
+      WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo AND CHARINDEX(@search, m.[Text]) > 0);
+END;
+SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, (SELECT MAX(archive) FROM @logs) AS last,
+       @read AS [read], CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;
+```
+
+Why each piece:
+- **Only listed archives, every value typed.** A 22004 raised inside `INSERT ... EXEC` (an archive that doesn't exist, a date it can't read, a `varchar` search) ends the batch as mssql-tds 0.4.0's protocol error, exit 10, whatever `TRY` says (S1; DESIGN.md §7, docs/notes/upstream-issues.md U14). So the archive number is checked against `sp_enumerrorlogs`, the time is a `datetime` variable sqlh's own expression sets, and the search an `nvarchar` the server never passes to the procedure.
+- **`sp_readerrorlog` alone, whole archives** (decision 89). Reading through `xp_readerrorlog` with a server-side window measured the same (210 ms for a 455 KB archive): the server reads the whole file either way. Decision 84 needs each archive's oldest line, which a window hides. So `errorlog` needs no `xp_readerrorlog` grant and runs one batch.
+- **The search in SQL, with each match's companions** (decision 89): the server's own search returns only the matching line of a multi-line entry, so `Login failed` would lose its `Error: 18456, Severity: 14, State: 8.` line and `18456` the user and the reason. A match keeps every line of the same `LogDate` and `ProcessInfo`. `CHARINDEX` compares in `#log`'s collation, tempdb's default (case-insensitive on the usual server collations). A search no longer narrows what is copied, so a large log takes as long with `--search` as without, bounded by `-t`.
+- **`@type` always passed:** with `@p2` NULL, `sp_readerrorlog` calls `xp_readerrorlog @p1` alone and drops its filters.
+- **The permission checked first:** without it `sp_readerrorlog` refuses with error 27219 (`Caller does not have permissions to execute the stored procedure`), which would end the run as a SQL error that says nothing of what to grant. securityadmin is checked because the procedure admits it.
+
+**What the lookup's row decides** (`schema::errorlog_then`), each refusal exit 1 with `-- error: ...` (`command_error`), as a name error is:
+- `can_read` 0: `errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a DBA can grant one` on SQL Server 2022 and later (`major` 16+), `errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it` before (VIEW ANY ERROR LOG came with 2022). securityadmin is never offered: Microsoft treats it as near sysadmin; it is detected, not advised. VIEW SERVER PERFORMANCE STATE alone doesn't open the log (live check 10, and the live test below).
+- `archives` 0: `this server lists no error log archives` (with `--agent`: `... no SQL Server Agent log archives`).
+- `read` 0: `the error log has no archive N; it keeps 0 to <last>` (`the SQL Server Agent log has no archive N; ...`), N the `--archive` asked for, else 0.
+- Otherwise the step.
+
+**The step,** one `SELECT` (so a capped log gets the brief count and no `-- partial:` advice, §3), section `server_log` (`time, source, text`) or with `--agent` `agent_log` (`time, level, text`):
+
+```sql
+SELECT LogDate AS [time], ProcessInfo AS source,
+       CASE WHEN RIGHT([Text], 2) COLLATE Latin1_General_100_BIN2 = NCHAR(13) + NCHAR(10)
+            THEN LEFT([Text], LEN([Text] + N'x') - 3) ELSE [Text] END AS [text]
+FROM #log ORDER BY LogDate DESC, n;
+-- --agent: CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN N'warning' WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level
+```
+
+- **Order:** newest first, and within one time the log's own order (`n`), so `Error: 18456, Severity: 14, State: 8.` stays above its `Login failed for user ...` line (measured on both servers). `max_rows` keeps the newest.
+- **Text:** the server ends some lines with CR LF, which would show as `\r\n`; one trailing CR LF is dropped (`LEN` of the text with an `x` after it counts trailing spaces, which `LEN` alone leaves out).
+- **Times** are `datetime`, server-local, as the log writes them, shown with no offset (`2026-11-21T10:15:30.120`): the `--since` given is in the same clock.
+- **Empty:** `-- no rows: server_log`.
+- **Limits** (`Command::limits`): 50 rows by default (each about 220 bytes), a flag over it; the cell limit stays the run's (500 by default).
+
+**A timeout during the lookup** says what it was doing and what helps: `query timeout after N s while reading the error log; raise -t; a later --since reads fewer archives, each one whole even with --search` with `--since`, and `...; raise -t; the archive is read whole, even with --search` without (`run::LookupLabel::ErrorLog`); never "narrow the query", which a command's user can't, and a narrower search wouldn't help. Through `sqlh mcp` the same with the call's words (`raise timeout (the server allows up to S s)`, `S s is the server's limit`, `since`, `search`; mcp-mode.md §4). Its other failures: `reading the error log failed: error N: ...` (exit 1) and `the error log read returned more than it should; nothing was shown` (exit 10).
+
+**Rare paths remain:** the log renamed by `sp_cycle_errorlog` between the listing and the read, or an access error on a file, can still reach U14's exit 10.
+
+**Tested:** unit tests in `schema::tests` (the options' parse and refusals, every `--since` form and its boundaries, the search and archive bounds, the literals in the SQL, each answer of the lookup's row, the step being one `SELECT`), `cli::tests::errorlog_takes_its_options_from_anywhere`, `mcp::tools::tests::the_errorlog_tool_takes_its_arguments_and_no_database`; exact output through the fake server (`engine::tests::errorlog_shows_its_section_or_says_why_not`, `an_errorlog_timeout_names_since_and_the_timeout`); the refusals before connecting (`tests/cli.rs`, `errorlog_refuses_its_bad_options_before_connecting` and `mcp::the_errorlog_tool_refuses_a_bad_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `errorlog_reads_the_servers_and_the_agents_log` (the owner's reads, newest first, no trailing CR LF, the Agent log's level words, an archive past the last exit 1, never 10), `errorlog_finds_a_whole_entry_and_reads_back_through_archives` (a failed login to `sqlh_nologin_<pid>` found by `--since 10m --search` as its `Error: 18456` line above its `Login failed` line, the same time and source; a window that starts inside archive 1 returns archive 1's newest line), `errorlog_needs_a_permission_and_says_which` (a reader refused in its version's words; VIEW SERVER STATE, securityadmin and, on 2022 and later, VIEW ANY ERROR LOG each read it; VIEW SERVER PERFORMANCE STATE alone doesn't) and `mcp_tools::the_errorlog_tool_reads_the_log`.
+
 ## 7. Patterns (`tables`, `find`)
 
 Agents think in substrings and globs, and `_` is everywhere in column names (`user_id`), where it would be a LIKE wildcard. So:
@@ -253,7 +331,7 @@ Agents think in substrings and globs, and `_` is everywhere in column names (`us
 - **First release:** SQL Server 2025 Standard on Windows Server 2025 Standard. Catalog fixtures and assertions must cover that target.
 - **Floor:** SQL Server 2016 SP3 is supported for reading and tested live (decision 49). Prefer inexpensive portability; do not add speculative fallback paths or retain an unconditional SQL Server 2012 restriction.
 - **Azure SQL DB:** a future compatibility consideration, not a first-release gate. The scope restrictions and limited `dbs` behavior described above remain constraints if Azure support is pursued.
-- **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed. No command needs `VIEW SERVER STATE`.
+- **Permissions:** catalog views only show objects the user has some permission on. The commands report what is visible; `info` shows the login and user, so "table missing" can be diagnosed, and its `server_permissions` the server-wide reads the login has (§6.1). The schema commands need no server permission; the server command `errorlog` needs VIEW ANY ERROR LOG or VIEW SERVER STATE (or securityadmin) and, without one, fails with exit 1, naming what to grant (§6.9).
 - **Temp tables:** `describe #t` works only on the session that created the table. Every CLI run is a new session, and so, in effect, is every `sqlh mcp` call (stateless, owner decision 15: the reset before a call drops the temp tables, `docs/mcp-mode.md` §5), so both refuse `#` names before connecting (exit 1, `#t is a temporary table, which only the session that made it can see; each sqlh run is a new session`; the same text in MCP). A session that keeps temp tables across calls would need MCP sessions, deferred until an agent trial shows the need.
 
 ## 9. Implementation plan (done 2026-10-13, `deps` 2026-10-14; as built above)

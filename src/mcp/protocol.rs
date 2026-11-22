@@ -211,13 +211,15 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, (Option<Value>, ProtocolErro
             None => params.remove("requestId"),
         };
     }
-    // A tool's numeric arguments (`tools::NUMERIC_ARGS`: `max_rows`, `max_cell`, `timeout`) are
-    // integers, decided by the same rule (R41): one serde_json read as a float becomes the
-    // integer its text is (`30.0`, `3e1`), or stays a float, which the tool refuses as no whole
-    // number (`10.0000000000000001`, which the float would make 10; `-1e-9999`, which it would
-    // make 0; `1e30`). Only those three are reread, each with one scan of the line, so a call
-    // costs at most three scans however many other arguments it holds (R42); any other
-    // argument is refused by name, and no value of it needs reading.
+    // A tool's numeric arguments (`tools::NUMERIC_ARGS`: `max_rows`, `max_cell`, `timeout`,
+    // `archive`) are integers, decided by the same rule (R41): one serde_json read as a float
+    // becomes the integer its text is (`30.0`, `3e1`), or stays a float, which the tool refuses
+    // as no whole number (`10.0000000000000001`, which the float would make 10; `-1e-9999`,
+    // which it would make 0; `1e30`). Only those four are reread, each with one scan of the
+    // line, so the rereading costs a call at most four scans however many other arguments it
+    // holds (R42), on top of serde_json's own parse, which is bounded by the message limit but
+    // not linear in it (mcp-mode.md §4, Parser work); any other argument is refused by name, and
+    // no value of it needs reading.
     if method == "tools/call"
         && let Some(Value::Object(arguments)) = params.get_mut("arguments")
     {
