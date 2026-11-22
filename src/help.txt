@@ -45,7 +45,7 @@ OUTPUT
 
 SCHEMA  describe|def|deps NAME | tables [PATTERN] | find PATTERN [--text] | dbs | info   (current database)
   describe: columns, keys, indexes, FKs, params. def: source. deps: uses, used_by. PATTERN: Ord, Ord*, dbo.?rd*
-SERVER  activity: sessions running, blocked or blocking | errorlog [--since 2h|DATE] [--search T] [--agent] [--archive N]: newest first, server-local times
+SERVER  activity: sessions running, blocked, blocking or idle in a transaction | errorlog [--since 2h|2026-11-20T08:00] [--search T] [--agent] [--archive N]: newest first, server-local times (--since's too)
 
 PROFILES  sqlh profiles add NAME -S server [-d db] [-U login] [--write-policy deny|flag|allow] [--description TEXT]
   sqlh profiles list [--search TEXT] | test NAME | rm NAME  (new profiles deny writes; --new-password re-asks; passwords stay in Credential Manager)

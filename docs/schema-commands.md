@@ -39,7 +39,7 @@ The schema commands give compact, correct answers in one call each, reducing rep
 | `sqlh find <pattern> [--text]` | Objects and columns whose names match. With `--text`, also procedure, view and function bodies that contain the pattern. |
 | `sqlh def <object>` | The source of a view, procedure, function or trigger. |
 | `sqlh deps <object>` | What the object references and what references it. |
-| `sqlh activity` | A server command (§6.8): the sessions running, blocked or blocking, with their chains. |
+| `sqlh activity` | A server command (§6.8): the sessions running, blocked, blocking or idle in an open transaction, with their chains. |
 | `sqlh errorlog [--since T] [--search TEXT] [--agent] [--archive N]` | A server command (§6.9): the SQL Server error log, or the SQL Server Agent log, newest first. |
 
 **Invocation.**
