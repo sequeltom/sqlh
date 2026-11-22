@@ -3999,7 +3999,7 @@ fn errorlog_refuses_its_bad_options_before_connecting() {
         ),
         (
             &["errorlog", "--archive", "-1"][..],
-            "--archive -1: expected a non-negative whole number".into(),
+            "--archive -1: expected 0 to 99".into(),
         ),
         (
             &["errorlog", "--since", "1h", "--archive", "1"][..],

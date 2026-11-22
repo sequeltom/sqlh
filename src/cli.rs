@@ -402,7 +402,17 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             Long("since") => flags.since = Some(string(p.value())?),
             Long("search") => flags.search = Some(string(p.value())?),
             Long("agent") => flags.agent = true,
-            Long("archive") => flags.archive = Some(number(p.value(), "--archive")?),
+            Long("archive") => {
+                // The bound in every refusal, as schema::errorlog words one past it.
+                let text = string(p.value())?;
+                let archive = text.parse().map_err(|_| {
+                    format!(
+                        "--archive {text}: expected 0 to {}",
+                        crate::schema::MAX_ARCHIVE
+                    )
+                })?;
+                flags.archive = Some(archive);
+            }
             Value(value) => words.push(string(Ok(value))?),
             _ => return Err(arg.unexpected().to_string()),
         }
@@ -802,7 +812,15 @@ mod tests {
             ),
             (
                 &["errorlog", "--archive", "x"][..],
-                "--archive x: expected a non-negative whole number",
+                "--archive x: expected 0 to 99",
+            ),
+            (
+                &["errorlog", "--archive", "-1"][..],
+                "--archive -1: expected 0 to 99",
+            ),
+            (
+                &["errorlog", "--archive", "4294967296"][..],
+                "--archive 4294967296: expected 0 to 99",
             ),
             (&["errorlog", "--since"][..], "missing argument"),
             (

@@ -1313,7 +1313,7 @@ const MAX_SINCE_MINUTES: u64 = 3650 * 24 * 60;
 const MAX_SEARCH_CHARS: usize = 500;
 
 /// The most `--archive` names: SQL Server keeps at most 99 archives besides the current log.
-const MAX_ARCHIVE: u32 = 99;
+pub const MAX_ARCHIVE: u32 = 99;
 
 /// `--since` as a T-SQL `datetime` expression in the server's clock (schema-commands.md §6.9),
 /// or `None` when it is none of the forms: `<N>m`, `<N>h` or `<N>d` before now, or a
