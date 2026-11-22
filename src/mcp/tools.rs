@@ -197,7 +197,7 @@ const TOOLS: &[Tool] = &[
             with the lines of the same time and source, which keeps an entry whole (a Login \
             failed line with its Error: 18456 line) but at a startup brings unrelated lines \
             too. agent reads the SQL Server Agent log instead (time, level, text; a search \
-            there keeps the lines of the same time and level). Needs VIEW ANY ERROR LOG or \
+            there returns the matching lines alone). Needs VIEW ANY ERROR LOG or \
             VIEW SERVER STATE (info shows server_permissions).",
         args: &[Arg::Since, Arg::Search, Arg::Agent, Arg::Archive],
         rows: true,
@@ -308,8 +308,8 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                     Arg::Search => (
                         "search",
                         json!({"type": "string", "minLength": 1, "maxLength": 500,
-                            "description": "Text a line contains; each match comes with the \
-                             lines of the same time and source (level, in the Agent log)."}),
+                            "description": "Text a line contains; in the server's log each match \
+                             comes with the lines of the same time and source."}),
                         false,
                     ),
                     Arg::Agent => (

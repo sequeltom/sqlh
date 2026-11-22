@@ -13871,7 +13871,7 @@ mod live {
     }
 
     // schema-commands.md §6.9 as the owner (sysadmin): the server's log, newest first, in its
-    // section; the Agent log with its levels as words, and its search's companions; an archive
+    // section; the Agent log with its levels as words, and its search's matching lines; an archive
     // past the last is exit 1 and never the driver's protocol error (exit 10, U14). A server
     // with no Agent log may answer `--agent` so (`no_agent_log`), and then has no Agent rows to
     // check.
@@ -13906,9 +13906,8 @@ mod live {
             "{}",
             r.stdout
         );
-        // The Agent log's search keeps the lines of the same time and level (schema-commands.md
-        // §6.9): every row shares both with a line that matches. The search is a line shown
-        // whole, with no escape in it.
+        // The Agent log's search keeps the matching lines alone (decision 90): every row
+        // matches. The search is a line shown whole, with no escape in it.
         let probe = agent_log.iter().find(|row| {
             let text = row[2].trim();
             !text.is_empty() && text.len() < 400 && !row[2].contains(['\\', '…'])
@@ -13924,14 +13923,10 @@ mod live {
             let rows = section_rows(&r.stdout);
             // CHARINDEX compares in tempdb's collation, case-insensitive on the test servers.
             let lower = search.to_lowercase();
-            let matched: Vec<_> = rows
-                .iter()
-                .filter(|row| row[2].to_lowercase().contains(&lower))
-                .collect();
-            assert!(!matched.is_empty(), "{search}: {}", r.stdout);
+            assert!(!rows.is_empty(), "{search}: {}", r.stdout);
             assert!(
                 rows.iter()
-                    .all(|row| matched.iter().any(|m| (m[0], m[1]) == (row[0], row[1]))),
+                    .all(|row| row[2].to_lowercase().contains(&lower)),
                 "{search}: {}",
                 r.stdout
             );

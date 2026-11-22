@@ -1449,11 +1449,12 @@ fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
 /// search filter `#log` afterwards, in SQL. `sp_readerrorlog` reads whole archives (decision
 /// 89); `@type` is always passed, since with it NULL the procedure drops its filters. `--since`
 /// reads back, archive after archive, until one starts at or before the window (decision 84).
-/// A search keeps each matching line's companions, the lines of the same time and
-/// `ProcessInfo`, so `Login failed` keeps its `Error: 18456` line; at a startup, and in the
-/// Agent log, whose `ProcessInfo` is the level, they include unrelated lines. Without the
-/// permission nothing is read: `sp_readerrorlog` would refuse with error 27219, which sqlh
-/// words itself.
+/// In the server's log a search keeps each matching line's companions, the lines of the same
+/// time and `ProcessInfo`, so `Login failed` keeps its `Error: 18456` line (at a startup they
+/// include unrelated lines). In the Agent log it keeps the matching lines alone (decision 90):
+/// no Agent message spans lines, and its `ProcessInfo` is the level, so the same rule there
+/// returned every line of that level in that second. Without the permission nothing is read:
+/// `sp_readerrorlog` would refuse with error 27219, which sqlh words itself.
 fn errorlog_sql(
     agent: bool,
     archive: Option<u32>,
@@ -1484,14 +1485,19 @@ fn errorlog_sql(
          SET @a += 1;\n\
          END;\n\
          IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;\n\
-         IF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m \
-         WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
-         AND CHARINDEX(@search, m.[Text]) > 0);\n\
+         IF @search IS NOT NULL DELETE FROM #log WHERE {unmatched};\n\
          END;\n\
          SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, \
          (SELECT MAX(archive) FROM @logs) AS last, @read AS [read], \
          CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;",
         log_type = if agent { 2 } else { 1 },
+        // `ISNULL`: a line with no text matches nothing, as `NOT EXISTS` drops it below.
+        unmatched = if agent {
+            "ISNULL(CHARINDEX(@search, [Text]), 0) = 0"
+        } else {
+            "NOT EXISTS (SELECT 1 FROM #log m WHERE m.LogDate = #log.LogDate \
+             AND m.ProcessInfo = #log.ProcessInfo AND CHARINDEX(@search, m.[Text]) > 0)"
+        },
         archive = archive.map_or_else(|| "NULL".to_owned(), |n| n.to_string()),
         since = since.unwrap_or("NULL"),
         search = literal_or_null(search),
@@ -2723,7 +2729,10 @@ mod tests {
             "INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;",
             "WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)",
             "INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;",
-            "AND CHARINDEX(@search, m.[Text]) > 0",
+            // The server log's search keeps each match's companions (decision 89).
+            "\nIF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m \
+             WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
+             AND CHARINDEX(@search, m.[Text]) > 0);\n",
             "(SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;",
         ] {
             assert!(sql.contains(part), "{part}\n{sql}");
@@ -2745,15 +2754,15 @@ mod tests {
             ),
             "{sql}"
         );
-        // The Agent log's companions are the server log's rule as it stands: the same time
-        // and `ProcessInfo`, there the level (schema-commands.md §6.9).
+        // Decision 90: the Agent log's search keeps only the lines that match, no companions.
         assert!(
             sql.contains(
-                "WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
-                 AND CHARINDEX(@search, m.[Text]) > 0);"
+                "\nIF @search IS NOT NULL DELETE FROM #log WHERE ISNULL(CHARINDEX(@search, \
+                 [Text]), 0) = 0;\n"
             ),
             "{sql}"
         );
+        assert!(!sql.contains("m.ProcessInfo"), "{sql}");
         let sql = errorlog_lookup_sql(&Errorlog {
             since: Some("90m".into()),
             ..Errorlog::default()
