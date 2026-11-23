@@ -68,7 +68,7 @@ A command returns several result sets, and each gets a **label** in place of a n
 
 - `-- <label>` replaces `-- result N`.
 - The header has **column names only**. The types would be the catalog query's own (`nvarchar(4000)` everywhere), which is noise.
-- **Empty sections print nothing.** One closing line lists them: `-- no rows: referenced_by, check_constraints, triggers`. The header is held back until the first row arrives, so an empty section costs nothing.
+- **Empty sections print nothing.** One closing line lists them: `-- no rows: referenced_by, check_constraints, triggers`, with a command's note in parentheses where it has one (`errorlog`, §6.9). The header is held back until the first row arrives, so an empty section costs nothing.
 - `def` prints its definition framed by a count: `-- definition: dbo.usp_GetUser (SQL_STORED_PROCEDURE), 42 lines`, then exactly 42 lines, each escaped like a value except that a tab stays a tab (DESIGN.md §5.1). The count tells a reader where the block ends, even though T-SQL comments inside it start with `-- `.
 - A section's footer is written only when it didn't show everything (rows hidden, values cut).
 
@@ -382,7 +382,7 @@ DECLARE @can bit = CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 OR HAS_PERMS
     OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 THEN 1 ELSE 0 END;
 DECLARE @logs TABLE (archive int, [date] nvarchar(259), bytes int);
 CREATE TABLE #log (n int IDENTITY, LogDate datetime, ProcessInfo nvarchar(64), [Text] nvarchar(max));
-DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int;
+DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int, @from varchar(16);
 IF @can = 1
 BEGIN
   INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;
@@ -394,13 +394,15 @@ BEGIN
     IF @archive IS NOT NULL OR @since IS NULL OR (SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;
     SET @a += 1;
   END;
+  SET @from = CONVERT(varchar(16), (SELECT MIN(LogDate) FROM #log), 120);
   IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;
   IF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m
       WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo AND CHARINDEX(@search, m.[Text]) > 0);
   -- --agent: IF @search IS NOT NULL DELETE FROM #log WHERE ISNULL(CHARINDEX(@search, [Text]), 0) = 0;
 END;
 SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, (SELECT MAX(archive) FROM @logs) AS last,
-       @read AS [read], CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;
+       @read AS [read], CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major,
+       @from AS [from], (SELECT COUNT(*) FROM #log) AS kept;
 ```
 
 Why each piece:
@@ -410,13 +412,14 @@ Why each piece:
 - **The Agent log's search keeps the matching lines alone** (decision 90). There `ProcessInfo` is the level (1, 2, 3) and `LogDate` has one-second precision, and no Agent message spans lines, so the server log's rule returned every line of the same level in that second: on `test` a search for `Waiting for SQL Server to recover` returned the Agent's 15 info lines of its start, and on 2016 one for `idle CPU` brought the `[475] Database Mail is not enabled` warning of the same second (2026-11-22). A line with no text matches nothing, in either log.
 - **Collation and cost.** `CHARINDEX` compares in `#log`'s collation, tempdb's default (case-insensitive on the usual server collations). A search no longer narrows what is copied, so a large log takes as long with `--search` as without, bounded by `-t`.
 - **`@type` always passed:** with `@p2` NULL, `sp_readerrorlog` calls `xp_readerrorlog @p1` alone and drops its filters.
+- **`from` and `kept`** (decision 93): the oldest line read, as `YYYY-MM-DD HH:MM` (style 120, cut to the minute), taken before a window or a search drops lines, and the lines left for the step, so the empty line below can say how far back the read went without a second query.
 - **The permission checked first:** without it `sp_readerrorlog` refuses with error 27219 (`Caller does not have permissions to execute the stored procedure`), which would end the run as a SQL error that says nothing of what to grant. securityadmin is checked because the procedure admits it.
 
 **What the lookup's row decides** (`schema::errorlog_then`), each refusal exit 1 with `-- error: ...` (`command_error`), as a name error is:
 - `can_read` 0: `errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a DBA can grant one` on SQL Server 2022 and later (`major` 16+), `errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it` before (VIEW ANY ERROR LOG came with 2022). securityadmin is never offered: Microsoft treats it as near sysadmin; it is detected, not advised. VIEW SERVER PERFORMANCE STATE alone doesn't open the log (live check 10, and the live test below).
 - `archives` 0: `this server lists no error log archives` (with `--agent`: `... no SQL Server Agent log archives`).
 - `read` 0: `the error log has no archive N; it keeps 0 to <last>` (`the SQL Server Agent log has no archive N; ...`), N the `--archive` asked for, else 0.
-- Otherwise the step.
+- Otherwise the step; without `--since` and with `kept` 0, with the empty line's note below.
 
 **The step,** one `SELECT` (so a capped log gets the brief count and no `-- partial:` advice, §3), section `server_log` (`time, source, text`) or with `--agent` `agent_log` (`time, level, text`):
 
@@ -431,14 +434,14 @@ FROM #log ORDER BY LogDate DESC, n;
 - **Order:** newest first, and within one time the log's own order (`n`), so `Error: 18456, Severity: 14, State: 8.` stays above its `Login failed for user ...` line (measured on both servers). `max_rows` keeps the newest.
 - **Text:** the server ends some lines with CR LF, which would show as `\r\n`; one trailing CR LF is dropped (`LEN` of the text with an `x` after it counts trailing spaces, which `LEN` alone leaves out).
 - **Times** are `datetime`, server-local, as the log writes them, shown with no offset (`2026-11-21T10:15:30.120`): the `--since` given is in the same clock.
-- **Empty:** `-- no rows: server_log`.
+- **Empty:** `-- no rows: server_log`, or `agent_log`. Without `--since` the read was one archive, so the line says which, where it starts, and what reads further (decision 93): `-- no rows: server_log (archive 0, from 2026-11-21 16:38; --since or --archive reads further back)`, or for the last archive the server keeps `(archive 6, from 2026-11-07 20:55, the oldest the server keeps)`, and for an archive with no lines `(archive N, which has no lines; ...)`. Through `sqlh mcp` it names the arguments, `since or archive reads further back`. A section with rows has no note (decision 93 chose the empty result only): its oldest line is the oldest line kept and shown, which after a search or the row cap is not where the read began. With `--since` the window is the caller's own, and the line is plain. In JSON the section keeps `rows: []` and the note is one of the document's `notes`, the line without its `-- ` (DESIGN.md §5.2), so contract 2.1 is unchanged.
 - **Limits** (`Command::limits`): 50 rows by default (each about 220 bytes), a flag over it; the cell limit stays the run's (500 by default).
 
 **A timeout during the lookup** says what it was doing and what helps: `query timeout after N s while reading the error log; raise -t; a later --since reads fewer archives, each one whole even with --search` with `--since`, and `...; raise -t; the archive is read whole, even with --search` without (`run::LookupLabel::ErrorLog`); never "narrow the query", which a command's user can't, and a narrower search wouldn't help. Through `sqlh mcp` the same with the call's words (`raise timeout (the server allows up to S s)`, `S s is the server's limit`, `since`, `search`; mcp-mode.md §4). Its other failures: `reading the error log failed: error N: ...` (exit 1) and `the error log read returned more than it should; nothing was shown` (exit 10).
 
-**Rare paths remain:** the log renamed by `sp_cycle_errorlog` between the listing and the read, or an access error on a file, can still reach U14's exit 10. **Unmeasured:** `--agent` on an instance whose SQL Server Agent never ran (no `SQLAGENT.OUT`), which AppVeyor's certification has, since it starts only the database engine (`scripts/appveyor-live.ps1`). The live tests take `agent_log` rows, `-- no rows: agent_log` or exit 1 `this server lists no SQL Server Agent log archives` there and fail on anything else, exit 10 included, so the next certification run measures it.
+**Rare paths remain:** the log renamed by `sp_cycle_errorlog` between the listing and the read, or an access error on a file, can still reach U14's exit 10. **Unmeasured:** `--agent` on an instance whose SQL Server Agent never ran (no `SQLAGENT.OUT`), which AppVeyor's certification has, since it starts only the database engine (`scripts/appveyor-live.ps1`). The live tests take `agent_log` rows, `-- no rows: agent_log (archive 0, ...)` or exit 1 `this server lists no SQL Server Agent log archives` there and fail on anything else, exit 10 included, so the next certification run measures it.
 
-**Tested:** unit tests in `schema::tests` (the options' parse and refusals, every `--since` form and its boundaries, the search and archive bounds, the literals in the SQL, each answer of the lookup's row, the step being one `SELECT`), `cli::tests::errorlog_takes_its_options_from_anywhere`, `mcp::tools::tests::the_errorlog_tool_takes_its_arguments_and_no_database`; exact output through the fake server (`engine::tests::errorlog_shows_its_section_or_says_why_not`, `an_errorlog_timeout_names_since_and_the_timeout`); the refusals before connecting (`tests/cli.rs`, `errorlog_refuses_its_bad_options_before_connecting` and `mcp::the_errorlog_tool_refuses_a_bad_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `errorlog_reads_the_servers_and_the_agents_log` (the owner's reads, newest first, no trailing CR LF, the Agent log's level words, an Agent-log search returning only lines that match, an archive past the last exit 1, never 10), `errorlog_finds_a_whole_entry_and_reads_back_through_archives` (a failed login to `sqlh_nologin_<pid>` found by `--since 10m --search` as its `Error: 18456` line above its `Login failed` line, the same time and source; a window that starts inside archive 1 returns archive 1's newest line), `errorlog_needs_a_permission_and_says_which` (a reader refused in its version's words; VIEW SERVER STATE, securityadmin and, on 2022 and later, VIEW ANY ERROR LOG each read it; VIEW SERVER PERFORMANCE STATE alone doesn't) and `mcp_tools::the_errorlog_tool_reads_the_log`.
+**Tested:** unit tests in `schema::tests` (the options' parse and refusals, every `--since` form and its boundaries, the search and archive bounds, the literals in the SQL, each answer of the lookup's row, the step being one `SELECT`, `an_empty_errorlog_says_how_far_back_it_read`: each form of the note and when there is none), the note on the line in each format (`output::text::tests::an_empty_section_carries_its_note`, `output::csv::tests::an_empty_sections_note_is_on_the_metadata_stream`, `output::json::tests::an_empty_sections_note_is_a_note`), `cli::tests::errorlog_takes_its_options_from_anywhere`, `mcp::tools::tests::the_errorlog_tool_takes_its_arguments_and_no_database`; exact output through the fake server (`engine::tests::errorlog_shows_its_section_or_says_why_not`, `an_errorlog_timeout_names_since_and_the_timeout`); the refusals before connecting (`tests/cli.rs`, `errorlog_refuses_its_bad_options_before_connecting` and `mcp::the_errorlog_tool_refuses_a_bad_argument_before_connecting`); and live on SQL Server 2025 and 2016 SP3: `errorlog_reads_the_servers_and_the_agents_log` (the owner's reads, newest first, no trailing CR LF, a search with nothing in archive 0 naming the archive, a server-local minute and what reads further or that it is the oldest, and with `--since` no note, the Agent log's level words, an Agent-log search returning only lines that match, an archive past the last exit 1, never 10), `errorlog_finds_a_whole_entry_and_reads_back_through_archives` (a failed login to `sqlh_nologin_<pid>` found by `--since 10m --search` as its `Error: 18456` line above its `Login failed` line, the same time and source; a window that starts inside archive 1 returns archive 1's newest line), `errorlog_needs_a_permission_and_says_which` (a reader refused in its version's words; VIEW SERVER STATE, securityadmin and, on 2022 and later, VIEW ANY ERROR LOG each read it; VIEW SERVER PERFORMANCE STATE alone doesn't) and `mcp_tools::the_errorlog_tool_reads_the_log`.
 
 ## 7. Patterns (`tables`, `find`)
 

@@ -277,6 +277,7 @@ fn steps(sql: String, sections: &[Section]) -> Plan {
     Plan::Steps(vec![Step {
         sql,
         sections: sections.to_vec(),
+        empty_note: None,
     }])
 }
 
@@ -886,7 +887,11 @@ fn describe_steps(object: &Object, aggregate: Aggregate) -> Vec<Step> {
         }
         _ => {}
     }
-    vec![Step { sql, sections }]
+    vec![Step {
+        sql,
+        sections,
+        empty_note: None,
+    }]
 }
 
 /// The `object` section: the name, the type, and what applies to it.
@@ -1105,6 +1110,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
             BIN = "COLLATE Latin1_General_100_BIN2",
         ),
         sections: vec![Section::definition("definition")],
+        empty_note: None,
     }])
 }
 
@@ -1300,6 +1306,7 @@ fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failu
             used_by = used_by_sql(),
         ),
         sections: vec![Section::rows("uses"), Section::rows("used_by")],
+        empty_note: None,
     }])
 }
 
@@ -1433,9 +1440,16 @@ fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
     }
     let agent = log.agent;
     let archive = log.archive;
+    // An empty read of one archive says how far back it went and what reads further
+    // (decision 93); a `since` window is the caller's own, so it needs no note.
+    let further = since
+        .is_none()
+        .then(|| format!("{} or {}", flag("since"), flag("archive")));
     Ok(Plan::Lookup {
         sql: errorlog_sql(agent, archive, since.as_deref(), log.search.as_deref()),
-        then: Box::new(move |found: &Found| errorlog_then(found, agent, archive)),
+        then: Box::new(move |found: &Found| {
+            errorlog_then(found, agent, archive, further.as_deref())
+        }),
         label: LookupLabel::ErrorLog {
             since: since.is_some(),
         },
@@ -1471,7 +1485,7 @@ fn errorlog_sql(
          DECLARE @logs TABLE (archive int, [date] nvarchar(259), bytes int);\n\
          CREATE TABLE #log (n int IDENTITY, LogDate datetime, ProcessInfo nvarchar(64), \
          [Text] nvarchar(max));\n\
-         DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int;\n\
+         DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int, @from varchar(16);\n\
          IF @can = 1\n\
          BEGIN\n\
          INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;\n\
@@ -1484,12 +1498,14 @@ fn errorlog_sql(
          OR (SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;\n\
          SET @a += 1;\n\
          END;\n\
+         SET @from = CONVERT(varchar(16), (SELECT MIN(LogDate) FROM #log), 120);\n\
          IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;\n\
          IF @search IS NOT NULL DELETE FROM #log WHERE {unmatched};\n\
          END;\n\
          SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, \
          (SELECT MAX(archive) FROM @logs) AS last, @read AS [read], \
-         CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;",
+         CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major, @from AS [from], \
+         (SELECT COUNT(*) FROM #log) AS kept;",
         log_type = if agent { 2 } else { 1 },
         // `ISNULL`: a line with no text matches nothing, as `NOT EXISTS` drops it below.
         unmatched = if agent {
@@ -1508,8 +1524,15 @@ fn errorlog_sql(
 /// What the lookup found (`errorlog_sql`'s last row) as the step, or the refusal: no
 /// permission (worded by the server's version: VIEW ANY ERROR LOG came with SQL Server 2022;
 /// securityadmin, which Microsoft treats as near sysadmin, is never offered), no archives, or no
-/// archive of the number asked for.
-fn errorlog_then(found: &Found, agent: bool, archive: Option<u32>) -> Result<Vec<Step>, Failure> {
+/// archive of the number asked for. With `further` (no `--since`, decision 93) and no line
+/// kept, the step's empty line names the archive read, where it starts (`from`, server-local
+/// like the lines) and, before the oldest, what reads further back.
+fn errorlog_then(
+    found: &Found,
+    agent: bool,
+    archive: Option<u32>,
+    further: Option<&str>,
+) -> Result<Vec<Step>, Failure> {
     let unexpected = || {
         Failure::new(
             Exit::Internal,
@@ -1551,14 +1574,29 @@ fn errorlog_then(found: &Found, agent: bool, archive: Option<u32>) -> Result<Vec
             }
         )));
     }
+    let last = int(row.get(2)).ok_or_else(unexpected)?;
+    let number = archive.unwrap_or(0);
     if read == 0 {
-        let last = int(row.get(2)).ok_or_else(unexpected)?;
         return Err(command_error(format!(
-            "{log} has no archive {}; it keeps 0 to {last}",
-            archive.unwrap_or(0)
+            "{log} has no archive {number}; it keeps 0 to {last}"
         )));
     }
-    Ok(vec![errorlog_step(agent)])
+    let mut step = errorlog_step(agent);
+    if let Some(further) = further
+        && int(row.get(6)).ok_or_else(unexpected)? == 0
+    {
+        let mut note = match text(row.get(5)) {
+            Some(from) => format!("archive {number}, from {from}"),
+            None => format!("archive {number}, which has no lines"),
+        };
+        if i64::from(number) < last {
+            note.push_str(&format!("; {further} reads further back"));
+        } else {
+            note.push_str(", the oldest the server keeps");
+        }
+        step.empty_note = Some(note);
+    }
+    Ok(vec![step])
 }
 
 /// The step: `#log`, newest first, and within one time in the log's own order (`n`), so an
@@ -1584,6 +1622,7 @@ fn errorlog_step(agent: bool) -> Step {
              FROM #log ORDER BY LogDate DESC, n;"
         ),
         sections: vec![Section::rows(label)],
+        empty_note: None,
     }
 }
 
@@ -1730,6 +1769,7 @@ fn activity_then(found: &Found) -> Result<Vec<Step>, Failure> {
         Some(Value::Int(1)) => Ok(vec![Step {
             sql: ACTIVITY_STEP.to_owned(),
             sections: vec![Section::rows("sessions")],
+            empty_note: None,
         }]),
         Some(Value::Int(_) | Value::Null) => Err(command_error(
             if major >= 16 {
@@ -2801,20 +2841,49 @@ mod tests {
             sql.ends_with(
                 "SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, (SELECT \
                  MAX(archive) FROM @logs) AS last, @read AS [read], \
-                 CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;"
+                 CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major, @from AS [from], \
+                 (SELECT COUNT(*) FROM #log) AS kept;"
             ),
             "{sql}"
         );
+        // Decision 93: the oldest line is taken before a window or a search drops lines.
+        let from = sql
+            .find("SET @from = CONVERT(varchar(16), (SELECT MIN(LogDate) FROM #log), 120);")
+            .expect("@from");
+        assert!(from < sql.find("DELETE").expect("DELETE"), "{sql}");
     }
 
     /// The lookup's row: can_read, archives, last, read, major.
     fn log_found(can: i64, archives: i64, last: Option<i64>, read: i64, major: i64) -> Found {
+        log_found_kept(
+            can,
+            archives,
+            last,
+            read,
+            major,
+            Some("2026-11-21 16:38"),
+            3,
+        )
+    }
+
+    /// `log_found` with the oldest line read (`from`) and the lines kept.
+    fn log_found_kept(
+        can: i64,
+        archives: i64,
+        last: Option<i64>,
+        read: i64,
+        major: i64,
+        from: Option<&str>,
+        kept: i64,
+    ) -> Found {
         vec![vec![vec![
             Value::Int(can),
             Value::Int(archives),
             last.map_or(Value::Null, Value::Int),
             Value::Int(read),
             Value::Int(major),
+            from.map_or(Value::Null, |from| Value::Text(from.into())),
+            Value::Int(kept),
         ]]]
     }
 
@@ -2823,7 +2892,8 @@ mod tests {
     #[test]
     fn errorlog_says_why_it_shows_nothing() {
         let message = |found: Found, agent, archive| {
-            let failure = errorlog_then(&found, agent, archive).unwrap_err();
+            let failure =
+                errorlog_then(&found, agent, archive, Some("--since or --archive")).unwrap_err();
             assert_eq!(failure.exit, Exit::SqlError, "{}", failure.message);
             failure.message
         };
@@ -2865,14 +2935,86 @@ mod tests {
             vec![Vec::new()],
             vec![vec![vec![Value::Text("1".into())]]],
         ] {
-            let failure = errorlog_then(&found, false, None).unwrap_err();
+            let failure = errorlog_then(&found, false, None, None).unwrap_err();
             assert_eq!(failure.exit, Exit::Internal, "{found:?}");
         }
         // Read: the step, in one section.
-        let steps = errorlog_then(&log_found(1, 7, Some(6), 2, 17), false, None).unwrap();
+        let steps = errorlog_then(&log_found(1, 7, Some(6), 2, 17), false, None, None).unwrap();
         assert_eq!(labels(&steps), ["server_log"]);
-        let steps = errorlog_then(&log_found(1, 10, Some(9), 1, 13), true, Some(3)).unwrap();
+        let steps = errorlog_then(&log_found(1, 10, Some(9), 1, 13), true, Some(3), None).unwrap();
         assert_eq!(labels(&steps), ["agent_log"]);
+    }
+
+    // Decision 93: an empty read of one archive (no `--since`) says which, from when, and what
+    // reads further back, or that it was the oldest; lines kept, or a window, say nothing.
+    #[test]
+    fn an_empty_errorlog_says_how_far_back_it_read() {
+        let further = Some("--since or --archive");
+        let note = |found: Found, archive, further| {
+            let mut steps = errorlog_then(&found, false, archive, further).unwrap();
+            assert_eq!(steps.len(), 1);
+            steps.remove(0).empty_note
+        };
+        let empty = |last, from| log_found_kept(1, 7, Some(last), 1, 17, from, 0);
+        assert_eq!(
+            note(empty(6, Some("2026-11-21 16:38")), None, further).as_deref(),
+            Some("archive 0, from 2026-11-21 16:38; --since or --archive reads further back")
+        );
+        assert_eq!(
+            note(empty(6, Some("2026-11-07 20:55")), Some(6), further).as_deref(),
+            Some("archive 6, from 2026-11-07 20:55, the oldest the server keeps")
+        );
+        assert_eq!(
+            note(empty(0, None), None, Some("since or archive")).as_deref(),
+            Some("archive 0, which has no lines, the oldest the server keeps")
+        );
+        assert_eq!(
+            note(empty(6, None), Some(2), Some("since or archive")).as_deref(),
+            Some("archive 2, which has no lines; since or archive reads further back")
+        );
+        assert_eq!(note(empty(6, Some("2026-11-21 16:38")), None, None), None);
+        let kept = log_found_kept(1, 7, Some(6), 1, 17, Some("2026-11-21 16:38"), 4);
+        assert_eq!(note(kept, None, further), None);
+        // A row without the two columns is sqlh's error, not an empty log.
+        let short = vec![vec![vec![
+            Value::Int(1),
+            Value::Int(7),
+            Value::Int(6),
+            Value::Int(1),
+            Value::Int(17),
+        ]]];
+        let failure = errorlog_then(&short, false, None, further).unwrap_err();
+        assert_eq!(failure.exit, Exit::Internal, "{}", failure.message);
+
+        // Through the command's plan: the CLI's words, sqlh mcp's, and no note with a window.
+        let planned = |log: Errorlog, advice: Advice| {
+            let Ok(Input::Command {
+                plan: Plan::Lookup { then, .. },
+                ..
+            }) = Command::Errorlog(log).input(advice)
+            else {
+                panic!("errorlog looks up first");
+            };
+            let mut steps = then(&empty(6, Some("2026-11-21 16:38"))).unwrap();
+            steps.remove(0).empty_note
+        };
+        for (advice, words) in [
+            (Advice::Cli, "--since or --archive"),
+            (Advice::Mcp, "since or archive"),
+        ] {
+            assert_eq!(
+                planned(Errorlog::default(), advice),
+                Some(format!(
+                    "archive 0, from 2026-11-21 16:38; {words} reads further back"
+                ))
+            );
+            let window = Errorlog {
+                since: Some("1h".into()),
+                search: Some("x".into()),
+                ..Errorlog::default()
+            };
+            assert_eq!(planned(window, advice), None, "{advice:?}");
+        }
     }
 
     // `Plan::Lookup`'s rule (run.rs): the step is one SELECT, so a capped log gets the brief

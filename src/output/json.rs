@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use super::text::write_diagnostic;
+use super::text::{no_rows_line, write_diagnostic};
 use super::{
     BatchInfo, Layout, Limits, NAME_CHARS, OutOfOrder, Output, Section, Summary, Tally, cut,
     cut_marker, hex, push_blocked, push_within,
@@ -463,6 +463,15 @@ impl<W: Write> BatchSink for JsonSink<W> {
 
     fn end_rows(&mut self) -> io::Result<()> {
         self.tally.end_rows();
+        // The section keeps its `rows: []`; the empty list matters only for a note (decision 93).
+        if let Some(section) = self.tally.section()
+            && !section.definition
+            && !self.tally.result_hidden()
+            && self.tally.rows_total() == 0
+            && self.tally.rows_exact()
+        {
+            self.tally.empty_section(section.label);
+        }
         self.end_result(false);
         self.drain(false)
     }
@@ -594,6 +603,10 @@ impl<W: Write> Output for JsonSink<W> {
 
     fn end_batch(&mut self, ended_ms: u128) -> io::Result<()> {
         self.flush_affected()?;
+        if let Some((empty, Some(note))) = self.tally.take_no_rows() {
+            let line = no_rows_line(&empty, Some(&note));
+            self.note(line.strip_prefix("-- ").unwrap_or(&line))?;
+        }
         self.close_batch(ended_ms);
         self.drain(false)
     }
@@ -701,6 +714,10 @@ impl<W: Write> Output for JsonSink<W> {
     fn set_sections(&mut self, sections: &[Section]) {
         self.tally.set_sections(sections);
     }
+
+    fn set_empty_note(&mut self, note: Option<&str>) {
+        self.tally.set_empty_note(note);
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +763,28 @@ mod tests {
         s.end_rows().unwrap();
         s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
         assert!(parse(s)["batches"][0]["events"][0].get("label").is_none());
+    }
+
+    // Decision 93: the section keeps `rows: []`, and its note is one of the document's notes,
+    // the text line without its `-- `; with rows, no note.
+    #[test]
+    fn an_empty_sections_note_is_a_note() {
+        let mut s = JsonSink::new(Vec::new(), Limits::default());
+        super::super::text::tests::noted_run(&mut s, false);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        let doc = parse(s);
+        assert_eq!(doc["batches"][0]["events"][0]["rows"], json!([]));
+        assert_eq!(
+            doc["notes"],
+            json!([format!(
+                "no rows: server_log ({})",
+                super::super::text::tests::EMPTY_NOTE
+            )])
+        );
+        let mut s = JsonSink::new(Vec::new(), Limits::default());
+        super::super::text::tests::noted_run(&mut s, true);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert!(parse(s).get("notes").is_none());
     }
 
     #[test]

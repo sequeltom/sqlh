@@ -1927,13 +1927,35 @@ mod tests {
         }
     }
 
-    /// The lookup's row, as `schema::errorlog_sql` ends: can_read, archives, last, read, major.
+    /// The lookup's row, as `schema::errorlog_sql` ends: can_read, archives, last, read, major,
+    /// and three lines kept from a read starting 2026-11-21 08:14.
     fn errorlog_found(
         can: i32,
         archives: i32,
         last: Option<i32>,
         read: i32,
         major: i32,
+    ) -> Vec<u8> {
+        errorlog_found_kept(
+            can,
+            archives,
+            last,
+            read,
+            major,
+            Some("2026-11-21 08:14"),
+            3,
+        )
+    }
+
+    /// `errorlog_found` with the oldest line read (`from`) and the lines kept (decision 93).
+    fn errorlog_found_kept(
+        can: i32,
+        archives: i32,
+        last: Option<i32>,
+        read: i32,
+        major: i32,
+        from: Option<&str>,
+        kept: i32,
     ) -> Vec<u8> {
         use fake_server::{Cell, Wire};
         fake_server::result(
@@ -1943,6 +1965,8 @@ mod tests {
                 ("last", Wire::Int),
                 ("read", Wire::Int),
                 ("major", Wire::Int),
+                ("from", Wire::Text),
+                ("kept", Wire::Int),
             ],
             &[&[
                 Cell::Int(can),
@@ -1950,6 +1974,8 @@ mod tests {
                 last.map_or(Cell::Null, Cell::Int),
                 Cell::Int(read),
                 Cell::Int(major),
+                from.map_or(Cell::Null, Cell::Text),
+                Cell::Int(kept),
             ]],
         )
     }
@@ -2050,6 +2076,24 @@ mod tests {
         );
         assert_eq!(exit, Exit::Ok, "{text}");
         assert_eq!(text, format!("-- no rows: server_log\n{ok}"));
+        // Decision 93: an empty read of one archive says how far back it went, in sqlh mcp's
+        // words for what reads further.
+        let (exit, text) = shown(
+            errorlog_found_kept(1, 7, Some(6), 1, 17, Some("2026-11-21 08:14"), 0),
+            log("source", &[]),
+            Errorlog {
+                search: Some("nothing like it".into()),
+                ..Errorlog::default()
+            },
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- no rows: server_log (archive 0, from 2026-11-21 08:14; since or archive \
+                 reads further back)\n{ok}"
+            )
+        );
 
         let failed = "-- failed (exit 1): SQL error, N ms; ?/master, connect N ms\n";
         for (found, asked, error) in [
@@ -2567,6 +2611,7 @@ mod tests {
                     plan: run::Plan::Steps(vec![run::Step {
                         sql: "SELECT * FROM t WITH (NOLOCK)".into(),
                         sections: Vec::new(),
+                        empty_note: None,
                     }]),
                 },
                 ..request("")

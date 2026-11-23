@@ -197,7 +197,9 @@ const TOOLS: &[Tool] = &[
             with the lines of the same time and source, which keeps an entry whole (a Login \
             failed line with its Error: 18456 line) but at a startup brings unrelated lines \
             too. agent reads the SQL Server Agent log instead (time, level, text; a search \
-            there returns the matching lines alone). Needs VIEW SERVER STATE, or VIEW ANY \
+            there returns the matching lines alone). Without since, an empty read says which \
+            archive it read, from when, and what reads further back. Needs VIEW SERVER STATE, \
+            or VIEW ANY \
             ERROR LOG on SQL Server 2022 and later (info shows server_permissions).",
         args: &[Arg::Since, Arg::Search, Arg::Agent, Arg::Archive],
         rows: true,

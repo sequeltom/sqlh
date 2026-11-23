@@ -40,6 +40,15 @@ pub(crate) enum Input {
 pub(crate) struct Step {
     pub(crate) sql: String,
     pub(crate) sections: Vec<Section>,
+    /// What the batch's `-- no rows:` line adds when its sections are empty (decision 93).
+    pub(crate) empty_note: Option<String>,
+}
+
+/// What a batch of a command shows: its `Step`'s sections and empty note.
+#[derive(Debug, Default)]
+pub(crate) struct Shown {
+    sections: Vec<Section>,
+    empty_note: Option<String>,
 }
 
 /// The rows a lookup returned: for each of its result sets, its rows.
@@ -600,8 +609,8 @@ impl BatchSink for Counted<'_> {
 pub(crate) struct Prepared {
     pub(crate) sources: Vec<Source>,
     batches: Vec<Batch>,
-    /// The sections each batch's result sets fill; empty for the user's SQL.
-    sections: Vec<Vec<Section>>,
+    /// What each batch shows (its sections, its empty note); empty for the user's SQL.
+    sections: Vec<Shown>,
     /// A command's lookup (`Plan::Lookup`): its SQL, and what makes the batches of its rows.
     lookup: Option<(String, Then, LookupLabel)>,
     policy: RunPolicy,
@@ -663,7 +672,7 @@ pub(crate) fn unconnected_settings(allow_write: bool) -> Settings {
 }
 
 /// A command's steps as batches of its one source, with their sections.
-fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Vec<Section>>) {
+fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Shown>) {
     steps
         .into_iter()
         .map(|step| {
@@ -674,7 +683,11 @@ fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Vec<Section>>) {
                 repeat: 1,
                 line_map: Vec::new(),
             };
-            (batch, step.sections)
+            let shown = Shown {
+                sections: step.sections,
+                empty_note: step.empty_note,
+            };
+            (batch, shown)
         })
         .unzip()
 }
@@ -1204,7 +1217,9 @@ pub(crate) async fn run_opened(
     let mut number = 0;
     let mut output_modes = false;
     'batches: for (index, batch) in batches.iter().enumerate() {
-        out.set_sections(sections.get(index).map_or(&[], Vec::as_slice));
+        let shown = sections.get(index);
+        out.set_sections(shown.map_or(&[], |shown| shown.sections.as_slice()));
+        out.set_empty_note(shown.and_then(|shown| shown.empty_note.as_deref()));
         // A stopped count cancels the rest of the batch; where that could cancel a later
         // statement's output, the count runs longer first, and a stop is reported as the rest
         // of the batch not run (decision 45, DESIGN.md §4.4). An option that adds output
@@ -1601,6 +1616,13 @@ mod tests {
         let row = |values: &[i64]| -> Found {
             vec![vec![values.iter().map(|&n| Value::Int(n)).collect()]]
         };
+        // can_read, archives, last, read, major, then from and kept.
+        let logged = |values: &[i64], kept: i64| -> Found {
+            let mut found = row(values);
+            found[0][0].push(Value::Text("2026-11-21 08:14".into()));
+            found[0][0].push(Value::Int(kept));
+            found
+        };
         let agent_search = Errorlog {
             since: Some("1h".into()),
             search: Some("x".into()),
@@ -1610,12 +1632,15 @@ mod tests {
         for (command, found) in [
             // can_view, major
             (Command::Activity, row(&[1, 17])),
-            // can_read, archives, last, read, major
+            // Empty, so its step has decision 93's note.
             (
                 Command::Errorlog(Errorlog::default()),
-                row(&[1, 7, 6, 1, 17]),
+                logged(&[1, 7, 6, 1, 17], 0),
             ),
-            (Command::Errorlog(agent_search), row(&[1, 10, 9, 2, 13])),
+            (
+                Command::Errorlog(agent_search),
+                logged(&[1, 10, 9, 2, 13], 4),
+            ),
         ] {
             let Ok(Input::Command {
                 plan: Plan::Lookup { sql, then, .. },

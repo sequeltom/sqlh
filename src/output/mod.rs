@@ -276,6 +276,9 @@ pub trait Output: BatchSink {
     /// The sections the next result sets fill, in order (schema commands, schema-commands.md
     /// §4): each takes the next label. Called before the batch that returns them begins.
     fn set_sections(&mut self, sections: &[Section]);
+    /// What the next batch's `-- no rows:` line adds when its sections have no rows (a
+    /// command's own wording, decision 93); in JSON a note. Called with `set_sections`.
+    fn set_empty_note(&mut self, note: Option<&str>);
 }
 
 /// A labeled result set of a schema command (schema-commands.md §4). In text and csv its
@@ -673,6 +676,8 @@ pub struct Tally {
     section: Option<Section>,
     /// Sections of the current batch that ended with no rows, for its `-- no rows:` line.
     empty_sections: Vec<&'static str>,
+    /// What that line adds (`Output::set_empty_note`).
+    empty_note: Option<String>,
 }
 
 impl Tally {
@@ -710,6 +715,7 @@ impl Tally {
             sections: VecDeque::new(),
             section: None,
             empty_sections: Vec::new(),
+            empty_note: None,
         }
     }
 
@@ -731,6 +737,19 @@ impl Tally {
     /// The batch's sections that had no rows, for its `-- no rows:` line; clears them.
     pub fn take_empty_sections(&mut self) -> Vec<&'static str> {
         std::mem::take(&mut self.empty_sections)
+    }
+
+    /// What the next batch's `-- no rows:` line adds (`Output::set_empty_note`).
+    pub fn set_empty_note(&mut self, note: Option<&str>) {
+        self.empty_note = note.map(str::to_owned);
+    }
+
+    /// The batch's `-- no rows:` line, with its note; clears both. `None` when every section
+    /// had rows.
+    pub fn take_no_rows(&mut self) -> Option<(Vec<&'static str>, Option<String>)> {
+        let note = self.empty_note.take();
+        let empty = self.take_empty_sections();
+        (!empty.is_empty()).then_some((empty, note))
     }
 
     /// `lines` lines of a definition block didn't fit the budget, which is then used up;

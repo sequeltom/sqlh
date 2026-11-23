@@ -13856,8 +13856,9 @@ mod live {
                 .starts_with("-- error: this server lists no SQL Server Agent log archives\n")
     }
 
-    /// An `errorlog --agent` run's rows: its section, possibly empty, or none when the server
-    /// lists no Agent log (`no_agent_log`).
+    /// An `errorlog --agent` run's rows, the run made without `--since`: its section, possibly
+    /// empty and then with decision 93's note, or none when the server lists no Agent log
+    /// (`no_agent_log`).
     fn agent_log_rows(r: &Run) -> Vec<Vec<&str>> {
         if no_agent_log(r) {
             return Vec::new();
@@ -13865,7 +13866,7 @@ mod live {
         assert_eq!(r.code, 0, "{}", r.stdout);
         assert!(
             r.stdout.starts_with("-- agent_log\ntime\tlevel\ttext\n")
-                || r.stdout.starts_with("-- no rows: agent_log\n"),
+                || r.stdout.starts_with("-- no rows: agent_log (archive 0, "),
             "{}",
             r.stdout
         );
@@ -13896,6 +13897,50 @@ mod live {
         // The server's trailing CR LF is gone.
         assert!(
             rows.iter().all(|row| !row[2].ends_with("\\r\\n")),
+            "{}",
+            r.stdout
+        );
+        // Decision 93: a search with nothing in archive 0 says how far back it read, and that
+        // `--since` or `--archive` reads further, or that archive 0 is all the server keeps;
+        // a window needs no note.
+        let absent = format!("sqlh_absent_{}_zq", std::process::id());
+        let r = live(&p, &db, &["errorlog", "--search", &absent]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let note = r
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("-- no rows: server_log (archive 0, from "))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("the note:\n{}", r.stdout));
+        let (from, further) = note.split_at(note.len().min(16));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        assert!(
+            from.len() == 16
+                && digits(&from[0..4])
+                && &from[4..5] == "-"
+                && digits(&from[5..7])
+                && &from[7..8] == "-"
+                && digits(&from[8..10])
+                && &from[10..11] == " "
+                && digits(&from[11..13])
+                && &from[13..14] == ":"
+                && digits(&from[14..16]),
+            "a server-local minute: {}",
+            r.stdout
+        );
+        assert!(
+            matches!(
+                further,
+                "; --since or --archive reads further back" | ", the oldest the server keeps"
+            ),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["errorlog", "--since", "1m", "--search", &absent]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- no rows: server_log\n-- ok: "),
             "{}",
             r.stdout
         );
@@ -14749,7 +14794,7 @@ mod live {
             } else {
                 assert!(
                     text.starts_with("-- agent_log\ntime\tlevel\ttext\n")
-                        || text.starts_with("-- no rows: agent_log\n"),
+                        || text.starts_with("-- no rows: agent_log (archive 0, "),
                     "{text}"
                 );
             }
