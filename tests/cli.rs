@@ -13909,11 +13909,30 @@ mod live {
             r.stdout
         );
         // The Agent log's search keeps the matching lines alone (decision 90): every row
-        // matches. The search is a line shown whole, with no escape in it.
-        let probe = agent_log.iter().find(|row| {
+        // matches. The search is a line shown whole, with no escape in it, and where the log
+        // has one, a line sharing its second and level with a line it isn't in: decision 89's
+        // companions would bring that line, so the check tells the two rules apart.
+        let searchable = |row: &&Vec<&str>| {
             let text = row[2].trim();
             !text.is_empty() && text.len() < 400 && !row[2].contains(['\\', '…'])
-        });
+        };
+        let companion = |probe: &Vec<&str>| {
+            let lower = probe[2].trim().to_lowercase();
+            agent_log.iter().any(|row| {
+                (row[0], row[1]) == (probe[0], probe[1]) && !row[2].to_lowercase().contains(&lower)
+            })
+        };
+        let probe = agent_log
+            .iter()
+            .filter(searchable)
+            .find(|row| companion(row))
+            .or_else(|| {
+                eprintln!(
+                    "no Agent log line shares its second and level with another it isn't in: \
+                     decision 90's difference from companions is unchecked on this server"
+                );
+                agent_log.iter().find(searchable)
+            });
         if let Some(probe) = probe {
             let search = probe[2].trim();
             let r = live(
@@ -14790,10 +14809,16 @@ mod live {
             let (p, db) = target();
             let mut blocked = Blocked::on(&p, &db);
             let table = blocked.table().to_owned();
+            // Laid out over lines, so its statement shows decision 92's collapse: one line,
+            // single spaces, nothing at either end.
+            let laid_out = format!(
+                "{}\r\n\t",
+                blocked.read.replacen(" FROM ", "\r\n\t   FROM  ", 1)
+            );
             let _waiter = Reaped(Some(spawn_live(
                 &p,
                 &db,
-                &["--lock-timeout", "0", "-t", "90", "-Q", &blocked.read],
+                &["--lock-timeout", "0", "-t", "90", "-Q", &laid_out],
             )));
             let args = [
                 "activity",
@@ -14834,6 +14859,7 @@ mod live {
             assert!(waiting["blocking"].is_null(), "{waiting:?}");
             assert_eq!(waiting["status"], "suspended", "{waiting:?}");
             assert_eq!(waiting["command"], "SELECT", "{waiting:?}");
+            assert_eq!(waiting["statement"], blocked.read.as_str(), "{waiting:?}");
             assert!(
                 waiting["wait"]
                     .as_str()

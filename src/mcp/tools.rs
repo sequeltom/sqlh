@@ -213,7 +213,8 @@ const TOOLS: &[Tool] = &[
             depth: 0 for a head blocker, 1 and on down its chain, NULL in or behind a cycle. Times \
             are durations in ms. open_tran 1 on a sqlh or sqlh mcp session is its rolled-back wrapper, not a leak. \
             input_buffer: the last batch of a head blocker or of an idle session with an open \
-            transaction. A plan: query sys.dm_exec_text_query_plan with the session's \
+            transaction. statement and input_buffer are on one line, each run of whitespace \
+            one space. A plan: query sys.dm_exec_text_query_plan with the session's \
             plan_handle and offsets from sys.dm_exec_requests. Needs VIEW SERVER PERFORMANCE \
             STATE (VIEW SERVER STATE before SQL Server 2022). It waits for a pooled connection \
             like any call, up to its timeout; the CLI's sqlh activity opens its own.",

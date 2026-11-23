@@ -1651,7 +1651,11 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
 /// so a session in a cycle, and one waiting behind a cycle without being in it, gets no depth
 /// rather than the hop bound's 100. `under` counts who waits on a session, directly or down
 /// its chain. The input buffer is read only for a head blocker and an idle session holding a
-/// transaction, where the statement says nothing.
+/// transaction, where the statement says nothing. Both texts have each run of spaces, tabs, CR
+/// and LF made one space and their ends trimmed before the cell cut (decision 92): once the
+/// first three `REPLACE`s have turned every tab into a space, a tab is a marker no text can
+/// hold, so `' '` → `' ' + tab`, then dropping `tab + ' '` and the tabs left is exact. The
+/// binary collation makes each `REPLACE` match code units whatever the server's collation.
 /// Chains come first, the largest first, each in depth order; then the rest, oldest first.
 const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     SELECT x.* FROM #s x\n\
@@ -1684,11 +1688,12 @@ const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     x.status, x.command, x.wait, x.wait_ms, x.wait_resource, x.cpu_ms, x.reads, x.elapsed_ms, \
     x.idle_ms,\n\
     x.open_tran, x.tran_ms, x.login, x.host, x.program, x.[database],\n\
-    CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start\n\
-    THEN SUBSTRING(st.text, x.stmt_start / 2 + 1,\n\
-    (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 \
-    + 1) END AS statement,\n\
-    ib.event_info AS input_buffer\n\
+    LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(r.s COLLATE Latin1_General_100_BIN2, \
+    NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), N' ', N' ' + NCHAR(9)), NCHAR(9) + N' ', \
+    N''), NCHAR(9), N''))) AS statement,\n\
+    LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ib.event_info COLLATE \
+    Latin1_General_100_BIN2, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), N' ', N' ' + \
+    NCHAR(9)), NCHAR(9) + N' ', N''), NCHAR(9), N''))) AS input_buffer\n\
     FROM shown x\n\
     LEFT JOIN tops t ON t.session_id = x.session_id\n\
     LEFT JOIN heads h ON h.session_id = x.session_id\n\
@@ -1698,6 +1703,10 @@ const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     OUTER APPLY sys.dm_exec_sql_text(x.sql_handle) st\n\
     OUTER APPLY (SELECT i.event_info FROM sys.dm_exec_input_buffer(x.session_id, NULL) i\n\
     WHERE (n.blocking IS NOT NULL AND t.depth IS NULL) OR (x.busy = 0 AND x.open_tran > 0)) ib\n\
+    OUTER APPLY (SELECT CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start\n\
+    THEN SUBSTRING(st.text, x.stmt_start / 2 + 1,\n\
+    (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 \
+    + 1) END AS s) r\n\
     ORDER BY CASE WHEN hn.blocking IS NULL THEN 1 ELSE 0 END, hn.blocking DESC, \
     COALESCE(h.head, x.session_id), COALESCE(t.depth, 0),\n\
     COALESCE(x.elapsed_ms, x.tran_ms, x.idle_ms) DESC, x.session_id\n\
@@ -3052,6 +3061,21 @@ mod tests {
             )
         );
         assert!(ACTIVITY_STEP.ends_with("\nOPTION (MAXRECURSION 100);"));
+        // Decision 92: both texts collapsed and trimmed, by the same expression.
+        let collapse = |text: &str| {
+            format!(
+                "LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE({text} COLLATE \
+                 Latin1_General_100_BIN2, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), \
+                 N' ', N' ' + NCHAR(9)), NCHAR(9) + N' ', N''), NCHAR(9), N'')))"
+            )
+        };
+        let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for column in [
+            format!("{} AS statement", collapse("r.s")),
+            format!("{} AS input_buffer", collapse("ib.event_info")),
+        ] {
+            assert!(words(ACTIVITY_STEP).contains(&column), "{column}");
+        }
         let list = ACTIVITY_STEP
             .split_once("\nSELECT x.session_id AS session,")
             .and_then(|(_, rest)| rest.split_once("\nFROM shown x\n"))
