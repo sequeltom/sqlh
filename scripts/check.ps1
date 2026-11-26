@@ -45,8 +45,9 @@ $sizeBudget = 3 * 1024 * 1024
 
 # Decision 97: dependencies' panic locations embed their source paths, under the builder's
 # cargo registry, which names the user's folder (GitHub's runner made the exe 1,024 bytes larger
-# than a local build). Remapped to `crates`, the exe has no user folder in it and is the same
-# size on any machine. Set for every cargo command here, debug ones too, so that no step builds
+# than a local build). Remapped to `crates`, the exe has no registry prefix in it, and the local
+# and CI builds measured the same size; other inputs (the version, the toolchain) can still
+# differ between machines. Set for every cargo command here, debug ones too, so that no step builds
 # the exe with other flags; on GitHub it is passed on to the job's later steps (GITHUB_ENV), so
 # release.yml's own `cargo test --release --no-run` doesn't rebuild the exe it stages. Cargo
 # adds it to .cargo/config.toml's `+crt-static` and splits it at spaces, so the path can't hold
