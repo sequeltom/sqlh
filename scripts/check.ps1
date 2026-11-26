@@ -11,7 +11,8 @@
       4. cargo test (unit and process-level tests; no server needed)
       5. cargo build --release
       6. cargo test --release --test cli (the process-level tests against the release exe)
-      7. the size budget: target\release\sqlh.exe at most 3 MB (owner, 2026-10-12)
+      7. the size budget: target\release\sqlh.exe, unsigned, at most 3 MB (owner, 2026-10-12;
+         decision 97), built with the cargo registry's path remapped and none of it left in it
       8. the imports: dumpbin /dependents lists only DLLs that ship with Windows
     Every cargo command that resolves dependencies runs with --locked, so none of them can
     update a stale Cargo.lock and let a later step pass on it (R23): a stale lockfile fails
@@ -38,8 +39,30 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# The size budget for the release exe, in bytes (3 MB; 2.42 MB on 2026-10-12).
+# The size budget for the release exe, in bytes (3 MB; 2.42 MB on 2026-10-12): the unsigned exe
+# this check builds. Signing appends a signature, so the signed exe is larger (decision 97).
 $sizeBudget = 3 * 1024 * 1024
+
+# Decision 97: dependencies' panic locations embed their source paths, under the builder's
+# cargo registry, which names the user's folder (GitHub's runner made the exe 1,024 bytes larger
+# than a local build). Remapped to `crates`, the exe has no user folder in it and is the same
+# size on any machine. Set for every cargo command here, debug ones too, so that no step builds
+# the exe with other flags; on GitHub it is passed on to the job's later steps (GITHUB_ENV), so
+# release.yml's own `cargo test --release --no-run` doesn't rebuild the exe it stages. Cargo
+# adds it to .cargo/config.toml's `+crt-static` and splits it at spaces, so the path can't hold
+# one.
+# The registry may not exist yet: a fresh GitHub runner fills it at step 1, and the remap
+# doesn't need the folder.
+$registry = Join-Path ($env:CARGO_HOME ?? (Join-Path $env:USERPROFILE '.cargo')) 'registry\src'
+if ($registry -match '\s') {
+    Write-Host "check failed: the cargo registry's path holds a space, which a remapped flag can't ($registry); set CARGO_HOME to a path without one" -ForegroundColor Red
+    exit 1
+}
+$remap = "--remap-path-prefix=$registry=crates"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $remap
+if ($env:GITHUB_ENV) {
+    Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=$remap"
+}
 
 # The DLLs sqlh may import: all ship with every supported Windows version (AGENTS.md, zero
 # runtime dependencies). A new import fails the check until it is shown to be in-box and
@@ -89,6 +112,12 @@ $size = (Get-Item $exe).Length
 Write-Host ("    {0:N0} bytes of {1:N0}" -f $size, $sizeBudget)
 if ($size -gt $sizeBudget) {
     Fail ("sqlh.exe is {0:N0} bytes, over the {1:N0}-byte budget; see what grew with cargo bloat --release --crates" -f $size, $sizeBudget)
+}
+# The remap held (decision 97): no registry path is left in the exe, however its folder is
+# spelled (rustc writes them as UTF-8), and the remapped ones are there.
+$text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($exe))
+if ($text.Contains('\registry\src\index.crates.io-') -or -not $text.Contains('crates\index.crates.io-')) {
+    Fail "sqlh.exe holds cargo registry paths that weren't remapped; the remap above didn't reach its build"
 }
 
 $step++

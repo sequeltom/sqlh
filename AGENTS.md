@@ -96,7 +96,8 @@ tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
-                 size budget (3 MiB), in-box imports; -Live adds the live tests. CI runs it too
+                 size budget (3 MiB, the unsigned exe), in-box imports; -Live adds the live tests. CI and the release
+                 workflow run it; it remaps the cargo registry's path in every build (decision 97)
 .github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
                  read-only; sign, the only job with the Azure token, which never runs the exe;
                  verify, read-only; publish, the draft release; plan-history.md 3.6, R22);
@@ -133,7 +134,10 @@ The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build ti
 **Day to day:** `pwsh scripts/check.ps1` runs every check below that needs no server and stops at the first failure; `pwsh scripts/check.ps1 -Live` adds the live tests. Run it before every commit that touches code. The individual commands:
 
 ```powershell
-cargo build --release                               # ~3.0 MB exe (budget 3 MiB, decision 87); full LTO takes ~1–2 min
+cargo build --release                               # ~3.0 MB exe; full LTO takes ~1–2 min. The budget (3 MiB, unsigned)
+                                                    # is measured by check.ps1, which remaps the registry's path (decision 97).
+                                                    # Bare cargo commands build without the remap: a larger exe, with the
+                                                    # user's folder in it, and a rebuild when check.ps1 runs next
 cargo test                                          # unit + process-level tests; no server needed
 cargo test --release --test cli                     # process-level tests against the release exe
 cargo build --release --features timing             # --verbose also times each connect step (dev builds; +270 KB)
