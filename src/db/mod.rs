@@ -778,11 +778,11 @@ fn client_context(
     };
     // No retries by the driver: it would retry a refused connection after 10 s, until the
     // deadline (14 s with -l 15). An agent can retry itself, and sooner; sqlh's own one retry is
-    // decision 95's, for a port this computer still held (`once_more_if_port_held`). A count
-    // of 0 also keeps idle connection resiliency off: the driver asks the server for
-    // session recovery only when it is above 0, so it never logs in again behind sqlh's
-    // back, and the engine's one retry on a new connection is the only reconnect (owner
-    // decision 41; docs/notes/driver-0.3.0.md §2).
+    // decision 95's, for a local address this computer reported in use
+    // (`once_more_if_port_held`). A count of 0 also keeps idle connection resiliency off: the
+    // driver asks the server for session recovery only when it is above 0, so it never logs in
+    // again behind sqlh's back, and the engine's one retry on a new connection is the only
+    // reconnect (owner decision 41; docs/notes/driver-0.3.0.md §2).
     context.connect_retry_count = 0;
     // Each TCP connect attempt gets -l seconds and the whole login one more, so an
     // unreachable address fails at TCP (exit 2) and a server that takes the connection
@@ -815,10 +815,11 @@ fn client_context(
     context
 }
 
-/// WSAEADDRINUSE: this computer's TCP stack refused the connect because the local port it
-/// chose, with the server's address and port, is still held by a closed connection (TIME_WAIT,
-/// 120 s by default). The TCP connect it ends sent nothing; an earlier hop may have (SQL
-/// Browser's lookup, a routing listener's login), and a second attempt makes that again.
+/// WSAEADDRINUSE: this computer's TCP stack refused the connect because the local address it
+/// chose was in use. The error doesn't say by what; when it was first seen, the likely cause was
+/// a port still held by a closed connection to the same server (TIME_WAIT, 120 s by default;
+/// PLAN.md, decision 95; R70). The TCP connect it ends sent nothing; an earlier hop may have
+/// (SQL Browser's lookup, a routing listener's login), and a second attempt makes that again.
 const WSAEADDRINUSE: i32 = 10048;
 
 fn port_held(error: &TdsError) -> bool {
@@ -848,6 +849,9 @@ fn login_deadline(start: Instant, login_timeout: u32) -> Option<Instant> {
 /// WSAEADDRINUSE is made once more, at once, and within the login's `deadline`; a new attempt
 /// gets another local port. Seen when one connection per run, many runs in a row, left 1,411
 /// ports in TIME_WAIT (PLAN.md §6, decision 95). Any other failure, and a second one, stand.
+/// The deadline is checked on the clock before the second attempt and after it ends, not left
+/// to the timer alone (R69): tokio's `Timeout` polls its future before its timer, so an attempt
+/// that ends in the same poll the deadline passes would win.
 async fn once_more_if_port_held<T, F, Fut>(
     deadline: Option<Instant>,
     mut attempt: F,
@@ -858,14 +862,23 @@ where
 {
     match attempt().await {
         Err(error) if port_held(&error) => match deadline {
-            Some(at) => tokio::time::timeout_at(at.into(), attempt())
-                .await
-                .unwrap_or_else(|_| {
-                    // `connect_error` words it as the login timeout it is: exit 4.
+            Some(at) => {
+                // `connect_error` words it as the login timeout it is: exit 4. A connection
+                // made late is dropped, which closes it.
+                let late = || {
                     Err(TdsError::TimeoutError(TimeoutErrorType::String(
                         "the second connect attempt passed the login deadline".into(),
                     )))
-                }),
+                };
+                if Instant::now() >= at {
+                    return late();
+                }
+                match tokio::time::timeout_at(at.into(), attempt()).await {
+                    Ok(_) if Instant::now() >= at => late(),
+                    Ok(result) => result,
+                    Err(_) => late(),
+                }
+            }
             None => attempt().await,
         },
         result => result,
@@ -1702,11 +1715,11 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
             ),
         ),
         // Decision 95: the second attempt failed so too. Not the server's name: this computer's.
+        // The error names no cause, so neither does the hint (R70).
         _ if port_held(&error) => (
             error.to_string(),
-            "this computer twice chose a local port that a closed connection to that server \
-             still held (Windows holds one about 2 minutes after it closes): wait a minute and \
-             try again",
+            "this computer reported its local address in use, twice: wait a minute and try \
+             again; if it persists, check this computer's TCP connections",
         ),
         TdsError::Io(_) | TdsError::ConnectionError(_) | TdsError::ConnectionClosed(_) => (
             error.to_string(),
@@ -2461,30 +2474,76 @@ mod tests {
             "failed (os error 10048) with more after it".into()
         )));
 
-        let tries = Cell::new(0);
-        let result = bounded(
-            &runtime,
-            once_more_if_port_held(Some(Instant::now()), || {
-                tries.set(tries.get() + 1);
-                let first = tries.get() == 1;
-                async move {
-                    if first {
-                        Err(held())
-                    } else {
-                        std::future::pending::<TdsResult<u8>>().await
-                    }
-                }
-            }),
-        );
-        assert_eq!(tries.get(), 2);
+        // R69: the deadline holds on the clock, not on the timer alone. Each case is the first
+        // attempt's 10048, then `second`, with `-l`'s deadline `at`.
         let options = fake_server::options("db01".into());
-        let Err(error) = result else {
-            panic!("a timeout")
+        let login_timeout = |result: TdsResult<u8>| {
+            result.is_err_and(|error| {
+                matches!(connect_error(error, &options), DbError::Timeout(ref words)
+                    if words.starts_with("login timeout: db01 "))
+            })
         };
-        assert!(
-            matches!(connect_error(error, &options), DbError::Timeout(ref words)
-                if words.starts_with("login timeout: db01 ")),
-        );
+        // The second attempt's result: success for `None`, else that OS error.
+        #[derive(Clone, Copy)]
+        enum Second {
+            Ready(Option<i32>),
+            Pending,
+            // Ends in its first poll, once the deadline has passed (`Timeout` polls it first).
+            ReadyLate(Option<i32>),
+        }
+        let outcome = |code: Option<i32>| match code {
+            None => Ok(7),
+            Some(code) => Err(TdsError::Io(io::Error::from_raw_os_error(code))),
+        };
+        let by = |at: Instant, second: Second| {
+            let tries = Cell::new(0);
+            let result = bounded(
+                &runtime,
+                once_more_if_port_held(Some(at), || {
+                    tries.set(tries.get() + 1);
+                    let first = tries.get() == 1;
+                    async move {
+                        match (first, second) {
+                            (true, _) => Err(held()),
+                            (false, Second::Ready(code)) => outcome(code),
+                            (false, Second::Pending) => std::future::pending().await,
+                            (false, Second::ReadyLate(code)) => {
+                                std::thread::sleep(
+                                    at.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(10),
+                                );
+                                outcome(code)
+                            }
+                        }
+                    }
+                }),
+            );
+            (result, tries.get())
+        };
+        // Far enough off that a pause of the test's thread doesn't reach it before the second
+        // attempt starts.
+        let soon = || Instant::now() + Duration::from_millis(500);
+        // Still running at the deadline: the timer's timeout.
+        let (result, tries) = by(soon(), Second::Pending);
+        assert!(login_timeout(result) && tries == 2);
+        // Ended once the deadline had passed: a connection made late is a timeout, and so is
+        // a late failure, whatever it was.
+        for code in [None, Some(10061), Some(WSAEADDRINUSE)] {
+            let (result, tries) = by(soon(), Second::ReadyLate(code));
+            assert!(login_timeout(result) && tries == 2, "{code:?}");
+        }
+        // In time, a second attempt's own result stands.
+        let later = || Instant::now() + Duration::from_secs(5);
+        assert!(matches!(by(later(), Second::Ready(None)), (Ok(7), 2)));
+        let (result, tries) = by(later(), Second::Ready(Some(10061)));
+        assert!(result.is_err_and(|e| !port_held(&e)) && tries == 2);
+        // Past the deadline already: no second attempt, whatever it would have returned.
+        if let Some(past) = Instant::now().checked_sub(Duration::from_secs(1)) {
+            for second in [Second::Ready(None), Second::Ready(Some(10061))] {
+                let (result, tries) = by(past, second);
+                assert!(login_timeout(result) && tries == 1);
+            }
+        }
     }
 
     // Decision 95's bound is the login's, -l and one second from the first attempt; -l 0 has
@@ -2528,9 +2587,9 @@ mod tests {
                     held.starts_with("cannot connect to db01 (")
                         && held.contains("(os error 10048); ")
                         && held.ends_with(
-                            "; this computer twice chose a local port that a closed connection \
-                             to that server still held (Windows holds one about 2 minutes after \
-                             it closes): wait a minute and try again"
+                            "; this computer reported its local address in use, twice: wait a \
+                             minute and try again; if it persists, check this computer's TCP \
+                             connections"
                         )
                         && !held.contains("server name"),
                     "{held}"

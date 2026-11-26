@@ -1698,6 +1698,12 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
 /// first three `REPLACE`s have turned every tab into a space, a tab is a marker no text can
 /// hold, so `' '` → `' ' + tab`, then dropping `tab + ' '` and the tabs left is exact. The
 /// binary collation makes each `REPLACE` match code units whatever the server's collation.
+/// The statement is cut from the batch in that collation too: the request's offsets count
+/// bytes, and under a supplementary-character (`_SC`, `_UTF8`) default, which `st.text` takes
+/// (the server's or the database's),
+/// `SUBSTRING` counts a surrogate pair as one character, so a statement after an emoji began
+/// a character late (the slice 2 review's follow-up; measured on both servers with an
+/// explicit `_SC` collation).
 /// Chains come first, the largest first, each in depth order; then the rest, oldest first.
 const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     SELECT x.* FROM #s x\n\
@@ -1746,7 +1752,7 @@ const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     OUTER APPLY (SELECT i.event_info FROM sys.dm_exec_input_buffer(x.session_id, NULL) i\n\
     WHERE (n.blocking IS NOT NULL AND t.depth IS NULL) OR (x.busy = 0 AND x.open_tran > 0)) ib\n\
     OUTER APPLY (SELECT CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start\n\
-    THEN SUBSTRING(st.text, x.stmt_start / 2 + 1,\n\
+    THEN SUBSTRING(st.text COLLATE Latin1_General_100_BIN2, x.stmt_start / 2 + 1,\n\
     (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 \
     + 1) END AS s) r\n\
     ORDER BY CASE WHEN hn.blocking IS NULL THEN 1 ELSE 0 END, hn.blocking DESC, \
@@ -3222,6 +3228,12 @@ mod tests {
         ] {
             assert!(words(ACTIVITY_STEP).contains(&column), "{column}");
         }
+        // The statement is cut in code units: under an `_SC` default, `SUBSTRING` of the
+        // byte offsets would start a character late after a surrogate pair.
+        assert!(
+            ACTIVITY_STEP.contains("SUBSTRING(st.text COLLATE Latin1_General_100_BIN2, "),
+            "{ACTIVITY_STEP}"
+        );
         let list = ACTIVITY_STEP
             .split_once("\nSELECT x.session_id AS session,")
             .and_then(|(_, rest)| rest.split_once("\nFROM shown x\n"))

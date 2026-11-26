@@ -30,7 +30,7 @@ For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not post vulnerabi
    (Get-FileHash .\sqlh-*-windows-x64.zip -Algorithm SHA256).Hash
    ```
 3. Unzip it to a folder of your own, for example `C:\Tools\sqlh`, and add that folder to your `PATH`.
-4. Check that it runs: `sqlh --version`. `Get-AuthenticodeSignature .\sqlh.exe` should report `Valid`, because the exe is code-signed. A newly released file can still get a Windows SmartScreen prompt until the file builds up a reputation, and company application-control policies may block unknown executables.
+4. Check the signature before you run it: `Get-AuthenticodeSignature .\sqlh.exe` should report `Valid`, because the exe is code-signed. Then check that it runs: `sqlh --version`. A newly released file can still get a Windows SmartScreen prompt until the file builds up a reputation, and company application-control policies may block unknown executables.
 
 Nothing else needs installing.
 
