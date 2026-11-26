@@ -4,7 +4,14 @@
 
 What makes it agent-friendly, in brief: compact typed output with hard limits, errors that point at the input line, documented exit codes, no prompts, and read-only by default. The full running list is [Built for agents](#built-for-agents).
 
-Status: pre-release. It is built and tested on Windows 11 x64 against SQL Server 2025, and against SQL Server 2016 SP3 for reading. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
+Status: early (0.x). Releases are signed and tested, and the output format is versioned, but flags and output may still change between minor versions. See [docs/PLAN.md](docs/PLAN.md) for what's being worked on.
+
+**Requirements:**
+- Windows x64. Validated on Windows 11.
+- SQL Server 2016 SP3 or later. Tested on 2016 SP3, 2017, 2019, 2022 and 2025.
+- A SQL login, or Windows authentication (NTLM or Kerberos).
+- Connections are encrypted by default. `-C` trusts a self-signed certificate.
+- Not yet supported: Azure SQL, Entra ID, macOS and Linux.
 
 ## Safety: read this first
 
@@ -14,17 +21,18 @@ Read-only mode **guards against accidents; it is not a security boundary.** Befo
 
 For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not post vulnerability details in a public issue.
 
-## Build
+## Install
 
-You need Rust (via `rustup`; the toolchain is pinned in `rust-toolchain.toml`) and the Visual Studio C++ build tools with a Windows SDK.
+1. Download `sqlh-VERSION-windows-x64.zip` and `SHA256SUMS.txt` from the [latest release](https://github.com/sequeltom/sqlh/releases/latest). The zip holds `sqlh.exe`, the licence and the third-party notices.
+2. Check the download against the published sums. Compare the hash with the zip's line in `SHA256SUMS.txt`:
 
-```powershell
-cargo build --release      # target\release\sqlh.exe, about 3 MB
-cargo test                 # no server needed
-pwsh scripts/check.ps1     # everything a change must pass; CI runs the same script
-```
+   ```powershell
+   (Get-FileHash .\sqlh-*-windows-x64.zip -Algorithm SHA256).Hash
+   ```
+3. Unzip it to a folder of your own, for example `C:\Tools\sqlh`, and add that folder to your `PATH`.
+4. Check that it runs: `sqlh --version`. `Get-AuthenticodeSignature .\sqlh.exe` should report `Valid`, because the exe is code-signed. A newly released file can still get a Windows SmartScreen prompt until the file builds up a reputation, and company application-control policies may block unknown executables.
 
-Releases will be built by GitHub Actions: a signed `sqlh.exe` in a zip with this licence and the third-party notices, plus SHA-256 sums.
+Nothing else needs installing.
 
 ## Quick start
 
@@ -51,7 +59,7 @@ Orders	2026-09-30T14:02:11.483
 
 `--format json` and `--format csv` are also available. `sqlh --help` is the full reference; it's written to be read by models.
 
-**Command line or MCP?** The command line is built for local and offline models, such as Qwen on a GPU with 24 GB or less: the agent reads `sqlh --help` once, when it needs it, and each call returns compact output. An MCP server's tool definitions go out with every request (about 16 KB of JSON for sqlh's eleven tools, roughly 4,000–5,000 tokens), which a frontier model barely notices and a small one can't spare. With a frontier model, such as Claude, use MCP: native tools, and connections kept open between calls.
+**Command line or MCP?** MCP (the Model Context Protocol) is how agent harnesses add tools. With a frontier model such as Claude, use sqlh as an MCP server: you get native tools, and connections stay open between calls. With a small local model, use the command line: it reads `sqlh --help` once, while MCP's tool definitions (about 4,000–5,000 tokens) go out with every request.
 
 To give a harness such as Claude Code or OpenCode sqlh's commands as tools, add it as an MCP server (list each profile it may use):
 
@@ -65,7 +73,7 @@ In OpenCode, add it to `opencode.json`:
 { "mcp": { "sqlh": { "type": "local", "command": ["sqlh", "mcp", "--profile", "dev"] } } }
 ```
 
-The tools only read: writes stay on the command line. [docs/mcp-mode.md](docs/mcp-mode.md) has the details.
+Every tool runs under the read-only guard, and writes are only possible from the command line. [docs/mcp-mode.md](docs/mcp-mode.md) has the details.
 
 ## Using it
 
@@ -120,7 +128,7 @@ Without `--allow-write`, a write is refused before anything runs (exit 5), with 
 
 ### Through MCP
 
-`sqlh mcp --profile NAME [--profile NAME ...]` runs sqlh as an MCP server for a harness (see [Quick start](#quick-start)). Only the profiles listed can be used, and every tool reads only:
+`sqlh mcp --profile NAME [--profile NAME ...]` runs sqlh as an MCP server for a harness (see [Quick start](#quick-start)). Only the profiles listed can be used, and every tool runs read-only, under the same guard and rollback as the command line:
 
 | Tool | What it does |
 |---|---|
@@ -198,7 +206,7 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 - **It says what the login may read on the server.** `info` (and `profiles test`) ends with `server_permissions`: `sysadmin`, the server-wide permissions that decide whether server views and the error log can be read (`VIEW SERVER STATE`, `VIEW ANY ERROR LOG` and the like), or `none`. An agent knows before it tries whether a server-wide read will be refused, and which grant to ask a DBA for. *(Phase 6, slice 2)*
 - **The error log in one call, whole entries, as far back as asked.** `errorlog --since 2h --search "Login failed"` gives the matching lines newest first, whatever their case or accents and whatever the server's collation, together with the lines logged at the same moment by the same source (a failed login's `Error: 18456` line comes with its reason; during a startup, unrelated lines come along too), and reads back into older log files when the window needs them, so "anything since last night?" isn't answered from a log that began at this morning's restart. `--agent` reads the SQL Server Agent log, where a search returns just the matching lines, since each Agent message is one line. When a search finds nothing in the current log, it says where that log starts and how to read further back, so an empty answer isn't taken for "it never happened". A login without the permission is told which one to ask a DBA for. *(Phase 6, slice 2)*
 - **Who is running and who blocks whom, in one call.** `activity` lists the sessions that are running, hold a transaction open, are blocked or block another, from one snapshot of the server, blocking chains first: each session's blocker, how many wait on it and how deep in its chain it sits, its wait and resource, durations in milliseconds, its statement, and a head blocker's last batch, each on one line so the cut keeps words, not indentation. It answers "what is blocking?" the way `sp_WhoIsActive` would, with nothing to install. A login that can't see other sessions is told which permission to ask a DBA for, rather than shown an empty list that reads as an idle server. *(Phase 6, slice 2)*
-- **Open connections, as native tools.** `sqlh mcp --profile NAME` is an MCP server: a harness such as Claude Code gets sqlh's commands as read-only tools, and an agent's repeated calls reuse an open connection instead of paying the 150–250 ms connect and login each time (on the dev LAN, a `SELECT 1` took 223 ms the first time and 9–11 ms on each call after it). Every call starts clean, so nothing one call does, not even a changed isolation level, leaks into the next. If a kept connection died while idle, the call runs again on a new one instead of failing, and the time that took is reported as connect time, not as the query's. A call with a wrong argument gets an ordinary result the model can read and correct, and where the command line's advice would name a flag, the advice in results names the call's own arguments or the profile's settings instead, or says that a limit is set where the server is started. It is part of the same exe, and its code runs only when a harness starts it: using sqlh only as a command-line tool costs nothing for it at run time (no startup time, no memory, no open connections). *(Phase 5.3)*
+- **Open connections, as native tools.** `sqlh mcp --profile NAME` is an MCP server: a harness such as Claude Code gets sqlh's commands as read-only tools, and an agent's repeated calls reuse an open connection instead of paying the 150–250 ms connect and login each time (on a local network, a `SELECT 1` took 223 ms the first time and 9–11 ms on each call after it). Every call starts clean, so nothing one call does, not even a changed isolation level, leaks into the next. If a kept connection died while idle, the call runs again on a new one instead of failing, and the time that took is reported as connect time, not as the query's. A call with a wrong argument gets an ordinary result the model can read and correct, and where the command line's advice would name a flag, the advice in results names the call's own arguments or the profile's settings instead, or says that a limit is set where the server is started. It is part of the same exe, and its code runs only when a harness starts it: using sqlh only as a command-line tool costs nothing for it at run time (no startup time, no memory, no open connections). *(Phase 5.3)*
 - **Multi-line SQL from any shell.** `-i file.sql` works everywhere, and stdin (`-i -`, heredocs) where the shell has it; UTF-8 and UTF-16 input are decoded. *(MVP)*
 - **Works the same in cmd.exe, PowerShell and Git Bash.** The `--help` examples run unchanged in each, and a test runs them. A Git Bash path (`/c/dir/f.sql`) that cmd.exe or PowerShell can't find is answered with the Windows spelling to use, and sqlh leaves the console's code page as it found it. A path from Explorer's "Copy as path" works as is after `-i` or `-o`. *(Phase 2.13)*
 - **Piped text in the wrong encoding is refused, with the fix.** Input that isn't valid UTF-8 (cmd.exe at an OEM code page, for example) ends in a usage error naming `chcp 65001` and PowerShell's `$OutputEncoding`; `--help` says how to keep non-ASCII text intact. So does UTF-16 without a BOM, or UTF-32, instead of a refusal that blames the SQL. The extra byte order marks Windows PowerShell 5.1 puts in front of piped SQL when its output is captured are dropped, so the documented setup works there too. *(Phase 2.13; wide text since the 2026-11-02 review; repeated marks since the 0.1.0 release check)*
@@ -214,20 +222,26 @@ What `sqlh` does that `sqlcmd` doesn't, because the reader is a model with a lim
 
 ## Documents
 
-This README is the human-facing overview. The other documents, [AGENTS.md](AGENTS.md) included, are written mainly for the AI agents that work on the project, so they are denser and more exact than this page. Claude Code imports AGENTS.md through CLAUDE.md.
+This README is the overview. For the details:
 
-- [docs/VISION.md](docs/VISION.md): what the product is for, and its priorities
-- [docs/PLAN.md](docs/PLAN.md): the current plan of attack
-- [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, guard, profiles)
+- [docs/DESIGN.md](docs/DESIGN.md): the technical spec (output contract, exit codes, the read-only guard, profiles)
 - [docs/mcp-mode.md](docs/mcp-mode.md): `sqlh mcp`, its tools and how it keeps connections
-- [docs/schema-commands.md](docs/schema-commands.md): the schema commands (`describe`, `find`, `deps`, ...)
-- [docs/command-categories.md](docs/command-categories.md): the decided design for sorting commands by risk (Phase 6, built in slices: two so far)
-- [CONTRIBUTING.md](CONTRIBUTING.md): contribution, build and test guidance
+- [docs/schema-commands.md](docs/schema-commands.md): the schema and server commands (`describe`, `find`, `deps`, `errorlog`, `activity`, ...)
+
+For contributors: [CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing and how to report a problem. The other documents are written mainly for the AI agents that work on the project, so they are denser and more exact than this page: [AGENTS.md](AGENTS.md) (imported by Claude Code through CLAUDE.md), [docs/VISION.md](docs/VISION.md) (what the product is for), [docs/PLAN.md](docs/PLAN.md) (the plan and the owner's decisions) and [docs/command-categories.md](docs/command-categories.md) (the design for sorting commands by risk, built in slices).
+
+## Build from source
+
+You need Rust (via `rustup`; the toolchain is pinned in `rust-toolchain.toml`) and the Visual Studio C++ build tools with a Windows SDK.
+
+```powershell
+cargo build --release      # target\release\sqlh.exe, about 3 MB
+cargo test                 # no server needed
+pwsh scripts/check.ps1     # everything a change must pass; CI runs the same script
+```
+
+Releases are built, signed and published by GitHub Actions.
 
 ## License
 
 [MIT](LICENSE).
-
-## Local housekeeping
-
-Builds go in the ignored `target/` directory; `cargo clean` frees the disk space, and the next build is slower. `scratch/` and `artifacts/` are ignored too, for experiments and local results. Real server data and connection profiles stay local, and committed examples use synthetic data. Executables will be distributed as GitHub release assets when releases are ready. The other contributor rules are in [AGENTS.md](AGENTS.md).

@@ -556,6 +556,17 @@ The repository goes public with 0.2.0, slice 2, the release after 0.1.0 (decisio
   - Rewrite `v0.1.0`'s release notes, which are internal PR titles.
 
   Agents fix the mechanical parts. The owner writes the README's opening and the release notes.
+
+  **Fixed 2026-11-26, for 0.2.0 (decision 96), docs only:**
+  - The README now has a status line instead of "pre-release", a requirements list, install steps (the zip, `SHA256SUMS.txt`, PATH, the signature, SmartScreen), and "Build from source" after the documents. "Will be built" is gone.
+  - MCP is defined where it first appears, and "Command line or MCP?" is shortened.
+  - The tools are described as running under the read-only guard.
+  - "Dev LAN" now reads "a local network".
+  - The documents list puts the specs first and the agents' documents under "For contributors". "Local housekeeping" moved to CONTRIBUTING.md.
+  - CONTRIBUTING.md has a policy, and says how to report a problem. It assumes issues are turned on at the flip, which is the owner's call.
+  - SECURITY.md has supported versions, private reporting through the Security tab and what counts. The "existing private contact method" line is gone.
+  - Blocker 6 is cleared by releasing slice 2 as 0.2.0.
+  - Still open: the "Built for agents" cut (the AGENTS.md tally rule), the guard bullets folded into one, the `%APPDATA%` note, a least-privilege login recipe, and the README's opening and the release notes, which are the owner's to write.
 - **Managed laptop: not run.** This is decision 81's first check for the public release: the downloaded zip on a work-managed machine with corporate antivirus or EDR and AppLocker or WDAC. Steps: check the sums, extract, check the signature, then run `--version` in PowerShell and cmd, then `profiles add` and a query. Note any SmartScreen prompt or block, and collect the AppLocker and CodeIntegrity events. Only the owner can arrange it.
 
 ### Phase 7: evidence-based evaluations (VISION priority 5)
