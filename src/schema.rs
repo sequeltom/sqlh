@@ -1699,11 +1699,10 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
 /// hold, so `' '` → `' ' + tab`, then dropping `tab + ' '` and the tabs left is exact. The
 /// binary collation makes each `REPLACE` match code units whatever the server's collation.
 /// The statement is cut from the batch in that collation too: the request's offsets count
-/// bytes, and under a supplementary-character (`_SC`, `_UTF8`) default, which `st.text` takes
-/// (the server's or the database's),
+/// bytes, and if `st.text` follows a supplementary-character (`_SC`, `_UTF8`) default (not
+/// measured: R71),
 /// `SUBSTRING` counts a surrogate pair as one character, so a statement after an emoji began
-/// a character late (the slice 2 review's follow-up; measured on both servers with an
-/// explicit `_SC` collation).
+/// a character late (R71; measured on both servers with an explicit `_SC` collation).
 /// Chains come first, the largest first, each in depth order; then the rest, oldest first.
 const ACTIVITY_STEP: &str = "WITH shown AS (\n\
     SELECT x.* FROM #s x\n\

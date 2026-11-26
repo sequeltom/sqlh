@@ -874,6 +874,8 @@ where
                     return late();
                 }
                 match tokio::time::timeout_at(at.into(), attempt()).await {
+                    // A cancel stays one, exit 6, however late it ended (R72).
+                    Ok(cancelled @ Err(TdsError::OperationCancelledError(_))) => cancelled,
                     Ok(_) if Instant::now() >= at => late(),
                     Ok(result) => result,
                     Err(_) => late(),
@@ -2490,6 +2492,8 @@ mod tests {
             Pending,
             // Ends in its first poll, once the deadline has passed (`Timeout` polls it first).
             ReadyLate(Option<i32>),
+            // The same, ending as the driver's cancellation.
+            CancelledLate,
         }
         let outcome = |code: Option<i32>| match code {
             None => Ok(7),
@@ -2514,14 +2518,21 @@ mod tests {
                                 );
                                 outcome(code)
                             }
+                            (false, Second::CancelledLate) => {
+                                std::thread::sleep(
+                                    at.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(10),
+                                );
+                                Err(TdsError::OperationCancelledError("x".into()))
+                            }
                         }
                     }
                 }),
             );
             (result, tries.get())
         };
-        // Far enough off that a pause of the test's thread doesn't reach it before the second
-        // attempt starts.
+        // Headroom, not synchronization: a pause of the test's thread longer than this before
+        // the second attempt would end the case early, with one attempt.
         let soon = || Instant::now() + Duration::from_millis(500);
         // Still running at the deadline: the timer's timeout.
         let (result, tries) = by(soon(), Second::Pending);
@@ -2532,6 +2543,15 @@ mod tests {
             let (result, tries) = by(soon(), Second::ReadyLate(code));
             assert!(login_timeout(result) && tries == 2, "{code:?}");
         }
+        // R72: but a cancel that ends late stays a cancel, which the run reports as exit 6.
+        let (result, tries) = by(soon(), Second::CancelledLate);
+        assert!(
+            tries == 2
+                && result.is_err_and(|error| matches!(
+                    connect_error(error, &options),
+                    DbError::Cancelled(_)
+                ))
+        );
         // In time, a second attempt's own result stands.
         let later = || Instant::now() + Duration::from_secs(5);
         assert!(matches!(by(later(), Second::Ready(None)), (Ok(7), 2)));
