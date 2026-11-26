@@ -1507,12 +1507,15 @@ fn errorlog_sql(
          CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major, @from AS [from], \
          (SELECT COUNT(*) FROM #log) AS kept;",
         log_type = if agent { 2 } else { 1 },
-        // `ISNULL`: a line with no text matches nothing, as `NOT EXISTS` drops it below.
+        // `ISNULL`: a line with no text matches nothing, as `NOT EXISTS` drops it below. The
+        // explicit collation on `[Text]` outranks `@search`'s and tempdb's, so case and accents
+        // never count, on any server, as in `find` (decision 94).
         unmatched = if agent {
-            "ISNULL(CHARINDEX(@search, [Text]), 0) = 0"
+            "ISNULL(CHARINDEX(@search, [Text] COLLATE Latin1_General_100_CI_AI), 0) = 0"
         } else {
             "NOT EXISTS (SELECT 1 FROM #log m WHERE m.LogDate = #log.LogDate \
-             AND m.ProcessInfo = #log.ProcessInfo AND CHARINDEX(@search, m.[Text]) > 0)"
+             AND m.ProcessInfo = #log.ProcessInfo \
+             AND CHARINDEX(@search, m.[Text] COLLATE Latin1_General_100_CI_AI) > 0)"
         },
         archive = archive.map_or_else(|| "NULL".to_owned(), |n| n.to_string()),
         since = since.unwrap_or("NULL"),
@@ -2789,10 +2792,11 @@ mod tests {
             "INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;",
             "WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)",
             "INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;",
-            // The server log's search keeps each match's companions (decision 89).
+            // The server log's search keeps each match's companions (decision 89), ignoring
+            // case and accents on every server (decision 94).
             "\nIF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m \
              WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
-             AND CHARINDEX(@search, m.[Text]) > 0);\n",
+             AND CHARINDEX(@search, m.[Text] COLLATE Latin1_General_100_CI_AI) > 0);\n",
             "(SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;",
         ] {
             assert!(sql.contains(part), "{part}\n{sql}");
@@ -2818,7 +2822,7 @@ mod tests {
         assert!(
             sql.contains(
                 "\nIF @search IS NOT NULL DELETE FROM #log WHERE ISNULL(CHARINDEX(@search, \
-                 [Text]), 0) = 0;\n"
+                 [Text] COLLATE Latin1_General_100_CI_AI), 0) = 0;\n"
             ),
             "{sql}"
         );

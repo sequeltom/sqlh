@@ -13987,7 +13987,7 @@ mod live {
             );
             assert_eq!(r.code, 0, "{search}: {}", r.stdout);
             let rows = section_rows(&r.stdout);
-            // CHARINDEX compares in tempdb's collation, case-insensitive on the test servers.
+            // The search ignores case (decision 94).
             let lower = search.to_lowercase();
             assert!(!rows.is_empty(), "{search}: {}", r.stdout);
             assert!(
@@ -14055,6 +14055,22 @@ mod live {
                 .take_while(|row| (row[0], row[1]) == (line[0], line[1]))
                 .any(|row| row[2].starts_with("Error: 18456, Severity: 14, State: ")),
             "{}",
+            r.stdout
+        );
+        // Decision 94: the search ignores case and accents on every server. Both test servers'
+        // own collations are accent-sensitive, so this misses unless the search sets its own.
+        let unlike = login.to_uppercase().replacen("NOLOGIN", "NÓLOGIN", 1);
+        let r = live(
+            &p,
+            &db,
+            &["errorlog", "--since", "10m", "--search", &unlike],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            section_rows(&r.stdout)
+                .iter()
+                .any(|row| row[2].starts_with(&format!("Login failed for user '{login}'."))),
+            "{unlike}:\n{}",
             r.stdout
         );
 

@@ -311,8 +311,9 @@ pub(crate) fn definitions(launch: &Launch) -> Value {
                     Arg::Search => (
                         "search",
                         json!({"type": "string", "minLength": 1, "maxLength": 500,
-                            "description": "Text a line contains; in the server's log each match \
-                             comes with the lines of the same time and source."}),
+                            "description": "Text a line contains, ignoring case and accents; in \
+                             the server's log each match comes with the lines of the same time \
+                             and source."}),
                         false,
                     ),
                     Arg::Agent => (
