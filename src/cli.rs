@@ -10,6 +10,7 @@ use crate::db::Encrypt;
 use crate::output::{Format, MIN_MAX_OUTPUT};
 
 pub use crate::schema::Command as SchemaCommand;
+use crate::schema::Flags as CommandFlags;
 
 pub enum Command {
     Run(Box<Opts>),
@@ -283,7 +284,7 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
     let mut o = Opts::default();
     // Words that aren't options: the SQL, or a schema command and its argument.
     let mut words: Vec<String> = Vec::new();
-    let mut text = false;
+    let mut flags = CommandFlags::default();
     while let Some(arg) = p.next().map_err(|e| e.to_string())? {
         match arg {
             Long("help") | Short('?') => return Ok(Command::Help),
@@ -397,12 +398,26 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
                 o.ignored.push(format!("-{c}"));
             }
             Short(c @ ('W' | 'e' | 'I' | 'u' | 'p' | 'R')) => o.ignored.push(format!("-{c}")),
-            Long("text") => text = true,
+            Long("text") => flags.text = true,
+            Long("since") => flags.since = Some(string(p.value())?),
+            Long("search") => flags.search = Some(string(p.value())?),
+            Long("agent") => flags.agent = true,
+            Long("archive") => {
+                // The bound in every refusal, as schema::errorlog words one past it.
+                let text = string(p.value())?;
+                let archive = text.parse().map_err(|_| {
+                    format!(
+                        "--archive {text}: expected 0 to {}",
+                        crate::schema::MAX_ARCHIVE
+                    )
+                })?;
+                flags.archive = Some(archive);
+            }
             Value(value) => words.push(string(Ok(value))?),
             _ => return Err(arg.unexpected().to_string()),
         }
     }
-    match SchemaCommand::parse(&words, text) {
+    match SchemaCommand::parse(&words, &flags) {
         Some(command) => {
             if o.query.is_some() || !o.inputs.is_empty() {
                 return Err(
@@ -411,7 +426,7 @@ fn parse_from(mut p: lexopt::Parser) -> Result<Command, String> {
             }
             o.command = Some(command?);
         }
-        None if text => return Err("--text only applies to sqlh find".to_owned()),
+        None if let Some(refusal) = flags.misplaced(None) => return Err(refusal),
         None if words
             .first()
             .is_some_and(|w| w == "mcp" || w == "profiles" || w == "profile") =>
@@ -745,6 +760,80 @@ mod tests {
             (
                 &["profiles", "add", "x", "describe", "y"][..],
                 "connection options only",
+            ),
+        ] {
+            let error = parse_args(args).err().expect("refused");
+            assert!(error.contains(wanted), "{args:?}: {error}");
+        }
+    }
+
+    // schema-commands.md §6.9: errorlog's options can come anywhere on the line; with SQL, or
+    // with another command, each one is refused, and `profiles list --search` keeps its own.
+    #[test]
+    fn errorlog_takes_its_options_from_anywhere() {
+        let o = opts(&[
+            "--since",
+            "2h",
+            "--profile",
+            "dev",
+            "errorlog",
+            "--search",
+            "Login failed",
+            "--agent",
+            "--archive",
+            "3",
+        ]);
+        assert_eq!(
+            o.command,
+            Some(SchemaCommand::Errorlog(crate::schema::Errorlog {
+                since: Some("2h".into()),
+                search: Some("Login failed".into()),
+                agent: true,
+                archive: Some(3),
+            }))
+        );
+        assert_eq!(o.profile.as_deref(), Some("dev"));
+        for (args, wanted) in [
+            (
+                &["--since", "1h", "-Q", "SELECT 1"][..],
+                "--since only applies to sqlh errorlog",
+            ),
+            (
+                &["--search", "x", "SELECT 1"][..],
+                "--search only applies to sqlh errorlog and sqlh profiles list",
+            ),
+            (
+                &["--agent", "tables"][..],
+                "--agent only applies to sqlh errorlog",
+            ),
+            (
+                &["describe", "t", "--archive", "1"][..],
+                "--archive only applies to sqlh errorlog",
+            ),
+            (
+                &["errorlog", "--archive", "x"][..],
+                "--archive x: expected 0 to 99",
+            ),
+            (
+                &["errorlog", "--archive", "-1"][..],
+                "--archive -1: expected 0 to 99",
+            ),
+            (
+                &["errorlog", "--archive", "4294967296"][..],
+                "--archive 4294967296: expected 0 to 99",
+            ),
+            (&["errorlog", "--since"][..], "missing argument"),
+            (
+                &["errorlog", "--text"][..],
+                "--text only applies to sqlh find",
+            ),
+            (
+                &["-Q", "SELECT 1", "errorlog"][..],
+                "give it without -Q or -i",
+            ),
+            (
+                &["profiles", "add", "x", "--since", "1h"][..],
+                "--since only applies to sqlh errorlog",
             ),
         ] {
             let error = parse_args(args).err().expect("refused");

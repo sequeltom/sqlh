@@ -26,7 +26,7 @@ use mssql_tds::connection::tds_client::{
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting, TdsResult};
 use mssql_tds::datatypes::row_writer::DiscardRowWriter;
-use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage};
+use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage, TimeoutErrorType};
 use mssql_tds::message::login_options::ApplicationIntent;
 use mssql_tds::security::SecurityContextProvider;
 
@@ -686,74 +686,17 @@ impl Session {
         cancel: &Cancel,
         spn: Arc<dyn SecurityContextProvider>,
     ) -> Result<Session, DbError> {
-        let mut context = ClientContext::default();
-        context.application_name = options.application_name.into();
-        context.database = options.database.clone().unwrap_or_default();
-        match &options.auth {
-            Auth::Integrated => {
-                context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-                // The driver calls this for each login hop, after its TCP connect, prelogin and
-                // TLS, with the host and port it dials (SQL Browser's port, each routed host), so
-                // the SPN is that hop's (decision 72; DESIGN.md §4.2, `-E`). `server_spn` stays
-                // unset: its one value would go to every hop (R52).
-                context.security_context_provider = Some(spn);
-            }
-            Auth::Sql { user, password } => {
-                context.tds_authentication_method = TdsAuthenticationMethod::Password;
-                context.user_name = user.clone();
-                // The driver keeps its own `String` for the connection's life (it may log in
-                // again); sqlh can't wipe that copy (DESIGN.md §8).
-                context.password = password.to_string();
-            }
-        }
-        context.encryption_options = EncryptionOptions {
-            mode: match options.encrypt {
-                Encrypt::Optional => EncryptionSetting::PreferOff,
-                Encrypt::Mandatory => EncryptionSetting::On,
-                Encrypt::Strict => EncryptionSetting::Strict,
-            },
-            trust_server_certificate: options.trust_server_certificate,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
-        // One attempt, no retries: the driver would retry a refused connection after 10 s,
-        // until the deadline (14 s with -l 15). An agent can retry itself, and sooner. A count
-        // of 0 also keeps idle connection resiliency off: the driver asks the server for
-        // session recovery only when it is above 0, so it never logs in again behind sqlh's
-        // back, and the engine's one retry on a new connection is the only reconnect (owner
-        // decision 41; docs/notes/driver-0.3.0.md §2).
-        context.connect_retry_count = 0;
-        // Each TCP connect attempt gets -l seconds and the whole login one more, so an
-        // unreachable address fails at TCP (exit 2) and a server that takes the connection
-        // but doesn't log in hits the deadline (exit 4). Equal limits raced.
-        // -l 0 means no limit, as in sqlcmd and like -t 0. The driver would take a TCP limit
-        // of 0 as "give up at once", so that gets a day (Windows gives up on a TCP connect
-        // after about 21 s anyway); a login deadline of 0 is the driver's "none".
-        let (tcp, login) = match options.login_timeout {
-            0 => (86_400, 0),
-            limit => (limit, limit.saturating_add(1)),
-        };
-        context.connect_timeout = tcp;
-        context.login_timeout = Some(login);
-        context.application_intent = if options.read_only_intent {
-            ApplicationIntent::ReadOnly
-        } else {
-            ApplicationIntent::ReadWrite
-        };
-        // Always explicit (owner decision 40): mssql-tds's `None` (0.3.0, 0.4.0) takes its own
-        // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
-        // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
-        // keeps sqlcmd's rule: one address after another unless -M.
-        context.multi_subnet_failover = Some(options.multi_subnet_failover);
-        // Version 2, the driver's default since 0.4.0, set here so that a later default can't
-        // change the output unseen (owner decision 71): SQL Server 2025 then sends float16
-        // vectors natively, which `value` writes at their own precision, and float32 ones as
-        // under version 1.
-        context.vector_version = VectorVersion::V2;
-
         let source = data_source(&options.server);
         let provider = TdsConnectionProvider::new();
-        let connecting = provider.create_client(context, &source, Some(&cancel.handle));
+        let deadline = login_deadline(Instant::now(), options.login_timeout);
+        let (provider, source, spn) = (&provider, &*source, &spn);
+        let connecting = once_more_if_port_held(deadline, move || {
+            provider.create_client(
+                client_context(options, Arc::clone(spn)),
+                source,
+                Some(&cancel.handle),
+            )
+        });
         // The driver drops a pending attempt itself when its handle is cancelled (0.2.0 to 0.4.0
         // wrap the whole connect in `run_until_cancelled`; with this race removed, a cancel during a
         // TCP attempt and during a login each ended the run within 100 ms). Racing sqlh's own
@@ -794,7 +737,157 @@ impl Session {
             retired: false,
         })
     }
+}
 
+/// The driver's settings for one connect attempt. Built anew for each (decision 95's second
+/// attempt too) rather than cloned: the driver takes the context, password and all, and a copy
+/// sqlh kept would be one more it can't wipe (DESIGN.md §8).
+fn client_context(
+    options: &ConnectOptions,
+    spn: Arc<dyn SecurityContextProvider>,
+) -> ClientContext {
+    let mut context = ClientContext::default();
+    context.application_name = options.application_name.into();
+    context.database = options.database.clone().unwrap_or_default();
+    match &options.auth {
+        Auth::Integrated => {
+            context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+            // The driver calls this for each login hop, after its TCP connect, prelogin and
+            // TLS, with the host and port it dials (SQL Browser's port, each routed host), so
+            // the SPN is that hop's (decision 72; DESIGN.md §4.2, `-E`). `server_spn` stays
+            // unset: its one value would go to every hop (R52).
+            context.security_context_provider = Some(spn);
+        }
+        Auth::Sql { user, password } => {
+            context.tds_authentication_method = TdsAuthenticationMethod::Password;
+            context.user_name = user.clone();
+            // The driver keeps its own `String` for the connection's life (it may log in
+            // again); sqlh can't wipe that copy (DESIGN.md §8).
+            context.password = password.to_string();
+        }
+    }
+    context.encryption_options = EncryptionOptions {
+        mode: match options.encrypt {
+            Encrypt::Optional => EncryptionSetting::PreferOff,
+            Encrypt::Mandatory => EncryptionSetting::On,
+            Encrypt::Strict => EncryptionSetting::Strict,
+        },
+        trust_server_certificate: options.trust_server_certificate,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+    // No retries by the driver: it would retry a refused connection after 10 s, until the
+    // deadline (14 s with -l 15). An agent can retry itself, and sooner; sqlh's own one retry is
+    // decision 95's, for a local address this computer reported in use
+    // (`once_more_if_port_held`). A count of 0 also keeps idle connection resiliency off: the
+    // driver asks the server for session recovery only when it is above 0, so it never logs in
+    // again behind sqlh's back, and the engine's one retry on a new connection is the only
+    // reconnect (owner decision 41; docs/notes/driver-0.3.0.md §2).
+    context.connect_retry_count = 0;
+    // Each TCP connect attempt gets -l seconds and the whole login one more, so an
+    // unreachable address fails at TCP (exit 2) and a server that takes the connection
+    // but doesn't log in hits the deadline (exit 4). Equal limits raced.
+    // -l 0 means no limit, as in sqlcmd and like -t 0. The driver would take a TCP limit
+    // of 0 as "give up at once", so that gets a day (Windows gives up on a TCP connect
+    // after about 21 s anyway); a login deadline of 0 is the driver's "none".
+    let (tcp, login) = match options.login_timeout {
+        0 => (86_400, 0),
+        limit => (limit, limit.saturating_add(1)),
+    };
+    context.connect_timeout = tcp;
+    context.login_timeout = Some(login);
+    context.application_intent = if options.read_only_intent {
+        ApplicationIntent::ReadOnly
+    } else {
+        ApplicationIntent::ReadWrite
+    };
+    // Always explicit (owner decision 40): mssql-tds's `None` (0.3.0, 0.4.0) takes its own
+    // default, which is on, or MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT, so a connect without
+    // -M would race its addresses in parallel and its timeout would become exit 4. sqlh
+    // keeps sqlcmd's rule: one address after another unless -M.
+    context.multi_subnet_failover = Some(options.multi_subnet_failover);
+    // Version 2, the driver's default since 0.4.0, set here so that a later default can't
+    // change the output unseen (owner decision 71): SQL Server 2025 then sends float16
+    // vectors natively, which `value` writes at their own precision, and float32 ones as
+    // under version 1.
+    context.vector_version = VectorVersion::V2;
+
+    context
+}
+
+/// WSAEADDRINUSE: this computer's TCP stack refused the connect because the local address it
+/// chose was in use. The error doesn't say by what; when it was first seen, the likely cause was
+/// a port still held by a closed connection to the same server (TIME_WAIT, 120 s by default;
+/// PLAN.md, decision 95; R70). The TCP connect it ends sent nothing; an earlier hop may have
+/// (SQL Browser's lookup, a routing listener's login), and a second attempt makes that again.
+const WSAEADDRINUSE: i32 = 10048;
+
+fn port_held(error: &TdsError) -> bool {
+    match error {
+        TdsError::Io(io) => io.raw_os_error() == Some(WSAEADDRINUSE),
+        // Under -M, mssql-tds 0.4.0's race of the addresses keeps only the last failure, as text
+        // (parallel_connect.rs: `All parallel connection attempts failed ... Last error: {e}`),
+        // and an OS error's text ends with its code.
+        TdsError::ConnectionError(text) => {
+            text.starts_with("All parallel connection attempts failed")
+                && text.ends_with("(os error 10048)")
+        }
+        _ => false,
+    }
+}
+
+/// The whole login's limit, `-l` and one second from `start` (`client_context`), which decision
+/// 95's second attempt stays within; `-l 0` has none.
+fn login_deadline(start: Instant, login_timeout: u32) -> Option<Instant> {
+    match login_timeout {
+        0 => None,
+        limit => start.checked_add(Duration::from_secs(u64::from(limit) + 1)),
+    }
+}
+
+/// Decision 95, the one retry of a connect (DESIGN.md §4.2, `-l`): an attempt refused with
+/// WSAEADDRINUSE is made once more, at once, and within the login's `deadline`; a new attempt
+/// gets another local port. Seen when one connection per run, many runs in a row, left 1,411
+/// ports in TIME_WAIT (PLAN.md §6, decision 95). Any other failure, and a second one, stand.
+/// The deadline is checked on the clock before the second attempt and after it ends, not left
+/// to the timer alone (R69): tokio's `Timeout` polls its future before its timer, so an attempt
+/// that ends in the same poll the deadline passes would win.
+async fn once_more_if_port_held<T, F, Fut>(
+    deadline: Option<Instant>,
+    mut attempt: F,
+) -> TdsResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = TdsResult<T>>,
+{
+    match attempt().await {
+        Err(error) if port_held(&error) => match deadline {
+            Some(at) => {
+                // `connect_error` words it as the login timeout it is: exit 4. A connection
+                // made late is dropped, which closes it.
+                let late = || {
+                    Err(TdsError::TimeoutError(TimeoutErrorType::String(
+                        "the second connect attempt passed the login deadline".into(),
+                    )))
+                };
+                if Instant::now() >= at {
+                    return late();
+                }
+                match tokio::time::timeout_at(at.into(), attempt()).await {
+                    // A cancel stays one, exit 6, however late it ended (R72).
+                    Ok(cancelled @ Err(TdsError::OperationCancelledError(_))) => cancelled,
+                    Ok(_) if Instant::now() >= at => late(),
+                    Ok(result) => result,
+                    Err(_) => late(),
+                }
+            }
+            None => attempt().await,
+        },
+        result => result,
+    }
+}
+
+impl Session {
     /// What the login says about the connection. Nothing is sent to the server; the driver
     /// already holds all of it. The database is the current one, since the driver applies the
     /// server's environment-change token for a `USE` (plan-history.md 2.11); read it right after
@@ -1623,6 +1716,13 @@ fn connect_error(error: TdsError, options: &ConnectOptions) -> DbError {
                 "Windows auth failed; check Kerberos/SPN setup, or use a profile with a SQL login",
             ),
         ),
+        // Decision 95: the second attempt failed so too. Not the server's name: this computer's.
+        // The error names no cause, so neither does the hint (R70).
+        _ if port_held(&error) => (
+            error.to_string(),
+            "this computer reported its local address in use, twice: wait a minute and try \
+             again; if it persists, check this computer's TCP connections",
+        ),
         TdsError::Io(_) | TdsError::ConnectionError(_) | TdsError::ConnectionClosed(_) => (
             error.to_string(),
             "check the server name; for a named instance with SQL Browser unreachable, try host,port",
@@ -1720,11 +1820,13 @@ fn tls_hint(detail: &str, hints: Hints) -> Option<&'static str> {
 mod tests {
     use super::{
         Backpressure, COUNT_STOP_UNCONFIRMED, Cancel, Cause, Counting, DbError, Drain, Hints,
-        PACE_TICKS, TdsError, check, classify, connect_error, data_source, fake_server, filled,
+        PACE_TICKS, TdsError, TdsResult, WSAEADDRINUSE, check, classify, connect_error,
+        data_source, fake_server, filled, login_deadline, once_more_if_port_held, port_held,
         split_protocol, tcp_form, tls_hint, wait_for_output,
     };
     use mssql_tds::core::CancelHandle;
     use std::future::Future;
+    use std::io;
     use std::time::{Duration, Instant};
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -2316,6 +2418,207 @@ mod tests {
         }
     }
 
+    // Decision 95: an attempt refused with WSAEADDRINUSE is made once more, and no other; a
+    // second attempt that outlasts the login's deadline ends as its timeout.
+    #[test]
+    fn a_connect_refused_a_held_port_is_tried_once_more() {
+        use std::cell::Cell;
+        let held = || TdsError::Io(io::Error::from_raw_os_error(WSAEADDRINUSE));
+        let refused = || TdsError::Io(io::Error::from_raw_os_error(10061));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Bounded, so a lost deadline fails the test instead of hanging it.
+        fn bounded<F: Future>(runtime: &tokio::runtime::Runtime, work: F) -> F::Output {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), work)
+                    .await
+                    .expect("bounded")
+            })
+        }
+        let run = |results: Vec<TdsResult<u8>>| {
+            let tries = Cell::new(0);
+            let mut results = results.into_iter();
+            let started = Instant::now();
+            let result = bounded(
+                &runtime,
+                once_more_if_port_held(None, || {
+                    tries.set(tries.get() + 1);
+                    std::future::ready(results.next().expect("one attempt too many"))
+                }),
+            );
+            // At once: no wait between the attempts.
+            assert!(started.elapsed() < Duration::from_millis(500));
+            (result, tries.get())
+        };
+        assert!(matches!(run(vec![Err(held()), Ok(7)]), (Ok(7), 2)));
+        let (result, tries) = run(vec![Err(held()), Err(held())]);
+        assert!(result.is_err_and(|e| port_held(&e)) && tries == 2);
+        let (result, tries) = run(vec![Err(refused()), Ok(7)]);
+        assert!(result.is_err_and(|e| !port_held(&e)) && tries == 1);
+        let (result, tries) = run(vec![Err(held()), Err(refused())]);
+        assert!(result.is_err_and(|e| !port_held(&e)) && tries == 2);
+        assert!(matches!(run(vec![Ok(7)]), (Ok(7), 1)));
+
+        // -M's form of the error (`port_held`).
+        let parallel = |code| {
+            TdsError::ConnectionError(format!(
+                "All parallel connection attempts failed to db01:1433. Last error: {}",
+                io::Error::from_raw_os_error(code)
+            ))
+        };
+        let (result, tries) = run(vec![Err(parallel(WSAEADDRINUSE)), Ok(7)]);
+        assert!(result.is_ok() && tries == 2);
+        let (result, tries) = run(vec![Err(parallel(10061)), Ok(7)]);
+        assert!(result.is_err() && tries == 1);
+        assert!(!port_held(&TdsError::ConnectionError(
+            "failed (os error 10048) with more after it".into()
+        )));
+
+        // R69: the deadline holds on the clock, not on the timer alone. Each case is the first
+        // attempt's 10048, then `second`, with `-l`'s deadline `at`.
+        let options = fake_server::options("db01".into());
+        let login_timeout = |result: TdsResult<u8>| {
+            result.is_err_and(|error| {
+                matches!(connect_error(error, &options), DbError::Timeout(ref words)
+                    if words.starts_with("login timeout: db01 "))
+            })
+        };
+        // The second attempt's result: success for `None`, else that OS error.
+        #[derive(Clone, Copy)]
+        enum Second {
+            Ready(Option<i32>),
+            Pending,
+            // Ends in its first poll, once the deadline has passed (`Timeout` polls it first).
+            ReadyLate(Option<i32>),
+            // The same, ending as the driver's cancellation.
+            CancelledLate,
+        }
+        let outcome = |code: Option<i32>| match code {
+            None => Ok(7),
+            Some(code) => Err(TdsError::Io(io::Error::from_raw_os_error(code))),
+        };
+        let by = |at: Instant, second: Second| {
+            let tries = Cell::new(0);
+            let result = bounded(
+                &runtime,
+                once_more_if_port_held(Some(at), || {
+                    tries.set(tries.get() + 1);
+                    let first = tries.get() == 1;
+                    async move {
+                        match (first, second) {
+                            (true, _) => Err(held()),
+                            (false, Second::Ready(code)) => outcome(code),
+                            (false, Second::Pending) => std::future::pending().await,
+                            (false, Second::ReadyLate(code)) => {
+                                std::thread::sleep(
+                                    at.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(10),
+                                );
+                                outcome(code)
+                            }
+                            (false, Second::CancelledLate) => {
+                                std::thread::sleep(
+                                    at.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(10),
+                                );
+                                Err(TdsError::OperationCancelledError("x".into()))
+                            }
+                        }
+                    }
+                }),
+            );
+            (result, tries.get())
+        };
+        // Headroom, not synchronization: a pause of the test's thread longer than this before
+        // the second attempt would end the case early, with one attempt.
+        let soon = || Instant::now() + Duration::from_millis(500);
+        // Still running at the deadline: the timer's timeout.
+        let (result, tries) = by(soon(), Second::Pending);
+        assert!(login_timeout(result) && tries == 2);
+        // Ended once the deadline had passed: a connection made late is a timeout, and so is
+        // a late failure, whatever it was.
+        for code in [None, Some(10061), Some(WSAEADDRINUSE)] {
+            let (result, tries) = by(soon(), Second::ReadyLate(code));
+            assert!(login_timeout(result) && tries == 2, "{code:?}");
+        }
+        // R72: but a cancel that ends late stays a cancel, which the run reports as exit 6.
+        let (result, tries) = by(soon(), Second::CancelledLate);
+        assert!(
+            tries == 2
+                && result.is_err_and(|error| matches!(
+                    connect_error(error, &options),
+                    DbError::Cancelled(_)
+                ))
+        );
+        // In time, a second attempt's own result stands.
+        let later = || Instant::now() + Duration::from_secs(5);
+        assert!(matches!(by(later(), Second::Ready(None)), (Ok(7), 2)));
+        let (result, tries) = by(later(), Second::Ready(Some(10061)));
+        assert!(result.is_err_and(|e| !port_held(&e)) && tries == 2);
+        // Past the deadline already: no second attempt, whatever it would have returned.
+        if let Some(past) = Instant::now().checked_sub(Duration::from_secs(1)) {
+            for second in [Second::Ready(None), Second::Ready(Some(10061))] {
+                let (result, tries) = by(past, second);
+                assert!(login_timeout(result) && tries == 1);
+            }
+        }
+    }
+
+    // Decision 95's bound is the login's, -l and one second from the first attempt; -l 0 has
+    // none, and a limit too far to count has none either rather than a panic.
+    #[test]
+    fn the_login_deadline_is_l_and_one_second() {
+        let start = Instant::now();
+        assert_eq!(login_deadline(start, 0), None);
+        assert_eq!(
+            login_deadline(start, 1),
+            Some(start + Duration::from_secs(2))
+        );
+        assert_eq!(
+            login_deadline(start, 15),
+            Some(start + Duration::from_secs(16))
+        );
+        // `Instant`'s range is the platform's; u32::MAX seconds, 136 years, may or may not fit.
+        let far = login_deadline(start, u32::MAX);
+        assert!(far.is_none_or(|at| at > start));
+    }
+
+    // Decision 95: a second WSAEADDRINUSE names this computer, never the server's name, in the
+    // CLI and in sqlh mcp; another IO error keeps its hint.
+    #[test]
+    fn a_held_port_is_this_computers_and_not_the_servers_name() {
+        for hints in [Hints::Flags, Hints::Profile] {
+            let mut options = fake_server::options("db01".into());
+            options.hints = hints;
+            let words = |error| match connect_error(error, &options) {
+                DbError::Connect(words) => words,
+                other => panic!("{other:?}"),
+            };
+            let io = |code| TdsError::Io(io::Error::from_raw_os_error(code));
+            // -M's form (`port_held`).
+            let parallel = TdsError::ConnectionError(format!(
+                "All parallel connection attempts failed to db01:1433. Last error: {}",
+                io::Error::from_raw_os_error(WSAEADDRINUSE)
+            ));
+            for held in [words(io(WSAEADDRINUSE)), words(parallel)] {
+                assert!(
+                    held.starts_with("cannot connect to db01 (")
+                        && held.contains("(os error 10048); ")
+                        && held.ends_with(
+                            "; this computer reported its local address in use, twice: wait a \
+                             minute and try again; if it persists, check this computer's TCP \
+                             connections"
+                        )
+                        && !held.contains("server name"),
+                    "{held}"
+                );
+            }
+            assert!(words(io(10061)).contains("; check the server name"));
+        }
+    }
+
     // R46: strict encryption checks the certificate even with -C, so its certificate failures
     // never suggest trusting it; the same failures under mandatory still do.
     #[test]
@@ -2649,6 +2952,72 @@ pub(crate) mod fake_server {
         reply
     }
 
+    /// A column of `result`, as SQL Server describes a nullable one of these types.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Wire {
+        /// INTN of 4 bytes: `int`.
+        Int,
+        /// DATETIMN of 8 bytes: `datetime`.
+        DateTime,
+        /// NVARCHAR of 8,000 bytes, in the login's collation: `nvarchar(4000)`.
+        Text,
+    }
+
+    /// A value of a `result` row, for its column's `Wire`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Cell<'a> {
+        Null,
+        Int(i32),
+        /// `datetime`'s days from 1900-01-01 and its time in 1/300 s.
+        DateTime(i32, u32),
+        Text(&'a str),
+    }
+
+    /// One result set and its final DONE: COLMETADATA (`81 | count u16 LE`, then per column
+    /// `user type u32 | flags u16, 0x01 nullable | type info | name B_VARCHAR`), a ROW (`D1`)
+    /// per row, each value as its type writes it (a length byte for INTN and DATETIMN, a u16
+    /// LE byte count for NVARCHAR, 0xFFFF for NULL).
+    pub(crate) fn result(columns: &[(&str, Wire)], rows: &[&[Cell]]) -> Vec<u8> {
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let mut tokens = vec![0x81];
+        tokens.extend(u16::try_from(columns.len()).unwrap().to_le_bytes());
+        for (name, wire) in columns {
+            tokens.extend([0, 0, 0, 0, 1, 0]);
+            match wire {
+                Wire::Int => tokens.extend([0x26, 4]),
+                Wire::DateTime => tokens.extend([0x6f, 8]),
+                Wire::Text => tokens.extend([0xe7, 0x40, 0x1f, 9, 4, 0xd0, 0, 0x34]),
+            }
+            tokens.push(u8::try_from(name.encode_utf16().count()).unwrap());
+            tokens.extend(utf16(name));
+        }
+        for row in rows {
+            tokens.push(0xd1);
+            for (cell, (_, wire)) in row.iter().zip(columns) {
+                match (cell, wire) {
+                    (Cell::Null, Wire::Text) => tokens.extend([0xff, 0xff]),
+                    (Cell::Null, _) => tokens.push(0),
+                    (Cell::Int(n), _) => {
+                        tokens.push(4);
+                        tokens.extend(n.to_le_bytes());
+                    }
+                    (Cell::DateTime(days, ticks), _) => {
+                        tokens.push(8);
+                        tokens.extend(days.to_le_bytes());
+                        tokens.extend(ticks.to_le_bytes());
+                    }
+                    (Cell::Text(text), _) => {
+                        let bytes = utf16(text);
+                        tokens.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
+                        tokens.extend(bytes);
+                    }
+                }
+            }
+        }
+        tokens.extend(done(rows.len() as u64));
+        tokens
+    }
+
     /// The login's answer: LOGINACK, the packet size, database and collation changes, DONE.
     fn login_reply() -> Vec<u8> {
         let name: Vec<u8> = "fake".encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -2776,6 +3145,8 @@ pub(crate) mod fake_server {
     #[derive(Clone, Debug, Default)]
     pub(crate) struct Conn {
         turns: Vec<(usize, Turn)>,
+        /// Requests answered with these tokens instead (`Conn::replying`).
+        replies: Vec<(usize, Vec<u8>)>,
         close_after: Option<usize>,
         no_reset_ack: bool,
         refuse_login: bool,
@@ -2814,6 +3185,13 @@ pub(crate) mod fake_server {
         /// connection can meet.
         pub(crate) fn refusing_login(mut self) -> Conn {
             self.refuse_login = true;
+            self
+        }
+
+        /// Answers the connection's `request`th SQL batch with `tokens` (built with `result`),
+        /// whatever it says: a command's lookup and step, with the rows a test needs.
+        pub(crate) fn replying(mut self, request: usize, tokens: Vec<u8>) -> Conn {
+            self.replies.push((request, tokens));
             self
         }
 
@@ -3047,7 +3425,15 @@ pub(crate) mod fake_server {
                     reply.extend(env_reset());
                 }
             }
+            let replied = script
+                .replies
+                .iter()
+                .find(|(number, _)| *number == answered);
             let sent = match script.turn(answered) {
+                Turn::Answer if let Some((_, tokens)) = replied => {
+                    reply.extend(tokens);
+                    write_packet(&mut s, &reply, true)
+                }
                 Turn::Answer => {
                     reply.extend(answer(&sql, conn, log));
                     write_packet(&mut s, &reply, true)

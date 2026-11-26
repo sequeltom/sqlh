@@ -353,9 +353,8 @@ impl<W: Write> Output for CsvSink<W> {
 
     fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
         self.flush_affected()?;
-        let empty = self.tally.take_empty_sections();
-        if let Some(line) = no_rows_line(&empty)
-            && !self.emit_meta(&line)?
+        if let Some((empty, note)) = self.tally.take_no_rows()
+            && !self.emit_meta(&no_rows_line(&empty, note.as_deref()))?
         {
             self.tally.withhold_note();
         }
@@ -393,6 +392,10 @@ impl<W: Write> Output for CsvSink<W> {
     fn set_sections(&mut self, sections: &[Section]) {
         self.tally.set_sections(sections);
     }
+
+    fn set_empty_note(&mut self, note: Option<&str>) {
+        self.tally.set_empty_note(note);
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +424,23 @@ mod tests {
             meta.text(),
             "-- object: name, type\n-- columns: column, type\n-- no rows: indexes\n\
              -- ok: 1 batch, 3 ms\n"
+        );
+    }
+
+    // Decision 93: the note is on the metadata stream's `-- no rows:` line, as in text.
+    #[test]
+    fn an_empty_sections_note_is_on_the_metadata_stream() {
+        let (data, meta) = (Shared::default(), Shared::default());
+        let mut s = CsvSink::new(data.clone(), Box::new(meta.clone()), Limits::default());
+        super::super::text::tests::noted_run(&mut s, false);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(data.text(), "");
+        assert_eq!(
+            meta.text(),
+            format!(
+                "-- no rows: server_log ({})\n-- ok: 1 batch, 3 ms\n",
+                super::super::text::tests::EMPTY_NOTE
+            )
         );
     }
 

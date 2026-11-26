@@ -40,6 +40,15 @@ pub(crate) enum Input {
 pub(crate) struct Step {
     pub(crate) sql: String,
     pub(crate) sections: Vec<Section>,
+    /// What the batch's `-- no rows:` line adds when its sections are empty (decision 93).
+    pub(crate) empty_note: Option<String>,
+}
+
+/// What a batch of a command shows: its `Step`'s sections and empty note.
+#[derive(Debug, Default)]
+pub(crate) struct Shown {
+    sections: Vec<Section>,
+    empty_note: Option<String>,
 }
 
 /// The rows a lookup returned: for each of its result sets, its rows.
@@ -51,10 +60,75 @@ pub(crate) type Then = Box<dyn Fn(&Found) -> Result<Vec<Step>, Failure>>;
 /// A command's SQL: steps known in advance (`tables`), or a lookup whose rows decide them
 /// (`describe` resolves a name first, and what it describes depends on the object's type).
 /// The lookup runs on the run's own connection, inside its wrapper transaction, and shows
-/// nothing: its rows go to `then`, and an error in it ends the run as a failure.
+/// nothing: its rows go to `then`, and an error in it ends the run as a failure that `label`
+/// words.
+///
+/// A lookup may hold several statements and fill `#temp` tables, which its steps read: same
+/// session, same wrapper. A command that does its server work there and whose step is one
+/// `SELECT` keeps `guard::several_outputs` false for the step, so a capped result gets the
+/// brief count and no `-- partial:` advice, which a command's user can't act on (it has no
+/// `GO` to add; decision 45).
 pub(crate) enum Plan {
     Steps(Vec<Step>),
-    Lookup { sql: String, then: Then },
+    Lookup {
+        sql: String,
+        then: Then,
+        label: LookupLabel,
+    },
+}
+
+/// What a lookup does, as its failures say it: a timeout, the server's error, a reply past
+/// the `CAPTURE_` bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupLabel {
+    /// `describe`, `def` and `deps` resolving a name.
+    Name,
+    /// `activity` copying the server's sessions.
+    Activity,
+    /// `errorlog` copying the log; `since` is whether `--since` chose the archives.
+    ErrorLog { since: bool },
+}
+
+impl LookupLabel {
+    /// The lookup as something being done: `while looking the name up`, `... failed`.
+    fn doing(self) -> &'static str {
+        match self {
+            LookupLabel::Name => "looking the name up",
+            LookupLabel::Activity => "reading the server's sessions",
+            LookupLabel::ErrorLog { .. } => "reading the error log",
+        }
+    }
+
+    /// The lookup as a thing: `the name lookup returned more than it should`.
+    fn noun(self) -> &'static str {
+        match self {
+            LookupLabel::Name => "the name lookup",
+            LookupLabel::Activity => "the read of the server's sessions",
+            LookupLabel::ErrorLog { .. } => "the error log read",
+        }
+    }
+
+    /// What a timeout's advice adds to raising the timeout. The error log is read an archive at
+    /// a time, each whole, and a search filters only what was copied (decision 89), so a
+    /// narrower search doesn't help; a later `--since` reads fewer archives.
+    fn after_timeout(self, advice: output::Advice) -> Option<&'static str> {
+        use output::Advice::{Cli, Mcp};
+        match (self, advice) {
+            (LookupLabel::Name | LookupLabel::Activity, _) => None,
+            (LookupLabel::ErrorLog { since: true }, Cli) => {
+                Some("a later --since reads fewer archives, each one whole even with --search")
+            }
+            (LookupLabel::ErrorLog { since: true }, Mcp) => {
+                Some("a later since reads fewer archives, each one whole even with search")
+            }
+            (LookupLabel::ErrorLog { since: false }, Cli) => {
+                Some("the archive is read whole, even with --search")
+            }
+            (LookupLabel::ErrorLog { since: false }, Mcp) => {
+                Some("the archive is read whole, even with search")
+            }
+        }
+    }
 }
 
 /// Where the line about the connection goes: nowhere, to stderr as a diagnostic
@@ -535,10 +609,10 @@ impl BatchSink for Counted<'_> {
 pub(crate) struct Prepared {
     pub(crate) sources: Vec<Source>,
     batches: Vec<Batch>,
-    /// The sections each batch's result sets fill; empty for the user's SQL.
-    sections: Vec<Vec<Section>>,
+    /// What each batch shows (its sections, its empty note); empty for the user's SQL.
+    sections: Vec<Shown>,
     /// A command's lookup (`Plan::Lookup`): its SQL, and what makes the batches of its rows.
-    lookup: Option<(String, Then)>,
+    lookup: Option<(String, Then, LookupLabel)>,
     policy: RunPolicy,
     report: Report,
     /// Where and why the guard refused the input, if it did.
@@ -556,6 +630,11 @@ impl Prepared {
     /// `RunPolicy::application_name`.
     pub(crate) fn application_name(&self) -> &'static str {
         self.policy.application_name()
+    }
+
+    /// What its lookup does, for a command that has one.
+    pub(crate) fn lookup_label(&self) -> Option<LookupLabel> {
+        self.lookup.as_ref().map(|(_, _, label)| *label)
     }
 
     /// Whether the request asked to count every hidden row (`Request::exact_count`).
@@ -593,7 +672,7 @@ pub(crate) fn unconnected_settings(allow_write: bool) -> Settings {
 }
 
 /// A command's steps as batches of its one source, with their sections.
-fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Vec<Section>>) {
+fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Shown>) {
     steps
         .into_iter()
         .map(|step| {
@@ -604,7 +683,11 @@ fn step_batches(steps: Vec<Step>) -> (Vec<Batch>, Vec<Vec<Section>>) {
                 repeat: 1,
                 line_map: Vec::new(),
             };
-            (batch, step.sections)
+            let shown = Shown {
+                sections: step.sections,
+                empty_note: step.empty_note,
+            };
+            (batch, shown)
         })
         .unzip()
 }
@@ -626,7 +709,7 @@ pub(crate) fn prepare(
                 let (batches, sections) = step_batches(steps);
                 (batches, sections, None)
             }
-            Plan::Lookup { sql, then } => (Vec::new(), Vec::new(), Some((sql, then))),
+            Plan::Lookup { sql, then, label } => (Vec::new(), Vec::new(), Some((sql, then, label))),
         };
         return Ok(Prepared {
             sources,
@@ -1110,10 +1193,13 @@ pub(crate) async fn run_opened(
     let looked_up;
     let (batches, sections) = match &prepared.lookup {
         None => (batches, &prepared.sections),
-        Some((sql, then)) => {
+        Some((sql, then, label)) => {
             // Boxed: its state would otherwise add to the session's future, which a debug
             // build lays out big enough to overflow the main thread's stack.
-            let found = Box::pin(look_up(session, sql, timeout, settings, cancel, gate)).await?;
+            let found = Box::pin(look_up(
+                session, sql, *label, timeout, settings, cancel, gate,
+            ))
+            .await?;
             looked_up = step_batches(then(&found)?);
             (&looked_up.0, &looked_up.1)
         }
@@ -1131,7 +1217,9 @@ pub(crate) async fn run_opened(
     let mut number = 0;
     let mut output_modes = false;
     'batches: for (index, batch) in batches.iter().enumerate() {
-        out.set_sections(sections.get(index).map_or(&[], Vec::as_slice));
+        let shown = sections.get(index);
+        out.set_sections(shown.map_or(&[], |shown| shown.sections.as_slice()));
+        out.set_empty_note(shown.and_then(|shown| shown.empty_note.as_deref()));
         // A stopped count cancels the rest of the batch; where that could cancel a later
         // statement's output, the count runs longer first, and a stop is reported as the rest
         // of the batch not run (decision 45, DESIGN.md §4.4). An option that adds output
@@ -1262,6 +1350,7 @@ pub(crate) async fn run_opened(
 async fn look_up(
     session: &mut Session,
     sql: &str,
+    label: LookupLabel,
     timeout: u32,
     settings: &Settings,
     cancel: &Cancel,
@@ -1283,14 +1372,18 @@ async fn look_up(
             DbError::Timeout(_) => Failure::new(
                 Exit::Timeout,
                 format!(
-                    "query timeout after {timeout} s while looking the name up; {}",
+                    "query timeout after {timeout} s while {}; {}{}",
+                    label.doing(),
                     raise_timeout(settings, timeout)
-                        .unwrap_or_else(|| format!("{timeout} s is the server's limit"))
+                        .unwrap_or_else(|| format!("{timeout} s is the server's limit")),
+                    label
+                        .after_timeout(settings.limits.advice)
+                        .map_or_else(String::new, |more| format!("; {more}"))
                 ),
             ),
             e => db_failure(e, settings.limits.advice),
         })?;
-    capture.finish()
+    capture.finish(label)
 }
 
 /// The most a lookup keeps (R31): result sets, rows in each, and characters of a value. The
@@ -1313,17 +1406,20 @@ struct Capture {
 
 impl Capture {
     /// What the lookup returned, or why it can't be used.
-    fn finish(self) -> Result<Found, Failure> {
+    fn finish(self, label: LookupLabel) -> Result<Found, Failure> {
         if let Some((number, text)) = self.error {
             return Err(Failure::new(
                 Exit::SqlError,
-                format!("looking the name up failed: error {number}: {text}"),
+                format!("{} failed: error {number}: {text}", label.doing()),
             ));
         }
         if self.overflow {
             return Err(Failure::new(
                 Exit::Internal,
-                "the name lookup returned more than it should; nothing was shown",
+                format!(
+                    "{} returned more than it should; nothing was shown",
+                    label.noun()
+                ),
             ));
         }
         Ok(self.found)
@@ -1440,14 +1536,14 @@ mod tests {
         }
         assert!(!capture.wants_values());
         assert_eq!(capture.cell_limit(), CAPTURE_CHARS);
-        let found = capture.finish().unwrap();
+        let found = capture.finish(LookupLabel::Name).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].len(), CAPTURE_ROWS);
 
         let overflowed = |feed: &dyn Fn(&mut Capture)| {
             let mut capture = Capture::default();
             feed(&mut capture);
-            let failure = capture.finish().unwrap_err();
+            let failure = capture.finish(LookupLabel::Name).unwrap_err();
             assert_eq!(failure.exit, Exit::Internal);
             assert!(failure.message.contains("returned more than it should"));
         };
@@ -1485,12 +1581,90 @@ mod tests {
             text: "Invalid object name".into(),
         };
         capture.error(&error).unwrap();
-        let failure = capture.finish().unwrap_err();
+        let failure = capture.finish(LookupLabel::Name).unwrap_err();
         assert_eq!(failure.exit, Exit::SqlError);
         assert_eq!(
             failure.message,
             "looking the name up failed: error 208: Invalid object name"
         );
+    }
+
+    // A lookup's failures say what it was doing (`LookupLabel`); the name commands' words are
+    // the ones they always had (engine.rs's lookup timeout test has the timeout's).
+    #[test]
+    fn a_lookups_failures_name_what_it_was_doing() {
+        assert_eq!(LookupLabel::Name.doing(), "looking the name up");
+        let mut capture = Capture::default();
+        capture.columns(&[]).unwrap();
+        capture.counting_stopped(Stop::Budget);
+        assert_eq!(
+            capture.finish(LookupLabel::Name).unwrap_err().message,
+            "the name lookup returned more than it should; nothing was shown"
+        );
+    }
+
+    // `Plan::Lookup`'s rule: the lookup holds a server command's work, its `#temp` tables live
+    // on into the step, and a step that is one `SELECT` reading them is not a batch with later
+    // statements, so it gets no longer count and no `-- partial:` advice. Checked on the steps
+    // `activity` and `errorlog` build from their lookups' rows, as a run builds them (one after
+    // common table expressions, a recursive one with `UNION ALL` in it, and a query hint); a
+    // second `SELECT` is not one, nor is a lookup (which is never asked).
+    #[test]
+    fn a_step_of_one_select_after_a_lookup_has_no_later_statements() {
+        use crate::output::Advice;
+        use crate::schema::{Command, Errorlog};
+        let row = |values: &[i64]| -> Found {
+            vec![vec![values.iter().map(|&n| Value::Int(n)).collect()]]
+        };
+        // can_read, archives, last, read, major, then from and kept.
+        let logged = |values: &[i64], kept: i64| -> Found {
+            let mut found = row(values);
+            found[0][0].push(Value::Text("2026-11-21 08:14".into()));
+            found[0][0].push(Value::Int(kept));
+            found
+        };
+        let agent_search = Errorlog {
+            since: Some("1h".into()),
+            search: Some("x".into()),
+            agent: true,
+            archive: None,
+        };
+        for (command, found) in [
+            // can_view, major
+            (Command::Activity, row(&[1, 17])),
+            // Empty, so its step has decision 93's note.
+            (
+                Command::Errorlog(Errorlog::default()),
+                logged(&[1, 7, 6, 1, 17], 0),
+            ),
+            (
+                Command::Errorlog(agent_search),
+                logged(&[1, 10, 9, 2, 13], 4),
+            ),
+        ] {
+            let Ok(Input::Command {
+                plan: Plan::Lookup { sql, then, .. },
+                ..
+            }) = command.input(Advice::Cli)
+            else {
+                panic!("{command:?} looks up first");
+            };
+            assert!(guard::several_outputs(&sql), "{command:?}'s lookup");
+            let steps = then(&found).unwrap_or_else(|f| panic!("{command:?}: {}", f.message));
+            assert_eq!(steps.len(), 1, "{command:?}");
+            assert!(
+                !guard::several_outputs(&steps[0].sql),
+                "{command:?}: {}",
+                steps[0].sql
+            );
+        }
+        for not_one in [
+            "SELECT 1 AS a FROM #log; SELECT 2 AS b FROM #log;",
+            "SET NOCOUNT ON; CREATE TABLE #log (n int); INSERT INTO #log EXEC sys.sp_readerrorlog \
+             0, 1; SELECT COUNT(*) AS n FROM #log;",
+        ] {
+            assert!(guard::several_outputs(not_one), "{not_one}");
+        }
     }
 
     // R14: a read-only run whose wrapper is gone after the last batch, with no batch having

@@ -576,9 +576,8 @@ impl<W: Write> Output for TextSink<W> {
 
     fn end_batch(&mut self, _ended_ms: u128) -> io::Result<()> {
         self.flush_affected()?;
-        let empty = self.tally.take_empty_sections();
-        if let Some(line) = no_rows_line(&empty)
-            && !self.emit(&line)?
+        if let Some((empty, note)) = self.tally.take_no_rows()
+            && !self.emit(&no_rows_line(&empty, note.as_deref()))?
         {
             self.tally.withhold_note();
         }
@@ -626,12 +625,23 @@ impl<W: Write> Output for TextSink<W> {
     fn set_sections(&mut self, sections: &[Section]) {
         self.tally.set_sections(sections);
     }
+
+    fn set_empty_note(&mut self, note: Option<&str>) {
+        self.tally.set_empty_note(note);
+    }
 }
 
-/// `-- no rows: foreign_keys, triggers`: a batch's sections that had no rows (text and csv);
-/// `None` when every section had some.
-pub fn no_rows_line(empty: &[&str]) -> Option<String> {
-    (!empty.is_empty()).then(|| format!("-- no rows: {}", empty.join(", ")))
+/// `-- no rows: foreign_keys, triggers`: a batch's sections that had no rows (text and csv),
+/// and its note in parentheses (`server_log (archive 0, from ...)`, decision 93); JSON's note
+/// is this without the `-- `.
+pub fn no_rows_line(empty: &[&str], note: Option<&str>) -> String {
+    let mut line = format!("-- no rows: {}", empty.join(", "));
+    if let Some(note) = note {
+        line.push_str(" (");
+        line.push_str(note);
+        line.push(')');
+    }
+    line
 }
 
 #[cfg(test)]
@@ -757,6 +767,48 @@ pub(super) mod tests {
         }
         s.end_rows().unwrap();
         s.end_batch(1).unwrap();
+    }
+
+    /// `errorlog`'s batch with its empty note (decision 93), shared by the three formats' tests:
+    /// one section, empty unless `row`.
+    pub const EMPTY_NOTE: &str =
+        "archive 0, from 2026-11-21 16:38; --since or --archive reads further back";
+    pub fn noted_run(s: &mut dyn Output, row: bool) {
+        s.set_sections(&[Section::rows("server_log")]);
+        s.set_empty_note(Some(EMPTY_NOTE));
+        s.begin_batch(&batch("errorlog", false, 1)).unwrap();
+        s.columns(&[col("text", "nvarchar(max)")]).unwrap();
+        if row {
+            s.row(&[Value::Text("Login failed".into())]).unwrap();
+        }
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+    }
+
+    // Decision 93: an empty section's line carries the batch's note; a section with rows
+    // shows no note, and the note goes with the batch it was set for.
+    #[test]
+    fn an_empty_section_carries_its_note() {
+        let mut s = TextSink::new(Vec::new(), Limits::default());
+        noted_run(&mut s, false);
+        s.finish(&summary("ok: 1 batch, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- no rows: server_log (archive 0, from 2026-11-21 16:38; --since or --archive \
+             reads further back)\n-- ok: 1 batch, 3 ms\n"
+        );
+        let mut s = TextSink::new(Vec::new(), Limits::default());
+        noted_run(&mut s, true);
+        s.set_sections(&[Section::rows("server_log")]);
+        s.begin_batch(&batch("errorlog", false, 1)).unwrap();
+        s.columns(&[col("text", "nvarchar(max)")]).unwrap();
+        s.end_rows().unwrap();
+        s.end_batch(1).unwrap();
+        s.finish(&summary("ok: 2 batches, 3 ms")).unwrap();
+        assert_eq!(
+            text(s),
+            "-- server_log\ntext\nLogin failed\n-- no rows: server_log\n-- ok: 2 batches, 3 ms\n"
+        );
     }
 
     // schema-commands.md §4: a section is `-- label` and a header of names only, written with

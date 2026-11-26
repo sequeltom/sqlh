@@ -28,7 +28,7 @@ Don't trade these away.
   - Tokio with the `current_thread` runtime.
   - `lexopt` for arguments. It's tiny, and sqlcmd-style flags (`-v a=1 b=2`, `-Ns`) are awkward in clap.
   - `windows-sys` for Win32 calls. It's already a transitive dependency.
-  - `serde_json` for `sqlh mcp`'s JSON-RPC: `Value` and `json!` only, no serde derive, to keep it small. It costs the exe 65 KB (spike 5.1); all of MCP is 310.0 KiB of decision 20's 350 KiB gate (amended 2026-10-18), with `serde_json` built for size (`opt-level = "z"`, `Cargo.toml`; PLAN.md §6).
+  - `serde_json` for `sqlh mcp`'s JSON-RPC: `Value` and `json!` only, no serde derive, to keep it small. It costs the exe 65 KB (spike 5.1); all of MCP is 298.0 KiB of decision 20's 350 KiB gate (amended 2026-10-18; measured at Phase 6 slice 2, mcp-mode.md §8), with `serde_json` built for size (`opt-level = "z"`, `Cargo.toml`; PLAN.md §6).
   - `zeroize` wipes sqlh's own copies of a password on drop (`src/secret.rs`, F14). It's already a transitive dependency.
   - `log`, only with `--features timing` (dev builds): it reads the driver's log events to time each connect step, and prints none of them (see Driver logging below).
 
@@ -68,9 +68,11 @@ src/secret.rs    Secret: a password as sqlh holds it, wiped on drop (zeroize)
 src/dns.rs       a name's canonical DNS name for Windows auth's SPN (GetAddrInfoW, decoded fallibly;
                  decision 79, R67), which db/spn.rs looks up within its budget
 src/profile.rs   sqlh profiles add | list | test | rm
-src/schema.rs    schema commands (info, dbs, tables, describe, find, def, deps): their SQL, N'...' literals,
-                 patterns, name parsing and resolution (a lookup, run::Plan::Lookup), the bracketing
-                 of names it shows, and labeled sections
+src/schema.rs    schema and server commands (info, dbs, tables, describe, find, def, deps; activity,
+                 errorlog): their SQL, N'...' literals, patterns, errorlog's --since parser, name
+                 parsing and resolution (a lookup, run::Plan::Lookup; activity's and errorlog's
+                 server reads are their lookups, each followed by one SELECT), the refusals a
+                 lookup's result decides, the bracketing of names it shows, and labeled sections
 src/help.txt     --help text (models read it)
 src/error.rs     exit codes (DESIGN.md §6) and Failure
 src/console.rs   echo-off password prompt; the Git Bash path hint (the console code page is left alone)
@@ -80,7 +82,8 @@ src/script.rs    input decoding, GO splitting, $(var) substitution, line mapping
 src/guard.rs     read-only classifier (own T-SQL lexer, streamed, linear lookahead, work budget); XACT_ABORT detection;
                  guard_ignored.rs, its measured table of what the servers ignore in a word, shared with a live test
 src/db/          the only mssql-tds user: connect (a failed connect's hints name flags, or in sqlh mcp
-                 the profile's keys: Hints), run a batch into a BatchSink, the bounded count of
+                 the profile's keys: Hints; one more attempt only after WSAEADDRINUSE, decision 95),
+                 run a batch into a BatchSink, the bounded count of
                  hidden rows (Counting), value/type rendering;
                  stream.rs reads large (PLP) values in chunks and cuts them as they arrive;
                  spn.rs is Windows auth's SPN per login hop, the driver's SecurityContextProvider
@@ -93,7 +96,8 @@ tests/fixtures/  creates/drops the sqlh_test scratch database the live tests use
 tests/smoke.sql  read-only end-to-end script for a real server; tests/golden/ holds its expected
                  output (text and JSON, volatile values normalized), checked by a live test
 scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --locked release build,
-                 size budget (3 MB), in-box imports; -Live adds the live tests. CI runs it too
+                 size budget (3 MiB, the unsigned exe), in-box imports; -Live adds the live tests. CI and the release
+                 workflow run it; it remaps the cargo registry's path in every build (decision 97)
 .github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
                  read-only; sign, the only job with the Azure token, which never runs the exe;
                  verify, read-only; publish, the draft release; plan-history.md 3.6, R22);
@@ -130,7 +134,10 @@ The exe's version is set by `build.rs` (decision 44): `SQLH_VERSION` at build ti
 **Day to day:** `pwsh scripts/check.ps1` runs every check below that needs no server and stops at the first failure; `pwsh scripts/check.ps1 -Live` adds the live tests. Run it before every commit that touches code. The individual commands:
 
 ```powershell
-cargo build --release                               # ~2.9 MB exe (budget 3 MB); full LTO takes ~1–2 min
+cargo build --release                               # ~3.0 MB exe; full LTO takes ~1–2 min. The budget (3 MiB, unsigned)
+                                                    # is measured by check.ps1, which remaps the registry's path (decision 97).
+                                                    # Bare cargo commands build without the remap: a larger exe, with the
+                                                    # user's folder in it, and a rebuild when check.ps1 runs next
 cargo test                                          # unit + process-level tests; no server needed
 cargo test --release --test cli                     # process-level tests against the release exe
 cargo build --release --features timing             # --verbose also times each connect step (dev builds; +270 KB)
@@ -209,9 +216,9 @@ The test server is the owner's, reached through a profile named `test`. The owne
 Keep this section short: where the work stands and what comes next. Review and fix history (commit ranges, R-numbers, what each verification ran) goes in PLAN.md while its work is open, then moves to docs/history/plan-history.md; never here.
 
 - **Built:** the MVP (DESIGN.md §13); profiles and Credential Manager; the text, json and csv formats; the schema commands; `sqlh mcp` on the connection-reuse engine; versioning (decision 44); and decision 45's longer count and `-- partial:` runs. Phases 1–5 are done (plan-history.md §4). The driver is mssql-tds 0.4.0 ([docs/notes/driver-0.4.0.md](docs/notes/driver-0.4.0.md); built on the branch `driver-0.4.0`, merged after its external review, 2026-11-08), the last for 0.1.0 (decision 70).
-- **First release:** a private `0.1.0` for the owner and a few colleagues, with what is built, Phase 6 Part 1's first slice, Windows authentication and mssql-tds 0.4.0 in scope (decision 70: no later driver); its gates are PLAN.md §7 (decision 50, as amended), all closed 2026-11-14 (decision 81: the managed-laptop check deferred to the public release, LocalDB and a routed hop untested). Next: tag `v0.1.0` on `main`; its release run builds the release.
-- **Next: Phase 6, classifier v2 Part 1, in thin slices** ([docs/command-categories.md](docs/command-categories.md); decisions 22–36, ordered by decision 51): the first slice, refusal wording and the five small items, is on `main` (PLAN.md §4, Phase 6), for 0.1.0; then `activity`/`errorlog`, read list round 2, contention, the pause and showplans, linked servers last; each slice released and used before the next. Part 2 waits for real use. Phase 6's interim EXEC allowlist is built (DESIGN.md §7).
+- **First release:** a private `0.1.0` for the owner and a few colleagues, with what is built, Phase 6 Part 1's first slice, Windows authentication and mssql-tds 0.4.0 in scope (decision 70: no later driver); its gates are PLAN.md §7 (decision 50, as amended), all closed 2026-11-14 (decision 81: the managed-laptop check deferred to the public release, LocalDB and a routed hop untested). `v0.1.0` is tagged (`682f035`). The repository goes public with `0.2.0`, slice 2 (decisions 91 and 96); its checks are in PLAN.md §4, Going public.
+- **Next: Phase 6, classifier v2 Part 1, in thin slices** ([docs/command-categories.md](docs/command-categories.md); decisions 22–36, ordered by decision 51): the first slice, refusal wording and the five small items, is on `main` (PLAN.md §4, Phase 6), for 0.1.0. The second, `info`'s `server_permissions`, `errorlog` and `activity` (decisions 83–90 and 92–95), is built on the branch `phase6-slice2`, ships as `0.2.0` (decision 96) and is externally reviewed, with R69 through R72 verified fixed (PLAN.md §4, Phase 6 slice 2); decision 87's measured size proposal is due before slice 3. Then read list round 2, contention, the pause and showplans, linked servers last; each slice released and used before the next. Part 2 waits for real use. Phase 6's interim EXEC allowlist is built (DESIGN.md §7).
 - **Planned, not started** (PLAN.md): `definition` paging and `info`'s dial name, AG role and time zone (MCP client feedback); setting the default profile; the md format; Azure SQL support and testing, whose scope is an owner decision.
 - **Direction:** the CLI is the center, MCP a second front end (decision 46). Hosted MCP for remote connectors is planned with Entra pass-through only (decision 47; a shared read-only login is its backup, not built), and builds MCP's own exe first. The CLI is optimized for local, offline and small models (24 GB of VRAM or less): what they must read comes first, and there is no daemon behind it (decision 48).
 - **Open:** the items carried over from finished work (PLAN.md §4, "Carried over from finished work"), among them the agent timeout trial and the flake `a_fast_narrow_result_is_bounded_by_t_in_every_mode` (one cause fixed 2026-11-13); the public release's first checks (a managed laptop's antivirus, EDR and AppLocker or WDAC; decision 81); the driver items still unverified in [docs/notes/m0-driver-spike.md](docs/notes/m0-driver-spike.md).
-- **Reviews:** the pre-tag workflow pins and decisions 80 and 81 are accepted; R68 (P3, lost machine-account coverage qualification) was corrected during review, with no open finding from that round. Evidence and limits are in PLAN.md §4. The tag still gets its own release run. The last finding is R68, so the next is R69.
+- **Reviews:** R69's late-result fix and R70 are accepted at cbab052. R71 (P3, collation-safe activity offsets) is accepted as fixed, with SC-default reachability unverified; its qualified wording is accepted at 4e19fcc. R72 (P2, a late connect retry can report observed cancellation as timeout) is verified fixed at 4e19fcc. No new findings. Evidence and limits are in PLAN.md §4. The last finding is R72, so the next is R73.

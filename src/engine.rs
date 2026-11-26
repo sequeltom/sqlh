@@ -201,7 +201,8 @@ impl Engine {
         counts: &mut Accounting,
         started: Instant,
     ) -> Result<Stats, Failure> {
-        let _permit = wait_for_connection(pool, timeout, cancel, started).await?;
+        let activity = prepared.lookup_label() == Some(run::LookupLabel::Activity);
+        let _permit = wait_for_connection(pool, timeout, cancel, started, activity).await?;
         let mut retried = false;
         // The connect time a call reports runs from here to the open that worked: a reused
         // connection that opened at once reports 0, and one that took a probe, a second
@@ -393,12 +394,14 @@ impl Engine {
 }
 
 /// Waits for one of `pool`'s connections to be free: at most the call's timeout, and a cancel
-/// ends the wait.
+/// ends the wait. `activity` gets no connection of its own (decision 88), so its timeout also
+/// names the CLI's, which opens one: the connections are busy just when it is wanted.
 async fn wait_for_connection<'p>(
     pool: &'p Pool,
     timeout: u32,
     cancel: &Cancel,
     started: Instant,
+    activity: bool,
 ) -> Result<tokio::sync::SemaphorePermit<'p>, Failure> {
     let limit = (timeout > 0).then(|| Duration::from_secs(u64::from(timeout)));
     let deadline = async {
@@ -418,12 +421,17 @@ async fn wait_for_connection<'p>(
         () = deadline => Err(Failure::new(
             Exit::Timeout,
             format!(
-                "query timeout after {timeout} s waiting for a free connection ({}); {}",
+                "query timeout after {timeout} s waiting for a free connection ({}); {}{}",
                 match pool.max {
                     1 => "the profile's only connection was busy".to_owned(),
                     max => format!("all {max} of the profile's connections were busy"),
                 },
-                more_connections(&pool.settings, timeout)
+                more_connections(&pool.settings, timeout),
+                if activity && pool.settings.limits.advice == Advice::Mcp {
+                    "; sqlh activity on the command line opens a connection of its own"
+                } else {
+                    ""
+                }
             ),
         )),
     }
@@ -1909,6 +1917,495 @@ mod tests {
         }
     }
 
+    /// `errorlog`'s request, for a call (`Advice::Mcp`) or the CLI.
+    fn errorlog_request(log: crate::schema::Errorlog, advice: Advice) -> Request {
+        Request {
+            input: crate::schema::Command::Errorlog(log)
+                .input(advice)
+                .expect("a lookup"),
+            ..request("")
+        }
+    }
+
+    /// The lookup's row, as `schema::errorlog_sql` ends: can_read, archives, last, read, major,
+    /// and three lines kept from a read starting 2026-11-21 08:14.
+    fn errorlog_found(
+        can: i32,
+        archives: i32,
+        last: Option<i32>,
+        read: i32,
+        major: i32,
+    ) -> Vec<u8> {
+        errorlog_found_kept(
+            can,
+            archives,
+            last,
+            read,
+            major,
+            Some("2026-11-21 08:14"),
+            3,
+        )
+    }
+
+    /// `errorlog_found` with the oldest line read (`from`) and the lines kept (decision 93).
+    fn errorlog_found_kept(
+        can: i32,
+        archives: i32,
+        last: Option<i32>,
+        read: i32,
+        major: i32,
+        from: Option<&str>,
+        kept: i32,
+    ) -> Vec<u8> {
+        use fake_server::{Cell, Wire};
+        fake_server::result(
+            &[
+                ("can_read", Wire::Int),
+                ("archives", Wire::Int),
+                ("last", Wire::Int),
+                ("read", Wire::Int),
+                ("major", Wire::Int),
+                ("from", Wire::Text),
+                ("kept", Wire::Int),
+            ],
+            &[&[
+                Cell::Int(can),
+                Cell::Int(archives),
+                last.map_or(Cell::Null, Cell::Int),
+                Cell::Int(read),
+                Cell::Int(major),
+                from.map_or(Cell::Null, Cell::Text),
+                Cell::Int(kept),
+            ]],
+        )
+    }
+
+    // schema-commands.md §6.9, the shapes through the real run path: the lookup shows nothing,
+    // its row decides; the step is the `server_log` or `agent_log` section, names-only header,
+    // values escaped as any (a tab; a later column's leading `--` needs none), `-- no rows:`
+    // when empty; a refusal is `-- error:` and exit 1. The fake answers the lookup (request 2)
+    // and the step (3).
+    #[test]
+    fn errorlog_shows_its_section_or_says_why_not() {
+        use crate::schema::Errorlog;
+        use fake_server::{Cell, Wire};
+        // 2026-11-21 10:15:30.120 and 2026-11-20 00:00, as datetime's days and 1/300 s.
+        let (today, at) = (46345, 36930 * 300 + 36);
+        let log = |second: &str, rows: &[&[Cell]]| {
+            fake_server::result(
+                &[
+                    ("time", Wire::DateTime),
+                    (second, Wire::Text),
+                    ("text", Wire::Text),
+                ],
+                rows,
+            )
+        };
+        let server = log(
+            "source",
+            &[
+                &[
+                    Cell::DateTime(today, at),
+                    Cell::Text("Logon"),
+                    Cell::Text("Error: 18456, Severity: 14, State: 5."),
+                ],
+                &[
+                    Cell::DateTime(today, at),
+                    Cell::Text("Logon"),
+                    Cell::Text("Login failed for user 'x'.\tReason: none"),
+                ],
+                &[
+                    Cell::DateTime(today - 1, 0),
+                    Cell::Text("spid9s"),
+                    Cell::Text("-- a line that looks like metadata"),
+                ],
+            ],
+        );
+        let ok = "-- ok: 1 batch, N ms; ?/master, connect N ms\n";
+        let shown = |found: Vec<u8>, step: Vec<u8>, log: Errorlog| {
+            let conns = vec![Conn::new().replying(2, found).replying(3, step)];
+            let request = errorlog_request(log, Advice::Mcp);
+            mcp_text(conns, 30, request, QueryOrigin::Generated, 30)
+        };
+        let (exit, text) = shown(
+            errorlog_found(1, 7, Some(6), 1, 17),
+            server,
+            Errorlog::default(),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- server_log\ntime\tsource\ttext\n\
+                 2026-11-21T10:15:30.120\tLogon\tError: 18456, Severity: 14, State: 5.\n\
+                 2026-11-21T10:15:30.120\tLogon\tLogin failed for user 'x'.\\tReason: none\n\
+                 2026-11-20T00:00:00.000\tspid9s\t-- a line that looks like metadata\n{ok}"
+            )
+        );
+        let agent = log(
+            "level",
+            &[&[
+                Cell::DateTime(today, at),
+                Cell::Text("warning"),
+                Cell::Text("[396] An idle CPU condition has not been defined"),
+            ]],
+        );
+        let agent_log = Errorlog {
+            agent: true,
+            ..Errorlog::default()
+        };
+        let (exit, text) = shown(errorlog_found(1, 10, Some(9), 1, 13), agent, agent_log);
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- agent_log\ntime\tlevel\ttext\n\
+                 2026-11-21T10:15:30.120\twarning\t[396] An idle CPU condition has not been \
+                 defined\n{ok}"
+            )
+        );
+        let searched = Errorlog {
+            since: Some("10m".into()),
+            search: Some("nothing like it".into()),
+            ..Errorlog::default()
+        };
+        let (exit, text) = shown(
+            errorlog_found(1, 7, Some(6), 2, 17),
+            log("source", &[]),
+            searched,
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(text, format!("-- no rows: server_log\n{ok}"));
+        // Decision 93: an empty read of one archive says how far back it went, in sqlh mcp's
+        // words for what reads further.
+        let (exit, text) = shown(
+            errorlog_found_kept(1, 7, Some(6), 1, 17, Some("2026-11-21 08:14"), 0),
+            log("source", &[]),
+            Errorlog {
+                search: Some("nothing like it".into()),
+                ..Errorlog::default()
+            },
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- no rows: server_log (archive 0, from 2026-11-21 08:14; since or archive \
+                 reads further back)\n{ok}"
+            )
+        );
+
+        let failed = "-- failed (exit 1): SQL error, N ms; ?/master, connect N ms\n";
+        for (found, asked, error) in [
+            (
+                errorlog_found(0, 0, None, 0, 17),
+                Errorlog::default(),
+                "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login \
+                 lacks; a DBA can grant one",
+            ),
+            (
+                errorlog_found(0, 0, None, 0, 13),
+                Errorlog::default(),
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it",
+            ),
+            (
+                errorlog_found(1, 0, None, 0, 17),
+                Errorlog::default(),
+                "this server lists no error log archives",
+            ),
+            (
+                errorlog_found(1, 7, Some(6), 0, 17),
+                Errorlog {
+                    archive: Some(12),
+                    ..Errorlog::default()
+                },
+                "the error log has no archive 12; it keeps 0 to 6",
+            ),
+        ] {
+            let (exit, text) = shown(found, log("source", &[]), asked);
+            assert_eq!(exit, Exit::SqlError, "{text}");
+            assert_eq!(text, format!("-- error: {error}\n{failed}"));
+        }
+    }
+
+    // A timeout while reading the error log names what helps: the timeout, and a later --since
+    // (fewer archives), never a narrower query, since each archive is read whole, search or not
+    // (decision 89). In the CLI's words and a call's.
+    #[test]
+    fn an_errorlog_timeout_names_since_and_the_timeout() {
+        use crate::schema::Errorlog;
+        let since = Errorlog {
+            since: Some("7d".into()),
+            ..Errorlog::default()
+        };
+        for (log, limit, advice) in [
+            (
+                since.clone(),
+                30,
+                "raise timeout (the server allows up to 30 s); a later since reads fewer \
+                 archives, each one whole even with search",
+            ),
+            (
+                Errorlog::default(),
+                1,
+                "1 s is the server's limit; the archive is read whole, even with search",
+            ),
+        ] {
+            let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+            let request = errorlog_request(log, Advice::Mcp);
+            let (exit, text) = mcp_text(hangs, limit, request, QueryOrigin::Generated, 1);
+            assert_eq!(exit, Exit::Timeout, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    "-- error: query timeout after 1 s while reading the error log; {advice}\n\
+                     -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+                )
+            );
+        }
+        for (log, advice) in [
+            (
+                since,
+                "raise -t; a later --since reads fewer archives, each one whole even with \
+                 --search",
+            ),
+            (
+                Errorlog::default(),
+                "raise -t; the archive is read whole, even with --search",
+            ),
+        ] {
+            let fake = serve_pool(vec![Conn::new().at(2, Turn::Hang { ack: true })]);
+            let engine = serving(&fake, DEFAULT_POOL, None);
+            let request = errorlog_request(log, Advice::Cli);
+            let called = block_on(call_as(
+                &engine,
+                request,
+                QueryOrigin::Generated,
+                1,
+                &Cancel::new(),
+            ));
+            assert_eq!(called.exit, Exit::Timeout, "{}", called.text);
+            assert!(
+                called.text.starts_with(&format!(
+                    "-- error: query timeout after 1 s while reading the error log; {advice}\n"
+                )),
+                "{}",
+                called.text
+            );
+        }
+    }
+
+    /// `activity`'s request, for a call (`Advice::Mcp`).
+    fn activity_request() -> Request {
+        Request {
+            input: crate::schema::Command::Activity
+                .input(Advice::Mcp)
+                .expect("a lookup"),
+            ..request("")
+        }
+    }
+
+    /// `activity`'s lookup row, as `schema::ACTIVITY_SQL` ends: can_view, major.
+    fn activity_found(can: Option<i32>, major: i32) -> Vec<u8> {
+        use fake_server::{Cell, Wire};
+        fake_server::result(
+            &[("can_view", Wire::Int), ("major", Wire::Int)],
+            &[&[can.map_or(Cell::Null, Cell::Int), Cell::Int(major)]],
+        )
+    }
+
+    // schema-commands.md §6.8, the shapes through the real run path: the lookup shows nothing,
+    // its row decides; the step is the `sessions` section, names-only header, NULL as NULL, a
+    // batch's line break escaped; `-- no rows: sessions` when nothing is worth showing; without
+    // the permission `-- error:` in the server version's words and exit 1. The fake answers
+    // the lookup (request 2) and the step (3).
+    #[test]
+    fn activity_shows_its_sessions_or_says_which_permission_it_lacks() {
+        use fake_server::{Cell, Wire};
+        const COLUMNS: [(&str, Wire); 21] = [
+            ("session", Wire::Int),
+            ("blocked_by", Wire::Int),
+            ("blocking", Wire::Int),
+            ("depth", Wire::Int),
+            ("status", Wire::Text),
+            ("command", Wire::Text),
+            ("wait", Wire::Text),
+            ("wait_ms", Wire::Int),
+            ("wait_resource", Wire::Text),
+            ("cpu_ms", Wire::Int),
+            ("reads", Wire::Int),
+            ("elapsed_ms", Wire::Int),
+            ("idle_ms", Wire::Int),
+            ("open_tran", Wire::Int),
+            ("tran_ms", Wire::Int),
+            ("login", Wire::Text),
+            ("host", Wire::Text),
+            ("program", Wire::Text),
+            ("database", Wire::Text),
+            ("statement", Wire::Text),
+            ("input_buffer", Wire::Text),
+        ];
+        let head: [Cell; 21] = [
+            Cell::Int(54),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(0),
+            Cell::Text("suspended"),
+            Cell::Text("WAITFOR"),
+            Cell::Text("WAITFOR"),
+            Cell::Int(1200),
+            Cell::Null,
+            Cell::Int(0),
+            Cell::Int(2),
+            Cell::Int(1250),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(1300),
+            Cell::Text("app"),
+            Cell::Text("WS1"),
+            Cell::Text("sqlh (writes)"),
+            Cell::Text("sqlh_test"),
+            Cell::Text("WAITFOR DELAY '00:01:00'"),
+            Cell::Text("BEGIN TRAN; INSERT dbo.t VALUES (1);\r\nWAITFOR DELAY '00:01:00'"),
+        ];
+        let blocked: [Cell; 21] = [
+            Cell::Int(74),
+            Cell::Int(54),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Text("suspended"),
+            Cell::Text("SELECT"),
+            Cell::Text("LCK_M_S"),
+            Cell::Int(900),
+            Cell::Text("RID: 7:1:584:0"),
+            Cell::Int(0),
+            Cell::Int(0),
+            Cell::Int(950),
+            Cell::Null,
+            Cell::Int(1),
+            Cell::Int(960),
+            Cell::Text("reader"),
+            Cell::Text("WS1"),
+            Cell::Text("sqlh"),
+            Cell::Text("sqlh_test"),
+            Cell::Text("SELECT COUNT(*) AS n FROM dbo.t"),
+            Cell::Null,
+        ];
+        let shown = |found: Vec<u8>, step: Vec<u8>| {
+            let conns = vec![Conn::new().replying(2, found).replying(3, step)];
+            mcp_text(conns, 30, activity_request(), QueryOrigin::Generated, 30)
+        };
+        let ok = "-- ok: 1 batch, N ms; ?/master, connect N ms\n";
+        let (exit, text) = shown(
+            activity_found(Some(1), 17),
+            fake_server::result(&COLUMNS, &[&head, &blocked]),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(
+            text,
+            format!(
+                "-- sessions\nsession\tblocked_by\tblocking\tdepth\tstatus\tcommand\twait\t\
+                 wait_ms\twait_resource\tcpu_ms\treads\telapsed_ms\tidle_ms\topen_tran\t\
+                 tran_ms\tlogin\thost\tprogram\tdatabase\tstatement\tinput_buffer\n\
+                 54\tNULL\t1\t0\tsuspended\tWAITFOR\tWAITFOR\t1200\tNULL\t0\t2\t1250\tNULL\t1\t\
+                 1300\tapp\tWS1\tsqlh (writes)\tsqlh_test\tWAITFOR DELAY '00:01:00'\t\
+                 BEGIN TRAN; INSERT dbo.t VALUES (1);\\r\\nWAITFOR DELAY '00:01:00'\n\
+                 74\t54\tNULL\t1\tsuspended\tSELECT\tLCK_M_S\t900\tRID: 7:1:584:0\t0\t0\t950\t\
+                 NULL\t1\t960\treader\tWS1\tsqlh\tsqlh_test\tSELECT COUNT(*) AS n FROM dbo.t\t\
+                 NULL\n{ok}"
+            )
+        );
+        let (exit, text) = shown(
+            activity_found(Some(1), 13),
+            fake_server::result(&COLUMNS, &[]),
+        );
+        assert_eq!(exit, Exit::Ok, "{text}");
+        assert_eq!(text, format!("-- no rows: sessions\n{ok}"));
+
+        let failed = "-- failed (exit 1): SQL error, N ms; ?/master, connect N ms\n";
+        for (found, error) in [
+            (
+                activity_found(Some(0), 17),
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it",
+            ),
+            (
+                activity_found(None, 13),
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL \
+                 Server shows a login only its own session. A DBA can grant it",
+            ),
+        ] {
+            let (exit, text) = shown(found, fake_server::result(&COLUMNS, &[]));
+            assert_eq!(exit, Exit::SqlError, "{text}");
+            assert_eq!(text, format!("-- error: {error}\n{failed}"));
+        }
+    }
+
+    // A timeout while reading the sessions says so, and offers only the timeout: a command's
+    // user has no query to narrow. While every connection is busy, the wait's advice also
+    // names the CLI's `sqlh activity`, which opens its own (decision 88); another call's
+    // doesn't.
+    #[test]
+    fn an_activity_timeout_says_what_it_was_reading_and_what_helps() {
+        let hangs = vec![Conn::new().at(2, Turn::Hang { ack: true })];
+        let (exit, text) = mcp_text(hangs, 30, activity_request(), QueryOrigin::Generated, 1);
+        assert_eq!(exit, Exit::Timeout, "{text}");
+        assert_eq!(
+            text,
+            "-- error: query timeout after 1 s while reading the server's sessions; raise \
+             timeout (the server allows up to 30 s)\n\
+             -- failed (exit 4): timeout, N ms; ?/master, connect N ms\n"
+        );
+
+        for (activity, after) in [
+            (
+                true,
+                "; raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger \
+                 --pool; sqlh activity on the command line opens a connection of its own",
+            ),
+            (
+                false,
+                "; raise timeout (the server allows up to 30 s), or start sqlh mcp with a larger \
+                 --pool",
+            ),
+        ] {
+            let busy = Conn::new().at(2, Turn::Delay(Duration::from_millis(1500)));
+            let fake = serve_pool(vec![busy]);
+            let engine = Rc::new(serving_mcp(&fake, 1, 30));
+            let waiting = block_on_local(async {
+                let holder =
+                    tokio::task::spawn_local(later(Rc::clone(&engine), Duration::ZERO, 30));
+                let engine = Rc::clone(&engine);
+                let waiting = tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let request = if activity {
+                        activity_request()
+                    } else {
+                        request("SELECT 1")
+                    };
+                    let origin = if activity {
+                        QueryOrigin::Generated
+                    } else {
+                        QueryOrigin::User
+                    };
+                    call_as(&engine, request, origin, 1, &Cancel::new()).await
+                });
+                let waiting = waiting.await.expect("waiting");
+                assert_ok(&holder.await.expect("holder"));
+                waiting
+            });
+            assert_eq!(waiting.exit, Exit::Timeout, "{}", waiting.text);
+            assert_eq!(
+                untimed(&waiting.text),
+                format!(
+                    "-- error: query timeout after 1 s waiting for a free connection (the \
+                     profile's only connection was busy){after}\n\
+                     -- failed (exit 4): timeout, N ms\n"
+                ),
+            );
+        }
+    }
+
     // The wait for a free connection, whole: what was busy (the profile's only connection, or
     // all of them), then a larger `timeout` and the server's --pool, or, once the call has the
     // server's limit, the server's --pool and -t.
@@ -2114,6 +2611,7 @@ mod tests {
                     plan: run::Plan::Steps(vec![run::Step {
                         sql: "SELECT * FROM t WITH (NOLOCK)".into(),
                         sections: Vec::new(),
+                        empty_note: None,
                     }]),
                 },
                 ..request("")

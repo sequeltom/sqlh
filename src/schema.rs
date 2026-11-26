@@ -1,27 +1,50 @@
-//! Schema commands (docs/schema-commands.md, plan-history.md Phase 4): `info`, `dbs`, `tables`,
-//! `describe`, `find` and `def`. Each is canned T-SQL run as sqlh's own SQL
-//! (`QueryOrigin::Generated`): read-only, in the wrapper transaction, no guard and no `$(var)`.
-//! Arguments reach the SQL only as `N'...'` literals (`literal`), never as identifiers. Each
-//! result set fills a labeled section (`output::Section`).
+//! Schema and server commands (docs/schema-commands.md, plan-history.md Phase 4, Phase 6 slice
+//! 2): `info`, `dbs`, `tables`, `describe`, `find`, `def`, `deps`, `activity` and `errorlog`.
+//! Each is canned T-SQL run as sqlh's own SQL (`QueryOrigin::Generated`): read-only, in the
+//! wrapper transaction, no guard and no `$(var)`. Arguments reach the SQL only as `N'...'`
+//! literals (`literal`) or numbers sqlh wrote, never as identifiers. Each result set fills a
+//! labeled section (`output::Section`).
 //!
-//! `describe` and `def` first look the name up (`run::Plan::Lookup`), on the same connection:
-//! the object's id and type decide what runs next.
+//! `describe`, `def` and `deps` first look the name up (`run::Plan::Lookup`), on the same
+//! connection: the object's id and type decide what runs next. `activity` and `errorlog` do
+//! their server work in their lookup, and each one's step is one `SELECT` of the `#temp` table
+//! the lookup filled.
 
 use crate::db::Value;
-use crate::error::{Exit, Failure};
+use crate::error::{Exit, Failure, echo};
 use crate::output::{Advice, Limits, Section};
-use crate::run::{Found, Input, Plan, Report, Step};
+use crate::run::{Found, Input, LookupLabel, Plan, Report, Step};
 
-/// The `profiles test` and `info` query. Runs on SQL Server 2012+ and Azure SQL DB without extra
-/// permissions (CONNECTIONPROPERTY needs no VIEW SERVER STATE). Encryption is a client-side
-/// fact, printed as a note with the connection line.
+/// The `profiles test` and `info` query: one row, so `profiles test` stays one unlabeled result.
+/// Any login can run it on SQL Server 2016 SP3 and later (CONNECTIONPROPERTY needs no VIEW SERVER
+/// STATE; HAS_PERMS_BY_NAME and IS_SRVROLEMEMBER ask about the caller); Azure SQL DB is
+/// unverified. Encryption is a client-side fact, printed as a note with the connection line.
+///
+/// `server_permissions` names what decides which server-wide reads work (schema-commands.md
+/// §6.1): `sysadmin` alone, since it holds everything; else the held ones of the list, `none`
+/// without any. The two 2022 permissions VIEW SERVER STATE implies are listed only without it.
+/// HAS_PERMS_BY_NAME gives NULL for a permission the server doesn't know (the 2022 ones on 2016),
+/// so every test is `= 1`. STUFF drops the first `, ` and gives NULL for an empty string.
 pub const INFO_SQL: &str = "SELECT @@SERVERNAME AS server, \
     CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS version, \
     CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition, \
     DB_NAME() AS [database], SUSER_SNAME() AS login, USER_NAME() AS [user], \
     CAST(CONNECTIONPROPERTY('net_transport') AS nvarchar(40)) AS transport, \
     CAST(CONNECTIONPROPERTY('auth_scheme') AS nvarchar(40)) AS auth_scheme, \
-    SYSDATETIMEOFFSET() AS server_time;";
+    SYSDATETIMEOFFSET() AS server_time, \
+    CASE WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1 THEN N'sysadmin' ELSE ISNULL(STUFF(\
+    CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1 \
+    THEN N', VIEW SERVER STATE' \
+    ELSE CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE') = 1 \
+    THEN N', VIEW SERVER PERFORMANCE STATE' ELSE N'' END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER SECURITY STATE') = 1 \
+    THEN N', VIEW SERVER SECURITY STATE' ELSE N'' END END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 \
+    THEN N', VIEW ANY ERROR LOG' ELSE N'' END \
+    + CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY DEFINITION') = 1 \
+    THEN N', VIEW ANY DEFINITION' ELSE N'' END \
+    + CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 THEN N', securityadmin' ELSE N'' END, \
+    1, 2, N''), N'none') END AS server_permissions;";
 
 /// The longest name `describe` and `def` take: four delimited parts of 128 characters, each
 /// with every character a doubled `]`, and three dots (`parse_name` checks each part).
@@ -46,20 +69,83 @@ pub enum Command {
     Find { pattern: String, text: bool },
     Def(String),
     Deps(String),
+    Activity,
+    Errorlog(Errorlog),
+}
+
+/// `errorlog`'s options (schema-commands.md §6.9), as given: `input` checks them, so both front
+/// ends refuse the same values in their own words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Errorlog {
+    /// `--since`: `30m`, `12h`, `7d` or a server-local time.
+    pub since: Option<String>,
+    pub search: Option<String>,
+    /// `--agent`: the SQL Server Agent log instead of the server's.
+    pub agent: bool,
+    pub archive: Option<u32>,
+}
+
+/// The flags only some commands take, as the command line gives them; `Command::parse` hands
+/// each to its command and refuses it anywhere else.
+#[derive(Debug, Default)]
+pub struct Flags {
+    /// `--text`, for `find`.
+    pub text: bool,
+    /// The rest are `errorlog`'s.
+    pub since: Option<String>,
+    pub search: Option<String>,
+    pub agent: bool,
+    pub archive: Option<u32>,
+}
+
+impl Flags {
+    /// The refusal of the first flag given that `command` doesn't take (`None`: the run is SQL,
+    /// not a command).
+    pub fn misplaced(&self, command: Option<&Command>) -> Option<String> {
+        let find = matches!(command, Some(Command::Find { .. }));
+        let errorlog = matches!(command, Some(Command::Errorlog(_)));
+        let only = |flag: &str| Some(format!("{flag} only applies to sqlh errorlog"));
+        if self.text && !find {
+            Some("--text only applies to sqlh find".to_owned())
+        } else if errorlog {
+            None
+        } else if self.since.is_some() {
+            only("--since")
+        } else if self.search.is_some() {
+            // `profiles list --search` is parsed apart, so it never comes here.
+            Some("--search only applies to sqlh errorlog and sqlh profiles list".to_owned())
+        } else if self.agent {
+            only("--agent")
+        } else if self.archive.is_some() {
+            only("--archive")
+        } else {
+            None
+        }
+    }
 }
 
 impl Command {
     /// The command a first positional word names, with the words after it, or `None` when the
-    /// word isn't a command (it is then SQL, as before). `text` is `--text`, for `find` only.
-    pub fn parse(words: &[String], text: bool) -> Option<Result<Command, String>> {
+    /// word isn't a command (it is then SQL, as before). `flags` are the options only some
+    /// commands take.
+    pub fn parse(words: &[String], flags: &Flags) -> Option<Result<Command, String>> {
         let (first, rest) = words.split_first()?;
         let name = first.as_str();
         if !matches!(
             name,
-            "info" | "dbs" | "tables" | "describe" | "find" | "def" | "deps"
+            "info"
+                | "dbs"
+                | "tables"
+                | "describe"
+                | "find"
+                | "def"
+                | "deps"
+                | "activity"
+                | "errorlog"
         ) {
             return None;
         }
+        let text = flags.text;
         let one = |what: &str| -> Result<String, String> {
             match rest {
                 [arg] if !arg.is_empty() => Ok(arg.clone()),
@@ -70,9 +156,20 @@ impl Command {
             }
         };
         let command = match name {
-            "info" | "dbs" if !rest.is_empty() => {
+            "info" | "dbs" | "activity" if !rest.is_empty() => {
                 Err(format!("{name} takes no arguments, not {:?}", rest[0]))
             }
+            "activity" => Ok(Command::Activity),
+            "errorlog" if !rest.is_empty() => Err(format!(
+                "errorlog takes --since, --search, --agent and --archive, not {:?}",
+                rest[0]
+            )),
+            "errorlog" => Ok(Command::Errorlog(Errorlog {
+                since: flags.since.clone(),
+                search: flags.search.clone(),
+                agent: flags.agent,
+                archive: flags.archive,
+            })),
             "info" => Ok(Command::Info),
             "dbs" => Ok(Command::Dbs),
             "tables" => match rest {
@@ -87,13 +184,12 @@ impl Command {
             "deps" => one("NAME").map(Command::Deps),
             _ => one("NAME").map(Command::Def),
         };
-        Some(command.and_then(|command| {
-            if text && !matches!(command, Command::Find { .. }) {
-                Err("--text only applies to sqlh find".to_owned())
-            } else {
-                Ok(command)
-            }
-        }))
+        Some(
+            command.and_then(|command| match flags.misplaced(Some(&command)) {
+                Some(refusal) => Err(refusal),
+                None => Ok(command),
+            }),
+        )
     }
 
     pub fn name(&self) -> &'static str {
@@ -105,6 +201,8 @@ impl Command {
             Command::Find { .. } => "find",
             Command::Def(_) => "def",
             Command::Deps(_) => "deps",
+            Command::Activity => "activity",
+            Command::Errorlog(_) => "errorlog",
         }
     }
 
@@ -120,17 +218,22 @@ impl Command {
     /// rows a section and 4,000 characters a value, since a wide table or a long check
     /// constraint is the answer, not noise (and so are `deps`'s lists); `def` shows its definition whole, as far as
     /// `--max-output` allows. A flag still wins; a profile's setting doesn't, since it was
-    /// chosen for queries.
+    /// chosen for queries. `errorlog` shows its newest 50 lines (about 220 bytes each), and
+    /// keeps the run's cell limit. `activity` shows 50 sessions, and 300 characters of each
+    /// statement and input buffer, the start that names what runs: 50 whole batches could fill
+    /// `--max-output` alone.
     pub fn limits(&self, limits: &mut Limits, rows_given: bool, cell_given: bool) {
         let (rows, cell) = match self {
-            Command::Describe(_) | Command::Deps(_) => (2000, 4000),
-            Command::Def(_) => (2000, 0),
+            Command::Describe(_) | Command::Deps(_) => (2000, Some(4000)),
+            Command::Def(_) => (2000, Some(0)),
+            Command::Activity => (50, Some(300)),
+            Command::Errorlog(_) => (50, None),
             _ => return,
         };
         if !rows_given {
             limits.max_rows = rows;
         }
-        if !cell_given {
+        if let (Some(cell), false) = (cell, cell_given) {
             limits.max_cell = cell;
         }
     }
@@ -156,6 +259,12 @@ impl Command {
             Command::Describe(name) => lookup(name, Shows::Describe, advice)?,
             Command::Def(name) => lookup(name, Shows::Def, advice)?,
             Command::Deps(name) => lookup(name, Shows::Deps, advice)?,
+            Command::Activity => Plan::Lookup {
+                sql: ACTIVITY_SQL.to_owned(),
+                then: Box::new(activity_then),
+                label: LookupLabel::Activity,
+            },
+            Command::Errorlog(log) => errorlog(log, advice)?,
         };
         Ok(Input::Command {
             name: self.name(),
@@ -168,12 +277,14 @@ fn steps(sql: String, sections: &[Section]) -> Plan {
     Plan::Steps(vec![Step {
         sql,
         sections: sections.to_vec(),
+        empty_note: None,
     }])
 }
 
-/// A failure of a schema command's argument: exit 1, as the design gives name errors
+/// A command's own refusal of what it was given or found (a name that names nothing usable, a
+/// lookup's answer that leaves nothing to show): exit 1, as the design gives name errors
 /// (schema-commands.md §5), with the message as the run's error.
-fn name_error(message: String) -> Failure {
+fn command_error(message: String) -> Failure {
     Failure::new(Exit::SqlError, message)
 }
 
@@ -555,7 +666,7 @@ enum Shows {
 fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
     let name = parse_name(asked)?;
     if name.object.starts_with('#') {
-        return Err(name_error(format!(
+        return Err(command_error(format!(
             "{asked} is a temporary table, which only the session that made it can see; each \
              sqlh run is a new session"
         )));
@@ -611,6 +722,7 @@ fn lookup(asked: &str, shows: Shows, advice: Advice) -> Result<Plan, Failure> {
     Ok(Plan::Lookup {
         sql,
         then: Box::new(then),
+        label: LookupLabel::Name,
     })
 }
 
@@ -706,7 +818,7 @@ fn resolve(asked: &str, name: &Name, found: &Found, advice: Advice) -> Result<Ob
         return Err(unexpected());
     }
     match candidates.len() {
-        0 => Err(name_error(format!(
+        0 => Err(command_error(format!(
             "no object named {asked} in database {current}; try: {} {}",
             match advice {
                 Advice::Cli => "sqlh find",
@@ -727,7 +839,7 @@ fn resolve(asked: &str, name: &Name, found: &Found, advice: Advice) -> Result<Ob
             } else {
                 String::new()
             };
-            Err(name_error(format!(
+            Err(command_error(format!(
                 "ambiguous name {asked}: {}{more}; qualify it with the schema",
                 names.join(", ")
             )))
@@ -775,7 +887,11 @@ fn describe_steps(object: &Object, aggregate: Aggregate) -> Vec<Step> {
         }
         _ => {}
     }
-    vec![Step { sql, sections }]
+    vec![Step {
+        sql,
+        sections,
+        empty_note: None,
+    }]
 }
 
 /// The `object` section: the name, the type, and what applies to it.
@@ -946,7 +1062,7 @@ fn parameters_sql() -> String {
 fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
     let name = &object.qualified;
     if matches!(object.kind.as_str(), "U" | "S" | "IT") {
-        return Err(name_error(match advice {
+        return Err(command_error(match advice {
             Advice::Cli => format!(
                 "def shows views, procedures, functions and triggers; for a table use: sqlh \
                  describe {name}"
@@ -958,7 +1074,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
         }));
     }
     if let Some(base) = &object.base {
-        return Err(name_error(match advice {
+        return Err(command_error(match advice {
             Advice::Cli => format!("{name} is a synonym for {base}; run: sqlh def {base}"),
             Advice::Mcp => {
                 format!("{name} is a synonym for {base}; call definition with object {base}")
@@ -966,7 +1082,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
         }));
     }
     if !object.visible {
-        return Err(name_error(format!(
+        return Err(command_error(format!(
             "the definition of {name} ({}) is not visible: it is encrypted, it has none (a \
              constraint, a CLR or extended procedure), or the login lacks VIEW DEFINITION",
             object.type_desc
@@ -994,6 +1110,7 @@ fn def_steps(object: &Object, advice: Advice) -> Result<Vec<Step>, Failure> {
             BIN = "COLLATE Latin1_General_100_BIN2",
         ),
         sections: vec![Section::definition("definition")],
+        empty_note: None,
     }])
 }
 
@@ -1172,7 +1289,7 @@ fn used_by_sql() -> String {
 /// `deps`: what the object uses and what uses it, or why that can't be shown.
 fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failure> {
     if !view_definition {
-        return Err(name_error(
+        return Err(command_error(
             "deps needs VIEW DEFINITION on the database, which the login lacks: without it SQL \
              Server shows no dependencies at all. describe shows foreign keys, and def an \
              object's source"
@@ -1189,7 +1306,491 @@ fn deps_steps(object: &Object, view_definition: bool) -> Result<Vec<Step>, Failu
             used_by = used_by_sql(),
         ),
         sections: vec![Section::rows("uses"), Section::rows("used_by")],
+        empty_note: None,
     }])
+}
+
+/// The furthest back `--since` reaches, in minutes: ten years, past any log's archives, and
+/// small enough for `DATEADD`'s `int`.
+const MAX_SINCE_MINUTES: u64 = 3650 * 24 * 60;
+
+/// The longest `--search`, in characters (code points), as MCP's schema counts its
+/// `maxLength`. `@search` holds twice as many UTF-16 units, since a character outside the BMP
+/// takes two, so it never cuts one without a word.
+const MAX_SEARCH_CHARS: usize = 500;
+
+/// The most `--archive` names: SQL Server keeps at most 99 archives besides the current log.
+pub const MAX_ARCHIVE: u32 = 99;
+
+/// `--since` as a T-SQL `datetime` expression in the server's clock (schema-commands.md §6.9),
+/// or `None` when it is none of the forms: `<N>m`, `<N>h` or `<N>d` before now, or a
+/// server-local time. sqlh writes the expression itself, so the server never parses the user's
+/// text and a bad one is a usage error before anything connects. It only sets `@since`, which
+/// filters `#log` after the read: no date reaches `INSERT ... EXEC`.
+fn since_sql(since: &str) -> Option<String> {
+    let per = match since.as_bytes().last() {
+        Some(b'm') => Some(1),
+        Some(b'h') => Some(60),
+        Some(b'd') => Some(24 * 60),
+        _ => None,
+    };
+    if let Some(per) = per {
+        // The unit is one ASCII byte, so the rest is a whole string.
+        let count = &since[..since.len() - 1];
+        if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let minutes = count.parse::<u64>().ok()?.checked_mul(per)?;
+        return (1..=MAX_SINCE_MINUTES)
+            .contains(&minutes)
+            .then(|| format!("DATEADD(minute, -{minutes}, GETDATE())"));
+    }
+    local_time(since).map(|at| format!("CONVERT(datetime, N'{at}', 126)"))
+}
+
+/// A server-local time, `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` or `YYYY-MM-DD HH:MM:SS` (a `T` may
+/// stand for the space), as ISO 8601 `YYYY-MM-DDTHH:MM:SS`: a real calendar date in
+/// `datetime`'s years, 1753 to 9999. No offset: the log's times have none.
+fn local_time(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let digits = |from: usize, len: usize| -> Option<u32> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| part.iter().fold(0, |n, d| n * 10 + u32::from(d - b'0')))
+    };
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let (year, month, day) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
+    let (hour, minute, second) = match b.len() {
+        10 => (0, 0, 0),
+        16 | 19
+            if matches!(b[10], b' ' | b'T')
+                && b[13] == b':'
+                && (b.len() == 16 || b[16] == b':') =>
+        {
+            let second = if b.len() == 19 { digits(17, 2)? } else { 0 };
+            (digits(11, 2)?, digits(14, 2)?, second)
+        }
+        _ => return None,
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    ((1753..=9999).contains(&year)
+        && (1..=days).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60)
+        .then(|| format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"))
+}
+
+/// Whether `search` can be searched for: 1 to 500 characters, not only whitespace, and no
+/// control character, which the server can't be trusted with (a NUL cuts the string short
+/// without an error, measured).
+fn search_ok(search: &str) -> bool {
+    (1..=MAX_SEARCH_CHARS).contains(&search.chars().count())
+        && !search.trim().is_empty()
+        && !search.chars().any(|c| c < ' ')
+}
+
+/// `errorlog` (schema-commands.md §6.9): its options checked before anything connects, then a
+/// lookup that copies the log into `#log` and a step that shows it.
+fn errorlog(log: &Errorlog, advice: Advice) -> Result<Plan, Failure> {
+    let flag = |name: &str| match advice {
+        Advice::Cli => format!("--{name}"),
+        Advice::Mcp => name.to_owned(),
+    };
+    let since = match &log.since {
+        None => None,
+        Some(text) => Some(since_sql(text).ok_or_else(|| {
+            Failure::usage(format!(
+                "{} {}: expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no \
+                 offset)",
+                flag("since"),
+                echo(text)
+            ))
+        })?),
+    };
+    if log.search.as_deref().is_some_and(|s| !search_ok(s)) {
+        return Err(Failure::usage(format!(
+            "{} takes 1 to {MAX_SEARCH_CHARS} characters and no control characters",
+            flag("search")
+        )));
+    }
+    if let Some(archive) = log.archive.filter(|&n| n > MAX_ARCHIVE) {
+        return Err(Failure::usage(format!(
+            "{} {archive}: expected 0 to {MAX_ARCHIVE}",
+            flag("archive")
+        )));
+    }
+    if since.is_some() && log.archive.is_some() {
+        return Err(Failure::usage(format!(
+            "{since} and {archive} don't combine: {since} reads back through the archives its \
+             window needs",
+            since = flag("since"),
+            archive = flag("archive")
+        )));
+    }
+    let agent = log.agent;
+    let archive = log.archive;
+    // An empty read of one archive says how far back it went and what reads further
+    // (decision 93); a `since` window is the caller's own, so it needs no note.
+    let further = since
+        .is_none()
+        .then(|| format!("{} or {}", flag("since"), flag("archive")));
+    Ok(Plan::Lookup {
+        sql: errorlog_sql(agent, archive, since.as_deref(), log.search.as_deref()),
+        then: Box::new(move |found: &Found| {
+            errorlog_then(found, agent, archive, further.as_deref())
+        }),
+        label: LookupLabel::ErrorLog {
+            since: since.is_some(),
+        },
+    })
+}
+
+/// The lookup: which logs the login may read and the server keeps, and the lines asked for,
+/// copied into `#log` for the step. Only `@a` and `@type`, both `int`, reach `INSERT ... EXEC`,
+/// and only an archive `sp_enumerrorlogs` lists is read: a 22004 there ends the batch as the
+/// driver's protocol error, exit 10, whatever `TRY` says (DESIGN.md §7, U14). The time and the
+/// search filter `#log` afterwards, in SQL. `sp_readerrorlog` reads whole archives (decision
+/// 89); `@type` is always passed, since with it NULL the procedure drops its filters. `--since`
+/// reads back, archive after archive, until one starts at or before the window (decision 84).
+/// In the server's log a search keeps each matching line's companions, the lines of the same
+/// time and `ProcessInfo`, so `Login failed` keeps its `Error: 18456` line (at a startup they
+/// include unrelated lines). In the Agent log it keeps the matching lines alone (decision 90):
+/// no Agent message spans lines, and its `ProcessInfo` is the level, so the same rule there
+/// returned every line of that level in that second. Without the permission nothing is read:
+/// `sp_readerrorlog` would refuse with error 27219, which sqlh words itself.
+fn errorlog_sql(
+    agent: bool,
+    archive: Option<u32>,
+    since: Option<&str>,
+    search: Option<&str>,
+) -> String {
+    format!(
+        "SET NOCOUNT ON;\n\
+         DECLARE @type int = {log_type}, @archive int = {archive}, @since datetime = {since}, \
+         @search nvarchar({search_units}) = {search};\n\
+         DECLARE @can bit = CASE WHEN IS_SRVROLEMEMBER(N'securityadmin') = 1 \
+         OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') = 1 \
+         OR HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW ANY ERROR LOG') = 1 THEN 1 ELSE 0 END;\n\
+         DECLARE @logs TABLE (archive int, [date] nvarchar(259), bytes int);\n\
+         CREATE TABLE #log (n int IDENTITY, LogDate datetime, ProcessInfo nvarchar(64), \
+         [Text] nvarchar(max));\n\
+         DECLARE @a int = ISNULL(@archive, 0), @read int = 0, @mark int, @from varchar(16);\n\
+         IF @can = 1\n\
+         BEGIN\n\
+         INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;\n\
+         WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)\n\
+         BEGIN\n\
+         SET @mark = ISNULL((SELECT MAX(n) FROM #log), 0);\n\
+         INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;\n\
+         SET @read += 1;\n\
+         IF @archive IS NOT NULL OR @since IS NULL \
+         OR (SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;\n\
+         SET @a += 1;\n\
+         END;\n\
+         SET @from = CONVERT(varchar(16), (SELECT MIN(LogDate) FROM #log), 120);\n\
+         IF @since IS NOT NULL DELETE #log WHERE LogDate < @since;\n\
+         IF @search IS NOT NULL DELETE FROM #log WHERE {unmatched};\n\
+         END;\n\
+         SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, \
+         (SELECT MAX(archive) FROM @logs) AS last, @read AS [read], \
+         CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major, @from AS [from], \
+         (SELECT COUNT(*) FROM #log) AS kept;",
+        log_type = if agent { 2 } else { 1 },
+        // `ISNULL`: a line with no text matches nothing, as `NOT EXISTS` drops it below. The
+        // explicit collation on `[Text]` outranks `@search`'s and tempdb's, so case and accents
+        // never count, on any server, as in `find` (decision 94).
+        unmatched = if agent {
+            "ISNULL(CHARINDEX(@search, [Text] COLLATE Latin1_General_100_CI_AI), 0) = 0"
+        } else {
+            "NOT EXISTS (SELECT 1 FROM #log m WHERE m.LogDate = #log.LogDate \
+             AND m.ProcessInfo = #log.ProcessInfo \
+             AND CHARINDEX(@search, m.[Text] COLLATE Latin1_General_100_CI_AI) > 0)"
+        },
+        archive = archive.map_or_else(|| "NULL".to_owned(), |n| n.to_string()),
+        since = since.unwrap_or("NULL"),
+        search = literal_or_null(search),
+        search_units = 2 * MAX_SEARCH_CHARS,
+    )
+}
+
+/// What the lookup found (`errorlog_sql`'s last row) as the step, or the refusal: no
+/// permission (worded by the server's version: VIEW ANY ERROR LOG came with SQL Server 2022;
+/// securityadmin, which Microsoft treats as near sysadmin, is never offered), no archives, or no
+/// archive of the number asked for. With `further` (no `--since`, decision 93) and no line
+/// kept, the step's empty line names the archive read, where it starts (`from`, server-local
+/// like the lines) and, before the oldest, what reads further back.
+fn errorlog_then(
+    found: &Found,
+    agent: bool,
+    archive: Option<u32>,
+    further: Option<&str>,
+) -> Result<Vec<Step>, Failure> {
+    let unexpected = || {
+        Failure::new(
+            Exit::Internal,
+            "the error log read returned unexpected rows",
+        )
+    };
+    let row = found
+        .first()
+        .and_then(|rows| rows.first())
+        .ok_or_else(unexpected)?;
+    let (can_read, archives, read) = (
+        int(row.first()).ok_or_else(unexpected)?,
+        int(row.get(1)).ok_or_else(unexpected)?,
+        int(row.get(3)).ok_or_else(unexpected)?,
+    );
+    let log = if agent {
+        "the SQL Server Agent log"
+    } else {
+        "the error log"
+    };
+    if can_read != 1 {
+        return Err(command_error(
+            if int(row.get(4)).is_some_and(|major| major >= 16) {
+                "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; \
+                 a DBA can grant one"
+            } else {
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it"
+            }
+            .to_owned(),
+        ));
+    }
+    if archives == 0 {
+        return Err(command_error(format!(
+            "this server lists no {} archives",
+            if agent {
+                "SQL Server Agent log"
+            } else {
+                "error log"
+            }
+        )));
+    }
+    let last = int(row.get(2)).ok_or_else(unexpected)?;
+    let number = archive.unwrap_or(0);
+    if read == 0 {
+        return Err(command_error(format!(
+            "{log} has no archive {number}; it keeps 0 to {last}"
+        )));
+    }
+    let mut step = errorlog_step(agent);
+    if let Some(further) = further
+        && int(row.get(6)).ok_or_else(unexpected)? == 0
+    {
+        let mut note = match text(row.get(5)) {
+            Some(from) => format!("archive {number}, from {from}"),
+            None => format!("archive {number}, which has no lines"),
+        };
+        if i64::from(number) < last {
+            note.push_str(&format!("; {further} reads further back"));
+        } else {
+            note.push_str(", the oldest the server keeps");
+        }
+        step.empty_note = Some(note);
+    }
+    Ok(vec![step])
+}
+
+/// The step: `#log`, newest first, and within one time in the log's own order (`n`), so an
+/// `Error: 18456, Severity: 14, State: 8.` line stays above its `Login failed` line. The
+/// server ends some lines with CR LF, which is dropped; `LEN` of the text with an `x` after it
+/// counts trailing spaces, which `LEN` alone leaves out. The Agent log's `ProcessInfo` is a
+/// level number, shown as its word.
+fn errorlog_step(agent: bool) -> Step {
+    let (second, label) = if agent {
+        (
+            "CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN N'warning' \
+             WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level",
+            "agent_log",
+        )
+    } else {
+        ("ProcessInfo AS source", "server_log")
+    };
+    Step {
+        sql: format!(
+            "SELECT LogDate AS [time], {second}, \
+             CASE WHEN RIGHT([Text], 2) COLLATE Latin1_General_100_BIN2 = NCHAR(13) + NCHAR(10) \
+             THEN LEFT([Text], LEN([Text] + N'x') - 3) ELSE [Text] END AS [text] \
+             FROM #log ORDER BY LogDate DESC, n;"
+        ),
+        sections: vec![Section::rows(label)],
+        empty_note: None,
+    }
+}
+
+/// `activity`'s lookup (schema-commands.md §6.8): one snapshot of every session but this one,
+/// with its request, its waiting task and its oldest transaction, copied into `#s` so the step
+/// reads one instant (read in place, the step's CTEs scanned each DMV 10 times: 203 ms of CPU
+/// and 29,832 reads on an idle server, against 49 ms and 1,815). A request is the one that is
+/// blocked, if any; a waiting task the one blocked by the request's blocker, else the longest
+/// waiting (a parallel worker can be blocked while its request isn't). The permission comes
+/// first: without it SQL Server shows a login only its own session, which `@@SPID` leaves out,
+/// so the list would read as an idle server (decision 86). VIEW SERVER PERFORMANCE STATE came
+/// with SQL Server 2022 (HAS_PERMS_BY_NAME gives NULL before it, and VIEW SERVER STATE
+/// decides). `GETDATE()` is fixed when the statement starts, and a transaction can begin, or
+/// a request end, while the DMVs are read after it, so an age is clamped at 0 (a `tran_ms` of
+/// -3 was seen on 2016).
+const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
+    DECLARE @can int = COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
+    HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\n\
+    IF @can = 1\n\
+    SELECT s.session_id,\n\
+    CASE WHEN r.blocking_session_id > 0 AND r.blocking_session_id <> s.session_id \
+    THEN r.blocking_session_id\n\
+    WHEN w.blocking_session_id IS NOT NULL THEN w.blocking_session_id\n\
+    WHEN r.blocking_session_id IN (-2, -3, -4) THEN r.blocking_session_id END AS blocked_by,\n\
+    COALESCE(r.status, s.status) AS status, r.command,\n\
+    COALESCE(w.wait_type, r.wait_type) AS wait, COALESCE(w.wait_duration_ms, r.wait_time) AS \
+    wait_ms,\n\
+    COALESCE(NULLIF(r.wait_resource, N''), w.resource_description) AS wait_resource,\n\
+    r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,\n\
+    CASE WHEN r.session_id IS NULL THEN CASE WHEN s.last_request_end_time > GETDATE() THEN 0 \
+    ELSE DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END END AS idle_ms,\n\
+    s.open_transaction_count AS open_tran,\n\
+    CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END AS \
+    tran_ms,\n\
+    s.login_name AS login, s.host_name AS host, s.program_name AS program,\n\
+    DB_NAME(COALESCE(r.database_id, s.database_id)) AS [database],\n\
+    r.sql_handle, r.statement_start_offset AS stmt_start, r.statement_end_offset AS stmt_end,\n\
+    CASE WHEN r.session_id IS NULL THEN 0 ELSE 1 END AS busy, s.is_user_process AS is_user\n\
+    INTO #s\n\
+    FROM sys.dm_exec_sessions s\n\
+    OUTER APPLY (SELECT TOP (1) q.* FROM sys.dm_exec_requests q WHERE q.session_id = \
+    s.session_id\n\
+    ORDER BY CASE WHEN q.blocking_session_id <> 0 THEN 0 ELSE 1 END, q.request_id) r\n\
+    OUTER APPLY (SELECT TOP (1) k.blocking_session_id, k.wait_type, k.wait_duration_ms, \
+    k.resource_description\n\
+    FROM sys.dm_os_waiting_tasks k\n\
+    WHERE k.session_id = s.session_id AND k.blocking_session_id > 0 AND k.blocking_session_id \
+    <> s.session_id\n\
+    ORDER BY CASE WHEN k.blocking_session_id = r.blocking_session_id THEN 0 ELSE 1 END, \
+    k.wait_duration_ms DESC) w\n\
+    OUTER APPLY (SELECT MIN(a.transaction_begin_time) AS begun\n\
+    FROM sys.dm_tran_session_transactions st\n\
+    JOIN sys.dm_tran_active_transactions a ON a.transaction_id = st.transaction_id\n\
+    WHERE st.session_id = s.session_id) t\n\
+    WHERE s.session_id <> @@SPID;\n\
+    SELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major;";
+
+/// `activity`'s step, one `SELECT` of `#s` (so a capped list gets the brief count and no
+/// `-- partial:` advice, `run::Plan`). Shown: a user session with a request or an open
+/// transaction (an idle pooled `sqlh mcp` connection has neither after `put_back`'s rollback,
+/// decision 83), any blocked session, system ones too, and any session one of them waits on.
+/// `up` walks each blocked session's chain to its head, carrying the sessions it has passed
+/// (`seen`); a step back to one of them (`again`) ends the walk, and so does `hops < 100`,
+/// within `MAXRECURSION 100`. `tops.cycle` marks a walk that came back or reached 100 hops,
+/// so a session in a cycle, and one waiting behind a cycle without being in it, gets no depth
+/// rather than the hop bound's 100. `under` counts who waits on a session, directly or down
+/// its chain. The input buffer is read only for a head blocker and an idle session holding a
+/// transaction, where the statement says nothing. Both texts have each run of spaces, tabs, CR
+/// and LF made one space and their ends trimmed before the cell cut (decision 92): once the
+/// first three `REPLACE`s have turned every tab into a space, a tab is a marker no text can
+/// hold, so `' '` → `' ' + tab`, then dropping `tab + ' '` and the tabs left is exact. The
+/// binary collation makes each `REPLACE` match code units whatever the server's collation.
+/// The statement is cut from the batch in that collation too: the request's offsets count
+/// bytes, and if `st.text` follows a supplementary-character (`_SC`, `_UTF8`) default (not
+/// measured: R71),
+/// `SUBSTRING` counts a surrogate pair as one character, so a statement after an emoji began
+/// a character late (R71; measured on both servers with an explicit `_SC` collation).
+/// Chains come first, the largest first, each in depth order; then the rest, oldest first.
+const ACTIVITY_STEP: &str = "WITH shown AS (\n\
+    SELECT x.* FROM #s x\n\
+    WHERE (x.is_user = 1 AND (x.busy = 1 OR x.open_tran > 0)) OR x.blocked_by IS NOT NULL\n\
+    OR EXISTS (SELECT 1 FROM #s b WHERE b.blocked_by = x.session_id)\n\
+    ), up AS (\n\
+    SELECT b.session_id, b.blocked_by AS above, 1 AS hops,\n\
+    CAST(CONCAT(',', b.session_id, ',', b.blocked_by, ',') AS varchar(1000)) AS seen, 0 AS again\n\
+    FROM shown b WHERE b.blocked_by > 0\n\
+    UNION ALL\n\
+    SELECT u.session_id, p.blocked_by, u.hops + 1,\n\
+    CAST(CONCAT(u.seen, p.blocked_by, ',') AS varchar(1000)),\n\
+    CASE WHEN CHARINDEX(CONCAT(',', p.blocked_by, ','), u.seen) > 0 THEN 1 ELSE 0 END\n\
+    FROM up u JOIN shown p ON p.session_id = u.above\n\
+    WHERE p.blocked_by > 0 AND u.again = 0 AND u.hops < 100\n\
+    ), tops AS (\n\
+    SELECT u.session_id, MAX(u.hops) AS depth,\n\
+    MAX(CASE WHEN u.again = 1 OR u.hops = 100 THEN 1 ELSE 0 END) AS cycle\n\
+    FROM up u GROUP BY u.session_id\n\
+    ), heads AS (\n\
+    SELECT u.session_id, u.above AS head FROM up u JOIN tops t ON t.session_id = u.session_id \
+    AND t.depth = u.hops\n\
+    ), under AS (\n\
+    SELECT u.above AS session_id, COUNT(DISTINCT u.session_id) AS blocking FROM up u WHERE \
+    u.above <> u.session_id GROUP BY u.above\n\
+    )\n\
+    SELECT x.session_id AS session, x.blocked_by, n.blocking,\n\
+    CASE WHEN t.cycle = 1 THEN NULL WHEN t.depth IS NOT NULL THEN t.depth WHEN n.blocking IS \
+    NOT NULL THEN 0 END AS depth,\n\
+    x.status, x.command, x.wait, x.wait_ms, x.wait_resource, x.cpu_ms, x.reads, x.elapsed_ms, \
+    x.idle_ms,\n\
+    x.open_tran, x.tran_ms, x.login, x.host, x.program, x.[database],\n\
+    LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(r.s COLLATE Latin1_General_100_BIN2, \
+    NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), N' ', N' ' + NCHAR(9)), NCHAR(9) + N' ', \
+    N''), NCHAR(9), N''))) AS statement,\n\
+    LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ib.event_info COLLATE \
+    Latin1_General_100_BIN2, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), N' ', N' ' + \
+    NCHAR(9)), NCHAR(9) + N' ', N''), NCHAR(9), N''))) AS input_buffer\n\
+    FROM shown x\n\
+    LEFT JOIN tops t ON t.session_id = x.session_id\n\
+    LEFT JOIN heads h ON h.session_id = x.session_id\n\
+    LEFT JOIN under n ON n.session_id = x.session_id\n\
+    LEFT JOIN under hn ON hn.session_id = COALESCE(h.head, CASE WHEN n.blocking IS NOT NULL \
+    THEN x.session_id END)\n\
+    OUTER APPLY sys.dm_exec_sql_text(x.sql_handle) st\n\
+    OUTER APPLY (SELECT i.event_info FROM sys.dm_exec_input_buffer(x.session_id, NULL) i\n\
+    WHERE (n.blocking IS NOT NULL AND t.depth IS NULL) OR (x.busy = 0 AND x.open_tran > 0)) ib\n\
+    OUTER APPLY (SELECT CASE WHEN x.stmt_end = -1 OR x.stmt_end >= x.stmt_start\n\
+    THEN SUBSTRING(st.text COLLATE Latin1_General_100_BIN2, x.stmt_start / 2 + 1,\n\
+    (CASE x.stmt_end WHEN -1 THEN DATALENGTH(st.text) ELSE x.stmt_end END - x.stmt_start) / 2 \
+    + 1) END AS s) r\n\
+    ORDER BY CASE WHEN hn.blocking IS NULL THEN 1 ELSE 0 END, hn.blocking DESC, \
+    COALESCE(h.head, x.session_id), COALESCE(t.depth, 0),\n\
+    COALESCE(x.elapsed_ms, x.tran_ms, x.idle_ms) DESC, x.session_id\n\
+    OPTION (MAXRECURSION 100);";
+
+/// What `activity`'s lookup found (`can_view`, `major`) as the step, or the refusal without the
+/// permission, worded by the server's version (decision 86).
+fn activity_then(found: &Found) -> Result<Vec<Step>, Failure> {
+    let unexpected = || {
+        Failure::new(
+            Exit::Internal,
+            "the read of the server's sessions returned unexpected rows",
+        )
+    };
+    let row = found
+        .first()
+        .and_then(|rows| rows.first())
+        .ok_or_else(unexpected)?;
+    let major = int(row.get(1)).ok_or_else(unexpected)?;
+    match row.first() {
+        Some(Value::Int(1)) => Ok(vec![Step {
+            sql: ACTIVITY_STEP.to_owned(),
+            sections: vec![Section::rows("sessions")],
+            empty_note: None,
+        }]),
+        Some(Value::Int(_) | Value::Null) => Err(command_error(
+            if major >= 16 {
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it"
+            } else {
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL Server \
+                 shows a login only its own session. A DBA can grant it"
+            }
+            .to_owned(),
+        )),
+        _ => Err(unexpected()),
+    }
 }
 
 #[cfg(test)]
@@ -1202,7 +1803,15 @@ mod tests {
 
     #[test]
     fn commands_are_the_first_word() {
-        let parse = |args: &[&str], text| Command::parse(&words(args), text);
+        let parse = |args: &[&str], text| {
+            Command::parse(
+                &words(args),
+                &Flags {
+                    text,
+                    ..Flags::default()
+                },
+            )
+        };
         assert_eq!(parse(&["SELECT 1"], false), None);
         assert_eq!(parse(&["Describe", "x"], false), None, "lower case only");
         assert_eq!(parse(&["info"], false), Some(Ok(Command::Info)));
@@ -1247,6 +1856,52 @@ mod tests {
             let error = parse(args, text).unwrap().unwrap_err();
             assert!(error.contains(wanted), "{args:?}: {error}");
         }
+    }
+
+    // schema-commands.md §6.1: `server_permissions` is the last column of the one statement, so
+    // `profiles test` (which runs INFO_SQL as a plain query) still shows one result; each
+    // permission is asked for by its name, and only VIEW SERVER STATE's absence lists the two
+    // it implies.
+    #[test]
+    fn info_ends_with_the_server_permissions() {
+        assert!(!crate::guard::several_outputs(INFO_SQL), "{INFO_SQL}");
+        assert_eq!(INFO_SQL.matches("SELECT").count(), 1, "{INFO_SQL}");
+        assert!(
+            INFO_SQL.ends_with(" END AS server_permissions;"),
+            "{INFO_SQL}"
+        );
+        let column = &INFO_SQL[INFO_SQL
+            .find("SYSDATETIMEOFFSET() AS server_time, ")
+            .unwrap()..];
+        let mut from = 0;
+        for shown in [
+            "N'sysadmin'",
+            "N', VIEW SERVER STATE'",
+            "N', VIEW SERVER PERFORMANCE STATE'",
+            "N', VIEW SERVER SECURITY STATE'",
+            "N', VIEW ANY ERROR LOG'",
+            "N', VIEW ANY DEFINITION'",
+            "N', securityadmin'",
+            "1, 2, N''), N'none')",
+        ] {
+            let at = column[from..]
+                .find(shown)
+                .unwrap_or_else(|| panic!("{shown} after {from} in {column}"));
+            from += at + shown.len();
+        }
+        let implied = &column[column.find("N', VIEW SERVER STATE'").unwrap()..];
+        assert!(
+            implied.starts_with(
+                "N', VIEW SERVER STATE' ELSE CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, \
+                 N'VIEW SERVER PERFORMANCE STATE') = 1"
+            ),
+            "{implied}"
+        );
+        // A permission SQL Server 2016 doesn't know is NULL there, and NULL is never held.
+        let asked = column.matches("HAS_PERMS_BY_NAME(").count()
+            + column.matches("IS_SRVROLEMEMBER(").count();
+        assert_eq!(asked, 7, "{column}");
+        assert_eq!(column.matches(") = 1 THEN").count(), asked, "{column}");
     }
 
     // Arguments only ever reach the SQL as N'...' literals with doubled quotes.
@@ -1833,5 +2488,825 @@ mod tests {
         let mut limits = Limits::default();
         Command::Tables(None).limits(&mut limits, false, false);
         assert_eq!(limits.max_rows, Limits::default().max_rows);
+        // errorlog: its newest 50 lines, the run's cell limit, a flag over both.
+        let log = Command::Errorlog(Errorlog::default());
+        let mut limits = Limits {
+            max_cell: 77,
+            ..Limits::default()
+        };
+        log.limits(&mut limits, false, false);
+        assert_eq!((limits.max_rows, limits.max_cell), (50, 77));
+        let mut limits = Limits::default();
+        log.limits(&mut limits, true, true);
+        assert_eq!(limits.max_rows, Limits::default().max_rows);
+    }
+
+    fn flags() -> Flags {
+        Flags::default()
+    }
+
+    // schema-commands.md §6.9: errorlog takes its four options and no words; each option is
+    // refused with any other command, and with SQL (`Flags::misplaced`).
+    #[test]
+    fn errorlog_takes_its_options_and_nothing_else_does() {
+        let given = Flags {
+            since: Some("2h".into()),
+            search: Some("Login failed".into()),
+            agent: true,
+            archive: Some(3),
+            ..flags()
+        };
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &given),
+            Some(Ok(Command::Errorlog(Errorlog {
+                since: Some("2h".into()),
+                search: Some("Login failed".into()),
+                agent: true,
+                archive: Some(3),
+            })))
+        );
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &flags()),
+            Some(Ok(Command::Errorlog(Errorlog::default())))
+        );
+        assert_eq!(
+            Command::parse(&words(&["errorlog", "x"]), &flags()),
+            Some(Err(
+                "errorlog takes --since, --search, --agent and --archive, not \"x\"".into()
+            ))
+        );
+        for (flags, refusal) in [
+            (
+                Flags {
+                    since: Some("1h".into()),
+                    ..flags()
+                },
+                "--since only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    search: Some("x".into()),
+                    ..flags()
+                },
+                "--search only applies to sqlh errorlog and sqlh profiles list",
+            ),
+            (
+                Flags {
+                    agent: true,
+                    ..flags()
+                },
+                "--agent only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    archive: Some(0),
+                    ..flags()
+                },
+                "--archive only applies to sqlh errorlog",
+            ),
+        ] {
+            assert_eq!(
+                Command::parse(&words(&["tables"]), &flags),
+                Some(Err(refusal.to_owned())),
+                "{refusal}"
+            );
+            assert_eq!(flags.misplaced(None).as_deref(), Some(refusal));
+            assert_eq!(
+                flags.misplaced(Some(&Command::Errorlog(Errorlog::default()))),
+                None
+            );
+        }
+        let text = Flags {
+            text: true,
+            ..flags()
+        };
+        assert_eq!(
+            Command::parse(&words(&["errorlog"]), &text),
+            Some(Err("--text only applies to sqlh find".into()))
+        );
+    }
+
+    // schema-commands.md §6.9: every form `--since` takes, as the expression sqlh writes, and
+    // what it refuses: a zero or a count past ten years, a unit or digit it doesn't know, a
+    // date that isn't on the calendar or outside datetime's years, an offset.
+    #[test]
+    fn since_takes_a_span_or_a_server_local_time() {
+        for (since, sql) in [
+            ("30m", "DATEADD(minute, -30, GETDATE())"),
+            ("1m", "DATEADD(minute, -1, GETDATE())"),
+            ("12h", "DATEADD(minute, -720, GETDATE())"),
+            ("7d", "DATEADD(minute, -10080, GETDATE())"),
+            ("007d", "DATEADD(minute, -10080, GETDATE())"),
+            ("3650d", "DATEADD(minute, -5256000, GETDATE())"),
+            ("87600h", "DATEADD(minute, -5256000, GETDATE())"),
+            ("5256000m", "DATEADD(minute, -5256000, GETDATE())"),
+            (
+                "2026-11-20",
+                "CONVERT(datetime, N'2026-11-20T00:00:00', 126)",
+            ),
+            (
+                "2026-11-20 08:00",
+                "CONVERT(datetime, N'2026-11-20T08:00:00', 126)",
+            ),
+            (
+                "2026-11-20T08:05:09",
+                "CONVERT(datetime, N'2026-11-20T08:05:09', 126)",
+            ),
+            (
+                "2024-02-29 23:59:59",
+                "CONVERT(datetime, N'2024-02-29T23:59:59', 126)",
+            ),
+            (
+                "2000-02-29",
+                "CONVERT(datetime, N'2000-02-29T00:00:00', 126)",
+            ),
+            (
+                "1753-01-01",
+                "CONVERT(datetime, N'1753-01-01T00:00:00', 126)",
+            ),
+            (
+                "9999-12-31 23:59:59",
+                "CONVERT(datetime, N'9999-12-31T23:59:59', 126)",
+            ),
+        ] {
+            assert_eq!(since_sql(since).as_deref(), Some(sql), "{since}");
+        }
+        for since in [
+            "",
+            "m",
+            "0m",
+            "0d",
+            "3651d",
+            "87601h",
+            "5256001m",
+            "99999999999999999999999d",
+            "-5m",
+            "+5m",
+            "5 m",
+            "5M",
+            "5s",
+            "5w",
+            "1.5h",
+            "２h",
+            "2h ",
+            " 2h",
+            "2023-02-29",
+            "1900-02-29",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-04-31",
+            "2026-11-00",
+            "1752-12-31",
+            "10000-01-01",
+            "2026-11-20 24:00",
+            "2026-11-20 08:60",
+            "2026-11-20 08:00:60",
+            "2026-11-20 8:00",
+            "2026-11-20 08:00:5",
+            "2026-11-20t08:00",
+            "2026-11-20  08:00",
+            "2026-11-20 08",
+            "2026-11-20T08:00Z",
+            "2026-11-20T08:00:00Z",
+            "2026-11-20T08:00:00+01:00",
+            "2026-11-20 08:00:00.000",
+            "2026/11/20",
+            "26-11-20",
+            "2026-1-20",
+            "20261120",
+            "yesterday",
+            "2026-11-2é",
+            "2026-11-20é",
+        ] {
+            assert_eq!(since_sql(since), None, "{since:?}");
+        }
+    }
+
+    // The options are checked before anything connects (exit 3), in the words of the front end
+    // that took them; a search and a time reach the SQL only as sqlh writes them.
+    #[test]
+    fn errorlogs_options_are_checked_before_it_runs() {
+        let refused = |log: Errorlog, advice| match errorlog(&log, advice) {
+            Err(failure) => {
+                assert_eq!(failure.exit, Exit::Usage);
+                failure.message
+            }
+            Ok(_) => panic!("{log:?} is refused"),
+        };
+        let since = |text: &str| Errorlog {
+            since: Some(text.into()),
+            ..Errorlog::default()
+        };
+        assert_eq!(
+            refused(since("2x"), Advice::Cli),
+            "--since 2x: expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no \
+             offset)"
+        );
+        assert_eq!(
+            refused(since("2026-11-20T08:00Z"), Advice::Mcp),
+            "since 2026-11-20T08:00Z: expected 30m, 12h, 7d or a server-local time like \
+             2026-11-20 08:00 (no offset)"
+        );
+        // A huge value is shown cut short.
+        let long = refused(since(&"x".repeat(5000)), Advice::Cli);
+        assert!(
+            long.starts_with(&format!("--since {}…: expected", "x".repeat(100))),
+            "{long}"
+        );
+        let search = |text: &str| Errorlog {
+            search: Some(text.into()),
+            ..Errorlog::default()
+        };
+        for bad in [
+            String::new(),
+            "   ".into(),
+            "\t".into(),
+            "a\0b".into(),
+            "line\nbreak".into(),
+            "x".repeat(501),
+            "\u{1F600}".repeat(501),
+        ] {
+            assert_eq!(
+                refused(search(&bad), Advice::Cli),
+                "--search takes 1 to 500 characters and no control characters",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            refused(search(""), Advice::Mcp),
+            "search takes 1 to 500 characters and no control characters"
+        );
+        for good in ["x".repeat(500), "\u{1F600}".repeat(500), " a ".into()] {
+            assert!(errorlog(&search(&good), Advice::Cli).is_ok(), "{good:?}");
+        }
+        let archive = |n| Errorlog {
+            archive: Some(n),
+            ..Errorlog::default()
+        };
+        assert!(errorlog(&archive(99), Advice::Cli).is_ok());
+        assert_eq!(
+            refused(archive(100), Advice::Cli),
+            "--archive 100: expected 0 to 99"
+        );
+        let both = Errorlog {
+            since: Some("1h".into()),
+            archive: Some(0),
+            ..Errorlog::default()
+        };
+        assert_eq!(
+            refused(both.clone(), Advice::Cli),
+            "--since and --archive don't combine: --since reads back through the archives its \
+             window needs"
+        );
+        assert_eq!(
+            refused(both, Advice::Mcp),
+            "since and archive don't combine: since reads back through the archives its window \
+             needs"
+        );
+    }
+
+    /// The SQL `errorlog` would run for `log`.
+    fn errorlog_lookup_sql(log: &Errorlog) -> String {
+        let Ok(Plan::Lookup { sql, label, .. }) = errorlog(log, Advice::Cli) else {
+            panic!("a lookup");
+        };
+        assert_eq!(
+            label,
+            LookupLabel::ErrorLog {
+                since: log.since.is_some()
+            }
+        );
+        sql
+    }
+
+    // U14: only the listed archive and the log type, both int, reach `INSERT ... EXEC`, so the
+    // server never refuses them there. The log type is always passed; the search is an N'...'
+    // literal with its quotes doubled, in a variable that holds 500 characters of two UTF-16
+    // units each; the time is sqlh's own expression.
+    #[test]
+    fn errorlogs_lookup_passes_only_typed_values() {
+        let sql = errorlog_lookup_sql(&Errorlog::default());
+        assert!(
+            sql.starts_with(
+                "SET NOCOUNT ON;\nDECLARE @type int = 1, @archive int = NULL, @since datetime = \
+                 NULL, @search nvarchar(1000) = NULL;\n"
+            ),
+            "{sql}"
+        );
+        for part in [
+            "INSERT INTO @logs EXEC sys.sp_enumerrorlogs @type;",
+            "WHILE EXISTS (SELECT 1 FROM @logs WHERE archive = @a)",
+            "INSERT INTO #log (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @a, @type;",
+            // The server log's search keeps each match's companions (decision 89), ignoring
+            // case and accents on every server (decision 94).
+            "\nIF @search IS NOT NULL DELETE FROM #log WHERE NOT EXISTS (SELECT 1 FROM #log m \
+             WHERE m.LogDate = #log.LogDate AND m.ProcessInfo = #log.ProcessInfo \
+             AND CHARINDEX(@search, m.[Text] COLLATE Latin1_General_100_CI_AI) > 0);\n",
+            "(SELECT MIN(LogDate) FROM #log WHERE n > @mark) <= @since BREAK;",
+        ] {
+            assert!(sql.contains(part), "{part}\n{sql}");
+        }
+        // No other EXEC: never xp_readerrorlog (decision 89).
+        assert_eq!(sql.matches("EXEC ").count(), 2, "{sql}");
+        assert!(!sql.contains("xp_"), "{sql}");
+        let sql = errorlog_lookup_sql(&Errorlog {
+            since: Some("2026-11-20 08:00".into()),
+            search: Some("it's ]; DROP TABLE x --".into()),
+            agent: true,
+            archive: None,
+        });
+        assert!(
+            sql.starts_with(
+                "SET NOCOUNT ON;\nDECLARE @type int = 2, @archive int = NULL, @since datetime = \
+                 CONVERT(datetime, N'2026-11-20T08:00:00', 126), @search nvarchar(1000) = \
+                 N'it''s ]; DROP TABLE x --';\n"
+            ),
+            "{sql}"
+        );
+        // Decision 90: the Agent log's search keeps only the lines that match, no companions.
+        assert!(
+            sql.contains(
+                "\nIF @search IS NOT NULL DELETE FROM #log WHERE ISNULL(CHARINDEX(@search, \
+                 [Text] COLLATE Latin1_General_100_CI_AI), 0) = 0;\n"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("m.ProcessInfo"), "{sql}");
+        let sql = errorlog_lookup_sql(&Errorlog {
+            since: Some("90m".into()),
+            ..Errorlog::default()
+        });
+        assert!(
+            sql.contains("@since datetime = DATEADD(minute, -90, GETDATE()),"),
+            "{sql}"
+        );
+        let sql = errorlog_lookup_sql(&Errorlog {
+            archive: Some(7),
+            ..Errorlog::default()
+        });
+        assert!(sql.contains("@archive int = 7,"), "{sql}");
+        // The lookup's one result is a row, the last statement.
+        assert!(
+            sql.ends_with(
+                "SELECT @can AS can_read, (SELECT COUNT(*) FROM @logs) AS archives, (SELECT \
+                 MAX(archive) FROM @logs) AS last, @read AS [read], \
+                 CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major, @from AS [from], \
+                 (SELECT COUNT(*) FROM #log) AS kept;"
+            ),
+            "{sql}"
+        );
+        // Decision 93: the oldest line is taken before a window or a search drops lines.
+        let from = sql
+            .find("SET @from = CONVERT(varchar(16), (SELECT MIN(LogDate) FROM #log), 120);")
+            .expect("@from");
+        assert!(from < sql.find("DELETE").expect("DELETE"), "{sql}");
+    }
+
+    /// The lookup's row: can_read, archives, last, read, major.
+    fn log_found(can: i64, archives: i64, last: Option<i64>, read: i64, major: i64) -> Found {
+        log_found_kept(
+            can,
+            archives,
+            last,
+            read,
+            major,
+            Some("2026-11-21 16:38"),
+            3,
+        )
+    }
+
+    /// `log_found` with the oldest line read (`from`) and the lines kept.
+    fn log_found_kept(
+        can: i64,
+        archives: i64,
+        last: Option<i64>,
+        read: i64,
+        major: i64,
+        from: Option<&str>,
+        kept: i64,
+    ) -> Found {
+        vec![vec![vec![
+            Value::Int(can),
+            Value::Int(archives),
+            last.map_or(Value::Null, Value::Int),
+            Value::Int(read),
+            Value::Int(major),
+            from.map_or(Value::Null, |from| Value::Text(from.into())),
+            Value::Int(kept),
+        ]]]
+    }
+
+    // schema-commands.md §6.9: each answer the lookup can give, as the step or the refusal
+    // (exit 1, `-- error:`), worded by the log and the server's version.
+    #[test]
+    fn errorlog_says_why_it_shows_nothing() {
+        let message = |found: Found, agent, archive| {
+            let failure =
+                errorlog_then(&found, agent, archive, Some("--since or --archive")).unwrap_err();
+            assert_eq!(failure.exit, Exit::SqlError, "{}", failure.message);
+            failure.message
+        };
+        assert_eq!(
+            message(log_found(0, 0, None, 0, 17), false, None),
+            "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a \
+             DBA can grant one"
+        );
+        assert_eq!(
+            message(log_found(0, 0, None, 0, 16), true, None),
+            "errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this login lacks; a \
+             DBA can grant one"
+        );
+        for major in [13, 15] {
+            assert_eq!(
+                message(log_found(0, 0, None, 0, major), false, None),
+                "errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can grant it"
+            );
+        }
+        assert_eq!(
+            message(log_found(1, 0, None, 0, 17), false, None),
+            "this server lists no error log archives"
+        );
+        assert_eq!(
+            message(log_found(1, 0, None, 0, 17), true, None),
+            "this server lists no SQL Server Agent log archives"
+        );
+        assert_eq!(
+            message(log_found(1, 7, Some(6), 0, 17), false, Some(9)),
+            "the error log has no archive 9; it keeps 0 to 6"
+        );
+        assert_eq!(
+            message(log_found(1, 10, Some(9), 0, 13), true, Some(12)),
+            "the SQL Server Agent log has no archive 12; it keeps 0 to 9"
+        );
+        // A reply that isn't the lookup's row is sqlh's error, not an answer.
+        for found in [
+            Vec::new(),
+            vec![Vec::new()],
+            vec![vec![vec![Value::Text("1".into())]]],
+        ] {
+            let failure = errorlog_then(&found, false, None, None).unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal, "{found:?}");
+        }
+        // Read: the step, in one section.
+        let steps = errorlog_then(&log_found(1, 7, Some(6), 2, 17), false, None, None).unwrap();
+        assert_eq!(labels(&steps), ["server_log"]);
+        let steps = errorlog_then(&log_found(1, 10, Some(9), 1, 13), true, Some(3), None).unwrap();
+        assert_eq!(labels(&steps), ["agent_log"]);
+    }
+
+    // Decision 93: an empty read of one archive (no `--since`) says which, from when, and what
+    // reads further back, or that it was the oldest; lines kept, or a window, say nothing.
+    #[test]
+    fn an_empty_errorlog_says_how_far_back_it_read() {
+        let further = Some("--since or --archive");
+        let note = |found: Found, archive, further| {
+            let mut steps = errorlog_then(&found, false, archive, further).unwrap();
+            assert_eq!(steps.len(), 1);
+            steps.remove(0).empty_note
+        };
+        let empty = |last, from| log_found_kept(1, 7, Some(last), 1, 17, from, 0);
+        assert_eq!(
+            note(empty(6, Some("2026-11-21 16:38")), None, further).as_deref(),
+            Some("archive 0, from 2026-11-21 16:38; --since or --archive reads further back")
+        );
+        assert_eq!(
+            note(empty(6, Some("2026-11-07 20:55")), Some(6), further).as_deref(),
+            Some("archive 6, from 2026-11-07 20:55, the oldest the server keeps")
+        );
+        assert_eq!(
+            note(empty(0, None), None, Some("since or archive")).as_deref(),
+            Some("archive 0, which has no lines, the oldest the server keeps")
+        );
+        assert_eq!(
+            note(empty(6, None), Some(2), Some("since or archive")).as_deref(),
+            Some("archive 2, which has no lines; since or archive reads further back")
+        );
+        assert_eq!(note(empty(6, Some("2026-11-21 16:38")), None, None), None);
+        let kept = log_found_kept(1, 7, Some(6), 1, 17, Some("2026-11-21 16:38"), 4);
+        assert_eq!(note(kept, None, further), None);
+        // A row without the two columns is sqlh's error, not an empty log.
+        let short = vec![vec![vec![
+            Value::Int(1),
+            Value::Int(7),
+            Value::Int(6),
+            Value::Int(1),
+            Value::Int(17),
+        ]]];
+        let failure = errorlog_then(&short, false, None, further).unwrap_err();
+        assert_eq!(failure.exit, Exit::Internal, "{}", failure.message);
+
+        // Through the command's plan: the CLI's words, sqlh mcp's, and no note with a window.
+        let planned = |log: Errorlog, advice: Advice| {
+            let Ok(Input::Command {
+                plan: Plan::Lookup { then, .. },
+                ..
+            }) = Command::Errorlog(log).input(advice)
+            else {
+                panic!("errorlog looks up first");
+            };
+            let mut steps = then(&empty(6, Some("2026-11-21 16:38"))).unwrap();
+            steps.remove(0).empty_note
+        };
+        for (advice, words) in [
+            (Advice::Cli, "--since or --archive"),
+            (Advice::Mcp, "since or archive"),
+        ] {
+            assert_eq!(
+                planned(Errorlog::default(), advice),
+                Some(format!(
+                    "archive 0, from 2026-11-21 16:38; {words} reads further back"
+                ))
+            );
+            let window = Errorlog {
+                since: Some("1h".into()),
+                search: Some("x".into()),
+                ..Errorlog::default()
+            };
+            assert_eq!(planned(window, advice), None, "{advice:?}");
+        }
+    }
+
+    // `Plan::Lookup`'s rule (run.rs): the step is one SELECT, so a capped log gets the brief
+    // count and no `-- partial:` advice; newest first, in the log's order within one time, and
+    // without the server's trailing CR LF.
+    #[test]
+    fn errorlogs_step_is_one_select() {
+        for agent in [false, true] {
+            let step = errorlog_step(agent);
+            assert!(!crate::guard::several_outputs(&step.sql), "{}", step.sql);
+            assert_eq!(step.sql.matches("SELECT").count(), 1, "{}", step.sql);
+            assert!(
+                step.sql.ends_with(" FROM #log ORDER BY LogDate DESC, n;"),
+                "{}",
+                step.sql
+            );
+            assert!(
+                step.sql.contains(
+                    "CASE WHEN RIGHT([Text], 2) COLLATE Latin1_General_100_BIN2 = NCHAR(13) + \
+                     NCHAR(10) THEN LEFT([Text], LEN([Text] + N'x') - 3) ELSE [Text] END AS \
+                     [text]"
+                ),
+                "{}",
+                step.sql
+            );
+        }
+        assert!(
+            errorlog_step(false)
+                .sql
+                .starts_with("SELECT LogDate AS [time], ProcessInfo AS source, ")
+        );
+        assert!(errorlog_step(true).sql.starts_with(
+            "SELECT LogDate AS [time], CASE ProcessInfo WHEN N'1' THEN N'error' WHEN N'2' THEN \
+             N'warning' WHEN N'3' THEN N'info' ELSE ProcessInfo END AS level, "
+        ));
+    }
+
+    // schema-commands.md §6.8: activity takes no words and none of errorlog's options or find's
+    // --text; 50 sessions and 300 characters a value unless a flag says otherwise.
+    #[test]
+    fn activity_takes_nothing() {
+        assert_eq!(
+            Command::parse(&words(&["activity"]), &flags()),
+            Some(Ok(Command::Activity))
+        );
+        assert_eq!(
+            Command::parse(&words(&["activity", "--plans"]), &flags()),
+            Some(Err("activity takes no arguments, not \"--plans\"".into()))
+        );
+        for (given, refusal) in [
+            (
+                Flags {
+                    since: Some("1h".into()),
+                    ..flags()
+                },
+                "--since only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    search: Some("x".into()),
+                    ..flags()
+                },
+                "--search only applies to sqlh errorlog and sqlh profiles list",
+            ),
+            (
+                Flags {
+                    agent: true,
+                    ..flags()
+                },
+                "--agent only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    archive: Some(1),
+                    ..flags()
+                },
+                "--archive only applies to sqlh errorlog",
+            ),
+            (
+                Flags {
+                    text: true,
+                    ..flags()
+                },
+                "--text only applies to sqlh find",
+            ),
+        ] {
+            assert_eq!(
+                Command::parse(&words(&["activity"]), &given),
+                Some(Err(refusal.to_owned()))
+            );
+        }
+        let mut limits = Limits::default();
+        Command::Activity.limits(&mut limits, false, false);
+        assert_eq!((limits.max_rows, limits.max_cell), (50, 300));
+        let mut limits = Limits::default();
+        Command::Activity.limits(&mut limits, true, true);
+        assert_eq!(
+            (limits.max_rows, limits.max_cell),
+            (Limits::default().max_rows, Limits::default().max_cell)
+        );
+        let Ok(Input::Command { name, plan }) = Command::Activity.input(Advice::Mcp) else {
+            panic!("a command");
+        };
+        assert_eq!(name, "activity");
+        let Plan::Lookup { sql, label, .. } = plan else {
+            panic!("a lookup");
+        };
+        assert_eq!((sql.as_str(), label), (ACTIVITY_SQL, LookupLabel::Activity));
+    }
+
+    // The snapshot leaves out the report's own session, and its one result is the row `then`
+    // reads, last; the permission decides whether anything is read.
+    #[test]
+    fn activitys_lookup_reads_one_snapshot_after_the_permission() {
+        assert!(ACTIVITY_SQL.starts_with(
+            "SET NOCOUNT ON;\nDECLARE @can int = \
+             COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
+             HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\nIF @can = 1\nSELECT "
+        ));
+        assert!(ACTIVITY_SQL.contains("\nINTO #s\nFROM sys.dm_exec_sessions s\n"));
+        assert!(ACTIVITY_SQL.contains("\nWHERE s.session_id <> @@SPID;\n"));
+        assert!(ACTIVITY_SQL.ends_with(
+            "\nSELECT @can AS can_view, CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS \
+             major;"
+        ));
+        // An age is never negative: GETDATE() is fixed before the DMVs are read.
+        for age in [
+            "CASE WHEN s.last_request_end_time > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, \
+             s.last_request_end_time, GETDATE()) END END AS idle_ms,\n",
+            "CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END \
+             AS tran_ms,\n",
+        ] {
+            assert!(ACTIVITY_SQL.contains(age), "{age}");
+        }
+        assert_eq!(ACTIVITY_SQL.matches("DATEDIFF_BIG").count(), 2);
+    }
+
+    /// schema-commands.md §6.8's `sql` blocks, the lookup's and the step's, in order.
+    fn activitys_documented_sql() -> Vec<&'static str> {
+        let doc = include_str!("../docs/schema-commands.md");
+        let section = doc
+            .split_once("\n### 6.8 `activity`")
+            .and_then(|(_, rest)| rest.split_once("\n### 6.9 "))
+            .map(|(section, _)| section)
+            .expect("schema-commands.md §6.8");
+        section
+            .split("```sql\n")
+            .skip(1)
+            .filter_map(|block| block.split_once("\n```").map(|(sql, _)| sql))
+            .collect()
+    }
+
+    // The docs are the source of truth: §6.8 shows the SQL `activity` runs, to the word (the
+    // layout aside), and its live test runs the step from there.
+    #[test]
+    fn the_docs_show_activitys_sql_as_built() {
+        let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let documented = activitys_documented_sql();
+        assert_eq!(documented.len(), 2, "{documented:?}");
+        assert_eq!(words(documented[0]), words(ACTIVITY_SQL));
+        assert_eq!(words(documented[1]), words(ACTIVITY_STEP));
+    }
+
+    // `Plan::Lookup`'s rule: the step is one statement, so a capped list gets the brief count
+    // and no `-- partial:` advice; its columns are schema-commands.md §6.8's, in order, and a
+    // cycle can't recurse past 100 hops.
+    #[test]
+    fn activitys_step_is_one_select_of_its_columns() {
+        assert!(
+            !crate::guard::several_outputs(ACTIVITY_STEP),
+            "{ACTIVITY_STEP}"
+        );
+        assert!(ACTIVITY_STEP.starts_with("WITH shown AS (\n"));
+        assert!(
+            ACTIVITY_STEP.contains("WHERE p.blocked_by > 0 AND u.again = 0 AND u.hops < 100\n")
+        );
+        // A walk that comes back to a session it passed, or reaches the bound, gives no depth,
+        // so a waiter behind a cycle isn't 100 deep (live:
+        // `activitys_depth_is_null_in_a_cycle_and_behind_one`).
+        assert!(ACTIVITY_STEP.contains(
+            "CASE WHEN CHARINDEX(CONCAT(',', p.blocked_by, ','), u.seen) > 0 THEN 1 ELSE 0 END\n"
+        ));
+        assert!(
+            ACTIVITY_STEP.contains(
+                "MAX(CASE WHEN u.again = 1 OR u.hops = 100 THEN 1 ELSE 0 END) AS cycle\n"
+            )
+        );
+        assert!(ACTIVITY_STEP.ends_with("\nOPTION (MAXRECURSION 100);"));
+        // Decision 92: both texts collapsed and trimmed, by the same expression.
+        let collapse = |text: &str| {
+            format!(
+                "LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE({text} COLLATE \
+                 Latin1_General_100_BIN2, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '), \
+                 N' ', N' ' + NCHAR(9)), NCHAR(9) + N' ', N''), NCHAR(9), N'')))"
+            )
+        };
+        let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for column in [
+            format!("{} AS statement", collapse("r.s")),
+            format!("{} AS input_buffer", collapse("ib.event_info")),
+        ] {
+            assert!(words(ACTIVITY_STEP).contains(&column), "{column}");
+        }
+        // The statement is cut in code units: under an `_SC` default, `SUBSTRING` of the
+        // byte offsets would start a character late after a surrogate pair.
+        assert!(
+            ACTIVITY_STEP.contains("SUBSTRING(st.text COLLATE Latin1_General_100_BIN2, "),
+            "{ACTIVITY_STEP}"
+        );
+        let list = ACTIVITY_STEP
+            .split_once("\nSELECT x.session_id AS session,")
+            .and_then(|(_, rest)| rest.split_once("\nFROM shown x\n"))
+            .map(|(list, _)| list)
+            .expect("the outer select list");
+        let mut at = 0;
+        for column in [
+            "x.blocked_by",
+            "n.blocking",
+            "END AS depth",
+            "x.status",
+            "x.command",
+            "x.wait,",
+            "x.wait_ms",
+            "x.wait_resource",
+            "x.cpu_ms",
+            "x.reads",
+            "x.elapsed_ms",
+            "x.idle_ms",
+            "x.open_tran",
+            "x.tran_ms",
+            "x.login",
+            "x.host",
+            "x.program",
+            "x.[database]",
+            "AS statement",
+            "AS input_buffer",
+        ] {
+            let found = list[at..]
+                .find(column)
+                .unwrap_or_else(|| panic!("{column} after byte {at}:\n{list}"));
+            at += found + column.len();
+        }
+    }
+
+    /// `activity`'s lookup row: can_view, major.
+    fn activity_found(can: Value, major: i64) -> Found {
+        vec![vec![vec![can, Value::Int(major)]]]
+    }
+
+    // Decision 86: without the permission, exit 1 naming the one the server knows; with it, the
+    // step, in the `sessions` section.
+    #[test]
+    fn activity_says_which_permission_it_lacks() {
+        let refused = |found: Found| {
+            let failure = activity_then(&found).unwrap_err();
+            assert_eq!(failure.exit, Exit::SqlError, "{}", failure.message);
+            failure.message
+        };
+        for major in [16, 17] {
+            assert_eq!(
+                refused(activity_found(Value::Int(0), major)),
+                "activity needs VIEW SERVER PERFORMANCE STATE, which this login lacks: without \
+                 it SQL Server shows a login only its own session. A DBA can grant it"
+            );
+        }
+        for can in [Value::Int(0), Value::Null] {
+            assert_eq!(
+                refused(activity_found(can, 13)),
+                "activity needs VIEW SERVER STATE, which this login lacks: without it SQL \
+                 Server shows a login only its own session. A DBA can grant it"
+            );
+        }
+        let steps = activity_then(&activity_found(Value::Int(1), 17)).unwrap();
+        assert_eq!(labels(&steps), ["sessions"]);
+        assert_eq!(steps[0].sql, ACTIVITY_STEP);
+        for found in [
+            Vec::new(),
+            vec![Vec::new()],
+            vec![vec![vec![Value::Int(1)]]],
+            activity_found(Value::Text("1".into()), 17),
+        ] {
+            let failure = activity_then(&found).unwrap_err();
+            assert_eq!(failure.exit, Exit::Internal, "{found:?}");
+        }
     }
 }

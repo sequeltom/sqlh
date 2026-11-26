@@ -3962,6 +3962,128 @@ fn schema_commands_refuse_what_they_cannot_answer_before_connecting() {
     }
 }
 
+// schema-commands.md §6.9: errorlog's options are checked before anything connects, each
+// refusal exit 3 with its reason; the server named is a closed port, which would be exit 2.
+#[test]
+fn errorlog_refuses_its_bad_options_before_connecting() {
+    let run = |args: &[&str]| run(sqlh().args(DEAD).args(args));
+    let since = "expected 30m, 12h, 7d or a server-local time like 2026-11-20 08:00 (no offset)";
+    for (args, wanted) in [
+        (
+            &["errorlog", "--since", "0m"][..],
+            format!("--since 0m: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "3651d"][..],
+            format!("--since 3651d: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "2026-02-29"][..],
+            format!("--since 2026-02-29: {since}"),
+        ),
+        (
+            &["errorlog", "--since", "2026-11-20T08:00+01:00"][..],
+            format!("--since 2026-11-20T08:00+01:00: {since}"),
+        ),
+        (
+            &["errorlog", "--search", " "][..],
+            "--search takes 1 to 500 characters and no control characters".into(),
+        ),
+        (
+            &["errorlog", "--search", "a\tb"][..],
+            "--search takes 1 to 500 characters and no control characters".into(),
+        ),
+        (
+            &["errorlog", "--archive", "100"][..],
+            "--archive 100: expected 0 to 99".into(),
+        ),
+        (
+            &["errorlog", "--archive", "-1"][..],
+            "--archive -1: expected 0 to 99".into(),
+        ),
+        (
+            &["errorlog", "--since", "1h", "--archive", "1"][..],
+            "--since and --archive don't combine: --since reads back through the archives its \
+             window needs"
+                .into(),
+        ),
+        (
+            &["errorlog", "x"][..],
+            "errorlog takes --since, --search, --agent and --archive, not \"x\"".into(),
+        ),
+        (
+            &["--since", "1h", "-Q", "SELECT 1"][..],
+            "--since only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["tables", "--search", "x"][..],
+            "--search only applies to sqlh errorlog and sqlh profiles list".into(),
+        ),
+        (
+            &["--agent", "SELECT 1"][..],
+            "--agent only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["dbs", "--archive", "1"][..],
+            "--archive only applies to sqlh errorlog".into(),
+        ),
+        (
+            &["--check", "errorlog"][..],
+            "--check compiles your SQL; a schema command runs its own".into(),
+        ),
+        (
+            &["-Q", "SELECT 1", "errorlog"][..],
+            "a schema command runs its own SQL; give it without -Q or -i".into(),
+        ),
+    ] {
+        let r = run(args);
+        assert_eq!(r.code, 3, "{args:?}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains(&format!("-- error: {wanted}")),
+            "{args:?}: {}",
+            r.stdout
+        );
+    }
+}
+
+// schema-commands.md §6.8: activity takes nothing, and what it is given is refused before
+// anything connects, exit 3; the server named is a closed port, which would be exit 2.
+#[test]
+fn activity_refuses_what_it_is_given_before_connecting() {
+    let run = |args: &[&str]| run(sqlh().args(DEAD).args(args));
+    for (args, wanted) in [
+        (&["activity", "--plans"][..], "invalid option '--plans'"),
+        (
+            &["activity", "54"][..],
+            "activity takes no arguments, not \"54\"",
+        ),
+        (
+            &["activity", "--since", "1h"][..],
+            "--since only applies to sqlh errorlog",
+        ),
+        (
+            &["activity", "--text"][..],
+            "--text only applies to sqlh find",
+        ),
+        (
+            &["--check", "activity"][..],
+            "--check compiles your SQL; a schema command runs its own",
+        ),
+        (
+            &["-Q", "SELECT 1", "activity"][..],
+            "a schema command runs its own SQL; give it without -Q or -i",
+        ),
+    ] {
+        let r = run(args);
+        assert_eq!(r.code, 3, "{args:?}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains(&format!("-- error: {wanted}")),
+            "{args:?}: {}",
+            r.stdout
+        );
+    }
+}
+
 // AGENTS.md: models read --help, so it stays short. plan-history.md 2.13 holds it at 62 lines.
 #[test]
 fn help_stays_within_its_line_budget() {
@@ -5596,6 +5718,88 @@ mod mcp {
         }
     }
 
+    // schema-commands.md §6.9 through sqlh mcp: the errorlog tool's arguments are refused before
+    // anything connects (the profile is a closed port, which would be exit 2), as a tool error
+    // with exit 3 in a call's words: a bad since or search the command checks, a bound the
+    // schema states, the database it doesn't take.
+    #[test]
+    fn the_errorlog_tool_refuses_a_bad_argument_before_connecting() {
+        let config = profiles("mcp_errorlog");
+        let calls = [
+            r#"{"since":"2026-11-20T08:00Z"}"#,
+            r#"{"search":"a\u0000b"}"#,
+            r#"{"since":"1h","archive":2}"#,
+            r#"{"archive":100}"#,
+            r#"{"database":"master"}"#,
+        ];
+        let lines: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(n, arguments)| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{{META},"name":"errorlog","arguments":{arguments}}}}}"#,
+                    n + 1
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (n, wanted) in [
+            "-- error: since 2026-11-20T08:00Z: expected 30m, 12h, 7d or a server-local time like \
+             2026-11-20 08:00 (no offset)\n",
+            "-- error: search takes 1 to 500 characters and no control characters\n",
+            "-- error: since and archive don't combine: since reads back through the archives \
+             its window needs\n",
+            "-- error: invalid arguments for errorlog: archive must be a whole number from 0 to \
+             99\n",
+            "-- error: invalid arguments for errorlog: unknown argument database (errorlog takes \
+             since, search, agent, archive, profile, max_rows, max_cell, timeout, format)\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = &by_id(&messages, n as i64 + 1)["result"];
+            assert_eq!(call["isError"], true, "{call}");
+            let text = call["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(wanted) && text.contains("-- failed (exit 3): usage error, "),
+                "{text}"
+            );
+        }
+    }
+
+    // schema-commands.md §6.8 through sqlh mcp: the activity tool takes no database and no
+    // argument of its own; either is a tool error with exit 3 before anything connects (the
+    // profile is a closed port, which would be exit 2).
+    #[test]
+    fn the_activity_tool_refuses_an_argument_before_connecting() {
+        let config = profiles("mcp_activity");
+        let lines: Vec<String> = [r#"{"database":"master"}"#, r#"{"session":54}"#]
+            .iter()
+            .enumerate()
+            .map(|(n, arguments)| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{{META},"name":"activity","arguments":{arguments}}}}}"#,
+                    n + 1
+                )
+            })
+            .collect();
+        let (r, messages) = session(&config, &["--profile", "win"], &lines);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        for (n, wanted) in ["database", "session"].into_iter().enumerate() {
+            let call = &by_id(&messages, n as i64 + 1)["result"];
+            assert_eq!(call["isError"], true, "{call}");
+            let text = call["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(&format!(
+                    "-- error: invalid arguments for activity: unknown argument {wanted} \
+                     (activity takes profile, max_rows, max_cell, timeout, format)\n"
+                )) && text.contains("-- failed (exit 3): usage error, "),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn a_modern_session_discovers_lists_and_calls() {
         let config = profiles("mcp_modern");
@@ -5641,7 +5845,7 @@ mod mcp {
         );
 
         let tools = by_id(&messages, 2)["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         assert_eq!(
             tools[0]["inputSchema"]["properties"]["profile"]["enum"],
             serde_json::json!(["win", "other"])
@@ -5733,7 +5937,7 @@ mod mcp {
         assert_eq!(by_id(&messages, 0)["result"], serde_json::json!({}));
         assert_eq!(by_id(&messages, 2)["result"], serde_json::json!({}));
         let list = &by_id(&messages, 3)["result"];
-        assert_eq!(list["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 11);
         assert!(list.get("ttlMs").is_none() && list.get("resultType").is_none());
         // The only profile is the default; the run fails to connect, as a tool error.
         let call = &by_id(&messages, 4)["result"];
@@ -6238,7 +6442,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            11
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
     }
@@ -7511,7 +7715,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            11
         );
         invalid(23, "Invalid params: _meta must be an object");
         invalid(
@@ -7554,7 +7758,7 @@ mod mcp {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            11
         );
         // Only 14 was acknowledged, and only 14 is answered and torn down at the end.
         let acks: Vec<_> = messages
@@ -13507,6 +13711,462 @@ mod live {
         }
     }
 
+    // schema-commands.md §6.1: `info`'s last column names the server-wide permissions that decide
+    // which server reads a login has, as the server answers for it: `sysadmin` for the owner's
+    // login (in `info` and in `profiles test`, whose header is typed), `none` for a reader with
+    // nothing on the server, then each permission granted alone and in the fixed order. VIEW
+    // SERVER STATE hides the two SQL Server 2022 permissions it implies; on 2016 those and VIEW
+    // ANY ERROR LOG don't exist (the grant doesn't parse), and are never listed.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn info_names_the_logins_server_permissions() {
+        let (p, db) = target();
+        // The row under the header that ends in `server_permissions`, and its last value.
+        let permissions = |r: &Run, header_end: &str| -> String {
+            assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+            let mut lines = r.stdout.lines();
+            let header = lines.find(|l| l.starts_with("server")).unwrap_or_default();
+            assert!(header.ends_with(header_end), "{}", r.stdout);
+            let row = lines.next().unwrap_or_default();
+            assert_eq!(
+                row.split('\t').count(),
+                header.split('\t').count(),
+                "{}",
+                r.stdout
+            );
+            row.rsplit('\t').next().unwrap_or_default().to_owned()
+        };
+        let named = "\tauth_scheme\tserver_time\tserver_permissions";
+        let typed = "\tserver_time:datetimeoffset(7)\tserver_permissions:nvarchar(114)";
+        assert_eq!(permissions(&live(&p, &db, &["info"]), named), "sysadmin");
+        let mut test = Command::new(exe());
+        test.stdin(Stdio::null()).args(["profiles", "test", &p]);
+        assert_eq!(permissions(&run(&mut test), typed), "sysadmin");
+
+        let reader = Reader::create(&p, &db);
+        let login = reader.login.clone();
+        let server = |sql: &str| {
+            let sql = sql.replace("{login}", &login);
+            let r = reader.probe.server.write(&format!("USE master; {sql}"));
+            assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        };
+        let shown = || permissions(&reader.run(&["info"]), named);
+        // VIEW DEFINITION on the scratch database isn't VIEW ANY DEFINITION on the server.
+        assert_eq!(shown(), "none");
+        let mut cases = vec![
+            ("GRANT VIEW SERVER STATE TO [{login}];", "VIEW SERVER STATE"),
+            (
+                "GRANT VIEW ANY DEFINITION TO [{login}];",
+                "VIEW ANY DEFINITION",
+            ),
+            (
+                "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}];",
+                "securityadmin",
+            ),
+        ];
+        let modern = server_major(&*reader.probe.server) >= 16;
+        if modern {
+            cases.extend([
+                (
+                    "GRANT VIEW ANY ERROR LOG TO [{login}];",
+                    "VIEW ANY ERROR LOG",
+                ),
+                (
+                    "GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];",
+                    "VIEW SERVER PERFORMANCE STATE",
+                ),
+                (
+                    "GRANT VIEW SERVER SECURITY STATE TO [{login}];",
+                    "VIEW SERVER SECURITY STATE",
+                ),
+            ]);
+        }
+        for (grant, expected) in cases {
+            server(grant);
+            assert_eq!(shown(), expected, "{grant}");
+            server(
+                &grant
+                    .replace("GRANT ", "REVOKE ")
+                    .replace(" TO [", " FROM [")
+                    .replace(" ADD MEMBER [", " DROP MEMBER ["),
+            );
+            assert_eq!(shown(), "none", "after undoing {grant}");
+        }
+
+        // Several at once, in the fixed order whatever the grants' order.
+        server(
+            "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}]; \
+             GRANT VIEW ANY DEFINITION TO [{login}]; GRANT VIEW SERVER STATE TO [{login}];",
+        );
+        assert_eq!(
+            shown(),
+            "VIEW SERVER STATE, VIEW ANY DEFINITION, securityadmin"
+        );
+        if modern {
+            server(
+                "GRANT VIEW ANY ERROR LOG TO [{login}]; \
+                 GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];",
+            );
+            assert_eq!(
+                shown(),
+                "VIEW SERVER STATE, VIEW ANY ERROR LOG, VIEW ANY DEFINITION, securityadmin",
+                "VIEW SERVER STATE hides what it implies"
+            );
+            server(
+                "REVOKE VIEW SERVER STATE FROM [{login}]; \
+                 GRANT VIEW SERVER SECURITY STATE TO [{login}];",
+            );
+            assert_eq!(
+                shown(),
+                "VIEW SERVER PERFORMANCE STATE, VIEW SERVER SECURITY STATE, VIEW ANY ERROR LOG, \
+                 VIEW ANY DEFINITION, securityadmin"
+            );
+        } else {
+            // VIEW ANY ERROR LOG is SQL Server 2022's: before that, the grant doesn't parse.
+            let grant = format!("USE master; GRANT VIEW ANY ERROR LOG TO [{login}];");
+            let r = reader.probe.server.write(&grant);
+            assert_eq!(r.code, 1, "{grant}\n{}", r.stdout);
+            assert!(r.stdout.contains("-- error 102 "), "{}", r.stdout);
+            assert_eq!(
+                shown(),
+                "VIEW SERVER STATE, VIEW ANY DEFINITION, securityadmin"
+            );
+        }
+    }
+
+    /// A text run's rows (the lines after the first header, up to the first `-- ` line), each
+    /// split at its tabs.
+    fn section_rows(stdout: &str) -> Vec<Vec<&str>> {
+        stdout
+            .lines()
+            .skip_while(|line| line.starts_with("-- "))
+            .skip(1)
+            .take_while(|line| !line.starts_with("-- "))
+            .map(|line| line.split('\t').collect())
+            .collect()
+    }
+
+    /// Whether `errorlog --agent` found no Agent log at all. AppVeyor's certification
+    /// (decision 75) starts only the database engine, so an instance whose Agent never ran is
+    /// possible there and its answer unmeasured (schema-commands.md §6.9): exit 1 with this
+    /// error is taken, never exit 10.
+    fn no_agent_log(r: &Run) -> bool {
+        r.code == 1
+            && r.stdout
+                .starts_with("-- error: this server lists no SQL Server Agent log archives\n")
+    }
+
+    /// An `errorlog --agent` run's rows, the run made without `--since`: its section, possibly
+    /// empty and then with decision 93's note, or none when the server lists no Agent log
+    /// (`no_agent_log`).
+    fn agent_log_rows(r: &Run) -> Vec<Vec<&str>> {
+        if no_agent_log(r) {
+            return Vec::new();
+        }
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- agent_log\ntime\tlevel\ttext\n")
+                || r.stdout.starts_with("-- no rows: agent_log (archive 0, "),
+            "{}",
+            r.stdout
+        );
+        section_rows(&r.stdout)
+    }
+
+    // schema-commands.md §6.9 as the owner (sysadmin): the server's log, newest first, in its
+    // section; the Agent log with its levels as words, and its search's matching lines; an archive
+    // past the last is exit 1 and never the driver's protocol error (exit 10, U14). A server
+    // with no Agent log may answer `--agent` so (`no_agent_log`), and then has no Agent rows to
+    // check.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_reads_the_servers_and_the_agents_log() {
+        let (p, db) = target();
+        let r = live(&p, &db, &["errorlog", "--max-rows", "0"]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- server_log\ntime\tsource\ttext\n"),
+            "{}",
+            r.stdout
+        );
+        let rows = section_rows(&r.stdout);
+        assert!(!rows.is_empty(), "{}", r.stdout);
+        for pair in rows.windows(2) {
+            assert!(pair[0][0] >= pair[1][0], "newest first: {pair:?}");
+        }
+        // The server's trailing CR LF is gone.
+        assert!(
+            rows.iter().all(|row| !row[2].ends_with("\\r\\n")),
+            "{}",
+            r.stdout
+        );
+        // Decision 93: a search with nothing in archive 0 says how far back it read, and that
+        // `--since` or `--archive` reads further, or that archive 0 is all the server keeps;
+        // a window needs no note.
+        let absent = format!("sqlh_absent_{}_zq", std::process::id());
+        let r = live(&p, &db, &["errorlog", "--search", &absent]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let note = r
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("-- no rows: server_log (archive 0, from "))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("the note:\n{}", r.stdout));
+        let (from, further) = note.split_at(note.len().min(16));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        assert!(
+            from.len() == 16
+                && digits(&from[0..4])
+                && &from[4..5] == "-"
+                && digits(&from[5..7])
+                && &from[7..8] == "-"
+                && digits(&from[8..10])
+                && &from[10..11] == " "
+                && digits(&from[11..13])
+                && &from[13..14] == ":"
+                && digits(&from[14..16]),
+            "a server-local minute: {}",
+            r.stdout
+        );
+        assert!(
+            matches!(
+                further,
+                "; --since or --archive reads further back" | ", the oldest the server keeps"
+            ),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["errorlog", "--since", "1m", "--search", &absent]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.starts_with("-- no rows: server_log\n-- ok: "),
+            "{}",
+            r.stdout
+        );
+        let r = live(&p, &db, &["errorlog", "--agent", "--max-rows", "0"]);
+        let agent_log = agent_log_rows(&r);
+        assert!(
+            agent_log
+                .iter()
+                .all(|row| matches!(row[1], "error" | "warning" | "info")),
+            "{}",
+            r.stdout
+        );
+        // The Agent log's search keeps the matching lines alone (decision 90): every row
+        // matches. The search is a line shown whole, with no escape in it, and where the log
+        // has one, a line sharing its second and level with a line it isn't in: decision 89's
+        // companions would bring that line, so the check tells the two rules apart.
+        let searchable = |row: &&Vec<&str>| {
+            let text = row[2].trim();
+            !text.is_empty() && text.len() < 400 && !row[2].contains(['\\', '…'])
+        };
+        let companion = |probe: &Vec<&str>| {
+            let lower = probe[2].trim().to_lowercase();
+            agent_log.iter().any(|row| {
+                (row[0], row[1]) == (probe[0], probe[1]) && !row[2].to_lowercase().contains(&lower)
+            })
+        };
+        let probe = agent_log
+            .iter()
+            .filter(searchable)
+            .find(|row| companion(row))
+            .or_else(|| {
+                eprintln!(
+                    "no Agent log line shares its second and level with another it isn't in: \
+                     decision 90's difference from companions is unchecked on this server"
+                );
+                agent_log.iter().find(searchable)
+            });
+        if let Some(probe) = probe {
+            let search = probe[2].trim();
+            let r = live(
+                &p,
+                &db,
+                &["errorlog", "--agent", "--search", search, "--max-rows", "0"],
+            );
+            assert_eq!(r.code, 0, "{search}: {}", r.stdout);
+            let rows = section_rows(&r.stdout);
+            // The search ignores case (decision 94).
+            let lower = search.to_lowercase();
+            assert!(!rows.is_empty(), "{search}: {}", r.stdout);
+            assert!(
+                rows.iter()
+                    .all(|row| row[2].to_lowercase().contains(&lower)),
+                "{search}: {}",
+                r.stdout
+            );
+        }
+        for agent in [&[][..], &["--agent"][..]] {
+            let mut args = vec!["errorlog", "--archive", "99"];
+            args.extend(agent);
+            let r = live(&p, &db, &args);
+            if !agent.is_empty() && no_agent_log(&r) {
+                continue;
+            }
+            assert_eq!(r.code, 1, "{args:?}: {}", r.stdout);
+            let log = if agent.is_empty() {
+                "the error log"
+            } else {
+                "the SQL Server Agent log"
+            };
+            assert!(
+                r.stdout.starts_with(&format!(
+                    "-- error: {log} has no archive 99; it keeps 0 to "
+                )),
+                "{}",
+                r.stdout
+            );
+        }
+    }
+
+    // Decisions 84 and 89: a failed login of the test's own makes a known entry, and a search
+    // finds it whole: its `Error: 18456` line above its `Login failed` line, the two together
+    // (same time and source), newest first. A window that starts inside archive 1 reads back
+    // into it: its newest line is returned with archive 0's.
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_finds_a_whole_entry_and_reads_back_through_archives() {
+        let (p, db) = target();
+        let login = format!("sqlh_nologin_{}", std::process::id());
+        let mut attempt = Command::new(exe());
+        attempt
+            .stdin(Stdio::null())
+            .env("SQLCMDPASSWORD", random_password())
+            .args(["--profile", &p, "-d", &db, "-U", &login, "-Q", "SELECT 1"]);
+        let r = run(&mut attempt);
+        assert_eq!(r.code, 2, "{}", r.stdout);
+        let r = live(&p, &db, &["errorlog", "--since", "10m", "--search", &login]);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let rows = section_rows(&r.stdout);
+        let failed = rows
+            .iter()
+            .position(|row| row[2].starts_with(&format!("Login failed for user '{login}'.")))
+            .unwrap_or_else(|| panic!("no Login failed line:\n{}", r.stdout));
+        let line = &rows[failed];
+        assert_eq!(line[1], "Logon", "{}", r.stdout);
+        // Its Error line is above it among the lines of its time and source, not necessarily
+        // next to it: other tests' failed logins of the same moment come too, and their lines
+        // can interleave with this one's.
+        assert!(
+            rows[..failed]
+                .iter()
+                .rev()
+                .take_while(|row| (row[0], row[1]) == (line[0], line[1]))
+                .any(|row| row[2].starts_with("Error: 18456, Severity: 14, State: ")),
+            "{}",
+            r.stdout
+        );
+        // Decision 94: the search ignores case and accents on every server. Both test servers'
+        // own collations are accent-sensitive, so this misses unless the search sets its own.
+        let unlike = login.to_uppercase().replacen("NOLOGIN", "NÓLOGIN", 1);
+        let r = live(
+            &p,
+            &db,
+            &["errorlog", "--since", "10m", "--search", &unlike],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            section_rows(&r.stdout)
+                .iter()
+                .any(|row| row[2].starts_with(&format!("Login failed for user '{login}'."))),
+            "{unlike}:\n{}",
+            r.stdout
+        );
+
+        // Archive 1's newest line, and a window from its second.
+        let r = live(&p, &db, &["errorlog", "--archive", "1", "--max-rows", "1"]);
+        if r.code == 1 && r.stdout.contains("has no archive 1") {
+            // Only archive 0: what --since reads is archive 0's, checked above.
+            return;
+        }
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        let newest = section_rows(&r.stdout)
+            .into_iter()
+            .next()
+            .map(|row| row.join("\t"))
+            .unwrap_or_else(|| panic!("archive 1 is empty:\n{}", r.stdout));
+        let since = newest[..19].replace('T', " ");
+        // Archive 1's line is the oldest shown, so nothing may cut the output before it.
+        let r = live(
+            &p,
+            &db,
+            &[
+                "errorlog",
+                "--since",
+                &since,
+                "--max-rows",
+                "0",
+                "--max-output",
+                "0",
+            ],
+        );
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert!(
+            r.stdout.lines().any(|l| l == newest),
+            "--since {since} reads back into archive 1 ({newest}):\n{}",
+            r.stdout
+        );
+    }
+
+    // schema-commands.md §6.9: who may read the log. A reader with nothing on the server is
+    // refused (exit 1), in words by the server's version; VIEW SERVER STATE, VIEW ANY ERROR LOG
+    // (SQL Server 2022 and later) and securityadmin each read it; VIEW SERVER PERFORMANCE STATE
+    // alone doesn't (live check 10).
+    #[test]
+    #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+    fn errorlog_needs_a_permission_and_says_which() {
+        let (p, db) = target();
+        let reader = Reader::create(&p, &db);
+        let login = reader.login.clone();
+        let server = |sql: &str| {
+            let sql = sql.replace("{login}", &login);
+            let r = reader.probe.server.write(&format!("USE master; {sql}"));
+            assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+        };
+        let modern = server_major(&*reader.probe.server) >= 16;
+        let refused = |why: &str| {
+            let r = reader.run(&["errorlog"]);
+            assert_eq!(r.code, 1, "{why}: {}", r.stdout);
+            let wanted = if modern {
+                "-- error: errorlog needs VIEW ANY ERROR LOG or VIEW SERVER STATE, which this \
+                 login lacks; a DBA can grant one\n"
+            } else {
+                "-- error: errorlog needs VIEW SERVER STATE, which this login lacks; a DBA can \
+                 grant it\n"
+            };
+            assert!(r.stdout.starts_with(wanted), "{why}: {}", r.stdout);
+        };
+        refused("no permission");
+        let mut grants = vec![
+            "GRANT VIEW SERVER STATE TO [{login}];",
+            "ALTER SERVER ROLE securityadmin ADD MEMBER [{login}];",
+        ];
+        if modern {
+            grants.push("GRANT VIEW ANY ERROR LOG TO [{login}];");
+            server("GRANT VIEW SERVER PERFORMANCE STATE TO [{login}];");
+            refused("VIEW SERVER PERFORMANCE STATE alone");
+            server("REVOKE VIEW SERVER PERFORMANCE STATE FROM [{login}];");
+        }
+        for grant in grants {
+            server(grant);
+            let r = reader.run(&["errorlog", "--max-rows", "1"]);
+            assert_eq!(r.code, 0, "{grant}: {}", r.stdout);
+            assert!(
+                r.stdout.starts_with("-- server_log\ntime\tsource\ttext\n"),
+                "{grant}: {}",
+                r.stdout
+            );
+            server(
+                &grant
+                    .replace("GRANT ", "REVOKE ")
+                    .replace(" TO [", " FROM [")
+                    .replace(" ADD MEMBER [", " DROP MEMBER ["),
+            );
+            refused(&format!("after undoing {grant}"));
+        }
+    }
+
     // PLAN.md Phase 6, the interim step: the error log, registry reads, drives, version and the
     // configuration listing run in the read-only wrapper, from a user database; a value for
     // sp_configure is refused before anything runs. Whether a login may run each one is the
@@ -13768,7 +14428,7 @@ mod live {
         /// its transaction back) and then drops the table.
         struct Blocked {
             read: String,
-            _hold: Reaped,
+            hold: Reaped,
             _probe: Probe,
         }
 
@@ -13782,8 +14442,26 @@ mod live {
                 );
                 Blocked {
                     read,
-                    _hold: hold,
+                    hold,
                     _probe: probe,
+                }
+            }
+
+            /// The test's own table, which only its own sessions' batches name.
+            fn table(&self) -> &str {
+                &self._probe.name
+            }
+
+            /// Fails the test, saying why, if the held write has ended: `hold_a_write` holds it
+            /// for a minute, and what a test then sees is no longer its chain. Called after a
+            /// look at the server and before its assertions, so a holder still running here was
+            /// running during the look.
+            fn still_held(&mut self, before: &str) {
+                if let Some(status) = self.hold.child().try_wait().expect("the holder's status") {
+                    panic!(
+                        "the held write ended ({status}) before {before}: the test outran \
+                         hold_a_write's minute"
+                    );
                 }
             }
         }
@@ -14082,6 +14760,473 @@ mod live {
                     "session {spid} never waited for the held write"
                 );
             }
+        }
+
+        // schema-commands.md §6.9 through sqlh mcp: the errorlog tool's sections in text and
+        // JSON, its rows the newest within max_rows, and a bad since a tool error that names the
+        // argument without `--`.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn the_errorlog_tool_reads_the_log() {
+            let (p, _db) = target();
+            let mut mcp = Mcp::on(&p);
+            let (error, text) = tool_text(&mcp.call(1, "errorlog", json!({"max_rows": 2})));
+            assert!(!error, "{text}");
+            assert!(
+                text.starts_with("-- server_log\ntime\tsource\ttext\n"),
+                "{text}"
+            );
+            let (body, status) = split_status(&text);
+            assert!(status.starts_with("-- ok: 1 batch, "), "{text}");
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with("-- 2 of ") && l.contains(" rows shown (max_rows 2")),
+                "{text}"
+            );
+            let document =
+                ok_document(&mcp.call(2, "errorlog", json!({"max_rows": 1, "format": "json"})));
+            let results = events(&document, "result");
+            assert_eq!(results.len(), 1, "{document}");
+            assert_eq!(results[0]["label"], "server_log", "{document}");
+            let names: Vec<&str> = results[0]["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["name"].as_str())
+                .collect();
+            assert_eq!(names, ["time", "source", "text"], "{document}");
+            // The Agent log, or on a server that lists none (AppVeyor's, which never starts the
+            // Agent) the command's own error, never exit 10.
+            let (error, text) =
+                tool_text(&mcp.call(4, "errorlog", json!({"agent": true, "max_rows": 1})));
+            if error {
+                assert!(
+                    text.starts_with(
+                        "-- error: this server lists no SQL Server Agent log archives\n\
+                         -- failed (exit 1): "
+                    ),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("-- agent_log\ntime\tlevel\ttext\n")
+                        || text.starts_with("-- no rows: agent_log (archive 0, "),
+                    "{text}"
+                );
+            }
+            let (error, text) = tool_text(&mcp.call(3, "errorlog", json!({"since": "soon"})));
+            assert!(error, "{text}");
+            assert!(
+                text.starts_with(
+                    "-- error: since soon: expected 30m, 12h, 7d or a server-local time like \
+                     2026-11-20 08:00 (no offset)\n-- failed (exit 3): usage error, "
+                ),
+                "{text}"
+            );
+            assert_eq!(mcp.finish().0, 0);
+        }
+
+        /// `activity`'s sessions, as a run in `--format json` gives them (none on any failure).
+        fn activity_rows(r: &Run) -> Vec<Row> {
+            if r.code != 0 {
+                return Vec::new();
+            }
+            let document: Value = serde_json::from_str(r.stdout.trim_end())
+                .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+            assert_eq!(events(&document, "result")[0]["label"], "sessions");
+            result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        }
+
+        /// The test's own chain in `rows`, if both its sessions are there: the read waiting on
+        /// `table` and the session it waits on. Other live tests' chains show too, so only
+        /// these two are looked at.
+        fn own_chain(rows: &[Row], table: &str) -> Option<(Row, Row)> {
+            let names = |row: &Row, column: &str| {
+                row[column]
+                    .as_str()
+                    .is_some_and(|text| text.contains(table))
+            };
+            let blocked = rows
+                .iter()
+                .find(|row| names(row, "statement") && !row["blocked_by"].is_null())?;
+            let head = rows
+                .iter()
+                .find(|row| row["session"] == blocked["blocked_by"])?;
+            Some((head.clone(), blocked.clone()))
+        }
+
+        // schema-commands.md §6.8 and decision 86, on a chain of the test's own: a write held
+        // open (`Blocked`'s holder) and a read waiting on it. The owner sees the head with
+        // depth 0, what it blocks counted and its batch in input_buffer, and the read with
+        // blocked_by the head, a lock wait on the heap's row, depth 1 and its statement. A
+        // reader with no server permission is refused in its version's words; VIEW SERVER STATE
+        // and, on SQL Server 2022 and later, VIEW SERVER PERFORMANCE STATE alone each see it.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn activity_shows_the_tests_own_chain_to_who_may_see_it() {
+            let (p, db) = target();
+            let mut blocked = Blocked::on(&p, &db);
+            let table = blocked.table().to_owned();
+            // Laid out over lines, so its statement shows decision 92's collapse: one line,
+            // single spaces, nothing at either end.
+            let laid_out = format!(
+                "{}\r\n\t",
+                blocked.read.replacen(" FROM ", "\r\n\t   FROM  ", 1)
+            );
+            let _waiter = Reaped(Some(spawn_live(
+                &p,
+                &db,
+                &["--lock-timeout", "0", "-t", "90", "-Q", &laid_out],
+            )));
+            let args = [
+                "activity",
+                "--format",
+                "json",
+                "--max-rows",
+                "0",
+                "--max-cell",
+                "0",
+            ];
+            // Each look is a login, so the first comes after the read has had time to start.
+            let give_up = Instant::now() + Duration::from_secs(20);
+            let (head, waiting) = loop {
+                std::thread::sleep(Duration::from_millis(300));
+                let r = live(&p, &db, &args);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                if let Some(chain) = own_chain(&activity_rows(&r), &table) {
+                    break chain;
+                }
+                blocked.still_held("the test's chain showed");
+                assert!(
+                    Instant::now() < give_up,
+                    "the test's chain never showed:\n{}",
+                    r.stdout
+                );
+            };
+            assert_eq!(head["depth"], 0, "{head:?}");
+            assert!(head["blocking"].as_i64() >= Some(1), "{head:?}");
+            assert!(head["blocked_by"].is_null(), "{head:?}");
+            assert_eq!(head["program"], "sqlh (writes)", "{head:?}");
+            assert!(
+                head["input_buffer"]
+                    .as_str()
+                    .is_some_and(|batch| batch.contains(&format!("INSERT {table} VALUES (1)"))),
+                "{head:?}"
+            );
+            assert_eq!(waiting["depth"], 1, "{waiting:?}");
+            assert!(waiting["blocking"].is_null(), "{waiting:?}");
+            assert_eq!(waiting["status"], "suspended", "{waiting:?}");
+            assert_eq!(waiting["command"], "SELECT", "{waiting:?}");
+            assert_eq!(waiting["statement"], blocked.read.as_str(), "{waiting:?}");
+            assert!(
+                waiting["wait"]
+                    .as_str()
+                    .is_some_and(|w| w.starts_with("LCK_M_")),
+                "{waiting:?}"
+            );
+            assert!(
+                waiting["wait_resource"]
+                    .as_str()
+                    .is_some_and(|w| w.starts_with("RID: ")),
+                "the compact form: {waiting:?}"
+            );
+            // A read-only sqlh run holds its rolled-back wrapper.
+            assert_eq!(waiting["open_tran"], 1, "{waiting:?}");
+            assert_eq!(waiting["program"], "sqlh", "{waiting:?}");
+            assert!(waiting["input_buffer"].is_null(), "{waiting:?}");
+            for column in ["wait_ms", "elapsed_ms", "tran_ms"] {
+                assert!(waiting[column].as_i64() >= Some(0), "{column}: {waiting:?}");
+            }
+
+            let reader = Reader::create(&p, &db);
+            let login = reader.login.clone();
+            let server = |sql: &str| {
+                let sql = sql.replace("{login}", &login);
+                let r = reader.probe.server.write(&format!("USE master; {sql}"));
+                assert_eq!(r.code, 0, "{sql}\n{}", r.stdout);
+            };
+            let modern = server_major(&*reader.probe.server) >= 16;
+            let refused = |why: &str| {
+                let r = reader.run(&["activity"]);
+                assert_eq!(r.code, 1, "{why}: {}", r.stdout);
+                let lacks = if modern {
+                    "VIEW SERVER PERFORMANCE STATE"
+                } else {
+                    "VIEW SERVER STATE"
+                };
+                assert!(
+                    r.stdout.starts_with(&format!(
+                        "-- error: activity needs {lacks}, which this login lacks: without it \
+                         SQL Server shows a login only its own session. A DBA can grant it\n"
+                    )),
+                    "{why}: {}",
+                    r.stdout
+                );
+            };
+            refused("no permission");
+            let mut grants = vec!["VIEW SERVER STATE"];
+            if modern {
+                grants.push("VIEW SERVER PERFORMANCE STATE");
+            }
+            for grant in grants {
+                server(&format!("GRANT {grant} TO [{{login}}];"));
+                let r = reader.run(&args);
+                blocked.still_held(&format!("the read with {grant}"));
+                assert_eq!(r.code, 0, "{grant}: {}", r.stdout);
+                let (seen_head, seen_waiting) = own_chain(&activity_rows(&r), &table)
+                    .unwrap_or_else(|| panic!("{grant} sees the chain:\n{}", r.stdout));
+                assert_eq!(seen_head["session"], head["session"], "{grant}");
+                assert_eq!(seen_waiting["session"], waiting["session"], "{grant}");
+                // The input buffer, the statement and the waiting task come from functions and
+                // DMVs with permission checks of their own (dm_exec_input_buffer,
+                // dm_exec_sql_text, dm_os_waiting_tasks): the grant alone shows them as the
+                // owner sees them. `own_chain` found the read by its statement, which names
+                // the table.
+                assert_eq!(
+                    seen_head["input_buffer"], head["input_buffer"],
+                    "{grant}: {seen_head:?}"
+                );
+                assert!(
+                    seen_waiting["wait"]
+                        .as_str()
+                        .is_some_and(|w| w.starts_with("LCK_M_")),
+                    "{grant}: {seen_waiting:?}"
+                );
+                assert!(
+                    seen_waiting["wait_resource"]
+                        .as_str()
+                        .is_some_and(|w| w.starts_with("RID: ")),
+                    "{grant}: {seen_waiting:?}"
+                );
+                server(&format!("REVOKE {grant} FROM [{{login}}];"));
+                refused(&format!("after revoking {grant}"));
+            }
+        }
+
+        // schema-commands.md §6.8's step, the SQL `activity` runs (the unit test
+        // `the_docs_show_activitys_sql_as_built` holds the doc to it), on a `#s` of made-up
+        // sessions, since no server keeps a blocking cycle for long (the deadlock monitor ends
+        // one within about 5 s): a chain's depths from its head; a cycle's two sessions, one
+        // waiting on the cycle and one waiting on that, all with no depth rather than the hop
+        // bound's 100; a chain of 101 sessions, 99 deep one from the end and no depth at 100
+        // hops. Only temp tables are written.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn activitys_depth_is_null_in_a_cycle_and_behind_one() {
+            let (p, db) = target();
+            let doc = fs::read_to_string(root().join("docs").join("schema-commands.md"))
+                .expect("docs/schema-commands.md");
+            let step = doc
+                .split_once("\n### 6.8 `activity`")
+                .and_then(|(_, rest)| rest.split_once("\n### 6.9 "))
+                .and_then(|(section, _)| section.split("```sql\n").nth(2))
+                .and_then(|block| block.split_once("\n```"))
+                .map(|(sql, _)| sql)
+                .expect("§6.8's step");
+            let mut sessions: Vec<(i64, Option<i64>)> = vec![
+                (30001, None),
+                (30002, Some(30001)),
+                (30003, Some(30002)),
+                (30011, Some(30012)),
+                (30012, Some(30011)),
+                (30013, Some(30011)),
+                (30014, Some(30013)),
+                (30101, None),
+            ];
+            sessions.extend((30102..=30201).map(|s| (s, Some(s - 1))));
+            let values: Vec<String> = sessions
+                .iter()
+                .map(|(s, b)| format!("({s}, {})", b.map_or("NULL".into(), |b| b.to_string())))
+                .collect();
+            // `#s` as the lookup makes it, every session busy so the row rule shows it.
+            let sql = format!(
+                "SELECT CAST(v.s AS smallint) AS session_id, v.b AS blocked_by, \
+                 N'suspended' AS status, N'SELECT' AS command, N'LCK_M_S' AS wait, \
+                 CAST(1 AS bigint) AS wait_ms, N'RID: 1:1:1:0' AS wait_resource, 0 AS cpu_ms, \
+                 CAST(0 AS bigint) AS reads, 1 AS elapsed_ms, CAST(NULL AS bigint) AS idle_ms, \
+                 1 AS open_tran, CAST(1 AS bigint) AS tran_ms, N'made up' AS login, N'h' AS host, \
+                 N'p' AS program, N'db' AS [database], CAST(NULL AS varbinary(64)) AS sql_handle, \
+                 0 AS stmt_start, -1 AS stmt_end, 1 AS busy, CAST(1 AS bit) AS is_user \
+                 INTO #s FROM (VALUES {}) AS v (s, b);\nGO\n{step}\n",
+                values.join(", ")
+            );
+            let dir = OwnScratch::new("activity_depth");
+            let input = dir.0.join("depth.sql");
+            fs::write(&input, sql).expect("the script");
+            let input = input.to_str().expect("a UTF-8 path");
+            let r = live(
+                &p,
+                &db,
+                &["--format", "json", "--max-rows", "0", "-i", input],
+            );
+            assert_eq!(r.code, 0, "{}", r.stdout);
+            let document: Value = serde_json::from_str(r.stdout.trim_end())
+                .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+            let rows = result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            assert_eq!(rows.len(), sessions.len(), "{document}");
+            let of = |session: i64, column: &str| {
+                rows.iter()
+                    .find(|row| row["session"] == session)
+                    .unwrap_or_else(|| panic!("session {session} isn't shown: {document}"))[column]
+                    .clone()
+            };
+            for (session, depth) in [
+                (30001, json!(0)),
+                (30002, json!(1)),
+                (30003, json!(2)),
+                (30011, Value::Null),
+                (30012, Value::Null),
+                (30013, Value::Null),
+                (30014, Value::Null),
+                (30101, json!(0)),
+                (30200, json!(99)),
+                (30201, Value::Null),
+            ] {
+                assert_eq!(of(session, "depth"), depth, "session {session}'s depth");
+            }
+            for (session, blocking) in [(30001, 2), (30011, 3), (30012, 3), (30101, 100)] {
+                assert_eq!(of(session, "blocking"), blocking, "session {session}");
+            }
+        }
+
+        // Decision 83 through sqlh mcp, on two pooled connections: a call stuck behind the
+        // test's held write shows in another call's activity as `sqlh mcp`, blocked, with its
+        // wrapper's open transaction; an idle pooled connection, rolled back by `put_back`,
+        // has neither a request nor a transaction, so it doesn't show. The call runs on a
+        // connection of the pool like any other (decision 88), and its own session is left
+        // out. That the idle one was there to be left out is seen from another session.
+        #[test]
+        #[ignore = "live: needs SQLH_TEST_PROFILE; run with --ignored"]
+        fn the_activity_tool_shows_a_busy_sqlh_mcp_session_and_not_an_idle_one() {
+            let (p, db) = target();
+            let mut blocked = Blocked::on(&p, &db);
+            let mut command = Command::new(exe());
+            command.args([
+                "mcp",
+                "--profile",
+                &p,
+                "--pool",
+                "2",
+                "--verbose",
+                "-t",
+                "30",
+            ]);
+            let mut mcp = Mcp::start(&mut command);
+            let spid = json!({"sql": "SELECT @@SPID AS spid", "format": "json"});
+            let spid_of = |result: &Value| {
+                first_row(&ok_document(result))["spid"]
+                    .as_i64()
+                    .expect("an SPID")
+            };
+            let busy = spid_of(&mcp.call(1, "query", spid.clone()));
+            // Longer than the looks below may take (`wait_until_blocked`'s 20 s at most, then
+            // a connect), within the server's -t 30; it is cancelled once it has been seen.
+            const BUSY_FOR: u64 = 28;
+            let sent = Instant::now();
+            mcp.request(
+                2,
+                "query",
+                &json!({"sql": blocked.read, "timeout": BUSY_FOR}),
+            );
+            wait_until_blocked(&p, &db, busy);
+            let idle = spid_of(&mcp.call(3, "query", spid));
+            assert_ne!(idle, busy, "a second connection");
+
+            // On the idle connection: the busy one shows, this call's own doesn't.
+            let document =
+                ok_document(&mcp.call(4, "activity", json!({"format": "json", "max_rows": 0})));
+            let looked = sent.elapsed();
+            assert!(
+                looked < Duration::from_secs(BUSY_FOR),
+                "the looks took {looked:?}, past the blocked call's {BUSY_FOR} s timeout, so it \
+                 may have ended before activity read the server"
+            );
+            blocked.still_held("activity read the server");
+            let rows = result_sets(&document)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let shown = rows
+                .iter()
+                .find(|row| row["session"] == busy)
+                .unwrap_or_else(|| panic!("session {busy} isn't shown: {document}"));
+            assert_eq!(shown["program"], "sqlh mcp", "{shown:?}");
+            assert!(!shown["blocked_by"].is_null(), "{shown:?}");
+            assert_eq!(shown["open_tran"], 1, "{shown:?}");
+            assert!(
+                shown["statement"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(blocked.table())),
+                "{shown:?}"
+            );
+            assert!(
+                rows.iter().all(|row| row["session"] != idle),
+                "the call's own session: {document}"
+            );
+
+            // The cancelled call's connection is put back, its wrapper rolled back, before its
+            // end is logged.
+            mcp.cancel(2);
+            let stderr = mcp.stderr_with("exit 6 (cancelled)", Duration::from_secs(10));
+            assert!(stderr.contains("exit 6 (cancelled)"), "{stderr}");
+            // Each pooled session as another session sees it: there, idle and with no
+            // transaction, before and after the next call. The reset on reuse gives the
+            // session that call takes a new login_time (seen on both servers), so the other,
+            // whose login_time doesn't change, sat idle in the pool while the call read the
+            // server.
+            let pooled = |spid: i64| {
+                let sql = format!(
+                    "SELECT s.program_name, CONVERT(nvarchar(30), s.login_time, 126) AS \
+                     login_time, s.open_transaction_count AS open_tran, (SELECT COUNT(*) FROM \
+                     sys.dm_exec_requests AS r WHERE r.session_id = s.session_id) AS requests \
+                     FROM sys.dm_exec_sessions AS s WHERE s.session_id = {spid}"
+                );
+                let r = live(&p, &db, &["--format", "json", "-Q", &sql]);
+                assert_eq!(r.code, 0, "{}", r.stdout);
+                let document: Value = serde_json::from_str(r.stdout.trim_end())
+                    .unwrap_or_else(|e| panic!("not a JSON document ({e}): {}", r.stdout));
+                let row = result_sets(&document)
+                    .into_iter()
+                    .next()
+                    .and_then(|rows| rows.into_iter().next())
+                    .unwrap_or_else(|| panic!("session {spid} is gone: the pool didn't keep it"));
+                assert_eq!(row["program_name"], "sqlh mcp", "{spid}: {row:?}");
+                assert_eq!(row["open_tran"], 0, "{spid}: {row:?}");
+                assert_eq!(row["requests"], 0, "{spid}: {row:?}");
+                row
+            };
+            let before = [pooled(busy), pooled(idle)];
+            let (error, text) = tool_text(&mcp.call(5, "activity", json!({"max_rows": 0})));
+            assert!(!error, "{text}");
+            let after = [pooled(busy), pooled(idle)];
+            assert_eq!(
+                before.iter().zip(&after).filter(|(b, a)| b == a).count(),
+                1,
+                "one connection the call reset, one idle: {before:?} then {after:?}"
+            );
+            assert!(
+                text.starts_with(
+                    "-- sessions\nsession\tblocked_by\tblocking\tdepth\tstatus\tcommand\twait\t\
+                     wait_ms\twait_resource\tcpu_ms\treads\telapsed_ms\tidle_ms\topen_tran\t\
+                     tran_ms\tlogin\thost\tprogram\tdatabase\tstatement\tinput_buffer\n"
+                ) || text.starts_with("-- no rows: sessions\n"),
+                "{text}"
+            );
+            for spid in [busy, idle] {
+                assert!(
+                    !text
+                        .lines()
+                        .any(|line| line.split('\t').next() == Some(&spid.to_string())),
+                    "session {spid} is shown:\n{text}"
+                );
+            }
+            assert_eq!(mcp.finish().0, 0);
         }
 
         // Decision 30(c), as the server sees it: `sqlh` for a read-only run, `sqlh (writes)` for
