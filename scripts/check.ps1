@@ -11,8 +11,8 @@
       4. cargo test (unit and process-level tests; no server needed)
       5. cargo build --release
       6. cargo test --release --test cli (the process-level tests against the release exe)
-      7. the size budget: target\release\sqlh.exe, unsigned, at most 3 MB (owner, 2026-10-12;
-         decision 97), built with the cargo registry's path remapped and none of it left in it
+      7. the size budget: target\release\sqlh.exe, unsigned, at most 3.25 MiB (decisions 99
+         and 97), built with the cargo registry's path remapped and none of it left in it
       8. the imports: dumpbin /dependents lists only DLLs that ship with Windows
     Every cargo command that resolves dependencies runs with --locked, so none of them can
     update a stale Cargo.lock and let a later step pass on it (R23): a stale lockfile fails
@@ -39,9 +39,11 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# The size budget for the release exe, in bytes (3 MB; 2.42 MB on 2026-10-12): the unsigned exe
-# this check builds. Signing appends a signature, so the signed exe is larger (decision 97).
-$sizeBudget = 3 * 1024 * 1024
+# The size budget for the release exe, in bytes: the unsigned exe this check builds. Signing
+# appends a signature, so the signed exe is larger (decision 97). 3.25 MiB for the rest of
+# Phase 6 Part 1 (decision 99), whose room isn't an allowance: a slice states its estimate
+# first. 3 MiB from 2026-10-12, when the exe was 2.42 MB.
+$sizeBudget = 3407872
 
 # Decision 97: dependencies' panic locations embed their source paths, under the builder's
 # cargo registry, which names the user's folder (GitHub's runner made the exe 1,024 bytes larger
