@@ -43,5 +43,7 @@ init:
 
 build: off
 
+# The appveyor-diag branch only (PLAN.md §4, AppVeyor, the sixth run's findings): the one-off
+# diagnostic in place of the certification. Never merged to main.
 test_script:
-  - ps: .\scripts\appveyor-live.ps1
+  - ps: .\scripts\appveyor-diag.ps1
