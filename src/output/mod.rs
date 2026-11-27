@@ -1490,8 +1490,8 @@ mod tests {
     #[test]
     fn a_path_as_typed_keeps_its_backslashes_only() {
         assert_eq!(
-            path_as_typed(r"C:\Users\tom\AppData\Roaming\sqlh\profiles.toml"),
-            r"C:\Users\tom\AppData\Roaming\sqlh\profiles.toml"
+            path_as_typed(r"C:\Users\me\AppData\Roaming\sqlh\profiles.toml"),
+            r"C:\Users\me\AppData\Roaming\sqlh\profiles.toml"
         );
         assert_eq!(
             path_as_typed(r"\\server\share\p.toml"),
