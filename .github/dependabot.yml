@@ -7,7 +7,7 @@ updates:
     ignore:
       # Bumped by hand, never by a PR from here: the driver is pinned exactly and its changelog
       # is read before each upgrade, and windows-sys stays on the version mssql-tds uses
-      # (AGENTS.md, Stack).
+      # (AGENTS.md, Stack). upstream-watch.yml files an issue when a new driver is published.
       - dependency-name: mssql-tds
       - dependency-name: windows-sys
   - package-ecosystem: github-actions

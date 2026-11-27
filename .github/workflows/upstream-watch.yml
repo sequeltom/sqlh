@@ -1,0 +1,47 @@
+# The driver watch (PLAN.md §4, Upstream watch): daily, scripts/upstream-watch.ps1 files an
+# issue when crates.io has an mssql-tds newer than Cargo.toml's pin, or yanks the pin.
+# Dependabot ignores the driver, and upstream publishes no GitHub releases to watch. It builds
+# and runs nothing of sqlh's and holds no secret beyond the run's own token.
+#
+# GitHub disables a public repository's scheduled workflows after 60 days without activity in
+# it, and mails whoever last changed the cron line: re-enable it in the Actions tab. A failed
+# run is mailed to the same person.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the issues instead of filing them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+# Two runs at once could both find no issue and both file one.
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
+
+    - name: Watch
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        if ($env:DRY_RUN -eq 'true') { ./scripts/upstream-watch.ps1 -DryRun } else { ./scripts/upstream-watch.ps1 }
