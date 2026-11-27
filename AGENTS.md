@@ -101,7 +101,10 @@ scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --
 .github/workflows/  ci.yml (check.ps1 on every push and PR); release.yml (tag or dispatch: build,
                  read-only; sign, the only job with the Azure token, which never runs the exe;
                  verify, read-only; publish, the draft release; plan-history.md 3.6, R22);
-                 build also uploads the tests' binary for AppVeyor (decision 75)
+                 build also uploads the tests' binary for AppVeyor (decision 75);
+                 upstream-watch.yml (daily: scripts/upstream-watch.ps1 files an issue for a newer
+                 or yanked mssql-tds; its mocked tests, .tests.ps1, run by check.ps1; PLAN.md §4,
+                 Upstream watch)
 appveyor.yml, scripts/appveyor-live.ps1 (and .tests.ps1, its mocked instance loop, run by
                  check.ps1)  release certification on AppVeyor, started by hand:
                  the release run's signed exe and tests against AppVeyor's SQL Servers, Windows
