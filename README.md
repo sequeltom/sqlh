@@ -17,7 +17,7 @@ Status: early (0.x). Releases are signed and tested, and the output format is ve
 
 Read-only mode **guards against accidents; it is not a security boundary.** Before anything runs, sqlh refuses the SQL it knows writes, and it runs everything inside a transaction that it rolls back. That stops a confused agent from changing data. It can't stop a determined one with the same login: in the middle of a batch, a statement sqlh has no rule for still reaches the server, and some effects survive a rollback.
 
-**Give agents a login with only the permissions they need**, for example `db_datareader` and `VIEW DEFINITION`. The database is the enforcement boundary. A new profile refuses writes altogether; a profile changed to allow them (`--write-policy flag`) still needs `--allow-write` on each run.
+**Give agents a login with only the permissions they need**, for example `db_datareader` and `VIEW DEFINITION` ([A login for the agent](#a-login-for-the-agent) has the script). The database is the enforcement boundary. A new profile refuses writes altogether; a profile changed to allow them (`--write-policy flag`) still needs `--allow-write` on each run.
 
 For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not post vulnerability details in a public issue.
 
@@ -79,7 +79,7 @@ Every tool runs under the read-only guard, and writes are only possible from the
 
 ### Profiles
 
-A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line. Profiles are saved in `%USERPROFILE%\.sqlh\profiles.toml`, where your shell and any agent read the same file; profiles from an older sqlh, under `%APPDATA%`, move there by themselves.
+A profile holds a server, a database, a login and its settings. Its password is kept in Windows Credential Manager, never in a file or on a command line. Profiles are saved in `%USERPROFILE%\.sqlh\profiles.toml`, where your shell and any agent read the same file.
 
 ```powershell
 sqlh profiles add dev -S myserver -d AppDb -U agent_reader --description "dev copy of AppDb"
@@ -90,6 +90,28 @@ sqlh profiles rm dev
 ```
 
 Without `-U` a profile uses Windows authentication. `profiles add` tests the connection as it saves, and the first profile saved becomes the default, used when a run names no server or profile. Running `profiles add` again for an existing name updates only the options given. Add `-C` for a server with a self-signed certificate, and `--new-password` to be asked for the password again.
+
+### A login for the agent
+
+The login's permissions are the boundary, not the read-only guard. This makes a login that can read and nothing more, with the server-wide reads `activity` and `errorlog` need. Run it as a sysadmin, with your own names:
+
+```sql
+-- On the server. A Windows login is shown; a SQL login takes WITH PASSWORD instead.
+CREATE LOGIN [CONTOSO\sqlh-agent] FROM WINDOWS;
+-- SQL Server 2022 and later: activity, and the error log.
+GRANT VIEW SERVER PERFORMANCE STATE TO [CONTOSO\sqlh-agent];
+GRANT VIEW ANY ERROR LOG TO [CONTOSO\sqlh-agent];
+-- SQL Server 2016 and 2019 have neither: VIEW SERVER STATE covers both, and shows more.
+-- GRANT VIEW SERVER STATE TO [CONTOSO\sqlh-agent];
+
+-- In each database the agent reads.
+USE AppDb;
+CREATE USER [CONTOSO\sqlh-agent] FOR LOGIN [CONTOSO\sqlh-agent];
+ALTER ROLE db_datareader ADD MEMBER [CONTOSO\sqlh-agent];
+GRANT VIEW DEFINITION TO [CONTOSO\sqlh-agent];   -- sources for def, and deps
+```
+
+Leave out the server grants if the agent shouldn't see other sessions or the error log: `activity` and `errorlog` then say which grant they lack. `sqlh info` shows what a login can read server-wide (`server_permissions`).
 
 ### Queries
 
