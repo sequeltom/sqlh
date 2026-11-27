@@ -6,7 +6,8 @@
 .DESCRIPTION
     Runs, in order, and stops at the first failure with a non-zero exit code:
       1. Cargo.lock is current: cargo metadata --locked
-      2. cargo fmt --check, then scripts/appveyor-live.tests.ps1 (mocked; no service touched)
+      2. cargo fmt --check, then scripts/appveyor-live.tests.ps1 and
+         scripts/upstream-watch.tests.ps1 (mocked; no service or network touched)
       3. cargo clippy --all-targets -- -D warnings, without and with --features timing
       4. cargo test (unit and process-level tests; no server needed)
       5. cargo build --release
@@ -99,6 +100,11 @@ Step 'cargo fmt --check' { cargo fmt --check }
 # it (R59): failures collected by stage, stops tried, no instance started after a failed stop.
 Step 'AppVeyor script (mocked)' {
     $out = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/appveyor-live.tests.ps1 2>&1
+    if ($LASTEXITCODE) { $out | Write-Host } else { $out | Select-Object -Last 1 | Write-Host }
+}
+# The driver watch's decisions against fixed inputs, in pwsh as its workflow runs it.
+Step 'Upstream watch (mocked)' {
+    $out = pwsh -NoProfile -File scripts/upstream-watch.tests.ps1 2>&1
     if ($LASTEXITCODE) { $out | Write-Host } else { $out | Select-Object -Last 1 | Write-Host }
 }
 Step 'cargo clippy' { cargo clippy --locked --all-targets -- -D warnings }
