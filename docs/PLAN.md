@@ -523,7 +523,7 @@ November 14, 2026. Independently reviewed main at `e731f39`, clean starting tree
 
 ### Dependabot's PRs (from 2026-11-14)
 
-The owner's review request, after `.github/dependabot.yml` arrived with PR #1. Open ones are checked for at the start of a session and before a release or tag, and each is recorded here when it is decided (AGENTS.md, Repository housekeeping; owner, 2026-11-27, after #11 waited six days unseen). No issue is opened for one: the PR is its own record. Each upstream changelog was read; none changes sqlh's code, so each is self-verified under decision 52 and listed in the next brief.
+The owner's review request, after `.github/dependabot.yml` arrived with PR #1. Open ones, and the upstream watch's open driver issues (below), are checked for at the start of a session and before a release or tag, and each PR is recorded here when it is decided (AGENTS.md, Repository housekeeping; owner, 2026-11-27, after #11 waited six days unseen). No issue is opened for one: the PR is its own record. Each upstream changelog was read; none changes sqlh's code, so each is self-verified under decision 52 and listed in the next brief.
 
 - **#2 serde_json 1.0.151 → 1.0.154, merged.** 152–154: `-0` and an f32 comparison in `arbitrary_precision`, the first bad byte in an invalid-UTF-8 error, `preserve_order` under `no_std`; none touches what `sqlh mcp` uses (`Value`, `json!`). CI `check`, size budget included, passed.
 - **#3 log 0.4.34 → 0.4.35, merged on its `check`.** Upstream says the release has no source changes (CI rework); the crate is built only with `--features timing`.
