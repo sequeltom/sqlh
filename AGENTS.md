@@ -110,7 +110,8 @@ appveyor.yml, scripts/appveyor-live.ps1 (and .tests.ps1, its mocked instance loo
                  the release run's signed exe and tests against AppVeyor's SQL Servers, Windows
                  auth, nothing compiled (decision 75; PLAN.md §4, AppVeyor)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
-README.md        human-facing intro, build, quick start, safety note, the running list of agent features
+README.md        human-facing intro, build, quick start, safety note, a short list of agent features
+docs/agent-features.md   the full list of agent features, a running tally (decision 101)
 docs/VISION.md   product direction and priorities (the owner's); it takes precedence over older plans
 docs/PLAN.md     the plan: open and planned work, sequencing, owner decisions, first-release checklist
 docs/history/plan-history.md   the plan's finished work: review triage, Phases 1–5, the driver upgrade,
@@ -212,7 +213,7 @@ The test server is the owner's, reached through a profile named `test`. The owne
   - `SQLH_DEBUG_PANIC`, `SQLH_DEBUG_STOP_HOLD_MS`, `SQLH_DEBUG_SESSION_PREFIX` (SQL sent ahead of the session setup, in the same batch), `SQLH_DEBUG_ROW_WORK_US` (work per row and per value chunk in the row loop), `SQLH_DEBUG_MCP_STALL_MS` (`sqlh mcp`'s stall limit for `-t 0`, in place of 60 s) and `SQLH_DEBUG_ADD_HOLD_MS` (a wait in `profiles add` before its edit, standing in for the password prompt) exist only when debug assertions are on, so a test that needs one is `#[cfg(debug_assertions)]`: a release run must not report it as passed.
   - A process test whose `profiles add` or `rm` can get as far as Credential Manager names its profile `sqlh-ut-...` (one of its own process where it can: `sqlh-ut-add-timing-<pid>`): `SQLH_CONFIG` moves the profiles file, not Credential Manager, and an add or remove touches the real `sqlh:<name>` (a Windows-auth add deletes it), so a plain name such as `local` could delete the password of a user's profile of that name (R65).
 - **`--help`:** models read it, so keep it example-first and under about 60 lines.
-- **README's "Built for agents" is a running tally.** When a change adds, alters or removes something made for agents (output shape, limits, errors, exit codes, guard behavior, safeguards, `--help` content), update that list in the same change: the entry, its `*(since ...)*` tag and the tally line. A planned item moves to Built only when its code and tests are committed; until then it stays under Planned with its PLAN.md task number. The README has a human reader (see "Documents and their readers"), so write each entry as what an agent gains and why it matters, in one or two plain lines; the exact behavior belongs in DESIGN.md.
+- **`docs/agent-features.md` is a running tally (decision 101).** When a change adds, alters or removes something made for agents (output shape, limits, errors, exit codes, guard behavior, safeguards, `--help` content), update that list in the same change: the entry, its `*(since ...)*` tag and the tally line. A planned item moves to Built only when its code and tests are committed; until then it stays under Planned with its PLAN.md task number. The list has human readers too, so write each entry as what an agent gains and why it matters, in one or two plain lines; the exact behavior belongs in DESIGN.md. README's "Built for agents" is its short version, ten headlines for a newcomer: change it only when a headline does (a new command, a guarantee added or removed), in the same change.
 
 ## Status
 

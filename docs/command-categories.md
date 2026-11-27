@@ -453,7 +453,7 @@ All are sqlh's own SQL (exempt from the classifier, always read-only, inside the
 
 **`info` reports the login's view permissions:** `VIEW SERVER PERFORMANCE STATE`, `VIEW SERVER STATE`, `VIEW ANY ERROR LOG`, `VIEW ANY DEFINITION`, `VIEW SERVER SECURITY STATE`, and sysadmin, one line. Agents then know up front which reads will fail or return nothing (§3.2, F1 and F2). For the candidate SQL Server 2016 floor, `VIEW SERVER STATE` stands in for the 2022 permissions.
 
-**Cost:** new code and output shapes (golden tests, DESIGN.md §5 and §9, README's "Built for agents"); MCP tools count against decision 20's 350 KiB gate, and the exe against its budget: 3.25 MiB (3,407,872 bytes) for the rest of Part 1, where each slice states its size estimate before it is built and goes back to the owner past it (decision 99; 3 MiB until then, decision 87). Measured with slice 2 (PLAN.md §4, Phase 6 slice 2): the exe was 3,111,424 bytes before it (34,304 left) and 3,134,464 after (11,264 left); MCP's share, the same commit built with `sqlh mcp`'s dispatch removed (mcp-mode.md §8), 298.0 KiB of the 350 KiB. At 0.2.0's code (`336c1c0`): 3,140,608 bytes, MCP 299.0 KiB (decision 99). The figure this line had, 337,408 bytes left at `f905385`, was stale.
+**Cost:** new code and output shapes (golden tests, DESIGN.md §5 and §9, `docs/agent-features.md`); MCP tools count against decision 20's 350 KiB gate, and the exe against its budget: 3.25 MiB (3,407,872 bytes) for the rest of Part 1, where each slice states its size estimate before it is built and goes back to the owner past it (decision 99; 3 MiB until then, decision 87). Measured with slice 2 (PLAN.md §4, Phase 6 slice 2): the exe was 3,111,424 bytes before it (34,304 left) and 3,134,464 after (11,264 left); MCP's share, the same commit built with `sqlh mcp`'s dispatch removed (mcp-mode.md §8), 298.0 KiB of the 350 KiB. At 0.2.0's code (`336c1c0`): 3,140,608 bytes, MCP 299.0 KiB (decision 99). The figure this line had, 337,408 bytes left at `f905385`, was stale.
 
 ### 6.8 Showplan hygiene (D8)
 
@@ -490,7 +490,7 @@ All are sqlh's own SQL (exempt from the classifier, always read-only, inside the
 | MCP session state | `leaves session state sqlh mcp's reset isn't known to clear` | n/a (the CLI runs it) | `Run it with the sqlh CLI, whose session ends with the run` |
 | deny tier | `is on sqlh's deny list (<why>)` | `No switch runs it; ask a person to run it outside sqlh if it is intended` | the same |
 
-**Contract impact:** DESIGN.md §5.1 and §7, the golden tests, `--help` where it quotes a refusal, README's "Built for agents". JSON carries the same words in `error`; a separate `kind` member would be a contract 2.2 addition (optional, part of D2).
+**Contract impact:** DESIGN.md §5.1 and §7, the golden tests, `--help` where it quotes a refusal, `docs/agent-features.md`. JSON carries the same words in `error`; a separate `kind` member would be a contract 2.2 addition (optional, part of D2).
 
 ### 6.10 Small items (D9)
 
