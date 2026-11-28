@@ -1640,7 +1640,13 @@ fn errorlog_step(agent: bool) -> Step {
 /// with SQL Server 2022 (HAS_PERMS_BY_NAME gives NULL before it, and VIEW SERVER STATE
 /// decides). `GETDATE()` is fixed when the statement starts, and a transaction can begin, or
 /// a request end, while the DMVs are read after it, so an age is clamped at 0 (a `tran_ms` of
-/// -3 was seen on 2016).
+/// -3 was seen on 2016). `open_tran` is the higher of the session's `open_transaction_count`
+/// and its user transactions in `dm_tran_session_transactions` (decision 102): on SQL Server
+/// 2019 RTM both counts, the session's and the request's, read 0 for a request running in a
+/// transaction begun in an earlier batch, sqlh's wrapper among them, while the view has it
+/// (AppVeyor, 2026-11-27). Only `is_user_transaction` rows count, since an autocommit write's
+/// own statement transaction is in the view too; the count still decides elsewhere, so a
+/// nesting level and a running autocommit write (2 on 2025 and 2016) read as before.
 const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
     DECLARE @can int = COALESCE(HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'), \
     HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'));\n\
@@ -1657,7 +1663,8 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
     r.cpu_time AS cpu_ms, r.logical_reads AS reads, r.total_elapsed_time AS elapsed_ms,\n\
     CASE WHEN r.session_id IS NULL THEN CASE WHEN s.last_request_end_time > GETDATE() THEN 0 \
     ELSE DATEDIFF_BIG(ms, s.last_request_end_time, GETDATE()) END END AS idle_ms,\n\
-    s.open_transaction_count AS open_tran,\n\
+    CASE WHEN t.user_trans > s.open_transaction_count THEN t.user_trans \
+    ELSE s.open_transaction_count END AS open_tran,\n\
     CASE WHEN t.begun > GETDATE() THEN 0 ELSE DATEDIFF_BIG(ms, t.begun, GETDATE()) END AS \
     tran_ms,\n\
     s.login_name AS login, s.host_name AS host, s.program_name AS program,\n\
@@ -1676,7 +1683,8 @@ const ACTIVITY_SQL: &str = "SET NOCOUNT ON;\n\
     <> s.session_id\n\
     ORDER BY CASE WHEN k.blocking_session_id = r.blocking_session_id THEN 0 ELSE 1 END, \
     k.wait_duration_ms DESC) w\n\
-    OUTER APPLY (SELECT MIN(a.transaction_begin_time) AS begun\n\
+    OUTER APPLY (SELECT MIN(a.transaction_begin_time) AS begun,\n\
+    COUNT(CASE WHEN st.is_user_transaction = 1 THEN 1 END) AS user_trans\n\
     FROM sys.dm_tran_session_transactions st\n\
     JOIN sys.dm_tran_active_transactions a ON a.transaction_id = st.transaction_id\n\
     WHERE st.session_id = s.session_id) t\n\
@@ -3159,6 +3167,18 @@ mod tests {
             assert!(ACTIVITY_SQL.contains(age), "{age}");
         }
         assert_eq!(ACTIVITY_SQL.matches("DATEDIFF_BIG").count(), 2);
+        // Decision 102: the higher of the session's count and its user transactions, so SQL
+        // Server 2019 RTM's 0 for a running request in a transaction reads 1, and an autocommit
+        // write's statement transaction counts for nothing.
+        assert!(ACTIVITY_SQL.contains(
+            "CASE WHEN t.user_trans > s.open_transaction_count THEN t.user_trans ELSE \
+             s.open_transaction_count END AS open_tran,\n"
+        ));
+        assert!(ACTIVITY_SQL.contains(
+            "COUNT(CASE WHEN st.is_user_transaction = 1 THEN 1 END) AS user_trans\n\
+             FROM sys.dm_tran_session_transactions st\n"
+        ));
+        assert_eq!(ACTIVITY_SQL.matches("open_transaction_count").count(), 2);
     }
 
     /// schema-commands.md §6.8's `sql` blocks, the lookup's and the step's, in order.
