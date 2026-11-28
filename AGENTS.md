@@ -105,8 +105,8 @@ scripts/check.ps1  the release check: fmt, clippy (both feature sets), tests, --
                  upstream-watch.yml (daily: scripts/upstream-watch.ps1 files an issue for a newer
                  or yanked mssql-tds; its mocked tests, .tests.ps1, run by check.ps1; PLAN.md §4,
                  Upstream watch)
-appveyor.yml, scripts/appveyor-live.ps1 (and .tests.ps1, its mocked instance loop, run by
-                 check.ps1)  release certification on AppVeyor, started by hand:
+appveyor.yml, scripts/appveyor-live.ps1 (and .tests.ps1, its mocked instance loop and
+                 SQL Browser reads, run by check.ps1)  release certification on AppVeyor, started by hand:
                  the release run's signed exe and tests against AppVeyor's SQL Servers, Windows
                  auth, nothing compiled (decision 75; PLAN.md §4, AppVeyor)
 about.toml, about.hbs  cargo-about's accepted licences and the THIRD-PARTY-NOTICES.html template
