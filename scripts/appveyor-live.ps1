@@ -16,8 +16,9 @@
     3. Runs the process tests once (no server), against the signed exe.
     4. For each instance named in $env:SQLH_CI_INSTANCES (or -Instances), one at a time, since
        every instance on the images listens on 1433 by default (Invoke-Instances): starts it;
-       writes a Windows-auth profile for COMPUTERNAME\INSTANCE, a named instance found through
-       SQL Browser; prints the server's version and how the login was made; creates the
+       waits, about three minutes at most, until SQL Browser reports it on a port that takes a
+       connection (Wait-Instance); writes a Windows-auth profile for COMPUTERNAME\INSTANCE, a
+       named instance found through SQL Browser; prints the server's version and how the login was made; creates the
        scratch database (tests/fixtures/sqlh_test.sql); runs the live tests; stops it. The
        login is real local SSPI through the driver's per-hop provider (db::spn, decision 72),
        with SQL Browser's port. It doesn't exercise the provider's name lookup: the driver
@@ -41,6 +42,65 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# How many times Wait-Instance asks SQL Browser, a second apart. An ask waits up to a second
+# for the answer, and a refused connect to the port it names takes about two (measured on
+# loopback), so the wait is bounded at about three minutes. The mock test lowers it.
+$ReadyTries = 60
+
+# The instance's TCP port from SQL Browser's answer to CLNT_UCAST_INST ([MC-SQLR]'s
+# SVR_RESP: 0x05, a little-endian length, then `key;value;` pairs ending in `;;`), or $null
+# when the answer isn't that instance's or names no TCP port.
+function Get-BrowserTcpPort([byte[]]$Response, [string]$Instance) {
+    if (-not $Response -or $Response.Length -lt 3 -or $Response[0] -ne 5) { return $null }
+    $size = $Response[1] + 256 * $Response[2]
+    if ($Response.Length -lt 3 + $size) { return $null }
+    $fields = [Text.Encoding]::ASCII.GetString($Response, 3, $size) -split ';'
+    $pairs = @{}
+    for ($i = 0; $i + 1 -lt $fields.Count -and $fields[$i]; $i += 2) { $pairs[$fields[$i]] = $fields[$i + 1] }
+    $port = 0
+    if ($pairs['InstanceName'] -ne $Instance -or -not [int]::TryParse("$($pairs['tcp'])", [ref]$port) -or
+        $port -lt 1 -or $port -gt 65535) { return $null }
+    $port
+}
+
+# The instance's port once SQL Browser reports it and the port takes a TCP connection, else
+# $null. One ask, to Browser on UDP 1434 of this computer; the mock test's fake Browser is on
+# a port of its own.
+function Get-InstancePort([string]$Instance, [string]$Address = '127.0.0.1', [int]$BrowserPort = 1434) {
+    $udp = New-Object Net.Sockets.UdpClient
+    try {
+        $udp.Client.ReceiveTimeout = 1000
+        $request = [byte[]](@(4) + [Text.Encoding]::ASCII.GetBytes($Instance) + @(0))
+        [void]$udp.Send($request, $request.Length, $Address, $BrowserPort)
+        $from = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
+        $port = Get-BrowserTcpPort $udp.Receive([ref]$from) $Instance
+        if (-not $port) { return $null }
+        $tcp = New-Object Net.Sockets.TcpClient
+        try { $tcp.Connect($Address, $port) } finally { $tcp.Close() }
+        $port
+    }
+    # No answer within the second, a refused port (Browser not listening yet), or a port not
+    # yet listening: not ready.
+    catch [Net.Sockets.SocketException] { $null }
+    finally { $udp.Close() }
+}
+
+# Waits until SQL Browser reports the instance on a port that takes a connection, before the
+# first connect (PLAN.md §4, AppVeyor, finding A: one connect through Browser failed right
+# after Start-Service returned). A wait for the server, never a retry of a test.
+function Wait-Instance([string]$Instance) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    for ($try = 1; $try -le $script:ReadyTries; $try++) {
+        $port = Get-InstancePort $Instance
+        if ($port) {
+            Write-Host "$Instance is on tcp $port, $($clock.ElapsedMilliseconds) ms after Start-Service returned"
+            return
+        }
+        if ($try -lt $script:ReadyTries) { Start-Sleep -Seconds 1 }
+    }
+    throw "SQL Browser didn't report it on a port that takes a connection in $($script:ReadyTries) tries a second apart"
+}
+
 # One instance, from start to stop. Returns its failures, each naming its stage, and whether
 # its service is known to have stopped. Any error, a cmdlet's or an executable's exit code,
 # ends the instance's work at its stage; the stop is always tried. `$Exe` and `$TestsExe` are
@@ -52,6 +112,8 @@ function Test-Instance([string]$Instance, $Exe, $TestsExe, [string]$Config) {
     $stage = 'start'
     try {
         Start-Service $service
+        $stage = 'ready'
+        Wait-Instance $Instance
         $stage = 'connect'
         $name = 'ci_' + $Instance.ToLowerInvariant()
         # sqlh's own subset of TOML (DESIGN.md §9): the backslash is escaped. The server's
